@@ -59,6 +59,12 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_health(request: Request) -> Response:
         return await svc.handle_health(request)
 
+    async def handle_history(request: Request) -> Response:
+        return await svc.handle_history(request)
+
+    async def handle_recent(request: Request) -> Response:
+        return await svc.handle_recent(request)
+
     return [
         Route("/v1/submit", handle_submit, methods=["POST"]),
         Route("/v1/chat/completions", handle_chat_completions, methods=["POST"]),
@@ -67,5 +73,7 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         Route("/v1/status", handle_status, methods=["GET"]),
         Route("/v1/metrics", handle_metrics, methods=["GET"]),
         Route("/v1/metrics/cost-model", handle_cost_model, methods=["GET"]),
+        Route("/v1/history", handle_history, methods=["GET"]),
+        Route("/v1/recent", handle_recent, methods=["GET"]),
         Route("/health", handle_health, methods=["GET"]),
     ]

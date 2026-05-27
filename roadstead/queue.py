@@ -252,6 +252,94 @@ class PersistentQueue:
         )
         return cursor.rowcount
 
+    def history_buckets(
+        self, hours: float = 4.0, bucket_minutes: int = 5,
+    ) -> list[dict]:
+        """Return time-bucketed aggregates from proxy_completions."""
+        if not self._conn:
+            return []
+        cutoff = time.time() - (hours * 3600)
+        bucket_s = bucket_minutes * 60
+        rows = self._conn.execute(
+            "SELECT "
+            "  CAST((completed_at - ?) / ? AS INTEGER) AS bucket_idx, "
+            "  endpoint, agent_id, "
+            "  COUNT(*) AS req, "
+            "  SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok, "
+            "  SUM(CASE WHEN status!='ok' THEN 1 ELSE 0 END) AS errors, "
+            "  AVG(duration_s) AS avg_dur, "
+            "  SUM(input_tokens) AS total_in, "
+            "  SUM(output_tokens) AS total_out, "
+            "  SUM(duration_s) AS slot_seconds "
+            "FROM proxy_completions "
+            "WHERE completed_at >= ? "
+            "GROUP BY bucket_idx, endpoint, agent_id "
+            "ORDER BY bucket_idx",
+            (cutoff, bucket_s, cutoff),
+        ).fetchall()
+
+        from datetime import datetime, timezone
+        buckets_map: dict[int, dict] = {}
+        for row in rows:
+            idx, ep, aid, req, ok_count, err_count, avg_dur, t_in, t_out, ss = row
+            if idx not in buckets_map:
+                start = cutoff + idx * bucket_s
+                buckets_map[idx] = {
+                    "start": datetime.fromtimestamp(start, tz=timezone.utc).isoformat(),
+                    "end": datetime.fromtimestamp(start + bucket_s, tz=timezone.utc).isoformat(),
+                    "per_endpoint": {},
+                    "per_agent": {},
+                }
+            b = buckets_map[idx]
+            if ep not in b["per_endpoint"]:
+                b["per_endpoint"][ep] = {
+                    "requests": 0, "ok": 0, "errors": 0,
+                    "avg_duration_s": 0, "total_in_tokens": 0,
+                    "total_out_tokens": 0,
+                }
+            epm = b["per_endpoint"][ep]
+            epm["requests"] += req
+            epm["ok"] += ok_count
+            epm["errors"] += err_count
+            epm["avg_duration_s"] = round((avg_dur or 0), 2)
+            epm["total_in_tokens"] += t_in or 0
+            epm["total_out_tokens"] += t_out or 0
+
+            if aid not in b["per_agent"]:
+                b["per_agent"][aid] = {"requests": 0, "slot_seconds": 0}
+            b["per_agent"][aid]["requests"] += req
+            b["per_agent"][aid]["slot_seconds"] = round(
+                b["per_agent"][aid]["slot_seconds"] + (ss or 0), 1,
+            )
+
+        return [buckets_map[k] for k in sorted(buckets_map)]
+
+    def recent_requests(self, limit: int = 50) -> list[dict]:
+        """Return the most recent completed requests for the feed."""
+        if not self._conn:
+            return []
+        rows = self._conn.execute(
+            "SELECT request_id, agent_id, endpoint, call_site, priority, "
+            "       input_tokens, output_tokens, duration_s, queue_wait_ms, "
+            "       status, completed_at "
+            "FROM proxy_completions ORDER BY completed_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        from datetime import datetime, timezone
+        return [
+            {
+                "request_id": r[0], "agent_id": r[1], "endpoint": r[2],
+                "call_site": r[3], "priority": r[4], "input_tokens": r[5],
+                "output_tokens": r[6], "duration_s": round(r[7] or 0, 2),
+                "queue_wait_ms": round(r[8] or 0, 1),
+                "status": r[9],
+                "completed_at": datetime.fromtimestamp(
+                    r[10], tz=timezone.utc,
+                ).isoformat() if r[10] else None,
+            }
+            for r in rows
+        ]
+
     # ----- query (for simulation / observability) -----
 
     def recent_completions(self, hours: float = 4.0) -> list[dict]:
