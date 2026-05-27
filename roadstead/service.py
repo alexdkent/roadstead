@@ -144,6 +144,7 @@ class ProxyService:
             cached = self._cache.get(cache_key)
             if cached:
                 return JSONResponse({
+                    "status": "ok",
                     "request_id": req.request_id,
                     "queue_wait_ms": 0,
                     "backend_latency_ms": 0,
@@ -351,6 +352,24 @@ class ProxyService:
 
     async def handle_cost_model(self, request: Request) -> Response:
         return JSONResponse(self._cost_model.snapshot())
+
+    # ----- handler: history -----
+
+    async def handle_history(self, request: Request) -> Response:
+        hours = float(request.query_params.get("hours", "4"))
+        bucket_minutes = int(request.query_params.get("bucket_minutes", "5"))
+        hours = min(hours, 168)
+        bucket_minutes = max(1, min(bucket_minutes, 60))
+        buckets = self._queue_db.history_buckets(hours, bucket_minutes)
+        return JSONResponse({"buckets": buckets})
+
+    # ----- handler: recent requests (for feed) -----
+
+    async def handle_recent(self, request: Request) -> Response:
+        limit = int(request.query_params.get("limit", "50"))
+        limit = min(limit, 200)
+        rows = self._queue_db.recent_requests(limit)
+        return JSONResponse({"requests": rows})
 
     # ----- handler: health -----
 
