@@ -200,6 +200,44 @@ class BackendClientPool:
         except Exception:
             return False
 
+    async def call_shadow(
+        self,
+        shadow_host: str,
+        shadow_port: int,
+        payload: dict,
+        payload_type: str,
+        request_id: str,
+        timeout_s: float = 300.0,
+    ) -> BackendResponse | None:
+        """Fire-and-forget shadow call for A/B testing.
+
+        Returns the response on success, None on any failure.
+        Never raises — shadow failures must not affect the primary path.
+        """
+        client = self._client_for(shadow_host, shadow_port)
+        path = self._path_for(payload_type)
+        headers = {"X-Request-ID": f"shadow-{request_id}"}
+        t0 = time.monotonic()
+        try:
+            resp = await asyncio.wait_for(
+                client.post(path, json=payload, headers=headers),
+                timeout=timeout_s,
+            )
+            duration = time.monotonic() - t0
+            if resp.status_code >= 400:
+                return None
+            body = resp.json()
+            usage = body.get("usage") or {}
+            return BackendResponse(
+                status_code=resp.status_code,
+                body=body,
+                duration_s=duration,
+                input_tokens=usage.get("prompt_tokens", 0),
+                output_tokens=usage.get("completion_tokens", 0),
+            )
+        except Exception:
+            return None
+
     @staticmethod
     def _path_for(payload_type: str) -> str:
         if payload_type == "embedding":

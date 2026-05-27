@@ -494,6 +494,39 @@ class ProxyService:
         self._record_completion(
             req, decision, duration,
             resp.input_tokens, resp.output_tokens, "ok",
+            response_body=resp.body,
+        )
+
+        # Shadow backend A/B: fire-and-forget to the shadow if configured
+        if ep_cfg.shadow_host and ep_cfg.shadow_port:
+            asyncio.create_task(self._execute_shadow(
+                req, ep_cfg, decision, resp,
+            ))
+
+    async def _execute_shadow(
+        self,
+        req: QueuedRequest,
+        ep_cfg: EndpointConfig,
+        decision: DispatchDecision,
+        primary_resp: BackendResponse,
+    ) -> None:
+        """Send the same request to the shadow backend and record the
+        comparison result. Never affects the primary caller."""
+        shadow_resp = await self._backend.call_shadow(
+            ep_cfg.shadow_host, ep_cfg.shadow_port,
+            req.payload, req.payload_type,
+            req.request_id, timeout_s=req.timeout_s,
+        )
+        if shadow_resp is None:
+            logger.debug("shadow dispatch %s failed", req.request_id)
+            return
+
+        self._queue_db.persist_complete(
+            f"shadow-{req.request_id}", req.agent_id, req.endpoint,
+            req.call_site, int(req.priority),
+            shadow_resp.input_tokens, shadow_resp.output_tokens,
+            shadow_resp.duration_s, decision.queue_wait_ms, "ok",
+            payload=req.payload, response=shadow_resp.body,
         )
 
     async def _execute_streaming(
@@ -570,6 +603,7 @@ class ProxyService:
         input_tokens: int,
         output_tokens: int,
         status: str,
+        response_body: dict | None = None,
     ) -> None:
         now = time.monotonic()
 
@@ -586,12 +620,14 @@ class ProxyService:
             now,
         )
 
-        # Persist completion
+        # Persist completion (with payload + response for corpus)
         self._queue_db.persist_complete(
             req.request_id, req.agent_id, req.endpoint,
             req.call_site, int(req.priority),
             input_tokens, output_tokens, duration_s,
             decision.queue_wait_ms, status,
+            payload=req.payload,
+            response=response_body,
         )
 
         # Log

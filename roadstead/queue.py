@@ -55,7 +55,9 @@ CREATE TABLE IF NOT EXISTS proxy_completions (
     duration_s       REAL,
     queue_wait_ms    REAL,
     status           TEXT NOT NULL,
-    completed_at     REAL NOT NULL
+    completed_at     REAL NOT NULL,
+    payload_json     TEXT,
+    response_json    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_pq_status ON proxy_queue(status);
@@ -83,7 +85,18 @@ class PersistentQueue:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=2500")
         conn.executescript(_SCHEMA)
+        self._migrate_completions(conn)
         return conn
+
+    @staticmethod
+    def _migrate_completions(conn: sqlite3.Connection) -> None:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(proxy_completions)"
+        ).fetchall()}
+        if "payload_json" not in cols:
+            conn.execute("ALTER TABLE proxy_completions ADD COLUMN payload_json TEXT")
+        if "response_json" not in cols:
+            conn.execute("ALTER TABLE proxy_completions ADD COLUMN response_json TEXT")
 
     def close(self) -> None:
         if self._conn:
@@ -131,6 +144,8 @@ class PersistentQueue:
         duration_s: float,
         queue_wait_ms: float,
         status: str,
+        payload: dict | None = None,
+        response: dict | None = None,
     ) -> None:
         if not self._conn:
             return
@@ -139,16 +154,18 @@ class PersistentQueue:
             "DELETE FROM proxy_queue WHERE request_id=?",
             (request_id,),
         )
+        payload_s = json.dumps(payload, separators=(",", ":")) if payload else None
+        response_s = json.dumps(response, separators=(",", ":")) if response else None
         self._conn.execute(
             "INSERT OR REPLACE INTO proxy_completions "
             "(request_id, agent_id, endpoint, call_site, priority, "
             " input_tokens, output_tokens, duration_s, queue_wait_ms, "
-            " status, completed_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            " status, completed_at, payload_json, response_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 request_id, agent_id, endpoint, call_site, priority,
                 input_tokens, output_tokens, duration_s, queue_wait_ms,
-                status, now,
+                status, now, payload_s, response_s,
             ),
         )
 
@@ -384,6 +401,51 @@ class PersistentQueue:
                 "endpoint": r[0], "call_site": r[1],
                 "input_tokens": r[2], "output_tokens": r[3],
                 "duration_s": r[4],
+            }
+            for r in rows
+        ]
+
+    def export_corpus(
+        self,
+        hours: float = 24.0,
+        endpoint: str | None = None,
+        call_site: str | None = None,
+    ) -> list[dict]:
+        """Export replay-ready corpus records with full payloads.
+
+        Returns only successful completions that have payload_json
+        recorded. Used by the test harness for recorded-replay and
+        A/B backend comparison modes.
+        """
+        if not self._conn:
+            return []
+        cutoff = time.time() - (hours * 3600)
+        where = ["completed_at >= ?", "status = 'ok'", "payload_json IS NOT NULL"]
+        params: list = [cutoff]
+        if endpoint:
+            where.append("endpoint = ?")
+            params.append(endpoint)
+        if call_site:
+            where.append("call_site LIKE ?")
+            params.append(call_site.replace("*", "%"))
+        rows = self._conn.execute(
+            "SELECT request_id, agent_id, endpoint, call_site, priority, "
+            "       input_tokens, output_tokens, duration_s, queue_wait_ms, "
+            "       completed_at, payload_json, response_json "
+            "FROM proxy_completions "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY completed_at",
+            params,
+        ).fetchall()
+        return [
+            {
+                "request_id": r[0], "agent_id": r[1], "endpoint": r[2],
+                "call_site": r[3], "priority": r[4],
+                "input_tokens": r[5], "output_tokens": r[6],
+                "duration_s": r[7], "queue_wait_ms": r[8],
+                "completed_at": r[9],
+                "payload": json.loads(r[10]) if r[10] else None,
+                "response": json.loads(r[11]) if r[11] else None,
             }
             for r in rows
         ]

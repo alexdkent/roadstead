@@ -124,6 +124,10 @@ class EndpointConfig:
     host: str = ""
     port: int = 0
 
+    # --- shadow backend (A/B testing) ---
+    shadow_host: str = ""
+    shadow_port: int = 0
+
     @property
     def background_floor_slots(self) -> int:
         return max(1, int(self.max_slots * self.background_floor_pct))
