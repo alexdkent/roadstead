@@ -162,10 +162,8 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         # of composer's 2 slots concurrently. The default 0.20 floor
         # produced bg_floor=max(1, int(2*0.2))=1, which serialized
         # forum-agent's parallel bg work onto a single slot.
-        # Sidekick's interactive composer turns are rare and short-bg-
-        # dominated, so the 0-slot interactive ceiling on composer
-        # is acceptable — interactive waits ≤30s for a bg call to
-        # complete.
+        # Interactive (chat turn) submits at P0_REALTIME and waits
+        # in the scheduler queue — ≤30s for a bg call to complete.
         background_floor_pct=1.0,
         host="10.0.0.3", port=9082,
     ),
