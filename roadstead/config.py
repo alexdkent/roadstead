@@ -149,23 +149,14 @@ class AgentQuotaConfig:
 DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
     "chat": EndpointConfig(
         endpoint_class="chat", role="qwen-analyst",
-        max_slots=4, context_per_slot=4096,
+        max_slots=1, context_per_slot=32768,
         host="10.0.0.6", port=8080,
     ),
     "companion": EndpointConfig(
         endpoint_class="companion", role="qwen-composer",
-        max_slots=2, context_per_slot=65536,
-        # v0.9.D (2026-05-27) — bump bg floor to 1.0. With forum-agent's
-        # voice-neutral classifiers now defaulting to composer
-        # (author_memory, themes_distilled, song_manifest.classify,
-        # thesis_pick fallback), bg needs to be able to occupy both
-        # of composer's 2 slots concurrently. The default 0.20 floor
-        # produced bg_floor=max(1, int(2*0.2))=1, which serialized
-        # forum-agent's parallel bg work onto a single slot.
-        # Interactive (chat turn) submits at P0_REALTIME and waits
-        # in the scheduler queue — ≤30s for a bg call to complete.
+        max_slots=2, context_per_slot=131072,
         background_floor_pct=1.0,
-        host="10.0.0.3", port=9082,
+        host="10.0.0.6", port=8081,
     ),
     "gemma": EndpointConfig(
         endpoint_class="gemma", role="gemma-router",
@@ -190,8 +181,8 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
     ),
     "thinker": EndpointConfig(
         endpoint_class="thinker", role="llama-thinker",
-        max_slots=4, context_per_slot=32768,
-        host="10.0.0.6", port=8084,
+        max_slots=6, context_per_slot=43008,
+        host="10.0.0.3", port=9083,
     ),
 }
 

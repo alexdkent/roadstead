@@ -62,8 +62,8 @@ class TestPriorityBandOrdering:
         sched, *_ = _make_scheduler()
         now = time.monotonic()
 
-        bg = _req(agent_id="bg_agent", priority="P3_INGESTION", now=now)
-        fg = _req(agent_id="fg_agent", priority="P0_REALTIME", now=now + 0.001)
+        bg = _req(agent_id="bg_agent", endpoint="llama-thinker", priority="P3_INGESTION", now=now)
+        fg = _req(agent_id="fg_agent", endpoint="llama-thinker", priority="P0_REALTIME", now=now + 0.001)
 
         sched.enqueue(bg)
         sched.enqueue(fg)
@@ -76,8 +76,8 @@ class TestPriorityBandOrdering:
         sched, *_ = _make_scheduler()
         now = time.monotonic()
 
-        bg = _req(agent_id="bg_agent", priority="P4_HYGIENE", now=now)
-        fg = _req(agent_id="fg_agent", priority="P2_POST_TURN", now=now + 0.001)
+        bg = _req(agent_id="bg_agent", endpoint="llama-thinker", priority="P4_HYGIENE", now=now)
+        fg = _req(agent_id="fg_agent", endpoint="llama-thinker", priority="P2_POST_TURN", now=now + 0.001)
 
         sched.enqueue(bg)
         sched.enqueue(fg)
