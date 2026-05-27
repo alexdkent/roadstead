@@ -17,7 +17,7 @@ import sys
 import uvicorn
 from starlette.applications import Starlette
 
-from .config import ProxyConfig
+from .config import ProxyConfig, load_agent_configs
 from .routes import make_routes
 from .service import ProxyService
 
@@ -52,6 +52,12 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
                 "LLM_PROXY_REQUEST_LOG",
                 os.path.join(log_dir, "llmproxy_requests.jsonl"),
             ),
+            # Per-agent DRR quota overrides (weight, max_balance_ss,
+            # default_priority). Reads originfleet/llmproxy/agents.yaml
+            # by default, or the path in LLM_PROXY_AGENTS_CONFIG.
+            # Missing file → empty dict → proxy lazy-creates agent
+            # configs at AgentQuotaConfig dataclass defaults.
+            agents=load_agent_configs(),
         )
 
     svc = ProxyService(config)
@@ -73,6 +79,13 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         stream=sys.stderr,
     )
+
+    # Emit a ship_version line on startup so the ship harness'
+    # restart-phase health-poll can confirm the new build is running.
+    # Same shape as originfleet.tools.llm_qos and every agent — the
+    # harness greps for "[ship_version] agent=<name>" in the log.
+    from originfleet.framework.ship_version import log_ship_version
+    log_ship_version("llmproxy")
 
     app = build_app()
 

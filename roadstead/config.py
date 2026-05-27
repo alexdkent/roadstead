@@ -7,8 +7,14 @@ config only carries *policy* knobs (weights, floors, timeouts).
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass, field
 from enum import IntEnum
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +155,18 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
     "companion": EndpointConfig(
         endpoint_class="companion", role="qwen-composer",
         max_slots=2, context_per_slot=65536,
+        # v0.9.D (2026-05-27) — bump bg floor to 1.0. With forum-agent's
+        # voice-neutral classifiers now defaulting to composer
+        # (author_memory, themes_distilled, song_manifest.classify,
+        # thesis_pick fallback), bg needs to be able to occupy both
+        # of composer's 2 slots concurrently. The default 0.20 floor
+        # produced bg_floor=max(1, int(2*0.2))=1, which serialized
+        # forum-agent's parallel bg work onto a single slot.
+        # Sidekick's interactive composer turns are rare and short-bg-
+        # dominated, so the 0-slot interactive ceiling on composer
+        # is acceptable — interactive waits ≤30s for a bg call to
+        # complete.
+        background_floor_pct=1.0,
         host="10.0.0.3", port=9082,
     ),
     "gemma": EndpointConfig(
@@ -200,3 +218,61 @@ class ProxyConfig:
         if agent_id not in self.agents:
             self.agents[agent_id] = AgentQuotaConfig(agent_id=agent_id)
         return self.agents[agent_id]
+
+
+# ---------------------------------------------------------------------------
+# Per-agent quota config loader
+# ---------------------------------------------------------------------------
+
+_DEFAULT_AGENTS_CONFIG_PATH = Path(__file__).resolve().parent / "agents.yaml"
+
+
+def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaConfig]:
+    """Load per-agent DRR quota config from a YAML file.
+
+    Each top-level key is an agent_id (matching what the
+    ProxyLLMClient / ProxyScheduler infers from the process cmdline).
+    Values may set any subset of:
+        weight (float),
+        max_balance_ss (float),
+        default_priority (str enum name — e.g. "P3_INGESTION").
+    Missing keys fall back to the AgentQuotaConfig dataclass defaults.
+
+    When ``path`` is None, looks for ``LLM_PROXY_AGENTS_CONFIG`` env
+    var, else falls back to ``<package>/agents.yaml``. A missing file
+    is non-fatal: returns ``{}`` and the proxy lazy-creates per-agent
+    configs at default values.
+    """
+    if path is None:
+        path = os.environ.get("LLM_PROXY_AGENTS_CONFIG") or _DEFAULT_AGENTS_CONFIG_PATH
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        import yaml  # imported lazily so the package boots without yaml in
+                    # purely-Python-stdlib test environments
+        raw = yaml.safe_load(p.read_text()) or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agents config load failed at %s: %s", p, exc)
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("agents config at %s: expected mapping, got %s", p, type(raw))
+        return {}
+    out: dict[str, AgentQuotaConfig] = {}
+    for agent_id, cfg in raw.items():
+        if not isinstance(cfg, dict):
+            logger.warning(
+                "agents config: skipping %r — expected mapping, got %s",
+                agent_id, type(cfg),
+            )
+            continue
+        kwargs: dict[str, Any] = {"agent_id": str(agent_id)}
+        if "weight" in cfg:
+            kwargs["weight"] = float(cfg["weight"])
+        if "max_balance_ss" in cfg:
+            kwargs["max_balance_ss"] = float(cfg["max_balance_ss"])
+        if "default_priority" in cfg:
+            kwargs["default_priority"] = LLMPriority.coerce(cfg["default_priority"])
+        out[str(agent_id)] = AgentQuotaConfig(**kwargs)
+    logger.info("loaded %d agent quota config(s) from %s", len(out), p)
+    return out

@@ -1,0 +1,26 @@
+# Per-agent DRR quota overrides for the centralized LLM proxy.
+#
+# Each top-level key is an agent_id (matching what the proxy infers
+# from /proc/self/cmdline — i.e. the leaf module under
+# originfleet.agents.* or originfleet.tools.*). Missing keys fall
+# back to AgentQuotaConfig dataclass defaults:
+#   weight: 1.0
+#   max_balance_ss: 60.0
+#   default_priority: P1_TURN_SUPPORT
+#
+# Override path: set LLM_PROXY_AGENTS_CONFIG=<path> to point the proxy
+# at a different file (e.g. for tests). Missing file is non-fatal —
+# proxy falls back to lazy-creating defaults.
+
+forum-agent:
+  # Voice-neutral periodics (digests, author_memory, themes, song_manifest)
+  # default to P3 ingestion band so they yield to sidekick's user turns.
+  # Heavy ticks fire ~6 thinker calls × 30s = 180 slot-seconds in a
+  # burst; the higher max_balance_ss lets the first 2 calls go without
+  # immediately throttling on DRR. Weight matches default — forum-agent
+  # isn't privileged relative to other agents.
+  weight: 1.0
+  max_balance_ss: 120.0
+  default_priority: P3_INGESTION
+
+# (Other agents not listed here use AgentQuotaConfig defaults.)
