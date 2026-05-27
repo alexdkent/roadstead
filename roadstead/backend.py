@@ -203,7 +203,7 @@ class BackendClientPool:
     @staticmethod
     def _path_for(payload_type: str) -> str:
         if payload_type == "embedding":
-            return "/v1/embeddings"
+            return "/embed"
         if payload_type == "rerank":
             return "/rerank"
         return "/v1/chat/completions"
