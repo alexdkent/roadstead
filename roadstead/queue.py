@@ -364,3 +364,26 @@ class PersistentQueue:
             }
             for r in rows
         ]
+
+    def completions_for_calibration(self, hours: float = 24.0) -> list[dict]:
+        """Return successful completions with non-zero token counts
+        for cost model bootstrap on startup."""
+        if not self._conn:
+            return []
+        cutoff = time.time() - (hours * 3600)
+        rows = self._conn.execute(
+            "SELECT endpoint, call_site, input_tokens, output_tokens, duration_s "
+            "FROM proxy_completions "
+            "WHERE completed_at >= ? AND status = 'ok' "
+            "  AND output_tokens > 0 AND duration_s > 0 "
+            "ORDER BY completed_at",
+            (cutoff,),
+        ).fetchall()
+        return [
+            {
+                "endpoint": r[0], "call_site": r[1],
+                "input_tokens": r[2], "output_tokens": r[3],
+                "duration_s": r[4],
+            }
+            for r in rows
+        ]

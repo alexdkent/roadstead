@@ -101,6 +101,9 @@ class ProxyService:
         for req in recovered:
             self._scheduler.enqueue(req)
 
+        # Bootstrap cost model from recent completion history
+        self._bootstrap_cost_model()
+
         # Start background loops
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
         self._poller_task = asyncio.create_task(self._capacity_poller_loop())
@@ -108,6 +111,31 @@ class ProxyService:
         logger.info(
             "llmproxy started: %d endpoints, %d total slots",
             len(self._config.endpoints), self._config.total_fleet_slots,
+        )
+
+    def _bootstrap_cost_model(self) -> None:
+        """Replay recent successful completions to calibrate the cost model.
+
+        The cost model is in-memory and lost on restart. This method
+        seeds it from the proxy_completions table so DRR budget charges
+        use observed performance instead of static defaults.
+        """
+        rows = self._queue_db.completions_for_calibration(hours=24)
+        if not rows:
+            return
+        replayed = 0
+        for r in rows:
+            self._cost_model.record_completion(
+                endpoint=r["endpoint"],
+                call_site=r["call_site"],
+                input_tokens=r["input_tokens"],
+                output_tokens=r["output_tokens"],
+                duration_s=r["duration_s"],
+                occupancy_during=1,
+            )
+            replayed += 1
+        logger.info(
+            "cost model bootstrapped from %d recent completions", replayed,
         )
 
     async def shutdown(self) -> None:

@@ -14,6 +14,8 @@ import os
 import signal
 import sys
 
+os.environ.setdefault("COLLECTIVE_AGENT_NAME", "llmproxy")
+
 import uvicorn
 from starlette.applications import Starlette
 
