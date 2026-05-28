@@ -491,10 +491,11 @@ class ProxyService:
         if future and not future.done():
             future.set_result(result)
 
+        capture_response = resp.body if req.payload_type == "chat_completion" else None
         self._record_completion(
             req, decision, duration,
             resp.input_tokens, resp.output_tokens, "ok",
-            response_body=resp.body,
+            response_body=capture_response,
         )
 
         # Shadow backend A/B: fire-and-forget to the shadow if configured
@@ -620,13 +621,16 @@ class ProxyService:
             now,
         )
 
-        # Persist completion (with payload + response for corpus)
+        # Persist completion (with payload + response for corpus).
+        # Skip corpus capture for embedding/rerank — large vectors bloat
+        # the DB and aren't useful for replay testing.
+        capture = req.payload_type == "chat_completion"
         self._queue_db.persist_complete(
             req.request_id, req.agent_id, req.endpoint,
             req.call_site, int(req.priority),
             input_tokens, output_tokens, duration_s,
             decision.queue_wait_ms, status,
-            payload=req.payload,
+            payload=req.payload if capture else None,
             response=response_body,
         )
 
