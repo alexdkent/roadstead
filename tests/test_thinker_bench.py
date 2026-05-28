@@ -75,3 +75,17 @@ def test_percentile():
     assert tb._pct([1, 2, 3, 4, 5], 50) == 3
     assert tb._pct([1, 2, 3, 4, 5], 95) == 5
     assert tb._pct([], 50) == 0.0
+
+
+def test_corpus_entry_must_be_unwrapped():
+    # Export wraps the real request under ["payload"]; both cmd_speed and
+    # cmd_grammar must pass entry["payload"], not the entry itself.
+    entry = {"request_id": "r1", "call_site": "x",
+             "payload": {"messages": [{"role": "user", "content": "hi"}]}}
+    good = tb._build_request(entry["payload"], engine="llama.cpp",
+                             with_grammar=False, stream=True, max_tokens=8)
+    assert good["messages"][-1]["content"] == "hi"
+    # Passing the raw entry loses the messages — the bug we fixed in cmd_speed.
+    bad = tb._build_request(entry, engine="llama.cpp", with_grammar=False,
+                            stream=True, max_tokens=8)
+    assert bad["messages"] == []
