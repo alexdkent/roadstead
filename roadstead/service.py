@@ -131,7 +131,7 @@ class ProxyService:
                 input_tokens=r["input_tokens"],
                 output_tokens=r["output_tokens"],
                 duration_s=r["duration_s"],
-                occupancy_during=1,
+                occupancy_during=0,
             )
             replayed += 1
         logger.info(

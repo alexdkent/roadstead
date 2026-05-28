@@ -167,22 +167,24 @@ class EndpointCostModel:
         est_prefill = self.prefill_k * input_tokens
         est_decode = max(0.01, duration_s - est_prefill)
 
-        # Update decode_tps for the observed occupancy
-        observed_tps = output_tokens / est_decode
-        occ = max(1, min(occupancy_during, self.max_slots))
-        if occ not in self.decode_tps_ewma:
-            self.decode_tps_ewma[occ] = EWMATracker(alpha=0.1)
-        self.decode_tps_ewma[occ].update(observed_tps)
+        # Update decode_tps for the observed occupancy.
+        # occupancy_during < 1 means unknown (e.g. bootstrap replay) —
+        # skip decode_tps calibration to avoid corrupting the curve.
+        if occupancy_during >= 1:
+            observed_tps = output_tokens / est_decode
+            occ = min(occupancy_during, self.max_slots)
+            if occ not in self.decode_tps_ewma:
+                self.decode_tps_ewma[occ] = EWMATracker(alpha=0.1)
+            self.decode_tps_ewma[occ].update(observed_tps)
 
-        # Commit calibrated values
-        if self.decode_tps_ewma[occ].sample_count >= 3:
-            if occ <= len(self.decode_tps):
-                self.decode_tps[occ - 1] = self.decode_tps_ewma[occ].value
+            if self.decode_tps_ewma[occ].sample_count >= 3:
+                if occ <= len(self.decode_tps):
+                    self.decode_tps[occ - 1] = self.decode_tps_ewma[occ].value
 
         # Update prefill_k if we have enough data
         if input_tokens > 100:
-            # Better prefill estimate: total - (output / observed_tps_at_occ)
-            tps_at_occ = self.decode_tps[occ - 1] if occ <= len(self.decode_tps) else 40.0
+            occ_idx = min(max(occupancy_during, 1), self.max_slots)
+            tps_at_occ = self.decode_tps[occ_idx - 1] if occ_idx <= len(self.decode_tps) else 40.0
             implied_decode = output_tokens / tps_at_occ if tps_at_occ > 0 else est_decode
             implied_prefill = max(0, duration_s - implied_decode)
             implied_k = implied_prefill / input_tokens if input_tokens > 0 else 0
