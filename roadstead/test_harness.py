@@ -393,8 +393,14 @@ class ProxyTestHarness:
         report: ABReport,
     ) -> None:
         async with sem:
-            payload = rec["payload"]
-            payload_type = "chat_completion"
+            # Corpus payloads are stored pre-normalization (top-level
+            # `system` + `extra_body`). The proxy applies
+            # _normalize_chat_payload before hitting the primary backend,
+            # so the shadow MUST get the same treatment — otherwise it
+            # silently loses system+grammar and the A/B comparison is
+            # invalid (shadow always looks worse). See backend.py.
+            from .backend import _normalize_chat_payload
+            payload = _normalize_chat_payload(rec["payload"])
             path = "/v1/chat/completions"
 
             ab = ABResult(

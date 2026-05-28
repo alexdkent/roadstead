@@ -100,9 +100,18 @@ class DeterministicCache:
         if payload.get("stream"):
             return None
 
+        # NOTE: cache_key runs on the pre-normalization payload (before
+        # backend._normalize_chat_payload inlines `system` into messages),
+        # so a top-level `system` field is NOT reflected in `messages`
+        # here. It MUST be in the key independently — otherwise two
+        # temperature=0 requests with identical messages but different
+        # system prompts (e.g. different extraction schemas) collide and
+        # the second gets the first's response. That's a correctness/
+        # cache-poisoning bug for structured extraction.
         canonical = json.dumps(
             {
                 "endpoint": endpoint,
+                "system": payload.get("system"),
                 "messages": payload.get("messages"),
                 "grammar": payload.get("grammar") or payload.get("extra_body", {}).get("grammar"),
                 "max_tokens": payload.get("max_tokens"),
