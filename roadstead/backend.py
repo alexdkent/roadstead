@@ -20,6 +20,34 @@ from .config import EndpointConfig
 logger = logging.getLogger(__name__)
 
 
+def _normalize_chat_payload(payload: dict) -> dict:
+    """Make an Anthropic/extra_body-shaped chat payload wire-correct for
+    llama-server.
+
+    The pre-proxy path built requests with ``call_nexus`` +
+    ``openai.OpenAI``: the former inlined a top-level ``system`` field as
+    the first ``messages`` entry, the latter merged ``extra_body`` keys
+    (e.g. GBNF ``grammar``) into the top-level request body. ``ProxyLLMClient``
+    does neither, so without this normalization llama-server silently ignores
+    both — structured-output call sites (knowledge extract/dedup/relationships,
+    temporal, health-verifier) lose their system prompt AND grammar and fall back to
+    free-form output that fails JSON parsing.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if "system" not in payload and "extra_body" not in payload:
+        return payload
+    p = dict(payload)
+    system = p.pop("system", None)
+    if system:
+        content = system if isinstance(system, str) else str(system)
+        p["messages"] = [{"role": "system", "content": content}, *(p.get("messages") or [])]
+    extra_body = p.pop("extra_body", None)
+    if isinstance(extra_body, dict):
+        p.update(extra_body)
+    return p
+
+
 @dataclass
 class BackendResponse:
     """Result of a backend call (non-streaming)."""
@@ -92,6 +120,8 @@ class BackendClientPool:
         client = self._client_for(ep_cfg.host, ep_cfg.port)
         path = self._path_for(payload_type)
         headers = {"X-Request-ID": request_id}
+        if payload_type == "chat_completion":
+            payload = _normalize_chat_payload(payload)
 
         t0 = time.monotonic()
         try:
@@ -143,6 +173,8 @@ class BackendClientPool:
         client = self._client_for(ep_cfg.host, ep_cfg.port)
         path = self._path_for(payload_type)
         headers = {"X-Request-ID": request_id}
+        if payload_type == "chat_completion":
+            payload = _normalize_chat_payload(payload)
 
         try:
             async with client.stream(
