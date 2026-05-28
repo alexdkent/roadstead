@@ -508,27 +508,17 @@ class Scheduler:
         current_occupancy: int,
         now: float,
     ) -> bool:
-        """Concurrency-aware admission: check whether dispatching this
-        request would cause unacceptable degradation to in-flight work."""
+        """Concurrency-aware admission control.
+
+        Currently slot-count gating only. The decode_tps degradation
+        guard was removed — llama.cpp's per-slot KV isolation means
+        adding a request doesn't degrade in-flight work the way shared-
+        decode would, and the cost model's observed_tps math produces
+        unreliable factors on prefill-dominated workloads (inflated
+        tps when prefill eats most of the duration).
+        """
         if ep_cfg.max_slots <= 0:
             return False
         if current_occupancy >= ep_cfg.max_slots:
             return False
-
-        if current_occupancy == 0:
-            return True
-
-        # Check degradation impact on in-flight requests
-        factor = self._cost.degradation_factor(ep_name, current_occupancy)
-        if factor <= 1.05:
-            return True
-
-        active = self._active.get(ep_name, {})
-        for ar in active.values():
-            elapsed = now - ar.dispatched_at
-            remaining = max(0, ar.estimated_remaining_s - elapsed)
-            degraded_remaining = remaining * factor
-            if ar.dispatched_at + elapsed + degraded_remaining > ar.request.timeout_deadline:
-                return False
-
         return True
