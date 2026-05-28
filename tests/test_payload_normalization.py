@@ -17,6 +17,30 @@ from originfleet.llmproxy.coalesce import DeterministicCache
 
 # --- backend normalization ---
 
+def test_vllm_moves_grammar_to_structured_outputs():
+    # vLLM ignores top-level `grammar`; it must land in structured_outputs.
+    payload = {
+        "model": "llama-thinker",
+        "messages": [{"role": "user", "content": "extract"}],
+        "extra_body": {"grammar": "root ::= object"},
+    }
+    out = _normalize_chat_payload(payload, vllm=True)
+    assert "grammar" not in out
+    assert out["structured_outputs"] == {"grammar": "root ::= object"}
+
+
+def test_llamacpp_keeps_top_level_grammar():
+    # Default (llama.cpp) backend: grammar stays top-level, no structured_outputs.
+    payload = {
+        "model": "llama-thinker",
+        "messages": [{"role": "user", "content": "extract"}],
+        "extra_body": {"grammar": "root ::= object"},
+    }
+    out = _normalize_chat_payload(payload)  # vllm=False
+    assert out["grammar"] == "root ::= object"
+    assert "structured_outputs" not in out
+
+
 def test_normalize_inlines_system_into_messages():
     payload = {
         "model": "llama-thinker",

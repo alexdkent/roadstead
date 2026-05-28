@@ -20,9 +20,9 @@ from .config import EndpointConfig
 logger = logging.getLogger(__name__)
 
 
-def _normalize_chat_payload(payload: dict) -> dict:
-    """Make an Anthropic/extra_body-shaped chat payload wire-correct for
-    llama-server.
+def _normalize_chat_payload(payload: dict, vllm: bool = False) -> dict:
+    """Make an Anthropic/extra_body-shaped chat payload wire-correct for the
+    backend.
 
     The pre-proxy path built requests with ``call_nexus`` +
     ``openai.OpenAI``: the former inlined a top-level ``system`` field as
@@ -32,10 +32,17 @@ def _normalize_chat_payload(payload: dict) -> dict:
     both — structured-output call sites (knowledge extract/dedup/relationships,
     temporal, health-verifier) lose their system prompt AND grammar and fall back to
     free-form output that fails JSON parsing.
+
+    For a vLLM backend (``vllm=True``), a top-level ``grammar`` (llama.cpp's
+    field) is silently ignored — vLLM enforces GBNF only via
+    ``structured_outputs.grammar``. We move it there so the thinker (vLLM-NVFP4)
+    actually enforces grammar instead of emitting free-form output.
     """
     if not isinstance(payload, dict):
         return payload
-    if "system" not in payload and "extra_body" not in payload:
+    if "system" not in payload and "extra_body" not in payload and not (
+        vllm and "grammar" in payload
+    ):
         return payload
     p = dict(payload)
     system = p.pop("system", None)
@@ -45,6 +52,11 @@ def _normalize_chat_payload(payload: dict) -> dict:
     extra_body = p.pop("extra_body", None)
     if isinstance(extra_body, dict):
         p.update(extra_body)
+    if vllm and isinstance(p.get("grammar"), str) and p["grammar"].strip():
+        so = p.get("structured_outputs")
+        so = dict(so) if isinstance(so, dict) else {}
+        so.setdefault("grammar", p.pop("grammar"))
+        p["structured_outputs"] = so
     return p
 
 
@@ -121,7 +133,8 @@ class BackendClientPool:
         path = self._path_for(payload_type)
         headers = {"X-Request-ID": request_id}
         if payload_type == "chat_completion":
-            payload = _normalize_chat_payload(payload)
+            payload = _normalize_chat_payload(
+                payload, vllm=(ep_cfg.backend_engine == "vllm"))
 
         t0 = time.monotonic()
         try:
@@ -174,7 +187,8 @@ class BackendClientPool:
         path = self._path_for(payload_type)
         headers = {"X-Request-ID": request_id}
         if payload_type == "chat_completion":
-            payload = _normalize_chat_payload(payload)
+            payload = _normalize_chat_payload(
+                payload, vllm=(ep_cfg.backend_engine == "vllm"))
 
         try:
             async with client.stream(

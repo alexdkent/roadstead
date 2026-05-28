@@ -128,6 +128,10 @@ class EndpointConfig:
     shadow_host: str = ""
     shadow_port: int = 0
 
+    # --- backend engine: "llama.cpp" (top-level `grammar`) or "vllm"
+    # (structured_outputs.grammar). Controls proxy-side payload normalization. ---
+    backend_engine: str = "llama.cpp"
+
     @property
     def background_floor_slots(self) -> int:
         return max(1, int(self.max_slots * self.background_floor_pct))
@@ -187,6 +191,7 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         endpoint_class="thinker", role="llama-thinker",
         max_slots=6, context_per_slot=43008,
         host="10.0.0.3", port=9083,
+        backend_engine="vllm",  # vLLM-NVFP4 on GB10 (replaced llama.cpp 2026-05-28)
     ),
 }
 
