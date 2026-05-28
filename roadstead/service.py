@@ -20,6 +20,7 @@ from .acl import IPIdentityMap
 from .agent_budget import BudgetManager
 from .backend import BackendClientPool, BackendError, BackendResponse, BackendTimeout, BackendUnavailable
 from .coalesce import DeterministicCache, EmbedCoalescer
+from .grammar import GrammarResult, grammar_hash, normalize_and_validate
 from .config import (
     CLASS_TO_ROLE,
     LLMPriority,
@@ -60,6 +61,12 @@ class ProxyService:
         # Caching / coalescing
         self._cache = DeterministicCache()
         self._coalescer = EmbedCoalescer()
+
+        # Grammar authority: cache of normalize+validate results keyed by
+        # grammar hash, + a set of hashes we've already alerted on so each
+        # bad grammar logs loudly once (not per request).
+        self._grammar_cache: dict[str, "GrammarResult"] = {}
+        self._grammar_alerted: set[str] = set()
 
         # Observability
         self._metrics = RollingMetrics(window_s=300.0)
@@ -166,6 +173,17 @@ class ProxyService:
             now=now,
         )
 
+        # Grammar authority: validate + safe-normalize any GBNF grammar
+        # BEFORE enqueue. Fail loud on an invalid grammar rather than
+        # dispatching it (llama-server would silently run unconstrained).
+        if req.payload_type == "chat_completion":
+            grammar_err = self._process_grammar(req)
+            if grammar_err is not None:
+                return JSONResponse(
+                    {"status": "error", "request_id": req.request_id, **grammar_err},
+                    status_code=422,
+                )
+
         # Check deterministic cache
         cache_key = self._cache.cache_key(req.endpoint, req.payload)
         if cache_key:
@@ -186,6 +204,54 @@ class ProxyService:
             return await self._handle_streaming_submit(req)
         else:
             return await self._handle_sync_submit(req, cache_key)
+
+    def _extract_grammar(self, payload: dict) -> tuple[str | None, str | None]:
+        """Return (grammar_string, location) where location is 'top' or
+        'extra_body', or (None, None) if no grammar present."""
+        g = payload.get("grammar")
+        if isinstance(g, str) and g.strip():
+            return g, "top"
+        eb = payload.get("extra_body")
+        if isinstance(eb, dict):
+            g = eb.get("grammar")
+            if isinstance(g, str) and g.strip():
+                return g, "extra_body"
+        return None, None
+
+    def _process_grammar(self, req: QueuedRequest) -> dict | None:
+        """Validate + safe-normalize the request's grammar in place.
+
+        Returns None on success (req.payload updated with the normalized
+        grammar). Returns an error payload dict on failure — the caller
+        must fail loud rather than dispatch. Results are cached by grammar
+        hash; each invalid grammar is logged loudly once.
+        """
+        grammar, location = self._extract_grammar(req.payload)
+        if grammar is None:
+            return None
+
+        h = grammar_hash(grammar)
+        result = self._grammar_cache.get(h)
+        if result is None:
+            result = normalize_and_validate(grammar)
+            self._grammar_cache[h] = result
+
+        if not result.ok:
+            if h not in self._grammar_alerted:
+                self._grammar_alerted.add(h)
+                logger.error(
+                    "GRAMMAR INVALID — failing loud (call_site=%s endpoint=%s): %s",
+                    req.call_site, req.endpoint, result.error_payload()["detail"],
+                )
+            return result.error_payload()
+
+        # Write the normalized grammar back where it came from.
+        if result.normalized:
+            if location == "top":
+                req.payload["grammar"] = result.grammar
+            else:
+                req.payload["extra_body"]["grammar"] = result.grammar
+        return None
 
     async def _handle_sync_submit(
         self, req: QueuedRequest, cache_key: str | None,
