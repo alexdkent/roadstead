@@ -203,8 +203,19 @@ class BackendClientPool:
                         )
         except httpx.ConnectError as exc:
             raise BackendUnavailable(f"backend {ep_cfg.role} unreachable: {exc}")
-        except asyncio.TimeoutError:
+        except httpx.RemoteProtocolError as exc:
+            # Backend dropped the connection — a server-closed keep-alive socket
+            # reused from the pool, or a crash mid-stream. httpx normally
+            # recovers from the keep-alive case transparently, but if it does
+            # surface, map it to a clean BackendUnavailable instead of letting
+            # the raw httpx error propagate (parity with call()).
+            raise BackendUnavailable(f"backend {ep_cfg.role} disconnected mid-stream: {exc}")
+        except (httpx.TimeoutException, asyncio.TimeoutError):
+            # stream() bounds reads via httpx.Timeout, which raises
+            # httpx.ReadTimeout (a TimeoutException) — not asyncio.TimeoutError.
             raise BackendTimeout(f"backend {ep_cfg.role} stream timeout after {timeout_s}s")
+        except httpx.HTTPError as exc:
+            raise BackendError(502, f"backend {ep_cfg.role} stream http error: {exc}")
 
     async def probe_props(self, ep_cfg: EndpointConfig) -> dict | None:
         """Probe backend /props for capacity discovery."""
