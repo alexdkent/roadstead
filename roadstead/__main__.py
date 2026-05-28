@@ -100,5 +100,95 @@ def main() -> None:
     )
 
 
+def _test_cli() -> None:
+    """Entry point for `python -m originfleet.llmproxy test ...`."""
+    p = argparse.ArgumentParser(prog="originfleet.llmproxy test")
+    sub = p.add_subparsers(dest="mode", required=True)
+
+    sim_p = sub.add_parser("sim", help="Discrete-event simulation")
+    sim_p.add_argument("scenario", help="Scenario name or 'all'")
+
+    replay_p = sub.add_parser("replay", help="Replay recorded traffic through proxy")
+    replay_p.add_argument("--hours", type=float, default=4.0)
+    replay_p.add_argument("--endpoint", default=None)
+    replay_p.add_argument("--call-site", default=None)
+    replay_p.add_argument("--compress", type=float, default=1.0)
+    replay_p.add_argument("--multiply", type=int, default=1)
+    replay_p.add_argument("--proxy-url", default="http://127.0.0.1:42161")
+    replay_p.add_argument("--db", default=None, help="Path to proxy queue.db")
+
+    ab_p = sub.add_parser("ab", help="A/B backend comparison")
+    ab_p.add_argument("--hours", type=float, default=4.0)
+    ab_p.add_argument("--endpoint", default=None)
+    ab_p.add_argument("--call-site", default=None)
+    ab_p.add_argument("--shadow-host", required=True)
+    ab_p.add_argument("--shadow-port", type=int, required=True)
+    ab_p.add_argument("--concurrency", type=int, default=4)
+    ab_p.add_argument("--proxy-url", default="http://127.0.0.1:42161")
+    ab_p.add_argument("--db", default=None, help="Path to proxy queue.db")
+
+    args = p.parse_args(sys.argv[2:])
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+
+    from .test_harness import ProxyTestHarness, ShapingConfig
+
+    db_path = args.db or os.path.join(
+        os.environ.get("COLLECTIVE_HOT_ROOT", "/tmp"),
+        "agents", "llmproxy", "queue.db",
+    )
+
+    if args.mode == "sim":
+        harness = ProxyTestHarness()
+        if args.scenario == "all":
+            from .simulation import BUILTIN_SCENARIOS as SCENARIOS
+            for name in sorted(SCENARIOS):
+                result = harness.run_sim(name)
+                print(result.report())
+                status = "PASS" if result.passed else "FAIL"
+                print(f"  → {status}")
+        else:
+            result = harness.run_sim(args.scenario)
+            print(result.report())
+            status = "PASS" if result.passed else "FAIL"
+            print(f"  → {status}")
+
+    elif args.mode == "replay":
+        harness = ProxyTestHarness(
+            proxy_url=args.proxy_url, db_path=db_path,
+        )
+        shaping = ShapingConfig(
+            compress=args.compress,
+            multiply=args.multiply,
+            endpoint_filter=args.endpoint,
+            call_site_filter=args.call_site,
+        )
+        report = asyncio.run(harness.run_replay(
+            hours=args.hours, shaping=shaping,
+        ))
+        print(report.summary())
+
+    elif args.mode == "ab":
+        harness = ProxyTestHarness(
+            proxy_url=args.proxy_url, db_path=db_path,
+        )
+        report = asyncio.run(harness.run_ab(
+            hours=args.hours,
+            endpoint=args.endpoint,
+            call_site=args.call_site,
+            shadow_host=args.shadow_host,
+            shadow_port=args.shadow_port,
+            concurrency=args.concurrency,
+        ))
+        print(report.summary())
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
+        _test_cli()
+    else:
+        main()
