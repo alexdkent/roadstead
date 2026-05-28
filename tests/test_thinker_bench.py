@@ -57,7 +57,7 @@ def test_vllm_grammar_field():
                "grammar": "root ::= x"}
     req = tb._build_request(payload, engine="vllm", with_grammar=True,
                             stream=True, max_tokens=None)
-    assert req["extra_body"]["guided_grammar"] == "root ::= x"
+    assert req["extra_body"]["structured_outputs"]["grammar"] == "root ::= x"
     assert "grammar" not in req
 
 
