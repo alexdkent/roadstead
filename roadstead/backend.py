@@ -67,7 +67,7 @@ class BackendClientPool:
         if key not in self._clients:
             self._clients[key] = httpx.AsyncClient(
                 base_url=f"http://{host}:{port}",
-                timeout=httpx.Timeout(connect=5.0, read=300.0, write=10.0, pool=5.0),
+                timeout=httpx.Timeout(connect=5.0, read=600.0, write=10.0, pool=5.0),
                 limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
             )
         return self._clients[key]
