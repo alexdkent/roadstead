@@ -152,6 +152,86 @@ def test_timeouts_report_aggregates(tmp_path):
     assert row["avg_queued"] == 5.0
 
 
+def test_timeout_event_records_identity_and_context(tmp_path):
+    svc = _svc(tmp_path)
+    req = QueuedRequest.create(
+        agent_id="sidekick", endpoint="thinker", priority="P1_TURN_SUPPORT",
+        call_site="sidekick.test", payload_type="chat_completion",
+        payload={"messages": [{"role": "user", "content": "x" * 4000}], "max_tokens": 256},
+        timeout_s=300.0, session_id="sess9", turn_id="turn1",
+        caller_id="sidekick/sidekick.test/sess9", now=time.monotonic(),
+    )
+    svc._record_timeout_event(req, layer="client_wait", elapsed_s=300.0)
+    row = svc._queue_db._conn.execute(
+        "SELECT session_id, turn_id, caller_id, context_window, context_used_pct "
+        "FROM proxy_timeouts WHERE request_id=?", (req.request_id,),
+    ).fetchone()
+    assert row[0] == "sess9"
+    assert row[1] == "turn1"
+    assert row[2] == "sidekick/sidekick.test/sess9"
+    assert row[3] == 43008  # thinker context_per_slot
+    # est_in = 4000 chars / 4 = 1000 tokens; 1000 / 43008 * 100 ≈ 2.3%
+    assert row[4] == 2.3
+
+
+def test_completion_persists_identity(tmp_path):
+    svc = _svc(tmp_path)
+    req = QueuedRequest.create(
+        agent_id="sidekick", endpoint="thinker", priority="P1_TURN_SUPPORT",
+        call_site="sidekick.test", payload_type="chat_completion",
+        payload={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 64},
+        timeout_s=300.0, session_id="s1", turn_id="t1", caller_id="sidekick/sidekick.test/s1",
+        now=time.monotonic(),
+    )
+    decision = DispatchDecision(request=req, queue_wait_ms=10.0, occupancy_at_dispatch=1)
+    svc._record_completion(req, decision, 5.0, 100, 50, "ok")
+    row = svc._queue_db._conn.execute(
+        "SELECT session_id, turn_id, caller_id FROM proxy_completions WHERE request_id=?",
+        (req.request_id,),
+    ).fetchone()
+    assert row == ("s1", "t1", "sidekick/sidekick.test/s1")
+
+
+def test_report_surfaces_callers_and_context(tmp_path):
+    svc = _svc(tmp_path)
+    for i in range(3):
+        svc._queue_db.persist_timeout_event(
+            request_id=f"c{i}", endpoint="thinker", priority=3, agent_id="forum-agent",
+            call_site="forum-agent.ingest", layer="client_wait", elapsed_s=600.0,
+            applied_timeout_s=600.0, queue_wait_ms=0.0, in_flight=2, queued=0,
+            max_slots=6, est_in=30000, est_out=1024, recommended_ms=1500000.0,
+            under_recommended=True, session_id=f"s{i}", turn_id=None,
+            caller_id="forum-agent/forum-agent.ingest/sess", context_window=43008,
+            context_used_pct=69.8,
+        )
+    rep = svc._queue_db.timeouts_report(24)
+    row = rep["rows"][0]
+    assert row["top_callers"] == {"forum-agent/forum-agent.ingest/sess": 3}
+    assert row["avg_context_used_pct"] == 69.8
+
+
+def test_migration_upgrades_old_timeouts_table(tmp_path):
+    import sqlite3
+    from originfleet.llmproxy.queue import PersistentQueue
+
+    db = str(tmp_path / "old.db")
+    c = sqlite3.connect(db)
+    c.execute(
+        "CREATE TABLE proxy_timeouts (id INTEGER PRIMARY KEY, request_id TEXT, "
+        "occurred_at REAL, endpoint TEXT, priority INTEGER, layer TEXT)"
+    )
+    c.commit()
+    c.close()
+
+    q = PersistentQueue(db)  # _open runs the ALTER migration
+    cols = {r[1] for r in q._conn.execute(
+        "PRAGMA table_info(proxy_timeouts)"
+    ).fetchall()}
+    assert {"session_id", "turn_id", "caller_id", "context_window",
+            "context_used_pct"} <= cols
+    q.close()
+
+
 @pytest.mark.asyncio
 async def test_timeouts_report_endpoint(tmp_path):
     svc = _svc(tmp_path)

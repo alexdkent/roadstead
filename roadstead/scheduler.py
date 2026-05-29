@@ -51,6 +51,7 @@ class QueuedRequest:
     estimated_cost_ss: float = 0.0
     session_id: str | None = None
     turn_id: str | None = None
+    caller_id: str | None = None
     timeout_s: float = 180.0
     stream: bool = False
 
@@ -67,6 +68,7 @@ class QueuedRequest:
         timeout_s: float = 180.0,
         session_id: str | None = None,
         turn_id: str | None = None,
+        caller_id: str | None = None,
         request_id: str | None = None,
         now: float | None = None,
     ) -> QueuedRequest:
@@ -87,6 +89,7 @@ class QueuedRequest:
             timeout_s=timeout_s,
             session_id=session_id,
             turn_id=turn_id,
+            caller_id=caller_id,
             stream=bool(payload.get("stream")),
         )
 

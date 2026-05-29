@@ -57,7 +57,10 @@ CREATE TABLE IF NOT EXISTS proxy_completions (
     status           TEXT NOT NULL,
     completed_at     REAL NOT NULL,
     payload_json     TEXT,
-    response_json    TEXT
+    response_json    TEXT,
+    session_id       TEXT,
+    turn_id          TEXT,
+    caller_id        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS proxy_timeout_shadow (
@@ -96,7 +99,12 @@ CREATE TABLE IF NOT EXISTS proxy_timeouts (
     est_in            INTEGER,
     est_out           INTEGER,
     recommended_ms    REAL,
-    under_recommended INTEGER
+    under_recommended INTEGER,
+    session_id        TEXT,
+    turn_id           TEXT,
+    caller_id         TEXT,
+    context_window    INTEGER,
+    context_used_pct  REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_pq_status ON proxy_queue(status);
@@ -127,17 +135,40 @@ class PersistentQueue:
         conn.execute("PRAGMA busy_timeout=2500")
         conn.executescript(_SCHEMA)
         self._migrate_completions(conn)
+        self._migrate_timeouts(conn)
         return conn
 
     @staticmethod
-    def _migrate_completions(conn: sqlite3.Connection) -> None:
-        cols = {r[1] for r in conn.execute(
-            "PRAGMA table_info(proxy_completions)"
+    def _add_missing_columns(
+        conn: sqlite3.Connection, table: str, columns: dict[str, str],
+    ) -> None:
+        """Idempotently ALTER-ADD any columns missing from ``table``."""
+        existing = {r[1] for r in conn.execute(
+            f"PRAGMA table_info({table})"
         ).fetchall()}
-        if "payload_json" not in cols:
-            conn.execute("ALTER TABLE proxy_completions ADD COLUMN payload_json TEXT")
-        if "response_json" not in cols:
-            conn.execute("ALTER TABLE proxy_completions ADD COLUMN response_json TEXT")
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    @classmethod
+    def _migrate_completions(cls, conn: sqlite3.Connection) -> None:
+        cls._add_missing_columns(conn, "proxy_completions", {
+            "payload_json": "TEXT",
+            "response_json": "TEXT",
+            "session_id": "TEXT",
+            "turn_id": "TEXT",
+            "caller_id": "TEXT",
+        })
+
+    @classmethod
+    def _migrate_timeouts(cls, conn: sqlite3.Connection) -> None:
+        cls._add_missing_columns(conn, "proxy_timeouts", {
+            "session_id": "TEXT",
+            "turn_id": "TEXT",
+            "caller_id": "TEXT",
+            "context_window": "INTEGER",
+            "context_used_pct": "REAL",
+        })
 
     def close(self) -> None:
         if self._conn:
@@ -187,6 +218,9 @@ class PersistentQueue:
         status: str,
         payload: dict | None = None,
         response: dict | None = None,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        caller_id: str | None = None,
     ) -> None:
         if not self._conn:
             return
@@ -201,12 +235,14 @@ class PersistentQueue:
             "INSERT OR REPLACE INTO proxy_completions "
             "(request_id, agent_id, endpoint, call_site, priority, "
             " input_tokens, output_tokens, duration_s, queue_wait_ms, "
-            " status, completed_at, payload_json, response_json) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " status, completed_at, payload_json, response_json, "
+            " session_id, turn_id, caller_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 request_id, agent_id, endpoint, call_site, priority,
                 input_tokens, output_tokens, duration_s, queue_wait_ms,
                 status, now, payload_s, response_s,
+                session_id, turn_id, caller_id,
             ),
         )
 
@@ -267,6 +303,11 @@ class PersistentQueue:
         est_out: int,
         recommended_ms: float,
         under_recommended: bool,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        caller_id: str | None = None,
+        context_window: int = 0,
+        context_used_pct: float | None = None,
     ) -> None:
         """Record a call that hit its timeout instead of finishing, with
         the load context at the moment it gave up. ``layer`` is one of
@@ -281,13 +322,15 @@ class PersistentQueue:
             "INSERT INTO proxy_timeouts "
             "(request_id, occurred_at, endpoint, priority, agent_id, call_site, "
             " layer, elapsed_s, applied_timeout_s, queue_wait_ms, in_flight, "
-            " queued, max_slots, est_in, est_out, recommended_ms, under_recommended) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " queued, max_slots, est_in, est_out, recommended_ms, under_recommended, "
+            " session_id, turn_id, caller_id, context_window, context_used_pct) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 request_id, time.time(), endpoint, int(priority), agent_id, call_site,
                 layer, elapsed_s, applied_timeout_s, queue_wait_ms, in_flight,
                 queued, max_slots, est_in, est_out, recommended_ms,
                 1 if under_recommended else 0,
+                session_id, turn_id, caller_id, context_window, context_used_pct,
             ),
         )
 
@@ -603,7 +646,7 @@ class PersistentQueue:
         cutoff = time.time() - (hours * 3600)
         rows = self._conn.execute(
             "SELECT endpoint, priority, layer, elapsed_s, in_flight, queued, "
-            "       under_recommended, recommended_ms "
+            "       under_recommended, recommended_ms, caller_id, context_used_pct "
             "FROM proxy_timeouts WHERE occurred_at >= ?",
             (cutoff,),
         ).fetchall()
@@ -611,23 +654,30 @@ class PersistentQueue:
         groups: dict[tuple[str, int, str], dict] = {}
         total = 0
         premature = 0
-        for ep, pri, layer, elapsed, in_flight, queued, under, rec_ms in rows:
+        for ep, pri, layer, elapsed, in_flight, queued, under, rec_ms, caller, ctx_pct in rows:
             total += 1
             premature += int(under or 0)
             g = groups.setdefault((ep, pri, layer), {
                 "elapsed": [], "in_flight": [], "queued": [],
-                "premature": 0, "recommended": [],
+                "premature": 0, "recommended": [], "callers": {}, "ctx_pct": [],
             })
             g["elapsed"].append(elapsed or 0.0)
             g["in_flight"].append(in_flight or 0)
             g["queued"].append(queued or 0)
             g["premature"] += int(under or 0)
             g["recommended"].append(rec_ms or 0.0)
+            if caller:
+                g["callers"][caller] = g["callers"].get(caller, 0) + 1
+            if ctx_pct is not None:
+                g["ctx_pct"].append(ctx_pct)
 
         out: list[dict] = []
         for (ep, pri, layer), g in groups.items():
             n = len(g["elapsed"])
             elapsed = sorted(g["elapsed"])
+            top_callers = dict(sorted(
+                g["callers"].items(), key=lambda kv: -kv[1],
+            )[:3])
             out.append({
                 "endpoint": ep,
                 "priority": pri,
@@ -639,6 +689,11 @@ class PersistentQueue:
                 "avg_in_flight": round(sum(g["in_flight"]) / n, 1) if n else 0.0,
                 "avg_queued": round(sum(g["queued"]) / n, 1) if n else 0.0,
                 "recommended_ms_p50": round(percentile(sorted(g["recommended"]), 50), 1),
+                "avg_context_used_pct": (
+                    round(sum(g["ctx_pct"]) / len(g["ctx_pct"]), 1)
+                    if g["ctx_pct"] else None
+                ),
+                "top_callers": top_callers,
             })
         out.sort(key=lambda r: (-r["count"], r["endpoint"], r["priority"], r["layer"]))
         return {"total": total, "premature": premature, "rows": out}

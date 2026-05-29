@@ -46,6 +46,9 @@ class RequestLogRecord:
     coalesced: bool = False
     estimated_input_tokens: int = 0
     max_output_tokens: int = 0
+    session_id: str | None = None
+    turn_id: str | None = None
+    caller_id: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(
@@ -71,6 +74,9 @@ class RequestLogRecord:
                 "max_output_tokens": self.max_output_tokens,
                 "cache_hit": self.cache_hit,
                 "coalesced": self.coalesced,
+                "session_id": self.session_id,
+                "turn_id": self.turn_id,
+                "caller_id": self.caller_id,
             },
             separators=(",", ":"),
         )

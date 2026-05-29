@@ -210,6 +210,7 @@ class ProxyService:
             timeout_s=float(body.get("timeout_s", 180.0)),
             session_id=body.get("session_id"),
             turn_id=body.get("turn_id"),
+            caller_id=body.get("caller_id"),
             request_id=body.get("request_id"),
             now=now,
         )
@@ -830,6 +831,9 @@ class ProxyService:
             decision.queue_wait_ms, status,
             payload=req.payload if capture else None,
             response=response_body,
+            session_id=req.session_id,
+            turn_id=req.turn_id,
+            caller_id=req.caller_id,
         )
 
         # Log
@@ -853,6 +857,9 @@ class ProxyService:
             status=status,
             estimated_input_tokens=estimate_input_tokens(req.payload),
             max_output_tokens=req.payload.get("max_tokens", 0),
+            session_id=req.session_id,
+            turn_id=req.turn_id,
+            caller_id=req.caller_id,
         ))
 
         # Metrics
@@ -962,6 +969,11 @@ class ProxyService:
             est_in = estimate_input_tokens(req.payload)
             est_out = int(req.payload.get("max_tokens", 0) or 0)
             priority = int(req.priority)
+            ep_cfg = self._config.endpoints.get(normalize_endpoint(req.endpoint))
+            context_window = ep_cfg.context_per_slot if ep_cfg else 0
+            context_used_pct = (
+                round(est_in / context_window * 100.0, 1) if context_window else None
+            )
             try:
                 recommended_ms = self._timeout_model.advise(
                     req.endpoint, priority, est_in, est_out,
@@ -971,12 +983,13 @@ class ProxyService:
             under = bool(recommended_ms and elapsed_s * 1000.0 <= recommended_ms)
 
             logger.warning(
-                "LLM TIMEOUT layer=%s endpoint=%s tier=%s agent=%s call_site=%s "
+                "LLM TIMEOUT layer=%s endpoint=%s tier=%s caller=%s "
                 "elapsed=%.1fs applied=%.1fs in_flight=%d queued=%d est_in=%d "
-                "est_out=%d recommended=%.0fms premature=%s",
-                layer, req.endpoint, req.priority.name, req.agent_id, req.call_site,
+                "est_out=%d ctx_used=%s%% recommended=%.0fms premature=%s",
+                layer, req.endpoint, req.priority.name,
+                req.caller_id or f"{req.agent_id}/{req.call_site}",
                 elapsed_s, req.timeout_s, snap["in_flight"], snap["queued"],
-                est_in, est_out, recommended_ms, under,
+                est_in, est_out, context_used_pct, recommended_ms, under,
             )
 
             if emit_metrics_and_log:
@@ -1012,6 +1025,9 @@ class ProxyService:
                     status="timeout",
                     estimated_input_tokens=est_in,
                     max_output_tokens=est_out,
+                    session_id=req.session_id,
+                    turn_id=req.turn_id,
+                    caller_id=req.caller_id,
                 ))
 
             self._queue_db.persist_timeout_event(
@@ -1031,6 +1047,11 @@ class ProxyService:
                 est_out=est_out,
                 recommended_ms=recommended_ms,
                 under_recommended=under,
+                session_id=req.session_id,
+                turn_id=req.turn_id,
+                caller_id=req.caller_id,
+                context_window=context_window,
+                context_used_pct=context_used_pct,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("timeout event record failed for %s: %s", rid, exc)
