@@ -197,12 +197,40 @@ class ProxyService:
 
     # ----- handler: /v1/submit -----
 
+    def _resolve_endpoint(self, body: dict) -> str:
+        """Pick the routing endpoint, honoring the requested ``model`` over
+        the caller's client role (OpenAI-consistent). The client role is the
+        default when no model is given.
+
+        Only overrides for chat completions when the payload's ``model``
+        maps to a *known* endpoint that differs from the submit endpoint —
+        so embeddings (no model) and rerank (model='bge', not an endpoint)
+        fall through untouched. Logs every reconciliation loudly so a
+        mis-wired client (role != requested model) stays visible.
+        """
+        submit_ep = normalize_endpoint(body.get("endpoint", "chat"))
+        if body.get("payload_type", "chat_completion") != "chat_completion":
+            return submit_ep
+        model = (body.get("payload") or {}).get("model")
+        if not model:
+            return submit_ep
+        model_ep = normalize_endpoint(str(model))
+        if model_ep in self._config.endpoints and model_ep != submit_ep:
+            logger.warning(
+                "route reconcile: client endpoint=%s but model=%s -> routing to %s "
+                "(caller=%s call_site=%s)",
+                submit_ep, model, model_ep,
+                body.get("caller_id"), body.get("call_site"),
+            )
+            return model_ep
+        return submit_ep
+
     async def handle_submit(self, body: dict, request: Request) -> Response:
         now = time.monotonic()
 
         req = QueuedRequest.create(
             agent_id=body.get("agent_id", "unknown"),
-            endpoint=body.get("endpoint", "chat"),
+            endpoint=self._resolve_endpoint(body),
             priority=body.get("priority"),
             call_site=body.get("call_site", "unknown"),
             payload_type=body.get("payload_type", "chat_completion"),
@@ -1087,6 +1115,16 @@ class ProxyService:
                     props = await self._backend.probe_props(ep_cfg)
                     if props:
                         self._apply_discovered_props(ep_name, ep_cfg, props)
+                    # Discover the served model id (the name the backend
+                    # answers to). vLLM validates it, so the proxy sends
+                    # this — not the caller's role/alias — on dispatch.
+                    served = await self._backend.probe_models(ep_cfg)
+                    if served and served != ep_cfg.served_model_id:
+                        logger.info(
+                            "endpoint %s: served model id = %s (was %s)",
+                            ep_name, served, ep_cfg.served_model_id or "<role>",
+                        )
+                        ep_cfg.served_model_id = served
                 except Exception as exc:
                     logger.debug("poller probe %s failed: %s", ep_name, exc)
             # Age out stale timeout-model samples (cheap; piggybacks the

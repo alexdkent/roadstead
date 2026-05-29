@@ -20,7 +20,9 @@ from .config import EndpointConfig
 logger = logging.getLogger(__name__)
 
 
-def _normalize_chat_payload(payload: dict, vllm: bool = False) -> dict:
+def _normalize_chat_payload(
+    payload: dict, vllm: bool = False, model_id: str | None = None,
+) -> dict:
     """Make an Anthropic/extra_body-shaped chat payload wire-correct for the
     backend.
 
@@ -37,14 +39,26 @@ def _normalize_chat_payload(payload: dict, vllm: bool = False) -> dict:
     field) is silently ignored — vLLM enforces GBNF only via
     ``structured_outputs.grammar``. We move it there so the thinker (vLLM-NVFP4)
     actually enforces grammar instead of emitting free-form output.
+
+    Also for vLLM, when ``model_id`` is given we force ``payload["model"]`` to
+    it: vLLM validates the model field and 404s on any other name (a role
+    alias, an endpoint class, or a different model the caller asked for and
+    that the proxy routed here). llama.cpp ignores the field, so we only touch
+    it for vLLM.
     """
     if not isinstance(payload, dict):
         return payload
-    if "system" not in payload and "extra_body" not in payload and not (
-        vllm and "grammar" in payload
+    needs_model_set = bool(vllm and model_id and payload.get("model") != model_id)
+    if (
+        "system" not in payload
+        and "extra_body" not in payload
+        and not (vllm and "grammar" in payload)
+        and not needs_model_set
     ):
         return payload
     p = dict(payload)
+    if vllm and model_id:
+        p["model"] = model_id
     system = p.pop("system", None)
     if system:
         content = system if isinstance(system, str) else str(system)
@@ -134,7 +148,8 @@ class BackendClientPool:
         headers = {"X-Request-ID": request_id}
         if payload_type == "chat_completion":
             payload = _normalize_chat_payload(
-                payload, vllm=(ep_cfg.backend_engine == "vllm"))
+                payload, vllm=(ep_cfg.backend_engine == "vllm"),
+                model_id=ep_cfg.effective_model_id)
 
         t0 = time.monotonic()
         try:
@@ -206,7 +221,8 @@ class BackendClientPool:
         headers = {"X-Request-ID": request_id}
         if payload_type == "chat_completion":
             payload = _normalize_chat_payload(
-                payload, vllm=(ep_cfg.backend_engine == "vllm"))
+                payload, vllm=(ep_cfg.backend_engine == "vllm"),
+                model_id=ep_cfg.effective_model_id)
 
         try:
             async with client.stream(
@@ -259,6 +275,23 @@ class BackendClientPool:
             )
             if resp.status_code == 200:
                 return resp.json()
+        except Exception:
+            pass
+        return None
+
+    async def probe_models(self, ep_cfg: EndpointConfig) -> str | None:
+        """Probe backend /v1/models for the served model id (the name the
+        backend answers to in the `model` field). Returns the first model
+        id, or None on any failure."""
+        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        try:
+            resp = await asyncio.wait_for(client.get("/v1/models"), timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json().get("data") or []
+                if data and isinstance(data[0], dict):
+                    model_id = data[0].get("id")
+                    if isinstance(model_id, str) and model_id:
+                        return model_id
         except Exception:
             pass
         return None

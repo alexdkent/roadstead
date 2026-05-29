@@ -132,6 +132,12 @@ class EndpointConfig:
     host: str = ""
     port: int = 0
 
+    # --- served model id (the name the backend answers to in the `model`
+    # field). Discovered from /v1/models at runtime; empty until then.
+    # vLLM validates this field and 404s on a mismatch, so the proxy sets
+    # it to ``effective_model_id`` before dispatching to a vLLM backend. ---
+    served_model_id: str = ""
+
     # --- shadow backend (A/B testing) ---
     shadow_host: str = ""
     shadow_port: int = 0
@@ -143,6 +149,13 @@ class EndpointConfig:
     @property
     def background_floor_slots(self) -> int:
         return max(1, int(self.max_slots * self.background_floor_pct))
+
+    @property
+    def effective_model_id(self) -> str:
+        """The model name to send to the backend: the discovered served id,
+        falling back to ``role`` (which equals the served id for the current
+        vLLM thinker, so this is correct even before discovery runs)."""
+        return self.served_model_id or self.role
 
 
 # ---------------------------------------------------------------------------
