@@ -209,10 +209,16 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         host="10.0.0.3", port=9087,
     ),
     "thinker": EndpointConfig(
+        # vLLM-NVFP4 on GB10 (replaced llama.cpp 2026-05-28). vLLM reports
+        # max_model_len=32768 over /v1/models; the capacity poller rediscovers
+        # this at runtime (_apply_discovered_vllm_capacity). max_slots=6 is a
+        # deliberate admission cap held BELOW vLLM's --max-num-seqs 12 — the
+        # proxy throttles dispatch for batch/memory headroom, not a discovered
+        # slot count.
         endpoint_class="thinker", role="llama-thinker",
-        max_slots=6, context_per_slot=43008,
+        max_slots=6, context_per_slot=32768,
         host="10.0.0.3", port=9083,
-        backend_engine="vllm",  # vLLM-NVFP4 on GB10 (replaced llama.cpp 2026-05-28)
+        backend_engine="vllm",
     ),
 }
 

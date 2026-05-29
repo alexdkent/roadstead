@@ -1112,9 +1112,18 @@ class ProxyService:
         while True:
             for ep_name, ep_cfg in self._config.endpoints.items():
                 try:
-                    props = await self._backend.probe_props(ep_cfg)
-                    if props:
-                        self._apply_discovered_props(ep_name, ep_cfg, props)
+                    # Capacity discovery is engine-specific. llama.cpp reports
+                    # slots + context via /props; vLLM has no /props or /slots,
+                    # so the per-request context ceiling comes from /v1/models
+                    # max_model_len (concurrency/max_slots stays config-driven).
+                    if ep_cfg.backend_engine == "vllm":
+                        cap = await self._backend.probe_vllm_capacity(ep_cfg)
+                        if cap:
+                            self._apply_discovered_vllm_capacity(ep_name, ep_cfg, cap)
+                    else:
+                        props = await self._backend.probe_props(ep_cfg)
+                        if props:
+                            self._apply_discovered_props(ep_name, ep_cfg, props)
                     # Discover the served model id (the name the backend
                     # answers to). vLLM validates it, so the proxy sends
                     # this — not the caller's role/alias — on dispatch.
@@ -1168,6 +1177,24 @@ class ProxyService:
             ctx_per_slot = n_ctx // n_parallel
             if ctx_per_slot != ep_cfg.context_per_slot:
                 ep_cfg.context_per_slot = ctx_per_slot
+
+    def _apply_discovered_vllm_capacity(
+        self, ep_name: str, ep_cfg: EndpointConfig, cap: dict,
+    ) -> None:
+        """Update a vLLM endpoint's context ceiling from /v1/models.
+
+        vLLM's ``max_model_len`` is the per-request context window directly
+        (not a fleet n_ctx to divide by slots). max_slots is left as configured
+        — vLLM doesn't expose --max-num-seqs over the API and the proxy's
+        admission cap is a deliberate policy knob, not a discovered value."""
+        mlen = cap.get("max_model_len")
+        if mlen and mlen != ep_cfg.context_per_slot:
+            old = ep_cfg.context_per_slot
+            ep_cfg.context_per_slot = mlen
+            logger.info(
+                "endpoint %s: context_per_slot %d → %d (vLLM max_model_len)",
+                ep_name, old, mlen,
+            )
 
 
 # avoid circular import — EndpointConfig used in type hints

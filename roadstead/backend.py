@@ -296,6 +296,25 @@ class BackendClientPool:
             pass
         return None
 
+    async def probe_vllm_capacity(self, ep_cfg: EndpointConfig) -> dict | None:
+        """Capacity discovery for a vLLM backend. vLLM has no llama.cpp /props
+        or /slots; the per-request context ceiling comes from /v1/models
+        `max_model_len`. Concurrency (--max-num-seqs) is NOT exposed over the
+        API, so max_slots stays config-driven. Returns
+        ``{"max_model_len": int}`` or None on any failure."""
+        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        try:
+            resp = await asyncio.wait_for(client.get("/v1/models"), timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json().get("data") or []
+                if data and isinstance(data[0], dict):
+                    mlen = data[0].get("max_model_len")
+                    if isinstance(mlen, int) and mlen > 0:
+                        return {"max_model_len": mlen}
+        except Exception:
+            pass
+        return None
+
     async def probe_health(self, ep_cfg: EndpointConfig) -> bool:
         """Simple health check."""
         client = self._client_for(ep_cfg.host, ep_cfg.port)
