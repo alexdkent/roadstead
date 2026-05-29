@@ -216,6 +216,13 @@ class ProxyConfig:
     stats_db_path: str = ""
     request_log_path: str = ""
 
+    # --- timeout-advice model (see timeout_model.py) ---
+    # ``recommended = max(p99 * margin, floor)``.  Margin is the one
+    # policy knob; window/min_samples govern the empirical distribution.
+    timeout_advice_margin: float = 1.5
+    timeout_advice_window_s: float = 7 * 86400.0
+    timeout_advice_min_samples: int = 30
+
     @property
     def total_fleet_slots(self) -> int:
         return sum(ep.max_slots for ep in self.endpoints.values())

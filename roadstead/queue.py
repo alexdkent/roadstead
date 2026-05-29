@@ -60,8 +60,27 @@ CREATE TABLE IF NOT EXISTS proxy_completions (
     response_json    TEXT
 );
 
+CREATE TABLE IF NOT EXISTS proxy_timeout_shadow (
+    request_id        TEXT PRIMARY KEY,
+    completed_at      REAL NOT NULL,
+    endpoint          TEXT NOT NULL,
+    priority          INTEGER NOT NULL,
+    est_in            INTEGER,
+    est_out           INTEGER,
+    actual_out        INTEGER,
+    actual_total_ms   REAL,
+    applied_timeout_s REAL,
+    recommended_ms    REAL,
+    p95_ms            REAL,
+    median_ms         REAL,
+    min_ms            REAL,
+    source            TEXT,
+    would_timeout     INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_pq_status ON proxy_queue(status);
 CREATE INDEX IF NOT EXISTS idx_pc_completed ON proxy_completions(completed_at);
+CREATE INDEX IF NOT EXISTS idx_pts_completed ON proxy_timeout_shadow(completed_at);
 """
 
 
@@ -169,6 +188,44 @@ class PersistentQueue:
             ),
         )
 
+    def persist_timeout_shadow(
+        self,
+        *,
+        request_id: str,
+        endpoint: str,
+        priority: int,
+        est_in: int,
+        est_out: int,
+        actual_out: int,
+        actual_total_ms: float,
+        applied_timeout_s: float,
+        recommended_ms: float,
+        p95_ms: float,
+        median_ms: float,
+        min_ms: float,
+        source: str,
+        would_timeout: bool,
+    ) -> None:
+        """Record what the timeout-advice model *would* have recommended
+        for a completed request, alongside the actual latency and the
+        timeout actually applied.  Observational only — never on the
+        caller's critical path."""
+        if not self._conn:
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO proxy_timeout_shadow "
+            "(request_id, completed_at, endpoint, priority, est_in, est_out, "
+            " actual_out, actual_total_ms, applied_timeout_s, recommended_ms, "
+            " p95_ms, median_ms, min_ms, source, would_timeout) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                request_id, time.time(), endpoint, int(priority),
+                est_in, est_out, actual_out, actual_total_ms, applied_timeout_s,
+                recommended_ms, p95_ms, median_ms, min_ms, source,
+                1 if would_timeout else 0,
+            ),
+        )
+
     def persist_expire(self, request_id: str) -> None:
         if not self._conn:
             return
@@ -259,7 +316,8 @@ class PersistentQueue:
         return recovered
 
     def cleanup_old_completions(self, max_age_s: float = 86400 * 7) -> int:
-        """Remove completion records older than max_age_s."""
+        """Remove completion records older than max_age_s.  Trims the
+        timeout-shadow table on the same retention window."""
         if not self._conn:
             return 0
         cutoff = time.time() - max_age_s
@@ -267,7 +325,12 @@ class PersistentQueue:
             "DELETE FROM proxy_completions WHERE completed_at < ?",
             (cutoff,),
         )
-        return cursor.rowcount
+        removed = cursor.rowcount
+        self._conn.execute(
+            "DELETE FROM proxy_timeout_shadow WHERE completed_at < ?",
+            (cutoff,),
+        )
+        return removed
 
     def history_buckets(
         self, hours: float = 4.0, bucket_minutes: int = 5,
@@ -381,6 +444,83 @@ class PersistentQueue:
             }
             for r in rows
         ]
+
+    def timeout_samples(self, hours: float = 168.0) -> list[dict]:
+        """Successful completions for bootstrapping the timeout model.
+
+        End-to-end latency is reconstructed downstream as
+        ``duration_s*1000 + queue_wait_ms`` (the persisted columns; the
+        live feed path uses the truer enqueue-to-now span)."""
+        if not self._conn:
+            return []
+        cutoff = time.time() - (hours * 3600)
+        rows = self._conn.execute(
+            "SELECT endpoint, priority, input_tokens, output_tokens, "
+            "       duration_s, queue_wait_ms "
+            "FROM proxy_completions "
+            "WHERE completed_at >= ? AND status = 'ok' AND duration_s > 0 "
+            "ORDER BY completed_at",
+            (cutoff,),
+        ).fetchall()
+        return [
+            {
+                "endpoint": r[0], "priority": r[1],
+                "input_tokens": r[2] or 0, "output_tokens": r[3] or 0,
+                "duration_s": r[4] or 0.0, "queue_wait_ms": r[5] or 0.0,
+            }
+            for r in rows
+        ]
+
+    def timeout_shadow_report(self, hours: float = 24.0) -> list[dict]:
+        """Per-(endpoint, tier) summary of the timeout-shadow log:
+        how often ``recommended`` would have fired, and how much headroom
+        it reclaims versus the timeout actually applied."""
+        if not self._conn:
+            return []
+        from .timeout_model import percentile
+
+        cutoff = time.time() - (hours * 3600)
+        rows = self._conn.execute(
+            "SELECT endpoint, priority, actual_total_ms, applied_timeout_s, "
+            "       recommended_ms, would_timeout, source "
+            "FROM proxy_timeout_shadow WHERE completed_at >= ?",
+            (cutoff,),
+        ).fetchall()
+
+        groups: dict[tuple[str, int], dict] = {}
+        for ep, pri, actual_ms, applied_s, rec_ms, wt, source in rows:
+            g = groups.setdefault((ep, pri), {
+                "actual": [], "recommended": [], "headroom": [],
+                "would_timeout": 0, "sources": {},
+            })
+            g["actual"].append(actual_ms or 0.0)
+            g["recommended"].append(rec_ms or 0.0)
+            g["headroom"].append((applied_s or 0.0) * 1000.0 - (rec_ms or 0.0))
+            g["would_timeout"] += int(wt or 0)
+            g["sources"][source] = g["sources"].get(source, 0) + 1
+
+        out: list[dict] = []
+        for (ep, pri), g in groups.items():
+            n = len(g["actual"])
+            actual = sorted(g["actual"])
+            rec = sorted(g["recommended"])
+            head = sorted(g["headroom"])
+            out.append({
+                "endpoint": ep,
+                "priority": pri,
+                "samples": n,
+                "would_timeout": g["would_timeout"],
+                "would_timeout_rate": round(g["would_timeout"] / n, 4) if n else 0.0,
+                "recommended_ms_p50": round(percentile(rec, 50), 1),
+                "recommended_ms_p95": round(percentile(rec, 95), 1),
+                "actual_total_ms_p50": round(percentile(actual, 50), 1),
+                "actual_total_ms_p95": round(percentile(actual, 95), 1),
+                "headroom_vs_applied_ms_p50": round(percentile(head, 50), 1),
+                "headroom_vs_applied_ms_p95": round(percentile(head, 95), 1),
+                "sources": g["sources"],
+            })
+        out.sort(key=lambda r: (r["endpoint"], r["priority"]))
+        return out
 
     def completions_for_calibration(self, hours: float = 24.0) -> list[dict]:
         """Return successful completions with non-zero token counts

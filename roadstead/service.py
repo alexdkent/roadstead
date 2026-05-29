@@ -28,6 +28,7 @@ from .config import (
     normalize_endpoint,
 )
 from .cost_model import CostModel, estimate_input_tokens
+from .timeout_model import TimeoutModel
 from .observability import (
     MetricsSample,
     RequestLogRecord,
@@ -53,6 +54,11 @@ class ProxyService:
 
         # Core components
         self._cost_model = CostModel()
+        self._timeout_model = TimeoutModel(
+            margin=config.timeout_advice_margin,
+            window_s=config.timeout_advice_window_s,
+            min_samples=config.timeout_advice_min_samples,
+        )
         self._budget_mgr = BudgetManager(starvation_timeout_s=config.starvation_timeout_s)
         self._scheduler = Scheduler(config, self._cost_model, self._budget_mgr)
         self._backend = BackendClientPool()
@@ -111,6 +117,9 @@ class ProxyService:
         # Bootstrap cost model from recent completion history
         self._bootstrap_cost_model()
 
+        # Bootstrap timeout-advice model from the same history
+        self._bootstrap_timeout_model()
+
         # Start background loops
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
         self._poller_task = asyncio.create_task(self._capacity_poller_loop())
@@ -143,6 +152,30 @@ class ProxyService:
             replayed += 1
         logger.info(
             "cost model bootstrapped from %d recent completions", replayed,
+        )
+
+    def _bootstrap_timeout_model(self) -> None:
+        """Seed the timeout-advice model from recent completion history so
+        percentiles survive a restart.  End-to-end latency at replay time
+        is ``duration_s*1000 + queue_wait_ms`` (the persisted columns)."""
+        window_h = self._config.timeout_advice_window_s / 3600.0
+        rows = self._queue_db.timeout_samples(hours=window_h)
+        if not rows:
+            return
+        now = time.monotonic()
+        for r in rows:
+            end_to_end_ms = (r["duration_s"] * 1000.0) + r["queue_wait_ms"]
+            self._timeout_model.record(
+                endpoint=r["endpoint"],
+                priority=r["priority"],
+                input_tokens=r["input_tokens"],
+                output_tokens=r["output_tokens"],
+                end_to_end_ms=end_to_end_ms,
+                status="ok",
+                now=now,
+            )
+        logger.info(
+            "timeout model bootstrapped from %d recent completions", len(rows),
         )
 
     async def shutdown(self) -> None:
@@ -465,6 +498,59 @@ class ProxyService:
         rows = self._queue_db.recent_requests(limit)
         return JSONResponse({"requests": rows})
 
+    # ----- handler: timeout advice -----
+
+    async def handle_timeout_advice(self, request: Request) -> Response:
+        """Recommended timeout (+ min/median/p95) for a model/tier/size,
+        derived from measured end-to-end latency."""
+        qp = request.query_params
+        model = qp.get("model")
+        if not model:
+            return JSONResponse(
+                {"error": "missing required param: model"}, status_code=400,
+            )
+        endpoint = normalize_endpoint(model)
+        if endpoint not in self._config.endpoints:
+            return JSONResponse(
+                {"error": f"unknown model {model!r}",
+                 "known": sorted(self._config.endpoints)},
+                status_code=400,
+            )
+        pri_raw = qp.get("priority") or "P1_TURN_SUPPORT"
+        # Accept both numeric strings ("1") and enum names ("P1_TURN_SUPPORT").
+        pri_val: str | int = int(pri_raw) if pri_raw.lstrip("-").isdigit() else pri_raw
+        try:
+            priority = int(LLMPriority.coerce(pri_val))
+        except (ValueError, KeyError):
+            return JSONResponse(
+                {"error": f"unknown priority {qp.get('priority')!r}"},
+                status_code=400,
+            )
+        try:
+            est_in = int(qp.get("est_in", "0"))
+            est_out = int(qp.get("est_out", "0"))
+        except ValueError:
+            return JSONResponse(
+                {"error": "est_in/est_out must be integers"}, status_code=400,
+            )
+
+        advice = self._timeout_model.advise(endpoint, priority, est_in, est_out)
+        return JSONResponse({
+            "model": endpoint,
+            "priority": LLMPriority(priority).name,
+            "est_in": est_in,
+            "est_out": est_out,
+            **advice,
+        })
+
+    async def handle_timeout_shadow_report(self, request: Request) -> Response:
+        """Per-(model, tier) shadow summary: would-timeout rate and
+        headroom reclaimed vs. the timeout actually applied."""
+        hours = float(request.query_params.get("hours", "24"))
+        hours = min(max(hours, 0.1), 168)
+        report = self._queue_db.timeout_shadow_report(hours)
+        return JSONResponse({"hours": hours, "report": report})
+
     # ----- handler: health -----
 
     async def handle_health(self, request: Request) -> Response:
@@ -735,8 +821,65 @@ class ProxyService:
             slot_seconds=duration_s,
         ))
 
+        # Timeout-advice model + shadow log (observational only — guarded
+        # so a fault here never disturbs the caller or the scheduler).
+        try:
+            self._record_timeout_shadow(req, now, duration_s, output_tokens, status)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("timeout shadow record failed for %s: %s", req.request_id, exc)
+
         # Trigger scheduler (a slot freed up)
         self._dispatch_event.set()
+
+    def _record_timeout_shadow(
+        self,
+        req: QueuedRequest,
+        now: float,
+        duration_s: float,
+        output_tokens: int,
+        status: str,
+    ) -> None:
+        """Feed the timeout model and log the counterfactual: what
+        ``recommended`` would have been for this call vs. the actual
+        end-to-end latency and the timeout actually applied."""
+        end_to_end_ms = (now - req.enqueued_at) * 1000.0
+        est_in = estimate_input_tokens(req.payload)
+        est_out = int(req.payload.get("max_tokens", 0) or 0)
+        priority = int(req.priority)
+
+        # Advice reflects history BEFORE this sample is folded in.
+        advice = self._timeout_model.advise(req.endpoint, priority, est_in, est_out)
+
+        self._timeout_model.record(
+            endpoint=req.endpoint,
+            priority=priority,
+            input_tokens=est_in,
+            output_tokens=output_tokens,
+            end_to_end_ms=end_to_end_ms,
+            status=status,
+            now=now,
+        )
+
+        # Only successful calls give a representative latency to compare.
+        if status != "ok":
+            return
+        recommended_ms = advice["recommended_ms"]
+        self._queue_db.persist_timeout_shadow(
+            request_id=req.request_id,
+            endpoint=normalize_endpoint(req.endpoint),
+            priority=priority,
+            est_in=est_in,
+            est_out=est_out,
+            actual_out=output_tokens,
+            actual_total_ms=round(end_to_end_ms, 1),
+            applied_timeout_s=req.timeout_s,
+            recommended_ms=recommended_ms,
+            p95_ms=advice["p95_ms"],
+            median_ms=advice["median_ms"],
+            min_ms=advice["min_ms"],
+            source=advice["source"],
+            would_timeout=(end_to_end_ms > recommended_ms),
+        )
 
     # ----- capacity poller -----
 
@@ -750,6 +893,9 @@ class ProxyService:
                         self._apply_discovered_props(ep_name, ep_cfg, props)
                 except Exception as exc:
                     logger.debug("poller probe %s failed: %s", ep_name, exc)
+            # Age out stale timeout-model samples (cheap; piggybacks the
+            # 10s poller instead of a dedicated task).
+            self._timeout_model.prune(time.monotonic())
             await asyncio.sleep(10.0)
 
     def _apply_discovered_props(
