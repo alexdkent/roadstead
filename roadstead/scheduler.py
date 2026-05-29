@@ -483,12 +483,16 @@ class Scheduler:
             return 0
 
         if band == PriorityBand.BACKGROUND:
-            bg_floor = ep_cfg.background_floor_slots
+            # Cap is background_cap_slots (>= floor): background may burst onto
+            # idle slots above its reserved floor. The interactive reservation
+            # below still keys off background_floor_slots, so raising the cap
+            # never reduces interactive headroom.
+            bg_cap = ep_cfg.background_cap_slots
             bg_in_flight = sum(
                 1 for ar in self._active.get(ep_cfg.endpoint_class, {}).values()
                 if ar.request.band == PriorityBand.BACKGROUND
             )
-            return min(total_free, max(0, bg_floor - bg_in_flight))
+            return min(total_free, max(0, bg_cap - bg_in_flight))
 
         # For INTERACTIVE/FOREGROUND: reserve bg floor only if bg has queued work
         bg_queued = eq.band_depth(PriorityBand.BACKGROUND)

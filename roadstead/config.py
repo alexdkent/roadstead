@@ -126,6 +126,13 @@ class EndpointConfig:
     # --- policy knobs ---
     min_expected_slots: int = 1
     background_floor_pct: float = 0.20
+    # Slots held back from the BACKGROUND band so an occasional interactive /
+    # fast-path call always has an open slot (no preemption exists). When set,
+    # background may use ``max_slots - fast_path_reserve_slots`` concurrently —
+    # scaling automatically if max_slots grows (6→8→10). 0 → legacy behavior
+    # (background capped at its floor). Intra-band fairness across agents is
+    # handled separately by the DRR scheduler, not this cap.
+    fast_path_reserve_slots: int = 0
     default_timeout_s: float = 180.0
 
     # --- backend connection ---
@@ -149,6 +156,19 @@ class EndpointConfig:
     @property
     def background_floor_slots(self) -> int:
         return max(1, int(self.max_slots * self.background_floor_pct))
+
+    @property
+    def background_cap_slots(self) -> int:
+        """Max concurrent background-band requests. With fast_path_reserve_slots
+        set, background may use all but that many slots (leaving headroom for
+        the occasional fast-path call) — scaling automatically with max_slots.
+        Legacy default (reserve 0): the floor doubles as the cap. Never below
+        the floor."""
+        if self.fast_path_reserve_slots > 0 and self.max_slots > 0:
+            cap = self.max_slots - self.fast_path_reserve_slots
+        else:
+            cap = self.background_floor_slots
+        return max(self.background_floor_slots, cap)
 
     @property
     def effective_model_id(self) -> str:
@@ -217,6 +237,12 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         # slot count.
         endpoint_class="thinker", role="llama-thinker",
         max_slots=6, context_per_slot=32768,
+        # ~95% of thinker load is background (knowledge ingestion, forum-agent
+        # proposals, hygiene), so let the background band use all but one slot
+        # (max_slots - 1); DRR keeps that fair across agents. The single
+        # reserved slot leaves room for the occasional fast-path call. Scales
+        # automatically if max_slots is raised (8→7 background, 10→9, etc.).
+        fast_path_reserve_slots=1,
         host="10.0.0.3", port=9083,
         backend_engine="vllm",
     ),
