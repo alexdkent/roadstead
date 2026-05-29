@@ -78,9 +78,31 @@ CREATE TABLE IF NOT EXISTS proxy_timeout_shadow (
     would_timeout     INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS proxy_timeouts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id        TEXT NOT NULL,
+    occurred_at       REAL NOT NULL,
+    endpoint          TEXT NOT NULL,
+    priority          INTEGER NOT NULL,
+    agent_id          TEXT,
+    call_site         TEXT,
+    layer             TEXT NOT NULL,
+    elapsed_s         REAL,
+    applied_timeout_s REAL,
+    queue_wait_ms     REAL,
+    in_flight         INTEGER,
+    queued            INTEGER,
+    max_slots         INTEGER,
+    est_in            INTEGER,
+    est_out           INTEGER,
+    recommended_ms    REAL,
+    under_recommended INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_pq_status ON proxy_queue(status);
 CREATE INDEX IF NOT EXISTS idx_pc_completed ON proxy_completions(completed_at);
 CREATE INDEX IF NOT EXISTS idx_pts_completed ON proxy_timeout_shadow(completed_at);
+CREATE INDEX IF NOT EXISTS idx_pto_occurred ON proxy_timeouts(occurred_at);
 """
 
 
@@ -226,6 +248,49 @@ class PersistentQueue:
             ),
         )
 
+    def persist_timeout_event(
+        self,
+        *,
+        request_id: str,
+        endpoint: str,
+        priority: int,
+        agent_id: str,
+        call_site: str,
+        layer: str,
+        elapsed_s: float,
+        applied_timeout_s: float,
+        queue_wait_ms: float | None,
+        in_flight: int,
+        queued: int,
+        max_slots: int,
+        est_in: int,
+        est_out: int,
+        recommended_ms: float,
+        under_recommended: bool,
+    ) -> None:
+        """Record a call that hit its timeout instead of finishing, with
+        the load context at the moment it gave up. ``layer`` is one of
+        ``admission`` (expired while queued), ``client_wait`` (the sync
+        caller's deadline fired — work may still be in flight),
+        ``backend`` (the model exceeded the deadline after dispatch), or
+        ``stream``. ``under_recommended`` flags a timeout that fired below
+        the data-driven recommended deadline (i.e. likely premature)."""
+        if not self._conn:
+            return
+        self._conn.execute(
+            "INSERT INTO proxy_timeouts "
+            "(request_id, occurred_at, endpoint, priority, agent_id, call_site, "
+            " layer, elapsed_s, applied_timeout_s, queue_wait_ms, in_flight, "
+            " queued, max_slots, est_in, est_out, recommended_ms, under_recommended) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                request_id, time.time(), endpoint, int(priority), agent_id, call_site,
+                layer, elapsed_s, applied_timeout_s, queue_wait_ms, in_flight,
+                queued, max_slots, est_in, est_out, recommended_ms,
+                1 if under_recommended else 0,
+            ),
+        )
+
     def persist_expire(self, request_id: str) -> None:
         if not self._conn:
             return
@@ -328,6 +393,10 @@ class PersistentQueue:
         removed = cursor.rowcount
         self._conn.execute(
             "DELETE FROM proxy_timeout_shadow WHERE completed_at < ?",
+            (cutoff,),
+        )
+        self._conn.execute(
+            "DELETE FROM proxy_timeouts WHERE occurred_at < ?",
             (cutoff,),
         )
         return removed
@@ -521,6 +590,58 @@ class PersistentQueue:
             })
         out.sort(key=lambda r: (r["endpoint"], r["priority"]))
         return out
+
+    def timeouts_report(self, hours: float = 24.0) -> dict:
+        """Per-(endpoint, tier, layer) summary of timeout events: how
+        often calls give up instead of finishing, the load when they do,
+        and how many fired below the data-driven recommended deadline
+        (premature). Also returns a grand total."""
+        if not self._conn:
+            return {"total": 0, "premature": 0, "rows": []}
+        from .timeout_model import percentile
+
+        cutoff = time.time() - (hours * 3600)
+        rows = self._conn.execute(
+            "SELECT endpoint, priority, layer, elapsed_s, in_flight, queued, "
+            "       under_recommended, recommended_ms "
+            "FROM proxy_timeouts WHERE occurred_at >= ?",
+            (cutoff,),
+        ).fetchall()
+
+        groups: dict[tuple[str, int, str], dict] = {}
+        total = 0
+        premature = 0
+        for ep, pri, layer, elapsed, in_flight, queued, under, rec_ms in rows:
+            total += 1
+            premature += int(under or 0)
+            g = groups.setdefault((ep, pri, layer), {
+                "elapsed": [], "in_flight": [], "queued": [],
+                "premature": 0, "recommended": [],
+            })
+            g["elapsed"].append(elapsed or 0.0)
+            g["in_flight"].append(in_flight or 0)
+            g["queued"].append(queued or 0)
+            g["premature"] += int(under or 0)
+            g["recommended"].append(rec_ms or 0.0)
+
+        out: list[dict] = []
+        for (ep, pri, layer), g in groups.items():
+            n = len(g["elapsed"])
+            elapsed = sorted(g["elapsed"])
+            out.append({
+                "endpoint": ep,
+                "priority": pri,
+                "layer": layer,
+                "count": n,
+                "premature": g["premature"],
+                "elapsed_s_p50": round(percentile(elapsed, 50), 2),
+                "elapsed_s_p95": round(percentile(elapsed, 95), 2),
+                "avg_in_flight": round(sum(g["in_flight"]) / n, 1) if n else 0.0,
+                "avg_queued": round(sum(g["queued"]) / n, 1) if n else 0.0,
+                "recommended_ms_p50": round(percentile(sorted(g["recommended"]), 50), 1),
+            })
+        out.sort(key=lambda r: (-r["count"], r["endpoint"], r["priority"], r["layer"]))
+        return {"total": total, "premature": premature, "rows": out}
 
     def completions_for_calibration(self, hours: float = 24.0) -> list[dict]:
         """Return successful completions with non-zero token counts

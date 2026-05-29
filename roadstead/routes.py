@@ -10,6 +10,7 @@ Provides:
   - GET  /v1/metrics/cost-model — cost model state
   - GET  /v1/timeout-advice — recommended timeout for a model/tier/size
   - GET  /v1/timeout-advice/shadow-report — shadow-mode impact summary
+  - GET  /v1/timeouts      — calls that hit their timeout (per model/tier/layer)
   - GET  /health           — health check
 """
 
@@ -73,6 +74,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_timeout_shadow_report(request: Request) -> Response:
         return await svc.handle_timeout_shadow_report(request)
 
+    async def handle_timeouts_report(request: Request) -> Response:
+        return await svc.handle_timeouts_report(request)
+
     return [
         Route("/v1/submit", handle_submit, methods=["POST"]),
         Route("/v1/chat/completions", handle_chat_completions, methods=["POST"]),
@@ -85,5 +89,6 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         Route("/v1/recent", handle_recent, methods=["GET"]),
         Route("/v1/timeout-advice", handle_timeout_advice, methods=["GET"]),
         Route("/v1/timeout-advice/shadow-report", handle_timeout_shadow_report, methods=["GET"]),
+        Route("/v1/timeouts", handle_timeouts_report, methods=["GET"]),
         Route("/health", handle_health, methods=["GET"]),
     ]

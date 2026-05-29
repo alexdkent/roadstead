@@ -83,6 +83,9 @@ class ProxyService:
         self._dispatch_event = asyncio.Event()
         self._pending_futures: dict[str, asyncio.Future] = {}
         self._pending_streams: dict[str, asyncio.Queue] = {}
+        # Dedupe set so a single request that races across two timeout
+        # layers (e.g. admission expiry + client-wait) is logged once.
+        self._timed_out_ids: set[str] = set()
         self._scheduler_task: asyncio.Task | None = None
         self._poller_task: asyncio.Task | None = None
         self._started_at = time.monotonic()
@@ -91,6 +94,11 @@ class ProxyService:
 
     async def startup(self) -> None:
         """Initialize cost model, recover queue, start scheduler loop."""
+        # Admission timeouts (queued past deadline) were previously a
+        # silent drop — wire the callback so they're logged + the caller
+        # is released promptly instead of waiting out its own deadline.
+        self._scheduler.on_timeout = self._on_admission_timeout
+
         # Register endpoints in cost model
         for ep_name, ep_cfg in self._config.endpoints.items():
             self._cost_model.register_endpoint(
@@ -305,12 +313,22 @@ class ProxyService:
             self._scheduler.cancel(req.request_id)
             self._queue_db.persist_expire(req.request_id)
             self._pending_futures.pop(req.request_id, None)
+            # The caller's deadline fired — work may still be in flight.
+            self._record_timeout_event(req, layer="client_wait", elapsed_s=req.timeout_s)
             return JSONResponse(
                 {"error": "timeout", "request_id": req.request_id},
                 status_code=504,
             )
         finally:
             self._pending_futures.pop(req.request_id, None)
+
+        # Admission timeout (scheduler callback) resolves the future with a
+        # timeout result — already logged there; surface the same 504.
+        if result.get("status") == "timeout":
+            return JSONResponse(
+                {"error": "timeout", "request_id": req.request_id},
+                status_code=504,
+            )
 
         # Cache if deterministic
         if cache_key and result.get("status") == "ok":
@@ -341,6 +359,7 @@ class ProxyService:
                         break
             except asyncio.TimeoutError:
                 yield f"data: {json.dumps({'type': 'error', 'error': 'timeout'})}\n\n"
+                self._record_timeout_event(req, layer="stream", elapsed_s=req.timeout_s)
             finally:
                 self._pending_streams.pop(req.request_id, None)
 
@@ -551,6 +570,15 @@ class ProxyService:
         report = self._queue_db.timeout_shadow_report(hours)
         return JSONResponse({"hours": hours, "report": report})
 
+    async def handle_timeouts_report(self, request: Request) -> Response:
+        """Calls that hit their timeout instead of finishing, per
+        (model, tier, layer), with the load context when they gave up and
+        how many fired below the recommended deadline (premature)."""
+        hours = float(request.query_params.get("hours", "24"))
+        hours = min(max(hours, 0.1), 168)
+        report = self._queue_db.timeouts_report(hours)
+        return JSONResponse({"hours": hours, **report})
+
     # ----- handler: health -----
 
     async def handle_health(self, request: Request) -> Response:
@@ -623,7 +651,16 @@ class ProxyService:
                 ep_cfg, req.payload, req.payload_type,
                 req.request_id, timeout_s=req.timeout_s,
             )
-        except (BackendTimeout, BackendUnavailable, BackendError) as exc:
+        except BackendTimeout as exc:
+            duration = time.monotonic() - t0
+            self._resolve_error(req, str(exc))
+            self._record_completion(req, decision, duration, 0, 0, "timeout")
+            self._record_timeout_event(
+                req, layer="backend", elapsed_s=duration,
+                queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
+            )
+            return
+        except (BackendUnavailable, BackendError) as exc:
             duration = time.monotonic() - t0
             self._resolve_error(req, str(exc))
             self._record_completion(req, decision, duration, 0, 0, "error")
@@ -718,6 +755,15 @@ class ProxyService:
                             output_tokens = usage.get("completion_tokens", output_tokens)
                 elif event.event_type == "done":
                     break
+        except BackendTimeout as exc:
+            await stream_q.put({"type": "error", "error": str(exc)})
+            duration = time.monotonic() - t0
+            self._record_completion(req, decision, duration, input_tokens, output_tokens, "timeout")
+            self._record_timeout_event(
+                req, layer="stream", elapsed_s=duration,
+                queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
+            )
+            return
         except Exception as exc:
             await stream_q.put({"type": "error", "error": str(exc)})
             duration = time.monotonic() - t0
@@ -880,6 +926,135 @@ class ProxyService:
             source=advice["source"],
             would_timeout=(end_to_end_ms > recommended_ms),
         )
+
+    # ----- timeout events -----
+
+    def _record_timeout_event(
+        self,
+        req: QueuedRequest,
+        *,
+        layer: str,
+        elapsed_s: float,
+        queue_wait_ms: float | None = None,
+        emit_metrics_and_log: bool = True,
+    ) -> None:
+        """Record a call that hit its timeout instead of finishing.
+
+        Writes a queryable ``proxy_timeouts`` row with the load context at
+        the moment it gave up, emits a WARNING (so log_scan/health-verifier see it),
+        and — for the layers that don't otherwise flow through
+        ``_record_completion`` (admission/client_wait) — a metrics sample
+        and request-log line so the timeout counter and JSONL trail are
+        complete. Fully guarded: a fault here never disturbs the caller.
+
+        ``layer``: admission | client_wait | backend | stream.
+        """
+        rid = req.request_id
+        if rid in self._timed_out_ids:
+            return  # already counted this request's timeout
+        self._timed_out_ids.add(rid)
+        if len(self._timed_out_ids) > 8192:
+            self._timed_out_ids.clear()  # bounded; rare duplicate after reset is harmless
+
+        try:
+            now = time.monotonic()
+            snap = self._scheduler.endpoint_snapshot(req.endpoint)
+            est_in = estimate_input_tokens(req.payload)
+            est_out = int(req.payload.get("max_tokens", 0) or 0)
+            priority = int(req.priority)
+            try:
+                recommended_ms = self._timeout_model.advise(
+                    req.endpoint, priority, est_in, est_out,
+                )["recommended_ms"]
+            except Exception:  # noqa: BLE001
+                recommended_ms = 0.0
+            under = bool(recommended_ms and elapsed_s * 1000.0 <= recommended_ms)
+
+            logger.warning(
+                "LLM TIMEOUT layer=%s endpoint=%s tier=%s agent=%s call_site=%s "
+                "elapsed=%.1fs applied=%.1fs in_flight=%d queued=%d est_in=%d "
+                "est_out=%d recommended=%.0fms premature=%s",
+                layer, req.endpoint, req.priority.name, req.agent_id, req.call_site,
+                elapsed_s, req.timeout_s, snap["in_flight"], snap["queued"],
+                est_in, est_out, recommended_ms, under,
+            )
+
+            if emit_metrics_and_log:
+                # Make the /v1/metrics "timeouts" counter real for the
+                # paths that never reach _record_completion.
+                self._metrics.record(MetricsSample(
+                    timestamp=now,
+                    endpoint=req.endpoint,
+                    agent_id=req.agent_id,
+                    priority=req.priority.name,
+                    queue_wait_ms=(queue_wait_ms or 0.0),
+                    backend_latency_ms=0.0,
+                    status="timeout",
+                    slot_seconds=0.0,
+                ))
+                self._request_logger.log(RequestLogRecord(
+                    ts=datetime.now(timezone.utc).isoformat(),
+                    request_id=rid,
+                    agent_id=req.agent_id,
+                    endpoint=req.endpoint,
+                    call_site=req.call_site,
+                    priority=req.priority.name,
+                    band=req.band.name.lower(),
+                    payload_type=req.payload_type,
+                    input_tokens=0,
+                    output_tokens=0,
+                    estimated_cost_ss=req.estimated_cost_ss,
+                    actual_cost_ss=0.0,
+                    queue_wait_ms=(queue_wait_ms or 0.0),
+                    backend_latency_ms=0.0,
+                    total_latency_ms=elapsed_s * 1000.0,
+                    occupancy_at_dispatch=snap["in_flight"],
+                    status="timeout",
+                    estimated_input_tokens=est_in,
+                    max_output_tokens=est_out,
+                ))
+
+            self._queue_db.persist_timeout_event(
+                request_id=rid,
+                endpoint=normalize_endpoint(req.endpoint),
+                priority=priority,
+                agent_id=req.agent_id,
+                call_site=req.call_site,
+                layer=layer,
+                elapsed_s=round(elapsed_s, 3),
+                applied_timeout_s=req.timeout_s,
+                queue_wait_ms=(round(queue_wait_ms, 1) if queue_wait_ms is not None else None),
+                in_flight=snap["in_flight"],
+                queued=snap["queued"],
+                max_slots=snap["max_slots"],
+                est_in=est_in,
+                est_out=est_out,
+                recommended_ms=recommended_ms,
+                under_recommended=under,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("timeout event record failed for %s: %s", rid, exc)
+
+    def _on_admission_timeout(self, req: QueuedRequest) -> None:
+        """Scheduler callback: a request expired while still queued. Log
+        it and release the caller promptly with a timeout result (instead
+        of letting it wait out its own — identical — deadline)."""
+        elapsed = time.monotonic() - req.enqueued_at
+        self._record_timeout_event(req, layer="admission", elapsed_s=elapsed)
+        future = self._pending_futures.get(req.request_id)
+        if future and not future.done():
+            future.set_result({
+                "request_id": req.request_id,
+                "status": "timeout",
+                "error": "timeout",
+            })
+        stream_q = self._pending_streams.get(req.request_id)
+        if stream_q:
+            try:
+                stream_q.put_nowait({"type": "error", "error": "timeout"})
+            except asyncio.QueueFull:
+                pass
+        self._queue_db.persist_expire(req.request_id)
 
     # ----- capacity poller -----
 
