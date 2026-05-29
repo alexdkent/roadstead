@@ -231,12 +231,12 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
     "thinker": EndpointConfig(
         # vLLM-NVFP4 on GB10 (replaced llama.cpp 2026-05-28). vLLM reports
         # max_model_len=32768 over /v1/models; the capacity poller rediscovers
-        # this at runtime (_apply_discovered_vllm_capacity). max_slots=6 is a
+        # this at runtime (_apply_discovered_vllm_capacity). max_slots=8 is a
         # deliberate admission cap held BELOW vLLM's --max-num-seqs 12 — the
         # proxy throttles dispatch for batch/memory headroom, not a discovered
         # slot count.
         endpoint_class="thinker", role="llama-thinker",
-        max_slots=6, context_per_slot=32768,
+        max_slots=8, context_per_slot=32768,
         # ~95% of thinker load is background (knowledge ingestion, forum-agent
         # proposals, hygiene), so let the background band use all but one slot
         # (max_slots - 1); DRR keeps that fair across agents. The single
