@@ -45,15 +45,27 @@ def _normalize_chat_payload(
     alias, an endpoint class, or a different model the caller asked for and
     that the proxy routed here). llama.cpp ignores the field, so we only touch
     it for vLLM.
+
+    Finally, for vLLM we default ``chat_template_kwargs.enable_thinking`` to
+    False. The thinker (Qwen3.6) emits chain-of-thought as PROSE ("Here's a
+    thinking process: ...") — not ``<think>`` tags — and no reasoning parser is
+    configured, so with thinking on the reasoning leaks into
+    ``message.content`` and breaks every structured/section parser downstream
+    (song theme JSON, craft scorecards, knowledge extract, etc.). Nothing reads
+    the reasoning today, so it is pure pollution. A caller that genuinely wants
+    reasoning can set ``chat_template_kwargs.enable_thinking`` itself and we
+    leave it untouched. llama.cpp ignores the field, so this is vLLM-only.
     """
     if not isinstance(payload, dict):
         return payload
     needs_model_set = bool(vllm and model_id and payload.get("model") != model_id)
+    needs_thinking_default = bool(vllm and not _has_enable_thinking(payload))
     if (
         "system" not in payload
         and "extra_body" not in payload
         and not (vllm and "grammar" in payload)
         and not needs_model_set
+        and not needs_thinking_default
     ):
         return payload
     p = dict(payload)
@@ -71,7 +83,25 @@ def _normalize_chat_payload(
         so = dict(so) if isinstance(so, dict) else {}
         so.setdefault("grammar", p.pop("grammar"))
         p["structured_outputs"] = so
+    # Default thinking off for vLLM (checked AFTER the extra_body merge so a
+    # caller's chat_template_kwargs nested in extra_body still wins).
+    if vllm and not _has_enable_thinking(p):
+        ck = p.get("chat_template_kwargs")
+        ck = dict(ck) if isinstance(ck, dict) else {}
+        ck["enable_thinking"] = False
+        p["chat_template_kwargs"] = ck
     return p
+
+
+def _has_enable_thinking(payload: dict) -> bool:
+    """True when the caller has already pinned chat_template_kwargs.enable_thinking
+    (top-level or nested in extra_body) — in which case we don't override it."""
+    for container in (payload, payload.get("extra_body")):
+        if isinstance(container, dict):
+            ck = container.get("chat_template_kwargs")
+            if isinstance(ck, dict) and "enable_thinking" in ck:
+                return True
+    return False
 
 
 @dataclass

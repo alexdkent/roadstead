@@ -106,6 +106,52 @@ def test_normalize_does_not_mutate_input():
     assert len(payload["messages"]) == 1
 
 
+# --- vLLM thinking-leak fix: default chat_template_kwargs.enable_thinking off ---
+# The thinker (Qwen3.6) emits chain-of-thought as prose with no <think> tags and
+# no reasoning parser, so thinking-on leaks the "Here's a thinking process: ..."
+# preamble into message.content and breaks structured parsers downstream.
+
+def test_vllm_defaults_enable_thinking_false():
+    payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
+    out = _normalize_chat_payload(payload, vllm=True)
+    assert out["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_llamacpp_does_not_touch_thinking():
+    # vLLM-only: a clean llama.cpp payload passes through untouched.
+    payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
+    out = _normalize_chat_payload(payload)  # vllm=False
+    assert "chat_template_kwargs" not in out
+    assert out == payload
+
+
+def test_vllm_preserves_caller_enable_thinking_top_level():
+    payload = {
+        "model": "llama-thinker",
+        "messages": [{"role": "user", "content": "x"}],
+        "chat_template_kwargs": {"enable_thinking": True},
+    }
+    out = _normalize_chat_payload(payload, vllm=True)
+    assert out["chat_template_kwargs"]["enable_thinking"] is True
+
+
+def test_vllm_preserves_caller_enable_thinking_in_extra_body():
+    payload = {
+        "model": "llama-thinker",
+        "messages": [{"role": "user", "content": "x"}],
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+    }
+    out = _normalize_chat_payload(payload, vllm=True)
+    assert out["chat_template_kwargs"]["enable_thinking"] is True
+    assert "extra_body" not in out
+
+
+def test_vllm_thinking_default_does_not_mutate_input():
+    payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
+    _normalize_chat_payload(payload, vllm=True)
+    assert "chat_template_kwargs" not in payload  # input untouched (corpus capture)
+
+
 # --- cache key must reflect system (cache-poisoning fix) ---
 
 def test_cache_key_differs_when_system_differs():
