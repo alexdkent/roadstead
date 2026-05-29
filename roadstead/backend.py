@@ -166,6 +166,24 @@ class BackendClientPool:
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
 
+        # Empty-completion gate (fail-loud). A 2xx with no generated content is a
+        # silent failure — backend hiccup, grammar over-constraint that masks all
+        # tokens, or an immediate EOS. It must NEVER pass as a valid (empty)
+        # result: callers (e.g. knowledge.extract_entities) would record "no
+        # entities" and silently drop data. Surface it as an error so the caller
+        # retries/handles and WS2 monitoring sees it. Content-based (not token-
+        # count) so it holds even when a backend omits usage; tool-call responses
+        # legitimately have empty content, so they're exempt.
+        if payload_type == "chat_completion":
+            choice0 = (body.get("choices") or [{}])[0] or {}
+            msg = choice0.get("message") or {}
+            if not (msg.get("content") or "").strip() and not msg.get("tool_calls"):
+                raise BackendError(
+                    502,
+                    f"backend {ep_cfg.role} returned empty completion "
+                    f"(no content, output_tokens={output_tokens})",
+                )
+
         return BackendResponse(
             status_code=resp.status_code,
             body=body,

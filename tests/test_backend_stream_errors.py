@@ -78,3 +78,43 @@ def test_stream_connect_error_still_unavailable():
         asyncio.run(_drain(_pool_with(handler)))
     assert isinstance(exc.value, BackendUnavailable)
     assert exc.value.status_code == 503
+
+
+# --- empty-completion gate (non-streaming call) ---
+
+def _json_handler(body):
+    def handler(request):
+        return httpx.Response(200, json=body)
+    return handler
+
+
+def _call(pool):
+    return asyncio.run(pool.call(EP, {"messages": [{"role": "user", "content": "x"}]},
+                                 "chat_completion", "rid", timeout_s=5))
+
+
+def test_call_empty_completion_raises():
+    body = {"choices": [{"message": {"content": ""}}], "usage": {"completion_tokens": 0}}
+    with pytest.raises(BackendError) as exc:
+        _call(_pool_with(_json_handler(body)))
+    assert exc.value.status_code == 502
+    assert "empty completion" in exc.value.detail
+
+
+def test_call_no_choices_raises():
+    with pytest.raises(BackendError):
+        _call(_pool_with(_json_handler({"choices": [], "usage": {}})))
+
+
+def test_call_tool_call_response_ok():
+    # empty content but tool_calls present -> valid, must NOT be gated
+    body = {"choices": [{"message": {"content": "", "tool_calls": [{"id": "1"}]}}],
+            "usage": {"completion_tokens": 5}}
+    resp = _call(_pool_with(_json_handler(body)))
+    assert resp.status_code == 200
+
+
+def test_call_nonempty_ok():
+    body = {"choices": [{"message": {"content": "hello"}}], "usage": {"completion_tokens": 2}}
+    resp = _call(_pool_with(_json_handler(body)))
+    assert resp.output_tokens == 2
