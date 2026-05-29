@@ -3,6 +3,14 @@
 All proxy behaviour is driven by these structures.  Slot counts and
 context sizes come from backend ``/props`` discovery at runtime — the
 config only carries *policy* knobs (weights, floors, timeouts).
+
+``DEFAULT_ENDPOINTS`` below is THE canonical role→host:port map for the
+whole system. The LLM proxy is the single front door to all LLM traffic
+(10.0.0.3 anvil / 10.0.0.6 nexus); every agent reaches a backend via
+``make_nexus_client(role)`` → ``ProxyLLMClient`` → ``:42161`` → here.
+There is no other routing table. The ``infra/inference/profiles/*.yaml``
+files mirror this for the inferctl/profile-transition *operational*
+tooling only — when they disagree, this file wins.
 """
 
 from __future__ import annotations
