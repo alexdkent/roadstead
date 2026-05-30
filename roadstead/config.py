@@ -229,19 +229,17 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         host="10.0.0.3", port=9087,
     ),
     "thinker": EndpointConfig(
-        # vLLM-NVFP4 on GB10 (replaced llama.cpp 2026-05-28). vLLM reports
-        # max_model_len=32768 over /v1/models; the capacity poller rediscovers
-        # this at runtime (_apply_discovered_vllm_capacity). max_slots=12 now
-        # MATCHES vLLM's --max-num-seqs 12 — the artificial admission cap is
-        # removed (2026-05-30). Decode is memory-bandwidth-bound so per-seq
-        # throughput is ~flat with concurrency; aggregate scales near-linearly
-        # and 8 showed 0 preemptions / 0 capacity-waits, so the cap was leaving
-        # throughput + parallelism on the table. Paired with the backend's
-        # gpu-memory-utilization 0.40→0.60 bump (grows the KV pool to keep 12
-        # concurrent off the preemption path). Remeasure thrashing
-        # (vllm:num_preemptions_total, kv_cache_usage_perc) and pull back if needed.
+        # vLLM-NVFP4 on GB10 (Qwen3.6-27B-Text-NVFP4-MTP since 2026-05-30).
+        # max_slots=32 MATCHES vLLM's --max-num-seqs 32 — the throughput knee
+        # from the autonomous tuning sweep at backend gpu-memory-utilization 0.50
+        # (0 preemptions to 32; KV ~24-66%; >32 has sharply diminishing aggregate
+        # for much worse per-stream latency). Decode is memory-bandwidth-bound, so
+        # the backend runs MTP speculative decoding (qwen3_5_mtp n=3) which is the
+        # real per-stream lever (+34-85%, composes with the guidance grammar path).
+        # Remeasure (vllm:num_preemptions_total, kv_cache_usage_perc) and pull back
+        # max-num-seqs/max_slots together if thrashing appears.
         endpoint_class="thinker", role="llama-thinker",
-        max_slots=12, context_per_slot=32768,
+        max_slots=32, context_per_slot=32768,
         # ~95% of thinker load is background (knowledge ingestion, forum-agent
         # proposals, hygiene), so let the background band use all but one slot
         # (max_slots - 1); DRR keeps that fair across agents. The single
