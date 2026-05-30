@@ -47,8 +47,13 @@ class AgentBudget:
 
     def is_starving(self, now: float, starvation_timeout_s: float) -> bool:
         """True if balance has been continuously negative for longer than
-        the starvation timeout.  The scheduler grants a minimum-service
-        request to starving agents regardless of balance."""
+        the starvation timeout.
+
+        NOTE: this is a *balance-health* signal used only for observability /
+        simulation metrics. It is NOT the dispatch starvation guard — that
+        moved to ``BudgetManager.pick_agent`` keyed on real head-of-queue wait
+        (denial of service), because a heavy consumer's balance is perpetually
+        negative even while it is being served continuously."""
         if self.negative_since == 0:
             return False
         return (now - self.negative_since) >= starvation_timeout_s
@@ -133,15 +138,38 @@ class BudgetManager:
         self,
         candidates: list[str],
         now: float,
+        wait_by_agent: dict[str, float] | None = None,
     ) -> str | None:
         """Select the next agent to serve from ``candidates`` using DRR.
 
-        Returns the agent_id with the highest effective balance, or a
-        starving agent if one exists.  Returns ``None`` if candidates is
-        empty.
+        Starvation is measured by **denial of service** — how long an agent's
+        oldest queued request has actually waited (``wait_by_agent``) — NOT by
+        the sign of its DRR balance. A heavy consumer that is being served
+        continuously has a deeply negative balance yet a *short* head-of-queue
+        wait, so it is correctly NOT starving; a light consumer locked behind
+        it accrues a long head-of-queue wait and gets rescued. (Keying
+        starvation off ``balance < 0`` was the bug: a perpetually-negative
+        heavy producer flagged itself "starving" forever and short-circuited
+        the picker, starving everyone else on the shared endpoint.)
+
+        When one or more candidates have waited past the starvation timeout,
+        the pool is restricted to those and the longest-waiting one is served.
+        Otherwise the agent with the highest weight-normalized balance wins.
+        Returns ``None`` if ``candidates`` is empty.
         """
         if not candidates:
             return None
+
+        # Denied-service escape hatch: serve the agent whose oldest queued
+        # request has waited longest past the timeout, regardless of balance.
+        if wait_by_agent:
+            starving = [
+                (wait_by_agent.get(a, 0.0), a)
+                for a in candidates
+                if wait_by_agent.get(a, 0.0) >= self._starvation_timeout_s
+            ]
+            if starving:
+                return max(starving, key=lambda t: t[0])[1]
 
         best_id: str | None = None
         best_score: float = float("-inf")
@@ -150,8 +178,6 @@ class BudgetManager:
             budget = self._agents.get(agent_id)
             if budget is None:
                 continue
-            if budget.is_starving(now, self._starvation_timeout_s):
-                return agent_id
             # Score: balance normalized by weight (higher is more deserving)
             score = budget.balance / budget.weight if budget.weight > 0 else budget.balance
             if score > best_score:

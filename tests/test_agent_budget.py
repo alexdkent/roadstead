@@ -86,7 +86,10 @@ class TestBudgetManager:
         picked = bm.pick_agent(["a", "b"], now)
         assert picked == "b"
 
-    def test_pick_agent_starving_gets_priority(self):
+    def test_pick_agent_denied_service_gets_priority(self):
+        # Starvation is keyed off real head-of-queue wait, not the sign of the
+        # balance. "a" has waited past the timeout (denied service) → it wins
+        # even with a deeply negative balance.
         bm = BudgetManager(starvation_timeout_s=1.0)
         bm.set_total_capacity(10.0)
         now = time.monotonic()
@@ -94,11 +97,28 @@ class TestBudgetManager:
         bm.get_or_create("a", now=now)
         bm.get_or_create("b", now=now)
         bm.agents["a"].balance = -100.0
-        bm.agents["a"].negative_since = now - 10.0  # starving
         bm.agents["b"].balance = 100.0
 
-        picked = bm.pick_agent(["a", "b"], now)
-        assert picked == "a"  # starving agent wins despite bad balance
+        picked = bm.pick_agent(["a", "b"], now, {"a": 10.0, "b": 0.1})
+        assert picked == "a"
+
+    def test_pick_agent_negative_balance_alone_is_not_starving(self):
+        # Regression for the DRR starvation bug: a deeply negative balance that
+        # has been negative "forever" (negative_since long ago) must NOT win
+        # the override if the agent is actually being served (fresh head wait).
+        bm = BudgetManager(starvation_timeout_s=1.0)
+        bm.set_total_capacity(10.0)
+        now = time.monotonic()
+
+        bm.get_or_create("heavy", now=now)
+        bm.get_or_create("light", now=now)
+        bm.agents["heavy"].balance = -100.0
+        bm.agents["heavy"].negative_since = now - 600.0  # "starving" under old rule
+        bm.agents["light"].balance = 50.0
+
+        # heavy is served continuously (fresh head); light has waited.
+        picked = bm.pick_agent(["heavy", "light"], now, {"heavy": 0.1, "light": 5.0})
+        assert picked == "light"
 
     def test_retroactive_adjust_refund(self):
         bm = BudgetManager()

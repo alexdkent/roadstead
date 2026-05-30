@@ -424,7 +424,17 @@ class Scheduler:
                 if not candidates:
                     break
 
-                agent_id = self._budgets.pick_agent(candidates, now)
+                # Head-of-queue wait per candidate so the picker can detect
+                # genuine denial of service (a light consumer locked behind a
+                # heavy producer) rather than keying starvation off the heavy
+                # producer's perpetually-negative balance.
+                wait_by_agent: dict[str, float] = {}
+                for cand in candidates:
+                    head = eq.peek(band, cand)
+                    if head is not None:
+                        wait_by_agent[cand] = now - head.enqueued_at
+
+                agent_id = self._budgets.pick_agent(candidates, now, wait_by_agent)
                 if agent_id is None:
                     break
 
