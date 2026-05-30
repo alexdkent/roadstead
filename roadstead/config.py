@@ -206,13 +206,18 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
     ),
     "companion": EndpointConfig(
         # nexus llama-companion — Huihui Qwen3-Next-80B-A3B abliterated
-        # (served id companion.gguf) on :8081. Live: --ctx-size 294912
-        # --parallel 3 → 98304/slot, 3 slots. The fleet's high-capability
+        # (served id companion.gguf) on :8081. Live: --ctx-size 393216
+        # --parallel 4 → 98304/slot, 4 slots. The fleet's high-capability
         # summarizer/composer (qwen-composer role). /props discovery is
         # unreliable on the 80B, so this seed is load-bearing — keep it exact.
         endpoint_class="companion", role="qwen-composer",
-        max_slots=3, context_per_slot=98304,
-        background_floor_pct=1.0,
+        max_slots=4, context_per_slot=98304,
+        # Reserve 1 slot for interactive/chat rounds; background (composer
+        # summaries + knowledge ingestion) uses the other 3. Mirrors the
+        # thinker's fast_path_reserve pattern. background_floor_pct left at the
+        # default (0.20 → floor 1) so the floor never overrides the reserve:
+        # background_cap = max(floor, max_slots - reserve) = max(1, 3) = 3.
+        fast_path_reserve_slots=1,
         host="10.0.0.6", port=8081,
     ),
     "gemma": EndpointConfig(
