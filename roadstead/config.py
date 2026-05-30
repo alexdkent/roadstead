@@ -197,33 +197,49 @@ class AgentQuotaConfig:
 
 DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
     "chat": EndpointConfig(
+        # nexus llama-vision — Qwen3-VL-30B-A3B (served id chat.gguf) on :8080.
+        # Live: --ctx-size 65536 --parallel 2 → 32768/slot, 2 slots. Serves the
+        # qwen-analyst role (classify / situation reports) + vision.
         endpoint_class="chat", role="qwen-analyst",
-        max_slots=1, context_per_slot=32768,
+        max_slots=2, context_per_slot=32768,
         host="10.0.0.6", port=8080,
     ),
     "companion": EndpointConfig(
+        # nexus llama-companion — Huihui Qwen3-Next-80B-A3B abliterated
+        # (served id companion.gguf) on :8081. Live: --ctx-size 294912
+        # --parallel 3 → 98304/slot, 3 slots. The fleet's high-capability
+        # summarizer/composer (qwen-composer role). /props discovery is
+        # unreliable on the 80B, so this seed is load-bearing — keep it exact.
         endpoint_class="companion", role="qwen-composer",
-        max_slots=2, context_per_slot=131072,
+        max_slots=3, context_per_slot=98304,
         background_floor_pct=1.0,
         host="10.0.0.6", port=8081,
     ),
     "gemma": EndpointConfig(
+        # anvil Gemma-4-E4B (cold classifier + vision) :9091 — n_ctx
+        # 16384/slot, 2 slots.
         endpoint_class="gemma", role="gemma-router",
-        max_slots=2, context_per_slot=8192,
+        max_slots=2, context_per_slot=16384,
         host="10.0.0.3", port=9091,
     ),
     "gemma-hot": EndpointConfig(
+        # anvil Gemma-4-E2B (greeter / tier-1.5 router) :9090 — n_ctx
+        # 4096/slot, 2 slots.
         endpoint_class="gemma-hot", role="gemma-greeter",
-        max_slots=2, context_per_slot=2048,
+        max_slots=2, context_per_slot=4096,
         host="10.0.0.3", port=9090,
     ),
     "rerank": EndpointConfig(
+        # anvil bge-reranker shim :9084 (infinity backend behind it on :9085)
+        # — n_ctx 8192/slot, 1 slot.
         endpoint_class="rerank", role="bge-reranker",
-        max_slots=1, context_per_slot=512,
+        max_slots=1, context_per_slot=8192,
         background_floor_pct=0.0,
         host="10.0.0.3", port=9084,
     ),
     "embed": EndpointConfig(
+        # anvil bge-m3 embed :9087 — n_ctx 8192/slot, 4 slots (CANONICAL
+        # fleet embed; nexus's local copy on :8091 is being removed).
         endpoint_class="embed", role="bge-m3-embed",
         max_slots=4, context_per_slot=8192,
         host="10.0.0.3", port=9087,
