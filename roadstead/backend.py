@@ -112,6 +112,7 @@ class BackendResponse:
     duration_s: float
     input_tokens: int
     output_tokens: int
+    finish_reason: str | None = None
 
 
 @dataclass
@@ -219,8 +220,10 @@ class BackendClientPool:
         # retries/handles and WS2 monitoring sees it. Content-based (not token-
         # count) so it holds even when a backend omits usage; tool-call responses
         # legitimately have empty content, so they're exempt.
+        finish_reason: str | None = None
         if payload_type == "chat_completion":
             choice0 = (body.get("choices") or [{}])[0] or {}
+            finish_reason = choice0.get("finish_reason")
             msg = choice0.get("message") or {}
             if not (msg.get("content") or "").strip() and not msg.get("tool_calls"):
                 raise BackendError(
@@ -235,6 +238,7 @@ class BackendClientPool:
             duration_s=duration,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            finish_reason=finish_reason,
         )
 
     async def stream(

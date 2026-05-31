@@ -158,6 +158,7 @@ class PersistentQueue:
             "session_id": "TEXT",
             "turn_id": "TEXT",
             "caller_id": "TEXT",
+            "finish_reason": "TEXT",
         })
 
     @classmethod
@@ -221,6 +222,7 @@ class PersistentQueue:
         session_id: str | None = None,
         turn_id: str | None = None,
         caller_id: str | None = None,
+        finish_reason: str | None = None,
     ) -> None:
         if not self._conn:
             return
@@ -236,13 +238,13 @@ class PersistentQueue:
             "(request_id, agent_id, endpoint, call_site, priority, "
             " input_tokens, output_tokens, duration_s, queue_wait_ms, "
             " status, completed_at, payload_json, response_json, "
-            " session_id, turn_id, caller_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " session_id, turn_id, caller_id, finish_reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 request_id, agent_id, endpoint, call_site, priority,
                 input_tokens, output_tokens, duration_s, queue_wait_ms,
                 status, now, payload_s, response_s,
-                session_id, turn_id, caller_id,
+                session_id, turn_id, caller_id, finish_reason,
             ),
         )
 

@@ -254,6 +254,10 @@ class Scheduler:
         # Callbacks (set by the proxy service)
         self.on_dispatch: Callable[[DispatchDecision], None] | None = None
         self.on_timeout: Callable[[QueuedRequest], None] | None = None
+        # Circuit breaker: the service owns per-endpoint health (probe-based);
+        # when set and an endpoint is unhealthy, the scheduler stops dispatching
+        # to it so its queue defers instead of feeding a dead backend.
+        self.is_endpoint_healthy: Callable[[str], bool] | None = None
 
     # ----- public API -----
 
@@ -402,6 +406,13 @@ class Scheduler:
         if not eq:
             return []
 
+        # Circuit breaker: skip a backend the service has marked unhealthy so its
+        # queued work defers (and expires to a deferrable timeout) rather than
+        # dispatching into a black hole. Interactive/foreground are fast-failed
+        # at submit time + on the unhealthy transition; this defers background.
+        if self.is_endpoint_healthy is not None and not self.is_endpoint_healthy(ep_name):
+            return []
+
         active = self._active.get(ep_name, {})
         in_flight = len(active)
         decisions: list[DispatchDecision] = []
@@ -508,7 +519,14 @@ class Scheduler:
         bg_queued = eq.band_depth(PriorityBand.BACKGROUND)
         if bg_queued > 0:
             bg_floor = ep_cfg.background_floor_slots
-            ceiling = ep_cfg.max_slots - bg_floor
+            # Never let the background reservation drop interactive's ceiling
+            # below 1 when a slot is free — otherwise queued background work
+            # blocks interactive entirely on a 1-slot endpoint (where
+            # max_slots - bg_floor == 0). No preemption is introduced: the
+            # total_free<=0 early-return above still holds when the endpoint is
+            # fully occupied; this only governs handing out a FREE slot, and the
+            # dispatch loop processes INTERACTIVE before BACKGROUND.
+            ceiling = max(1, ep_cfg.max_slots - bg_floor)
             non_bg_in_flight = current_in_flight - sum(
                 1 for ar in self._active.get(ep_cfg.endpoint_class, {}).values()
                 if ar.request.band == PriorityBand.BACKGROUND

@@ -24,9 +24,16 @@ from .grammar import GrammarResult, grammar_hash, normalize_and_validate
 from .config import (
     CLASS_TO_ROLE,
     LLMPriority,
+    PriorityBand,
     ProxyConfig,
     normalize_endpoint,
 )
+
+# Phase 1.3 — bounded in-proxy retry for transient backend failures (defer,
+# don't drop). Only retry if at least this much of the caller's deadline remains
+# after a short backoff, so a retry never starts work the caller will abandon.
+_MIN_RETRY_BUDGET_S = 5.0
+_RETRY_BACKOFF_S = 0.5
 from .cost_model import CostModel, estimate_input_tokens
 from .timeout_model import TimeoutModel
 from .observability import (
@@ -86,6 +93,20 @@ class ProxyService:
         # Dedupe set so a single request that races across two timeout
         # layers (e.g. admission expiry + client-wait) is logged once.
         self._timed_out_ids: set[str] = set()
+        # In-flight dispatch tasks keyed by request_id (Phase 1.5 / 2.1). Lets
+        # the drain path await them on shutdown; the slot-leak fix is the
+        # deadline-bound backend call in _execute_sync/_execute_streaming.
+        self._inflight_tasks: dict[str, asyncio.Task] = {}
+        # Per-endpoint circuit-breaker health (Phase 1.2). An endpoint flips
+        # unhealthy only after consecutive capacity-probe failures CONFIRMED by a
+        # failed /health probe — latency/saturation never flips it
+        # (alert-don't-kill). While unhealthy the scheduler defers its queue.
+        self._endpoint_health: dict[str, dict] = {
+            ep: {"healthy": True, "consecutive_failures": 0, "unhealthy_since": None}
+            for ep in config.endpoints
+        }
+        self._health_fail_threshold = 3
+        self._transient_retry_max = 1
         self._scheduler_task: asyncio.Task | None = None
         self._poller_task: asyncio.Task | None = None
         self._started_at = time.monotonic()
@@ -98,6 +119,10 @@ class ProxyService:
         # silent drop — wire the callback so they're logged + the caller
         # is released promptly instead of waiting out its own deadline.
         self._scheduler.on_timeout = self._on_admission_timeout
+        # Circuit breaker: the scheduler skips an endpoint the poller has marked
+        # unhealthy so its queued work defers instead of dispatching into a dead
+        # backend (Phase 1.2).
+        self._scheduler.is_endpoint_healthy = self._endpoint_healthy
 
         # Register endpoints in cost model
         for ep_name, ep_cfg in self._config.endpoints.items():
@@ -285,6 +310,20 @@ class ProxyService:
                     "response": cached,
                     "cache_hit": True,
                 })
+
+        # Circuit breaker (Phase 1.2): when the backend is marked unhealthy,
+        # fast-fail interactive/foreground submits immediately with a DEFERRABLE
+        # error instead of queuing them to wait out their full deadline; let
+        # background work queue so it defers until the backend recovers. (Cache
+        # hits above are served regardless — they don't need the backend.)
+        if not self._endpoint_healthy(req.endpoint) and req.band != PriorityBand.BACKGROUND:
+            err = f"backend {req.endpoint} unavailable (circuit open)"
+            if openai:
+                return self._openai_error(err, "backend_unavailable", 503)
+            return JSONResponse(
+                {"status": "error", "request_id": req.request_id, "error": err},
+                status_code=503,
+            )
 
         # Streaming vs non-streaming
         if req.stream:
@@ -574,6 +613,9 @@ class ProxyService:
                 snap["utilization_pct"] = round(
                     (ss_consumed / ss_available * 100) if ss_available > 0 else 0, 1,
                 )
+            h = self._endpoint_health.get(ep_name, {})
+            snap["healthy"] = h.get("healthy", True)
+            snap["paused"] = not h.get("healthy", True)  # check_alerts (Phase 2.5) keys on this
             endpoints[ep_name] = snap
 
         agents = {
@@ -705,13 +747,19 @@ class ProxyService:
 
     async def handle_health(self, request: Request) -> Response:
         ok = self._scheduler_task is not None and not self._scheduler_task.done()
+        unhealthy = [ep for ep, h in self._endpoint_health.items() if not h["healthy"]]
+        # The proxy is UP iff its scheduler is alive (200). A dead BACKEND
+        # degrades status but must NOT 503 the proxy — that would make a monitor
+        # restart a healthy front door over a backend blip (alert-don't-kill).
+        status = "ok" if (ok and not unhealthy) else ("degraded" if ok else "down")
         return JSONResponse(
             {
-                "status": "ok" if ok else "degraded",
+                "status": status,
                 "uptime_s": round(time.monotonic() - self._started_at, 0),
                 "total_dispatched": self._scheduler.stats()["total_dispatched"],
                 "endpoints": len(self._config.endpoints),
                 "total_slots": self._config.total_fleet_slots,
+                "unhealthy_endpoints": unhealthy,
             },
             status_code=200 if ok else 503,
         )
@@ -734,7 +782,12 @@ class ProxyService:
             decisions = self._scheduler.tick(now)
 
             for decision in decisions:
-                asyncio.create_task(self._execute_dispatch(decision))
+                rid = decision.request.request_id
+                task = asyncio.create_task(self._execute_dispatch(decision))
+                self._inflight_tasks[rid] = task
+                task.add_done_callback(
+                    lambda t, _rid=rid: self._inflight_tasks.pop(_rid, None)
+                )
 
     async def _execute_dispatch(self, decision: DispatchDecision) -> None:
         """Execute a dispatch decision: call the backend and resolve the
@@ -767,53 +820,112 @@ class ProxyService:
         ep_cfg: EndpointConfig,
         decision: DispatchDecision,
     ) -> None:
-        t0 = time.monotonic()
-        try:
-            resp = await self._backend.call(
-                ep_cfg, req.payload, req.payload_type,
-                req.request_id, timeout_s=req.timeout_s,
-            )
-        except BackendTimeout as exc:
+        attempts = 0
+        while True:
+            attempts += 1
+            # Phase 1.5 slot-leak fix: bound each backend attempt to the
+            # caller's ABSOLUTE deadline (timeout_deadline), not a fresh full
+            # timeout_s. The client started its clock at enqueue and the backend
+            # at dispatch (after queue_wait), so a fresh timeout_s here would let
+            # an abandoned call outlive its caller and hold the slot for
+            # queue_wait + timeout_s. The remaining-deadline bound frees the slot
+            # at the SLA instead.
+            remaining = req.timeout_deadline - time.monotonic()
+            if remaining <= 0:
+                self._resolve_error(
+                    req, f"backend {ep_cfg.role} deadline exceeded before dispatch")
+                self._record_completion(req, decision, 0.0, 0, 0, "timeout")
+                self._record_timeout_event(
+                    req, layer="backend", elapsed_s=0.0,
+                    queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
+                )
+                return
+
+            t0 = time.monotonic()
+            try:
+                resp = await self._backend.call(
+                    ep_cfg, req.payload, req.payload_type,
+                    req.request_id, timeout_s=max(1.0, remaining),
+                )
+            except BackendTimeout as exc:
+                duration = time.monotonic() - t0
+                self._resolve_error(req, str(exc))
+                self._record_completion(req, decision, duration, 0, 0, "timeout")
+                self._record_timeout_event(
+                    req, layer="backend", elapsed_s=duration,
+                    queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
+                )
+                return
+            except (BackendUnavailable, BackendError) as exc:
+                duration = time.monotonic() - t0
+                # Phase 1.3 defer-don't-drop: a transient infra failure (backend
+                # unreachable/503, or an empty completion — a backend hiccup, not
+                # a content error) RETRIES within the remaining deadline rather
+                # than burning the call. Deterministic 4xx/other 5xx surface.
+                if (
+                    self._is_transient_backend_error(exc)
+                    and attempts <= self._transient_retry_max
+                    and (req.timeout_deadline - time.monotonic()) > _MIN_RETRY_BUDGET_S
+                    and self._endpoint_healthy(req.endpoint)
+                ):
+                    logger.warning(
+                        "transient backend error on %s (attempt %d) — retrying: %s",
+                        ep_cfg.role, attempts, exc,
+                    )
+                    await asyncio.sleep(_RETRY_BACKOFF_S)
+                    continue
+                self._resolve_error(req, str(exc))
+                self._record_completion(req, decision, duration, 0, 0, "error")
+                return
+
             duration = time.monotonic() - t0
-            self._resolve_error(req, str(exc))
-            self._record_completion(req, decision, duration, 0, 0, "timeout")
-            self._record_timeout_event(
-                req, layer="backend", elapsed_s=duration,
-                queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
+
+            # Phase 1.1 truncation integrity. finish_reason=length means the
+            # backend hit max_tokens mid-output. For a STRUCTURED request
+            # (grammar / response_format / structured_outputs) the body is almost
+            # certainly broken/unparseable JSON — fail loud with a DEFERRABLE
+            # error so the caller re-chunks instead of recording garbage, and
+            # never cache it (status != ok). Free-form truncation is benign.
+            if resp.finish_reason == "length" and self._request_is_structured(req):
+                self._resolve_error(
+                    req,
+                    f"backend {ep_cfg.role} truncated structured output "
+                    f"(finish_reason=length, output_tokens={resp.output_tokens})",
+                )
+                self._record_completion(
+                    req, decision, duration,
+                    resp.input_tokens, resp.output_tokens, "truncated",
+                    response_body=resp.body if req.payload_type == "chat_completion" else None,
+                    finish_reason=resp.finish_reason,
+                )
+                return
+
+            result = {
+                "request_id": req.request_id,
+                "queue_wait_ms": round(decision.queue_wait_ms, 1),
+                "backend_latency_ms": round(duration * 1000, 1),
+                "estimated_cost_ss": round(req.estimated_cost_ss, 3),
+                "response": resp.body,
+                "status": "ok",
+            }
+
+            future = self._pending_futures.get(req.request_id)
+            if future and not future.done():
+                future.set_result(result)
+
+            capture_response = resp.body if req.payload_type == "chat_completion" else None
+            self._record_completion(
+                req, decision, duration,
+                resp.input_tokens, resp.output_tokens, "ok",
+                response_body=capture_response, finish_reason=resp.finish_reason,
             )
+
+            # Shadow backend A/B: fire-and-forget to the shadow if configured
+            if ep_cfg.shadow_host and ep_cfg.shadow_port:
+                asyncio.create_task(self._execute_shadow(
+                    req, ep_cfg, decision, resp,
+                ))
             return
-        except (BackendUnavailable, BackendError) as exc:
-            duration = time.monotonic() - t0
-            self._resolve_error(req, str(exc))
-            self._record_completion(req, decision, duration, 0, 0, "error")
-            return
-
-        duration = time.monotonic() - t0
-        result = {
-            "request_id": req.request_id,
-            "queue_wait_ms": round(decision.queue_wait_ms, 1),
-            "backend_latency_ms": round(duration * 1000, 1),
-            "estimated_cost_ss": round(req.estimated_cost_ss, 3),
-            "response": resp.body,
-            "status": "ok",
-        }
-
-        future = self._pending_futures.get(req.request_id)
-        if future and not future.done():
-            future.set_result(result)
-
-        capture_response = resp.body if req.payload_type == "chat_completion" else None
-        self._record_completion(
-            req, decision, duration,
-            resp.input_tokens, resp.output_tokens, "ok",
-            response_body=capture_response,
-        )
-
-        # Shadow backend A/B: fire-and-forget to the shadow if configured
-        if ep_cfg.shadow_host and ep_cfg.shadow_port:
-            asyncio.create_task(self._execute_shadow(
-                req, ep_cfg, decision, resp,
-            ))
 
     async def _execute_shadow(
         self,
@@ -859,11 +971,15 @@ class ProxyService:
         t0 = time.monotonic()
         input_tokens = 0
         output_tokens = 0
+        last_finish_reason: str | None = None
 
+        # Phase 1.5: bound the stream to the caller's remaining deadline so an
+        # abandoned stream can't hold its slot past the SLA.
+        stream_timeout = max(1.0, req.timeout_deadline - time.monotonic())
         try:
             async for event in self._backend.stream(
                 ep_cfg, req.payload, req.payload_type,
-                req.request_id, timeout_s=req.timeout_s,
+                req.request_id, timeout_s=stream_timeout,
             ):
                 if event.event_type == "chunk":
                     await stream_q.put({
@@ -875,6 +991,11 @@ class ProxyService:
                         if usage:
                             input_tokens = usage.get("prompt_tokens", input_tokens)
                             output_tokens = usage.get("completion_tokens", output_tokens)
+                        choices = event.parsed.get("choices") or []
+                        if choices and isinstance(choices[0], dict):
+                            fr = choices[0].get("finish_reason")
+                            if fr:
+                                last_finish_reason = fr
                 elif event.event_type == "done":
                     break
         except BackendTimeout as exc:
@@ -899,7 +1020,106 @@ class ProxyService:
             "backend_latency_ms": round(duration * 1000, 1),
             "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
         })
-        self._record_completion(req, decision, duration, input_tokens, output_tokens, "ok")
+        # Phase 1.1: the chunks already streamed (can't un-send), but record
+        # truncation of a structured stream so the storm is visible in metrics.
+        status = (
+            "truncated"
+            if last_finish_reason == "length" and self._request_is_structured(req)
+            else "ok"
+        )
+        self._record_completion(
+            req, decision, duration, input_tokens, output_tokens, status,
+            finish_reason=last_finish_reason,
+        )
+
+    # ----- circuit breaker / integrity helpers (Phase 1) -----
+
+    def _endpoint_healthy(self, endpoint: str) -> bool:
+        h = self._endpoint_health.get(normalize_endpoint(endpoint))
+        return h["healthy"] if h else True
+
+    @staticmethod
+    def _is_transient_backend_error(exc: Exception) -> bool:
+        """Infra-transient backend failures that should DEFER (retry within the
+        deadline) rather than surface: unreachable/503 and an empty completion
+        (a backend hiccup). A real 4xx / other-5xx is deterministic → surface.
+        BackendTimeout is handled on its own branch and never reaches here."""
+        if isinstance(exc, BackendUnavailable):
+            return True
+        if isinstance(exc, BackendError):
+            return "empty completion" in (exc.detail or "")
+        return False
+
+    def _request_is_structured(self, req: QueuedRequest) -> bool:
+        """True when the request constrained its output (grammar / JSON schema /
+        structured outputs), so a finish_reason=length truncation almost
+        certainly produced broken/unparseable output — not a benign capped reply."""
+        if req.payload_type != "chat_completion":
+            return False
+        p = req.payload
+        if not isinstance(p, dict):
+            return False
+        if self._extract_grammar(p)[0]:
+            return True
+        if p.get("response_format") or p.get("structured_outputs"):
+            return True
+        eb = p.get("extra_body")
+        if isinstance(eb, dict) and any(
+            eb.get(k) for k in (
+                "response_format", "structured_outputs",
+                "guided_grammar", "guided_json", "guided_choice",
+            )
+        ):
+            return True
+        return False
+
+    async def _update_endpoint_health(
+        self, ep_name: str, ep_cfg: "EndpointConfig", probe_ok: bool,
+    ) -> None:
+        """Drive the per-endpoint circuit from poller probe results. Only a
+        sustained capacity-probe failure CONFIRMED by a failed /health probe
+        flips an endpoint unhealthy — a saturated backend still answers /health,
+        so load never trips the circuit (alert-don't-kill)."""
+        h = self._endpoint_health.setdefault(
+            ep_name, {"healthy": True, "consecutive_failures": 0, "unhealthy_since": None})
+        if probe_ok:
+            if not h["healthy"]:
+                logger.warning("endpoint %s RECOVERED — resuming dispatch", ep_name)
+                self._dispatch_event.set()  # drain its deferred queue
+            h["healthy"] = True
+            h["consecutive_failures"] = 0
+            h["unhealthy_since"] = None
+            return
+        h["consecutive_failures"] += 1
+        if h["healthy"] and h["consecutive_failures"] >= self._health_fail_threshold:
+            alive = await self._backend.probe_health(ep_cfg)
+            if not alive:
+                h["healthy"] = False
+                h["unhealthy_since"] = time.monotonic()
+                logger.critical(
+                    "endpoint %s UNHEALTHY — %d consecutive probe failures + /health "
+                    "down; deferring its queue, fast-failing interactive",
+                    ep_name, h["consecutive_failures"],
+                )
+                self._fast_fail_interactive(ep_name)
+            else:
+                # Backend answers /health → up but discovery is flaky; don't trip.
+                h["consecutive_failures"] = 0
+
+    def _fast_fail_interactive(self, ep_name: str) -> None:
+        """On the unhealthy transition, release queued INTERACTIVE/FOREGROUND
+        requests for this endpoint with a deferrable error so they don't wait out
+        their full deadline; BACKGROUND stays queued to defer until recovery."""
+        eq = self._scheduler._queues.get(ep_name)
+        if not eq:
+            return
+        for band in (PriorityBand.INTERACTIVE, PriorityBand.FOREGROUND):
+            for agent_id in list(eq._queues.get(band, {}).keys()):
+                for req in list(eq._queues[band][agent_id]):
+                    self._scheduler.cancel(req.request_id)
+                    self._queue_db.persist_expire(req.request_id)
+                    self._resolve_error(
+                        req, f"backend {ep_name} unavailable (circuit open)")
 
     def _resolve_error(self, req: QueuedRequest, error: str) -> None:
         future = self._pending_futures.get(req.request_id)
@@ -925,6 +1145,7 @@ class ProxyService:
         output_tokens: int,
         status: str,
         response_body: dict | None = None,
+        finish_reason: str | None = None,
     ) -> None:
         now = time.monotonic()
 
@@ -955,6 +1176,7 @@ class ProxyService:
             session_id=req.session_id,
             turn_id=req.turn_id,
             caller_id=req.caller_id,
+            finish_reason=finish_reason,
         )
 
         # Log
@@ -1204,6 +1426,7 @@ class ProxyService:
         """Periodically probe backends for slot counts and context sizes."""
         while True:
             for ep_name, ep_cfg in self._config.endpoints.items():
+                probe_ok = False
                 try:
                     # Capacity discovery is engine-specific. llama.cpp reports
                     # slots + context via /props; vLLM has no /props or /slots,
@@ -1213,22 +1436,32 @@ class ProxyService:
                         cap = await self._backend.probe_vllm_capacity(ep_cfg)
                         if cap:
                             self._apply_discovered_vllm_capacity(ep_name, ep_cfg, cap)
+                            probe_ok = True
                     else:
                         props = await self._backend.probe_props(ep_cfg)
                         if props:
                             self._apply_discovered_props(ep_name, ep_cfg, props)
+                            probe_ok = True
                     # Discover the served model id (the name the backend
                     # answers to). vLLM validates it, so the proxy sends
                     # this — not the caller's role/alias — on dispatch.
                     served = await self._backend.probe_models(ep_cfg)
-                    if served and served != ep_cfg.served_model_id:
-                        logger.info(
-                            "endpoint %s: served model id = %s (was %s)",
-                            ep_name, served, ep_cfg.served_model_id or "<role>",
-                        )
-                        ep_cfg.served_model_id = served
+                    if served:
+                        probe_ok = True
+                        if served != ep_cfg.served_model_id:
+                            logger.info(
+                                "endpoint %s: served model id = %s (was %s)",
+                                ep_name, served, ep_cfg.served_model_id or "<role>",
+                            )
+                            ep_cfg.served_model_id = served
                 except Exception as exc:
                     logger.debug("poller probe %s failed: %s", ep_name, exc)
+                # Circuit-breaker health update (Phase 1.2). Guarded so a fault
+                # here never stalls discovery.
+                try:
+                    await self._update_endpoint_health(ep_name, ep_cfg, probe_ok)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("health update %s failed: %s", ep_name, exc)
             # Age out stale timeout-model samples (cheap; piggybacks the
             # 10s poller instead of a dedicated task).
             self._timeout_model.prune(time.monotonic())
