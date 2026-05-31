@@ -19,7 +19,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from .acl import IPIdentityMap
 from .agent_budget import BudgetManager
 from .backend import BackendClientPool, BackendError, BackendResponse, BackendTimeout, BackendUnavailable
-from .coalesce import DeterministicCache, EmbedCoalescer
+from .coalesce import DeterministicCache
 from .grammar import GrammarResult, grammar_hash, normalize_and_validate
 from .config import (
     CLASS_TO_ROLE,
@@ -39,6 +39,11 @@ _RETRY_BACKOFF_S = 0.5
 # for the historic SIGTERM hang (uvicorn waiting forever behind a slow request):
 # drain up to this long, then force-cancel stragglers.
 _DRAIN_DEADLINE_S = 30.0
+
+# Phase 3.1 — single server-side submit-timeout default (was a 180.0 literal in
+# three places). Client-side extend-only advice still applies on top per role/
+# tier; this is only the floor when a caller supplies no timeout.
+_DEFAULT_TIMEOUT_S = 180.0
 from .cost_model import CostModel, estimate_input_tokens
 from .timeout_model import TimeoutModel
 from .observability import (
@@ -77,9 +82,8 @@ class ProxyService:
         self._backend = BackendClientPool()
         self._queue_db = PersistentQueue(config.queue_db_path or None)
 
-        # Caching / coalescing
+        # Deterministic response cache (temperature=0).
         self._cache = DeterministicCache()
-        self._coalescer = EmbedCoalescer()
 
         # Grammar authority: cache of normalize+validate results keyed by
         # grammar hash, + a set of hashes we've already alerted on so each
@@ -116,6 +120,8 @@ class ProxyService:
         self._transient_retry_max = 1
         # Retention sweep cadence (Phase 2.3) — monotonic ts of the last DB trim.
         self._last_cleanup_at = 0.0
+        # DRR-balance persistence cadence (Phase 3.4).
+        self._last_budget_save_at = 0.0
         # Load-shed threshold (Phase 2.4): per-(endpoint, band) queue depth at
         # which NON-interactive submits are shed with 429 + Retry-After.
         self._shed_depth = 50
@@ -158,6 +164,15 @@ class ProxyService:
                 weight=acfg.weight,
                 max_balance=acfg.max_balance_ss,
             )
+
+        # Restore persisted DRR balances (Phase 3.4) so fairness survives a
+        # restart instead of resetting to zero. Balances are clamped to the
+        # agent's cap and the replenish clock rebased onto this process's monotonic.
+        for row in self._queue_db.load_budgets():
+            b = self._budget_mgr.get_or_create(row["agent_id"], weight=row["weight"])
+            b.balance = max(-b.max_balance, min(b.max_balance, row["balance"]))
+            b.total_consumed = row["total_consumed"]
+            b.last_replenish_at = time.monotonic()
 
         # Recover queued requests from WAL
         recovered = self._queue_db.recover_queued(time.monotonic())
@@ -263,6 +278,12 @@ class ProxyService:
                     t.cancel()
         if self._poller_task:
             self._poller_task.cancel()
+        # Persist DRR balances so fairness survives the restart (Phase 3.4); the
+        # writer flushes this during close().
+        try:
+            self._queue_db.save_budgets(self._budget_mgr.snapshot())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("budget save on shutdown failed: %s", exc)
         await self._backend.close()
         self._queue_db.close()  # flushes the writer queue, then closes connections
         self._request_logger.close()
@@ -323,7 +344,7 @@ class ProxyService:
             call_site=body.get("call_site", "unknown"),
             payload_type=body.get("payload_type", "chat_completion"),
             payload=body.get("payload", {}),
-            timeout_s=float(body.get("timeout_s", 180.0)),
+            timeout_s=float(body.get("timeout_s", _DEFAULT_TIMEOUT_S)),
             session_id=body.get("session_id"),
             turn_id=body.get("turn_id"),
             caller_id=body.get("caller_id"),
@@ -612,9 +633,9 @@ class ProxyService:
         # backend (which would reject the unknown field).
         client_timeout = body.pop("timeout_s", None) or request.headers.get("X-Timeout-S")
         try:
-            timeout_s = float(client_timeout) if client_timeout else 180.0
+            timeout_s = float(client_timeout) if client_timeout else _DEFAULT_TIMEOUT_S
         except (TypeError, ValueError):
-            timeout_s = 180.0
+            timeout_s = _DEFAULT_TIMEOUT_S
 
         submit_body = {
             "agent_id": agent_id,
@@ -702,10 +723,6 @@ class ProxyService:
             "agents": agents,
             "alerts": self._alerts,  # Phase 2.5 — health-verifier/log_scan surface
             "cache": self._cache.stats(),
-            "coalesce": {
-                "saved_calls": self._coalescer.saved_calls,
-                "active_pending": self._coalescer.active_pending,
-            },
             "scheduler": {
                 **self._scheduler.stats(),
                 "uptime_s": round(time.monotonic() - self._started_at, 0),
@@ -1580,6 +1597,11 @@ class ProxyService:
             if mono - self._last_cleanup_at > 86400.0:
                 self._last_cleanup_at = mono
                 self._queue_db.cleanup_old_completions()
+            # Periodic DRR-balance persistence (Phase 3.4) so a SIGKILL loses at
+            # most ~60s of fairness state.
+            if mono - self._last_budget_save_at > 60.0:
+                self._last_budget_save_at = mono
+                self._queue_db.save_budgets(self._budget_mgr.snapshot())
             # Alerting (Phase 2.5): evaluate conditions → logs + /v1/status so
             # health-verifier/log_scan see proxy-internal health. Never restarts a backend.
             try:

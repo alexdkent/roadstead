@@ -469,6 +469,21 @@ class PersistentQueue:
                 ),
             )
 
+    def load_budgets(self) -> list[dict]:
+        """Restore persisted DRR balances on startup (Phase 3.4) so fairness
+        survives a restart instead of resetting to zero."""
+        if not self._conn:
+            return []
+        rows = self._reader().execute(
+            "SELECT agent_id, weight, balance, total_consumed "
+            "FROM proxy_agent_budgets"
+        ).fetchall()
+        return [
+            {"agent_id": r[0], "weight": r[1] or 1.0,
+             "balance": r[2] or 0.0, "total_consumed": r[3] or 0.0}
+            for r in rows
+        ]
+
     # ----- recovery -----
 
     def recover_queued(self, now: float) -> list[QueuedRequest]:

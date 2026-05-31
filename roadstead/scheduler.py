@@ -315,11 +315,12 @@ class Scheduler:
 
     def complete(self, record: CompletionRecord, now: float) -> None:
         """Report that a dispatched request has finished (success or failure)."""
-        self._total_completed += 1
-
-        # Find and remove from active
+        # Find and remove from active. Count the completion only on a real hit
+        # so a double-complete (e.g. a late backend return for an already-
+        # completed request) doesn't inflate the counter or touch a slot.
         for ep, active_map in self._active.items():
             if record.request_id in active_map:
+                self._total_completed += 1
                 active_req = active_map.pop(record.request_id)
 
                 # Retroactive cost adjustment

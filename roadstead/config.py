@@ -133,7 +133,6 @@ class EndpointConfig:
     # (background capped at its floor). Intra-band fairness across agents is
     # handled separately by the DRR scheduler, not this cap.
     fast_path_reserve_slots: int = 0
-    default_timeout_s: float = 180.0
 
     # --- backend connection ---
     host: str = ""

@@ -1,81 +1,25 @@
-"""Embedding coalescing and deterministic response caching.
+"""Deterministic response caching.
 
-Embedding coalescing: identical embed requests arriving concurrently
-share one backend call.
+For temperature=0 requests with identical payloads, cache the response for a
+short TTL.
 
-Deterministic cache: for temperature=0 requests with identical payloads,
-cache the response for a short TTL.
+(An ``EmbedCoalescer`` lived here to dedupe concurrent identical embed requests,
+but it was never wired into the dispatch path — its check/register/resolve were
+never called and it only reported an always-zero ``saved_calls`` on /v1/status.
+Removed in Phase 3 rather than wiring a new single-flight concurrency surface
+(hung-waiter risk) for a throughput optimization the deterministic cache already
+covers after the first call.)
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Embedding coalescer
-# ---------------------------------------------------------------------------
-
-class EmbedCoalescer:
-    """Deduplicates concurrent identical embedding requests.
-
-    If request B arrives while request A (with the same text) is
-    in-flight, B awaits A's result instead of making a second backend
-    call.
-    """
-
-    def __init__(self) -> None:
-        self._pending: dict[str, asyncio.Future] = {}
-        self._saved_calls: int = 0
-
-    @staticmethod
-    def _key(endpoint: str, text: str) -> str:
-        return hashlib.sha256(f"{endpoint}:{text}".encode()).hexdigest()
-
-    def check(self, endpoint: str, text: str) -> asyncio.Future | None:
-        """If an identical request is in-flight, return its future.
-        The caller should await it instead of making a new backend call."""
-        key = self._key(endpoint, text)
-        fut = self._pending.get(key)
-        if fut is not None and not fut.done():
-            self._saved_calls += 1
-            return fut
-        return None
-
-    def register(self, endpoint: str, text: str) -> tuple[str, asyncio.Future]:
-        """Register a new in-flight embedding request.  Returns (key, future).
-        The caller must set_result or set_exception on the future when done."""
-        key = self._key(endpoint, text)
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future = loop.create_future()
-        self._pending[key] = fut
-        return key, fut
-
-    def resolve(self, key: str, result: dict) -> None:
-        fut = self._pending.pop(key, None)
-        if fut and not fut.done():
-            fut.set_result(result)
-
-    def reject(self, key: str, exc: Exception) -> None:
-        fut = self._pending.pop(key, None)
-        if fut and not fut.done():
-            fut.set_exception(exc)
-
-    @property
-    def saved_calls(self) -> int:
-        return self._saved_calls
-
-    @property
-    def active_pending(self) -> int:
-        return sum(1 for f in self._pending.values() if not f.done())
 
 
 # ---------------------------------------------------------------------------
