@@ -47,6 +47,7 @@ _DEFAULT_TIMEOUT_S = 180.0
 from .cost_model import CostModel, estimate_input_tokens
 from .timeout_model import TimeoutModel
 from .observability import (
+    AlertCondition,
     MetricsSample,
     RequestLogRecord,
     RequestLogger,
@@ -130,6 +131,11 @@ class ProxyService:
         # poll tick.
         self._alerts: list[dict] = []
         self._alert_logged: set = set()
+        # Phase 5B observability counters (exposed on /v1/status).
+        self._slot_leak_reclaimed = 0       # streaming dispatches cancelled on
+                                            # consumer-disconnect → slot freed
+        self._drain_straggler_cancelled = 0  # in-flight tasks cancelled at the
+                                            # shutdown drain deadline
         self._scheduler_task: asyncio.Task | None = None
         self._poller_task: asyncio.Task | None = None
         self._started_at = time.monotonic()
@@ -169,7 +175,18 @@ class ProxyService:
         # restart instead of resetting to zero. Balances are clamped to the
         # agent's cap and the replenish clock rebased onto this process's monotonic.
         for row in self._queue_db.load_budgets():
-            b = self._budget_mgr.get_or_create(row["agent_id"], weight=row["weight"])
+            # Phase 5B.4: prefer the agent's CONFIGURED weight + cap over the
+            # persisted row. get_or_create only applies weight/max_balance when
+            # the agent is NEW, and for a lazily-created agent (not in config)
+            # the old call passed no max_balance → it defaulted to 60.0,
+            # clamping the restored balance to the wrong bound + letting a stale
+            # persisted weight override config intent. Reconcile explicitly.
+            acfg = self._config.agents.get(row["agent_id"])
+            weight = acfg.weight if acfg else row["weight"]
+            b = self._budget_mgr.get_or_create(row["agent_id"], weight=weight)
+            if acfg:
+                b.max_balance = acfg.max_balance_ss
+                b.weight = acfg.weight
             b.balance = max(-b.max_balance, min(b.max_balance, row["balance"]))
             b.total_consumed = row["total_consumed"]
             b.last_replenish_at = time.monotonic()
@@ -265,17 +282,32 @@ class ProxyService:
         if tasks:
             logger.info(
                 "draining %d in-flight dispatch(es) (≤%.0fs)", len(tasks), _DRAIN_DEADLINE_S)
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*tasks, return_exceptions=True),
-                    timeout=_DRAIN_DEADLINE_S,
-                )
-            except asyncio.TimeoutError:
-                stragglers = [t for t in tasks if not t.done()]
+            # asyncio.wait (NOT wait_for(gather)) returns (done, pending) WITHOUT
+            # cancelling the pending tasks — so we cancel stragglers explicitly +
+            # count them. wait_for(gather) would cancel them itself on timeout,
+            # robbing us of the count and the explicit ordering below.
+            _done, pending = await asyncio.wait(tasks, timeout=_DRAIN_DEADLINE_S)
+            if pending:
                 logger.warning(
-                    "drain deadline hit — cancelling %d straggler(s)", len(stragglers))
-                for t in stragglers:
+                    "drain deadline hit — cancelling %d straggler(s)", len(pending))
+                for t in pending:
                     t.cancel()
+                self._drain_straggler_cancelled += len(pending)
+                # Phase 5B.2: AWAIT the cancellations so each straggler's
+                # CancelledError handler runs (resolves the caller + records the
+                # completion → frees the slot) BEFORE _queue_db.close() flushes
+                # below — otherwise close() can flush a half-written completion or
+                # leave the caller unresolved. Bounded so a wedged cancel can't
+                # hang shutdown.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=3.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "drain: %d straggler(s) didn't unwind within 3s of cancel",
+                        len([t for t in pending if not t.done()]))
         if self._poller_task:
             self._poller_task.cancel()
         # Persist DRR balances so fairness survives the restart (Phase 3.4); the
@@ -604,7 +636,18 @@ class ProxyService:
                     yield f"data: {json.dumps({'type': 'error', 'error': 'timeout'})}\n\n"
                 self._record_timeout_event(req, layer="stream", elapsed_s=req.timeout_s)
             finally:
+                # Phase 5B.1: the SSE consumer is gone (client disconnect, our
+                # own timeout, or normal completion). Cancel the producer
+                # dispatch task if it's still running — otherwise a producer
+                # blocked on a full stream_q.put (maxsize=256, consumer no longer
+                # draining) wedges forever, holding the scheduler slot until the
+                # proxy restarts. That leak cascaded all 4 companion slots into a
+                # full endpoint jam (2026-05-31). The CancelledError branch in
+                # _execute_dispatch records the completion → frees the slot.
                 self._pending_streams.pop(req.request_id, None)
+                producer = self._inflight_tasks.get(req.request_id)
+                if producer is not None and not producer.done():
+                    producer.cancel()
 
         return StreamingResponse(
             stream_generator(),
@@ -733,6 +776,14 @@ class ProxyService:
             "scheduler": {
                 **self._scheduler.stats(),
                 "uptime_s": round(time.monotonic() - self._started_at, 0),
+            },
+            # Phase 5B reliability counters.
+            "reliability": {
+                "slot_leak_reclaimed": self._slot_leak_reclaimed,
+                "drain_straggler_cancelled": self._drain_straggler_cancelled,
+                "writer_thread_alive": self._queue_db.writer_alive(),
+                "writer_thread_restarts": self._queue_db.writer_restarts(),
+                "write_q_dropped": self._queue_db.write_q_dropped(),
             },
         })
 
@@ -905,6 +956,26 @@ class ProxyService:
                 await self._execute_streaming(req, ep_cfg, decision)
             else:
                 await self._execute_sync(req, ep_cfg, decision)
+        except asyncio.CancelledError:
+            # Phase 5B.2: this dispatch task was cancelled. Two callers cancel
+            # it: (a) a streaming consumer disconnected and the SSE generator's
+            # finally cancels us (Phase 5B.1 — otherwise a producer wedged on a
+            # full stream_q.put would hold the scheduler slot forever — the live
+            # companion-jam bug), or (b) the shutdown drain deadline fired.
+            # Either way we MUST record the completion so the scheduler frees the
+            # slot, then re-raise so cancellation propagates and the task ends.
+            # CancelledError is a BaseException, so the `except Exception` below
+            # would NOT catch it — without this branch the slot leaks.
+            duration = time.monotonic() - t0
+            self._slot_leak_reclaimed += 1
+            logger.info(
+                "dispatch %s cancelled (consumer gone / drain) after %.1fs — "
+                "reclaiming slot", req.request_id, duration,
+            )
+            self._resolve_error(
+                req, "llm proxy stream cancelled (consumer disconnected)")
+            self._record_completion(req, decision, duration, 0, 0, "cancelled")
+            raise
         except Exception as exc:
             duration = time.monotonic() - t0
             logger.error(
@@ -1249,6 +1320,19 @@ class ProxyService:
             queue_wal_size=self._queue_db.wal_size_bytes(),
             now=now,
         )
+        # Phase 5B.3: surface DB-writer-thread death (the single sanctioned bg
+        # thread). If it dies, persistence degrades to loud sync fallback — page.
+        if not self._queue_db.writer_alive():
+            alerts.append(AlertCondition(
+                name="writer_thread_dead", severity="CRITICAL", triggered=True,
+                detail=f"db writer thread down (restarts={self._queue_db.writer_restarts()})",
+            ))
+        dropped = self._queue_db.write_q_dropped()
+        if dropped:
+            alerts.append(AlertCondition(
+                name="write_queue_overflow", severity="WARNING", triggered=True,
+                detail=f"{dropped} best-effort DB write(s) dropped (queue full)",
+            ))
         self._alerts = [
             {"name": a.name, "severity": a.severity, "detail": a.detail}
             for a in alerts

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import queue as _queue
+
 from originfleet.llmproxy.queue import PersistentQueue
 
 
@@ -53,4 +55,60 @@ def test_timeouts_report(tmp_path):
     rep = pq.timeouts_report(hours=1)
     assert rep["total"] == 1 and rep["premature"] == 1
     assert rep["rows"][0]["layer"] == "backend"
+    pq.close()
+
+
+# --- Phase 5B.3: writer-thread hardening ------------------------------------
+
+def test_writer_alive_true_in_prewriter_mode(tmp_path):
+    # Before start_async_writer, writes run synchronously on the loop thread —
+    # that's the LEGITIMATE single-threaded mode, reported healthy (not "dead").
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    assert pq.writer_alive() is True
+    assert pq.writer_restarts() == 0
+    pq.close()
+
+
+def test_write_queue_is_bounded(tmp_path):
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    pq.start_async_writer()
+    assert pq._write_q.maxsize == pq._write_q_maxsize > 0  # not unbounded
+    pq.close()
+
+
+def test_writer_restarts_on_death(tmp_path):
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    pq.start_async_writer()
+    # Kill the writer (sentinel + join) — simulate a dead writer thread.
+    pq._write_q.put(None)
+    pq._writer.join(timeout=2.0)
+    assert not pq._writer.is_alive()
+    assert pq.writer_alive() is False  # detected dead
+    # A write must self-heal: restart the writer + apply the write, NOT silently
+    # run it on the loop thread.
+    _pc(pq, "after_death")
+    assert pq.writer_restarts() >= 1
+    assert pq.writer_alive() is True
+    pq.flush(timeout=5.0)
+    assert any(r["request_id"] == "after_death" for r in pq.recent_requests(10))
+    pq.close()
+
+
+def test_write_queue_overflow_drops_not_blocks(tmp_path):
+    # A full bounded queue must DROP + count, never block the event loop.
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    pq._write_q_maxsize = 2
+    pq._write_q = _queue.Queue(maxsize=2)
+    pq._writer_started_once = True
+
+    class _AliveButIdle:  # looks alive, never drains the queue
+        def is_alive(self):
+            return True
+
+    pq._writer = _AliveButIdle()
+    for _ in range(5):  # 2 fit, 3 overflow
+        pq._w("INSERT INTO proxy_completions(request_id) VALUES ('x')")
+    assert pq.write_q_dropped() == 3  # dropped, and we got here (never blocked)
+    pq._writer = None  # avoid close() touching the stub
+    pq._writer_started_once = False
     pq.close()
