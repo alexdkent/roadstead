@@ -12,11 +12,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from originfleet.llmproxy import service as service_mod
-from originfleet.llmproxy.backend import BackendStreamEvent
+from originfleet.llmproxy.backend import (
+    BackendResponse, BackendStreamEvent, BackendUnavailable,
+)
 from originfleet.llmproxy.config import AgentQuotaConfig, ProxyConfig
 from originfleet.llmproxy.observability import (
     MetricsSample, RollingMetrics, check_alerts,
@@ -242,6 +245,44 @@ def test_drr_imbalance_fires_with_queue():
         queue_wal_size=0, now=now)
     assert any(a.name == "drr_imbalance" for a in alerts), \
         "imbalance WITH queued work is actionable — must page"
+
+
+# --- 5C.5 metrics: exactly one completion per request (no double-count) ------
+
+_OK_COMPLETION = {
+    "id": "c", "object": "chat.completion",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                 "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+}
+
+
+@pytest.mark.asyncio
+async def test_transient_retry_records_exactly_one_completion():
+    # Audit guard: a transient backend error that retries-then-succeeds must
+    # record the completion ONCE (the retry `continue`s without recording).
+    svc = ProxyService(ProxyConfig())
+    calls = {"n": 0}
+
+    async def flaky(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise BackendUnavailable("backend thinker unreachable")
+        return BackendResponse(200, _OK_COMPLETION, 0.01, 5, 2, finish_reason="stop")
+
+    svc._backend.call = flaky
+    _stub_probes(svc)
+    await svc.startup()
+    try:
+        before = svc._scheduler.stats()["total_completed"]
+        resp = await svc.handle_submit(_body(timeout_s=30.0), _FakeRequest())
+        assert resp.status_code == 200, resp.body
+        assert json.loads(resp.body.decode())["status"] == "ok"
+        assert calls["n"] == 2, "should retry once then succeed"
+        # ONE completion despite the retry — scheduler.complete fires once.
+        assert svc._scheduler.stats()["total_completed"] == before + 1
+    finally:
+        await svc.shutdown()
 
 
 # --- 5C drain-503 carries a deferrable marker -------------------------------
