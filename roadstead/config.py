@@ -266,6 +266,15 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         # (max_slots - 1); DRR keeps that fair across agents. The single
         # reserved slot leaves room for the occasional fast-path call. Scales
         # automatically if max_slots is raised (8→7 background, 10→9, etc.).
+        #
+        # background_floor_pct PINNED to 0.0 (→ floor 1). The 0.20 default was
+        # calibrated for the old 6-slot thinker (int(6·0.20)=1); at 32 slots it
+        # silently became int(32·0.20)=6, walling 6 slots off from rare
+        # interactive bursts (interactive ceiling 32-6=26) for no benefit on a
+        # background-dominated endpoint. The floor's only role is the
+        # interactive-reservation ceiling — keep it minimal so an interactive
+        # burst can use all 31 non-reserved slots. Cap stays 31 via the reserve.
+        background_floor_pct=0.0,
         fast_path_reserve_slots=1,
         host="10.0.0.3", port=9083,
         backend_engine="vllm",

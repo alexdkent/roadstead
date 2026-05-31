@@ -26,8 +26,27 @@ def _ep(max_slots: int, reserve: int) -> EndpointConfig:
 def test_thinker_default_cap_is_max_slots_minus_one():
     t = DEFAULT_ENDPOINTS["thinker"]
     assert t.fast_path_reserve_slots == 1
-    assert t.background_floor_slots == 1          # reservation unchanged
-    assert t.background_cap_slots == t.max_slots - 1  # 5 of 6 today
+    assert t.background_floor_slots == 1          # pinned via background_floor_pct=0.0
+    assert t.background_cap_slots == t.max_slots - 1  # 31 of 32 today
+
+
+def test_no_endpoint_floor_starves_interactive():
+    """Doctrine guard against the max_slots/background_floor_pct drift that bit
+    the thinker (6→32 slots made the 0.20 floor reserve 6 of 32). For EVERY
+    endpoint the background floor must leave at least one slot for an
+    interactive/fast-path call, and a reserve-configured endpoint's background
+    cap must equal max_slots - reserve. Fails loud if a future topology bump
+    changes a slot count without its dependents."""
+    for name, ep in DEFAULT_ENDPOINTS.items():
+        assert ep.background_floor_slots <= max(1, ep.max_slots - 1), (
+            f"{name}: floor {ep.background_floor_slots} would starve interactive "
+            f"on {ep.max_slots} slots"
+        )
+        if ep.fast_path_reserve_slots:
+            assert ep.background_cap_slots == ep.max_slots - ep.fast_path_reserve_slots, (
+                f"{name}: cap {ep.background_cap_slots} != max_slots-reserve "
+                f"{ep.max_slots - ep.fast_path_reserve_slots}"
+            )
 
 
 def test_cap_scales_with_max_slots():
