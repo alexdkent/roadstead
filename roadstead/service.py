@@ -44,6 +44,14 @@ _DRAIN_DEADLINE_S = 30.0
 # three places). Client-side extend-only advice still applies on top per role/
 # tier; this is only the floor when a caller supplies no timeout.
 _DEFAULT_TIMEOUT_S = 180.0
+
+# Phase 5C — time-to-first-token watchdog for streaming. Data (2026-05-31): the
+# companion 80B sometimes produces ZERO tokens on a large-context synth and burns
+# the FULL deadline (180s), uselessly holding a scarce slot. If no first token
+# arrives within this bound, abort + free the slot + return a deferrable error so
+# the caller defers instead of the slot being dead for minutes. Capped to the
+# caller's own deadline so a legitimately short request isn't over-waited.
+_STREAM_TTFT_DEADLINE_S = 30.0
 from .cost_model import CostModel, estimate_input_tokens
 from .timeout_model import TimeoutModel
 from .observability import (
@@ -362,7 +370,11 @@ class ProxyService:
         if self._draining.is_set():
             # Phase 2.1: refuse new work while draining for shutdown so it defers
             # to the (about-to-restart) next instance instead of being dropped.
-            err = "proxy draining for shutdown"
+            # Phase 5C: include the "backpressure" marker so the body is
+            # classified deferrable (is_deferrable_llm_error) by BOTH the sync
+            # and streaming clients — without it, a streaming turn caught mid-
+            # SIGTERM surfaced a hard error instead of deferring cleanly.
+            err = "proxy draining for shutdown — backpressure"
             if openai:
                 return self._openai_error(err, "backpressure", 503)
             return JSONResponse({"status": "error", "error": err}, status_code=503)
@@ -1002,8 +1014,18 @@ class ProxyService:
             # at the SLA instead.
             remaining = req.timeout_deadline - time.monotonic()
             if remaining <= 0:
-                self._resolve_error(
-                    req, f"backend {ep_cfg.role} deadline exceeded before dispatch")
+                # Phase 5C: the deadline passed in-queue. For BACKGROUND work,
+                # surface a DEFERRABLE error ("backpressure") so the caller
+                # re-queues it on a later pass instead of dead-lettering work it
+                # never got to run — the "stop abandoning work at the deadline"
+                # goal. Interactive/foreground still hard-fail (the turn is over).
+                is_bg = int(req.priority) >= int(LLMPriority.P3_INGESTION)
+                msg = (
+                    f"backend {ep_cfg.role} deadline exceeded in queue — backpressure"
+                    if is_bg else
+                    f"backend {ep_cfg.role} deadline exceeded before dispatch"
+                )
+                self._resolve_error(req, msg)
                 self._record_completion(req, decision, 0.0, 0, 0, "timeout")
                 self._record_timeout_event(
                     req, layer="backend", elapsed_s=0.0,
@@ -1147,32 +1169,50 @@ class ProxyService:
         # Phase 1.5: bound the stream to the caller's remaining deadline so an
         # abandoned stream can't hold its slot past the SLA.
         stream_timeout = max(1.0, req.timeout_deadline - time.monotonic())
+        # Phase 5C: time-to-first-token watchdog. Start with a SHORT deadline; on
+        # the first token, reschedule to the full SLA. A 0-token hang then aborts
+        # in ~TTFT seconds (freeing the slot) instead of burning the whole 180s.
+        ttft_deadline_s = min(_STREAM_TTFT_DEADLINE_S, stream_timeout)
+        loop = asyncio.get_event_loop()
         try:
-            async for event in self._backend.stream(
-                ep_cfg, req.payload, req.payload_type,
-                req.request_id, timeout_s=stream_timeout,
-            ):
-                if event.event_type == "chunk":
-                    if ttft_ms is None:
-                        ttft_ms = (time.monotonic() - t0) * 1000.0
-                    await stream_q.put({
-                        "type": "chunk",
-                        "data": event.data,
-                    })
-                    if event.parsed:
-                        usage = event.parsed.get("usage")
-                        if usage:
-                            input_tokens = usage.get("prompt_tokens", input_tokens)
-                            output_tokens = usage.get("completion_tokens", output_tokens)
-                        choices = event.parsed.get("choices") or []
-                        if choices and isinstance(choices[0], dict):
-                            fr = choices[0].get("finish_reason")
-                            if fr:
-                                last_finish_reason = fr
-                elif event.event_type == "done":
-                    break
-        except BackendTimeout as exc:
-            await stream_q.put({"type": "error", "error": str(exc)})
+            async with asyncio.timeout(ttft_deadline_s) as _cm:
+                async for event in self._backend.stream(
+                    ep_cfg, req.payload, req.payload_type,
+                    req.request_id, timeout_s=stream_timeout,
+                ):
+                    if event.event_type == "chunk":
+                        if ttft_ms is None:
+                            ttft_ms = (time.monotonic() - t0) * 1000.0
+                            # First token — extend the watchdog to the full SLA.
+                            _cm.reschedule(loop.time() + max(
+                                0.1, stream_timeout - (time.monotonic() - t0)))
+                        await stream_q.put({
+                            "type": "chunk",
+                            "data": event.data,
+                        })
+                        if event.parsed:
+                            usage = event.parsed.get("usage")
+                            if usage:
+                                input_tokens = usage.get("prompt_tokens", input_tokens)
+                                output_tokens = usage.get("completion_tokens", output_tokens)
+                            choices = event.parsed.get("choices") or []
+                            if choices and isinstance(choices[0], dict):
+                                fr = choices[0].get("finish_reason")
+                                if fr:
+                                    last_finish_reason = fr
+                    elif event.event_type == "done":
+                        break
+        except (asyncio.TimeoutError, BackendTimeout) as exc:
+            # ttft watchdog OR overall stream deadline OR backend timeout. The
+            # "backpressure" marker makes it deferrable (is_deferrable_llm_error)
+            # so the caller defers instead of dead-lettering. A 0-token hang is
+            # the common case — name it so log_scan can see the pattern.
+            if ttft_ms is None and isinstance(exc, asyncio.TimeoutError):
+                err = ("backend produced no output within "
+                       f"{ttft_deadline_s:.0f}s (ttft timeout) — backpressure")
+            else:
+                err = f"stream deadline exceeded — backpressure ({exc})"
+            await stream_q.put({"type": "error", "error": err})
             duration = time.monotonic() - t0
             self._record_completion(req, decision, duration, input_tokens, output_tokens, "timeout")
             self._record_timeout_event(
@@ -1258,19 +1298,37 @@ class ProxyService:
     async def _update_endpoint_health(
         self, ep_name: str, ep_cfg: "EndpointConfig", probe_ok: bool,
     ) -> None:
-        """Drive the per-endpoint circuit from poller probe results. Only a
-        sustained capacity-probe failure CONFIRMED by a failed /health probe
-        flips an endpoint unhealthy — a saturated backend still answers /health,
-        so load never trips the circuit (alert-don't-kill)."""
+        """Drive the per-endpoint circuit from poller probe results.
+
+        Liveness (/health) is decoupled from capacity-discovery (/props,
+        /v1/models): a sustained discovery failure trips the circuit ONLY when a
+        /health probe also fails (a saturated backend still answers /health, so
+        load never trips it — alert-don't-kill). Phase 5C makes RECOVERY
+        symmetric: an already-tripped endpoint recovers as soon as /health is
+        back, even if capacity-discovery is still flaky — otherwise a backend
+        whose /props stays down (but is alive + serving) would latch open
+        forever (the one-way-latch the audit flagged)."""
         h = self._endpoint_health.setdefault(
             ep_name, {"healthy": True, "consecutive_failures": 0, "unhealthy_since": None})
         if probe_ok:
             if not h["healthy"]:
-                logger.warning("endpoint %s RECOVERED — resuming dispatch", ep_name)
+                logger.warning("endpoint %s RECOVERED (discovery) — resuming dispatch", ep_name)
                 self._dispatch_event.set()  # drain its deferred queue
             h["healthy"] = True
             h["consecutive_failures"] = 0
             h["unhealthy_since"] = None
+            return
+        # Discovery failed. If already tripped, recover on LIVENESS alone so a
+        # /health-up backend with flaky discovery doesn't latch open forever.
+        if not h["healthy"]:
+            if await self._backend.probe_health(ep_cfg):
+                logger.warning(
+                    "endpoint %s RECOVERED (/health up, discovery still flaky) — "
+                    "resuming dispatch", ep_name)
+                h["healthy"] = True
+                h["consecutive_failures"] = 0
+                h["unhealthy_since"] = None
+                self._dispatch_event.set()
             return
         h["consecutive_failures"] += 1
         if h["healthy"] and h["consecutive_failures"] >= self._health_fail_threshold:

@@ -288,16 +288,22 @@ def check_alerts(
                 f"endpoint {ep} has {snap['queued']} queued requests",
             ))
 
-    # Fairness imbalance
-    consumed = metrics.per_agent_consumed(now)
-    shares = list(consumed.values())
-    if len(shares) >= 2:
-        ji = jains_fairness_index(shares)
-        if ji < 0.7:
-            alerts.append(AlertCondition(
-                "drr_imbalance", "WARNING", True,
-                f"Jain's index = {ji:.2f}",
-            ))
+    # Fairness imbalance — only actionable UNDER CONTENTION. Phase 5C: gate on a
+    # real queue somewhere. An imbalanced slot-second share with every endpoint
+    # idle (queued=0) is harmless (a heavy consumer being served alone is not
+    # starving anyone) and was firing continuously as noise. Only page when at
+    # least one endpoint actually has requests waiting.
+    any_queued = any(s.get("queued", 0) > 0 for s in endpoint_snapshots.values())
+    if any_queued:
+        consumed = metrics.per_agent_consumed(now)
+        shares = list(consumed.values())
+        if len(shares) >= 2:
+            ji = jains_fairness_index(shares)
+            if ji < 0.7:
+                alerts.append(AlertCondition(
+                    "drr_imbalance", "WARNING", True,
+                    f"Jain's index = {ji:.2f} (with queued work)",
+                ))
 
     # Cost model stale
     for ep, count in cost_model_samples.items():

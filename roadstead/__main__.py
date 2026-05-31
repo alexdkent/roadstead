@@ -21,7 +21,7 @@ from starlette.applications import Starlette
 
 from .config import ProxyConfig, load_agent_configs
 from .routes import make_routes
-from .service import ProxyService
+from .service import _DRAIN_DEADLINE_S, ProxyService
 
 logger = logging.getLogger("originfleet.llmproxy")
 
@@ -97,11 +97,13 @@ def main() -> None:
         port=args.port,
         log_level=args.log_level,
         access_log=False,
-        # Phase 2.1: bound the graceful (SIGTERM) shutdown so it can't hang
-        # forever behind a slow in-flight request — uvicorn waits at most this
-        # long for ASGI requests, and svc.shutdown() drains in-flight backend
-        # dispatches within _DRAIN_DEADLINE_S (30s) before force-cancelling.
-        timeout_graceful_shutdown=35,
+        # Phase 2.1/5C: bound the graceful (SIGTERM) shutdown so it can't hang
+        # forever behind a slow in-flight request. svc.shutdown() drains within
+        # _DRAIN_DEADLINE_S, then the queue DB close() does flush(5s)+join(5s).
+        # uvicorn's budget MUST exceed drain + close-tail (+margin) or it
+        # hard-kills the process mid-flush and drops queued writes (budgets +
+        # completions). Derive it so the two can't drift apart.
+        timeout_graceful_shutdown=int(_DRAIN_DEADLINE_S) + 18,  # 30 + 18 = 48s
     )
 
 

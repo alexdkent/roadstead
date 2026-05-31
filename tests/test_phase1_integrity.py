@@ -268,6 +268,12 @@ async def test_circuit_open_fast_fails_interactive():
 async def test_circuit_open_defers_background_to_timeout():
     svc = await _started_svc()
     try:
+        # Phase 5C: the circuit recovers on /health alone (decoupled from
+        # capacity-discovery). To keep this endpoint genuinely DOWN — so the
+        # poller can't recover it mid-test — make /health fail too.
+        async def _health_down(*a, **k):
+            return False
+        svc._backend.probe_health = _health_down
         svc._endpoint_health["thinker"] = {
             "healthy": False, "consecutive_failures": 5, "unhealthy_since": time.monotonic()}
         body = {
