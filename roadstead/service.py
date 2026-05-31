@@ -682,12 +682,18 @@ class ProxyService:
         remote_ip = request.client.host if request.client else "unknown"
         identity = self._acl.identify(remote_ip)
         if not identity:
-            return JSONResponse(
-                {"error": "access_denied", "your_ip": remote_ip},
-                status_code=403,
-            )
+            # Phase 5D: OpenAI-shaped 403 (was a bare {"error": "<str>"} that a
+            # strict OpenAI client crashes on doing resp.error.message).
+            return self._openai_error(
+                f"access denied for {remote_ip}", "access_denied", 403)
         agent_id, default_priority = identity
         model = body.get("model", "qwen-analyst")
+        # Phase 5D: validate the model maps to a known endpoint BEFORE enqueue.
+        # Otherwise an unknown model burns a scheduler slot + DRR charge and
+        # fails late with a confusing 502; OpenAI clients expect 404/model_not_found.
+        if normalize_endpoint(str(model)) not in self._config.endpoints:
+            return self._openai_error(
+                f"unknown model {model!r}", "model_not_found", 404)
 
         # Honor a client-supplied deadline (goose recipes can run long): a
         # ``timeout_s`` body field or an ``X-Timeout-S`` header overrides the
@@ -715,10 +721,8 @@ class ProxyService:
         remote_ip = request.client.host if request.client else "unknown"
         identity = self._acl.identify(remote_ip)
         if not identity:
-            return JSONResponse(
-                {"error": "access_denied", "your_ip": remote_ip},
-                status_code=403,
-            )
+            return self._openai_error(
+                f"access denied for {remote_ip}", "access_denied", 403)
         agent_id, default_priority = identity
 
         submit_body = {
@@ -730,7 +734,10 @@ class ProxyService:
             "payload": body,
             "timeout_s": 60.0,
         }
-        return await self.handle_submit(submit_body, request)
+        # Phase 5D: openai=True so success returns the bare OpenAI embeddings
+        # object ({object:list,data:[...],usage}) and errors are OpenAI-shaped —
+        # was leaking the internal {status,response} envelope to OpenAI clients.
+        return await self.handle_submit(submit_body, request, openai=True)
 
     # ----- handler: models -----
 

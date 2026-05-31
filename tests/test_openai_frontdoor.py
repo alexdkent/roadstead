@@ -36,6 +36,15 @@ class _FakeRequest:
     headers: dict = {}
 
 
+# A public IP the ACL won't recognize → 403.
+class _DeniedRequest:
+    class _Client:
+        host = "8.8.8.8"
+
+    client = _Client()
+    headers: dict = {}
+
+
 _COMPLETION = {
     "id": "chatcmpl-test",
     "object": "chat.completion",
@@ -199,6 +208,80 @@ async def test_cache_hit_returns_bare_completion():
         body = json.loads(resp.body.decode())
         assert body["object"] == "chat.completion"
         assert "cache_hit" not in body and "status" not in body
+    finally:
+        await svc.shutdown()
+
+
+# --- Phase 5D: front-door correctness ---------------------------------------
+
+@pytest.mark.asyncio
+async def test_acl_denied_is_openai_shaped_403_chat():
+    svc = await _make_started_service()
+    try:
+        resp = await svc.handle_openai_chat(_openai_body(), _DeniedRequest())
+        assert resp.status_code == 403
+        body = json.loads(resp.body.decode())
+        # OpenAI error object, NOT the bare {"error": "<str>", "your_ip": ...}.
+        assert isinstance(body.get("error"), dict)
+        assert body["error"]["type"] == "access_denied"
+        assert "your_ip" not in body
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_acl_denied_is_openai_shaped_403_embeddings():
+    svc = await _make_started_service()
+    try:
+        resp = await svc.handle_openai_embeddings(
+            {"model": "bge-m3", "input": "x"}, _DeniedRequest())
+        assert resp.status_code == 403
+        body = json.loads(resp.body.decode())
+        assert isinstance(body.get("error"), dict)
+        assert body["error"]["type"] == "access_denied"
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_is_404_model_not_found_no_slot_burned():
+    svc = await _make_started_service()
+    try:
+        before = svc._scheduler.stats()["total_dispatched"]
+        resp = await svc.handle_openai_chat(
+            _openai_body(model="gpt-4-turbo"), _FakeRequest())
+        assert resp.status_code == 404
+        body = json.loads(resp.body.decode())
+        assert body["error"]["type"] == "model_not_found"
+        # Rejected pre-enqueue → no scheduler slot consumed.
+        assert svc._scheduler.stats()["total_dispatched"] == before
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_embeddings_returns_bare_openai_object_not_envelope():
+    _EMB = {
+        "object": "list",
+        "data": [{"object": "embedding", "embedding": [0.1, 0.2], "index": 0}],
+        "model": "bge-m3", "usage": {"prompt_tokens": 2, "total_tokens": 2},
+    }
+
+    async def embed_call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
+        return BackendResponse(status_code=200, body=_EMB,
+                               duration_s=0.01, input_tokens=2, output_tokens=0)
+
+    svc = await _make_started_service(call=embed_call)
+    try:
+        resp = await svc.handle_openai_embeddings(
+            {"model": "bge-m3", "input": "hello"}, _FakeRequest())
+        assert resp.status_code == 200
+        body = json.loads(resp.body.decode())
+        # Bare OpenAI embeddings object — NOT the internal {status,response} envelope.
+        assert body["object"] == "list"
+        assert body["data"][0]["object"] == "embedding"
+        for envelope_key in ("status", "request_id", "queue_wait_ms", "response"):
+            assert envelope_key not in body, envelope_key
     finally:
         await svc.shutdown()
 
