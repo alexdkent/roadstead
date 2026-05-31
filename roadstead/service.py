@@ -225,7 +225,15 @@ class ProxyService:
             return model_ep
         return submit_ep
 
-    async def handle_submit(self, body: dict, request: Request) -> Response:
+    async def handle_submit(
+        self, body: dict, request: Request, *, openai: bool = False,
+    ) -> Response:
+        # ``openai=True`` (set only by the /v1/chat/completions front door)
+        # varies ONLY the response serialization: the bare OpenAI
+        # chat.completion / chat.completion.chunk + [DONE] stream, instead of
+        # the internal submit envelope. The enqueue / scheduler / grammar /
+        # cache / DRR / telemetry path is identical. Default False keeps every
+        # agent's /v1/submit response byte-identical.
         now = time.monotonic()
 
         req = QueuedRequest.create(
@@ -249,6 +257,11 @@ class ProxyService:
         if req.payload_type == "chat_completion":
             grammar_err = self._process_grammar(req)
             if grammar_err is not None:
+                if openai:
+                    return self._openai_error(
+                        grammar_err.get("detail", "invalid grammar"),
+                        "invalid_request_error", 422,
+                    )
                 return JSONResponse(
                     {"status": "error", "request_id": req.request_id, **grammar_err},
                     status_code=422,
@@ -259,6 +272,10 @@ class ProxyService:
         if cache_key:
             cached = self._cache.get(cache_key)
             if cached:
+                # OpenAI consumers get the bare cached completion; internal
+                # consumers get the submit envelope (unchanged).
+                if openai:
+                    return JSONResponse(cached)
                 return JSONResponse({
                     "status": "ok",
                     "request_id": req.request_id,
@@ -271,9 +288,9 @@ class ProxyService:
 
         # Streaming vs non-streaming
         if req.stream:
-            return await self._handle_streaming_submit(req)
+            return await self._handle_streaming_submit(req, openai=openai)
         else:
-            return await self._handle_sync_submit(req, cache_key)
+            return await self._handle_sync_submit(req, cache_key, openai=openai)
 
     def _extract_grammar(self, payload: dict) -> tuple[str | None, str | None]:
         """Return (grammar_string, location) where location is 'top' or
@@ -324,7 +341,7 @@ class ProxyService:
         return None
 
     async def _handle_sync_submit(
-        self, req: QueuedRequest, cache_key: str | None,
+        self, req: QueuedRequest, cache_key: str | None, *, openai: bool = False,
     ) -> Response:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
@@ -344,6 +361,10 @@ class ProxyService:
             self._pending_futures.pop(req.request_id, None)
             # The caller's deadline fired — work may still be in flight.
             self._record_timeout_event(req, layer="client_wait", elapsed_s=req.timeout_s)
+            if openai:
+                return self._openai_error(
+                    f"proxy timeout after {req.timeout_s:.0f}s", "proxy_timeout", 504,
+                )
             return JSONResponse(
                 {"error": "timeout", "request_id": req.request_id},
                 status_code=504,
@@ -354,6 +375,10 @@ class ProxyService:
         # Admission timeout (scheduler callback) resolves the future with a
         # timeout result — already logged there; surface the same 504.
         if result.get("status") == "timeout":
+            if openai:
+                return self._openai_error(
+                    f"proxy timeout after {req.timeout_s:.0f}s", "proxy_timeout", 504,
+                )
             return JSONResponse(
                 {"error": "timeout", "request_id": req.request_id},
                 status_code=504,
@@ -363,10 +388,21 @@ class ProxyService:
         if cache_key and result.get("status") == "ok":
             self._cache.put(cache_key, result.get("response", {}))
 
+        # OpenAI consumers get the bare chat.completion (or an OpenAI-shaped
+        # error); internal consumers get the submit envelope (unchanged).
+        if openai:
+            if result.get("status") == "ok":
+                return JSONResponse(result.get("response", {}))
+            return self._openai_error(
+                result.get("error", "backend error"), "backend_error", 502,
+            )
+
         status_code = 200 if result.get("status") == "ok" else 502
         return JSONResponse(result, status_code=status_code)
 
-    async def _handle_streaming_submit(self, req: QueuedRequest) -> Response:
+    async def _handle_streaming_submit(
+        self, req: QueuedRequest, *, openai: bool = False,
+    ) -> Response:
         queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         self._pending_streams[req.request_id] = queue
 
@@ -375,19 +411,56 @@ class ProxyService:
         self._dispatch_event.set()
 
         async def stream_generator():
-            # Emit queued event
-            yield f"data: {json.dumps({'type': 'queued', 'request_id': req.request_id})}\n\n"
+            # Internal envelope consumers get the queued marker; OpenAI
+            # consumers (goose-cli) get ONLY chat.completion.chunk frames, so
+            # the queued/admitted markers are dropped — an OpenAI client chokes
+            # parsing them.
+            if not openai:
+                yield f"data: {json.dumps({'type': 'queued', 'request_id': req.request_id})}\n\n"
 
             try:
                 while True:
                     event = await asyncio.wait_for(
                         queue.get(), timeout=req.timeout_s,
                     )
+                    if openai:
+                        etype = event.get("type")
+                        if etype == "chunk":
+                            # event["data"] is the backend's raw OpenAI
+                            # chat.completion.chunk line — re-emit verbatim.
+                            yield f"data: {event['data']}\n\n"
+                            continue
+                        if etype == "done":
+                            yield "data: [DONE]\n\n"
+                            break
+                        if etype == "error":
+                            yield (
+                                "data: "
+                                + json.dumps({"error": {
+                                    "message": event.get("error", "stream error"),
+                                    "type": "proxy_error",
+                                }})
+                                + "\n\n"
+                            )
+                            break
+                        # queued / admitted / anything else → not an OpenAI frame.
+                        continue
+                    # Internal envelope path (unchanged): re-emit every event.
                     yield f"data: {json.dumps(event)}\n\n"
                     if event.get("type") in ("done", "error"):
                         break
             except asyncio.TimeoutError:
-                yield f"data: {json.dumps({'type': 'error', 'error': 'timeout'})}\n\n"
+                if openai:
+                    yield (
+                        "data: "
+                        + json.dumps({"error": {
+                            "message": f"proxy stream timeout after {req.timeout_s:.0f}s",
+                            "type": "proxy_timeout",
+                        }})
+                        + "\n\n"
+                    )
+                else:
+                    yield f"data: {json.dumps({'type': 'error', 'error': 'timeout'})}\n\n"
                 self._record_timeout_event(req, layer="stream", elapsed_s=req.timeout_s)
             finally:
                 self._pending_streams.pop(req.request_id, None)
@@ -400,6 +473,15 @@ class ProxyService:
 
     # ----- handler: OpenAI compat -----
 
+    @staticmethod
+    def _openai_error(message: str, err_type: str, status_code: int) -> JSONResponse:
+        """OpenAI-shaped error envelope for the /v1/chat/completions front door
+        (goose-cli + any OpenAI client expects ``{"error": {...}}``)."""
+        return JSONResponse(
+            {"error": {"message": str(message), "type": err_type}},
+            status_code=status_code,
+        )
+
     async def handle_openai_chat(self, body: dict, request: Request) -> Response:
         remote_ip = request.client.host if request.client else "unknown"
         identity = self._acl.identify(remote_ip)
@@ -411,16 +493,27 @@ class ProxyService:
         agent_id, default_priority = identity
         model = body.get("model", "qwen-analyst")
 
+        # Honor a client-supplied deadline (goose recipes can run long): a
+        # ``timeout_s`` body field or an ``X-Timeout-S`` header overrides the
+        # 180s default. Popped from the body so it isn't forwarded to the
+        # backend (which would reject the unknown field).
+        client_timeout = body.pop("timeout_s", None) or request.headers.get("X-Timeout-S")
+        try:
+            timeout_s = float(client_timeout) if client_timeout else 180.0
+        except (TypeError, ValueError):
+            timeout_s = 180.0
+
         submit_body = {
             "agent_id": agent_id,
             "endpoint": model,
             "priority": int(default_priority),
             "call_site": f"{agent_id}.openai_compat",
+            "caller_id": agent_id,
             "payload_type": "chat_completion",
             "payload": body,
-            "timeout_s": 180.0,
+            "timeout_s": timeout_s,
         }
-        return await self.handle_submit(submit_body, request)
+        return await self.handle_submit(submit_body, request, openai=True)
 
     async def handle_openai_embeddings(self, body: dict, request: Request) -> Response:
         remote_ip = request.client.host if request.client else "unknown"
