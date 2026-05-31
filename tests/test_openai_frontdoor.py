@@ -23,7 +23,7 @@ from originfleet.llmproxy.backend import (
     BackendStreamEvent,
 )
 from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import ProxyService
+from originfleet.llmproxy.service import ProxyService, _strip_null_toolcall_names
 
 
 # A docker-bridge IP → ACL "internal" identity (so handle_openai_chat's
@@ -282,6 +282,100 @@ async def test_embeddings_returns_bare_openai_object_not_envelope():
         assert body["data"][0]["object"] == "embedding"
         for envelope_key in ("status", "request_id", "queue_wait_ms", "response"):
             assert envelope_key not in body, envelope_key
+    finally:
+        await svc.shutdown()
+
+
+# --- Phase 5E: tool-call name:null normalization ----------------------------
+
+def test_strip_null_toolcall_names_removes_null_name():
+    data = ('{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,'
+            '"function":{"name":null,"arguments":"{\\"city\\": "}}]}}]}')
+    out = json.loads(_strip_null_toolcall_names(data))
+    fn = out["choices"][0]["delta"]["tool_calls"][0]["function"]
+    assert "name" not in fn          # null name dropped
+    assert fn["arguments"] == '{"city": '  # arguments untouched
+
+
+def test_strip_null_toolcall_names_keeps_string_name():
+    data = ('{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1",'
+            '"function":{"name":"get_weather","arguments":""}}]}}]}')
+    out = json.loads(_strip_null_toolcall_names(data))
+    tc = out["choices"][0]["delta"]["tool_calls"][0]
+    assert tc["function"]["name"] == "get_weather"  # string name preserved
+    assert tc["id"] == "c1" and tc["index"] == 0    # id + index preserved
+
+
+def test_strip_null_toolcall_names_passthrough_non_toolcall_is_identity():
+    # The >99% case: a plain content chunk → returns the ORIGINAL object (no
+    # parse/re-serialize), byte-identical.
+    data = ('{"id":"x","object":"chat.completion.chunk",'
+            '"choices":[{"index":0,"delta":{"content":"hi"}}]}')
+    assert _strip_null_toolcall_names(data) is data
+    assert _strip_null_toolcall_names("[DONE]") == "[DONE]"
+    assert _strip_null_toolcall_names(": keepalive") == ": keepalive"
+
+
+def test_strip_null_toolcall_names_defensive_shapes():
+    # malformed JSON, missing/odd shapes → returned unchanged, never raises.
+    for bad in ('{"tool_calls": not json',
+                '{"tool_calls":1,"choices":"nope"}',
+                '{"choices":[{"delta":{"tool_calls":[{"function":42}]}}],"x":"tool_calls"}'):
+        assert _strip_null_toolcall_names(bad) == bad
+
+
+def test_strip_null_toolcall_names_multi_choice_multi_call():
+    data = json.dumps({"choices": [
+        {"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "function": {"name": None, "arguments": "a"}},
+            {"index": 1, "function": {"name": "keep", "arguments": "b"}}]}},
+        {"index": 1, "delta": {"tool_calls": [
+            {"index": 0, "function": {"name": None, "arguments": "c"}}]}},
+    ]})
+    out = json.loads(_strip_null_toolcall_names(data))
+    tcs0 = out["choices"][0]["delta"]["tool_calls"]
+    assert "name" not in tcs0[0]["function"] and tcs0[0]["function"]["arguments"] == "a"
+    assert tcs0[1]["function"]["name"] == "keep"
+    assert "name" not in out["choices"][1]["delta"]["tool_calls"][0]["function"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_toolcall_continuations_drop_null_name_end_to_end():
+    _TC_CHUNKS = [
+        '{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,'
+        '"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function",'
+        '"function":{"name":"get_weather","arguments":""}}]}}]}',
+        '{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,'
+        '"delta":{"tool_calls":[{"index":0,"function":{"name":null,'
+        '"arguments":"{\\"city\\": "}}]}}]}',
+        '{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,'
+        '"delta":{"tool_calls":[{"index":0,"function":{"name":null,'
+        '"arguments":"\\"Paris\\"}"}}]}}]}',
+    ]
+
+    async def tc_stream(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
+        for c in _TC_CHUNKS:
+            yield BackendStreamEvent(event_type="chunk", data=c, parsed=json.loads(c))
+        yield BackendStreamEvent(event_type="done", data="[DONE]")
+
+    svc = await _make_started_service(stream=tc_stream)
+    try:
+        resp = await svc.handle_openai_chat(_openai_body(stream=True), _FakeRequest())
+        frames = await _collect_stream(resp)
+        chunk_frames = [json.loads(f) for f in frames if f != "[DONE]"]
+        funcs = [tc["function"]
+                 for fr in chunk_frames
+                 for ch in fr.get("choices", [])
+                 for tc in (ch.get("delta", {}).get("tool_calls") or [])]
+        assert funcs, "expected tool_call deltas in the stream"
+        # First delta keeps the string name; continuations carry NO name key.
+        assert funcs[0]["name"] == "get_weather"
+        for fn in funcs[1:]:
+            assert "name" not in fn, fn
+        # Arguments reassemble to the full tool call (unchanged end-to-end).
+        assembled = "".join(fn.get("arguments", "") for fn in funcs)
+        assert assembled == '{"city": "Paris"}'
+        assert frames.count("[DONE]") == 1
     finally:
         await svc.shutdown()
 

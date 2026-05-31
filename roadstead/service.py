@@ -52,6 +52,48 @@ _DEFAULT_TIMEOUT_S = 180.0
 # the caller defers instead of the slot being dead for minutes. Capped to the
 # caller's own deadline so a legitimately short request isn't over-waited.
 _STREAM_TTFT_DEADLINE_S = 30.0
+
+
+def _strip_null_toolcall_names(data: str) -> str:
+    """Phase 5E — OpenAI streaming tool-call normalization.
+
+    vLLM's ``qwen3_xml`` tool-call parser emits
+    ``"function": {"name": null, "arguments": "..."}`` in every CONTINUATION
+    delta. The OpenAI streaming convention is to send ``function.name`` only in
+    the FIRST delta and OMIT it afterward; strict clients (the Vercel AI SDK /
+    ``@ai-sdk/openai-compatible``) reject the explicit null with
+    "Expected 'function.name' to be a string". Drop any tool-call ``function``
+    ``name`` key whose value is null so the front door is spec-compliant —
+    without touching the inference server.
+
+    PURE PASS-THROUGH otherwise: a chunk with no ``tool_calls`` returns the
+    ORIGINAL string (no parse / no re-serialize), so the >99% of chunks that
+    carry plain content stay byte-identical at near-zero overhead. Re-serializes
+    ONLY when a null name was actually removed. Defensive against missing/odd
+    shapes; never raises (a normalization bug must not break the stream).
+    """
+    if '"tool_calls"' not in data:
+        return data
+    try:
+        obj = json.loads(data)
+    except Exception:  # noqa: BLE001
+        return data
+    modified = False
+    for ch in (obj.get("choices") or []):
+        if not isinstance(ch, dict):
+            continue
+        delta = ch.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        for tc in (delta.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            # key present AND null → drop it (string names + absent key untouched).
+            if isinstance(fn, dict) and "name" in fn and fn["name"] is None:
+                del fn["name"]
+                modified = True
+    return json.dumps(obj) if modified else data
 from .cost_model import CostModel, estimate_input_tokens
 from .timeout_model import TimeoutModel
 from .observability import (
@@ -612,8 +654,10 @@ class ProxyService:
                         etype = event.get("type")
                         if etype == "chunk":
                             # event["data"] is the backend's raw OpenAI
-                            # chat.completion.chunk line — re-emit verbatim.
-                            yield f"data: {event['data']}\n\n"
+                            # chat.completion.chunk line — re-emit verbatim, with
+                            # Phase 5E tool-call name-null normalization (no-op +
+                            # original bytes for non-tool-call chunks).
+                            yield f"data: {_strip_null_toolcall_names(event['data'])}\n\n"
                             continue
                         if etype == "done":
                             yield "data: [DONE]\n\n"
