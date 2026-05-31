@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import logging
+import queue as _queue
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -33,7 +35,14 @@ CREATE TABLE IF NOT EXISTS proxy_queue (
     estimated_cost REAL,
     session_id     TEXT,
     turn_id        TEXT,
-    stream         INTEGER NOT NULL DEFAULT 0
+    stream         INTEGER NOT NULL DEFAULT 0,
+    -- Wall-clock recovery (Phase 2.6): enqueued_at/timeout_deadline are
+    -- time.monotonic() (process-relative), meaningless after a restart. Persist
+    -- wall-clock enqueue + the budget so recovery can rebase onto the new
+    -- monotonic clock and discard genuinely-expired rows.
+    enqueued_wall  REAL,
+    timeout_s      REAL,
+    caller_id      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS proxy_agent_budgets (
@@ -125,6 +134,9 @@ class PersistentQueue:
     def __init__(self, db_path: str | Path | None = None) -> None:
         self._db_path = str(db_path) if db_path else ""
         self._conn: sqlite3.Connection | None = None
+        self._read_conn: sqlite3.Connection | None = None
+        self._write_q: "_queue.Queue | None" = None
+        self._writer: threading.Thread | None = None
         if self._db_path:
             self._conn = self._open(self._db_path)
 
@@ -136,6 +148,7 @@ class PersistentQueue:
         conn.executescript(_SCHEMA)
         self._migrate_completions(conn)
         self._migrate_timeouts(conn)
+        self._migrate_queue(conn)
         return conn
 
     @staticmethod
@@ -171,7 +184,109 @@ class PersistentQueue:
             "context_used_pct": "REAL",
         })
 
+    @classmethod
+    def _migrate_queue(cls, conn: sqlite3.Connection) -> None:
+        cls._add_missing_columns(conn, "proxy_queue", {
+            "enqueued_wall": "REAL",
+            "timeout_s": "REAL",
+            "caller_id": "TEXT",
+        })
+
+    # ----- async writer (Phase 2.2): writes run on a dedicated thread that owns
+    # the write connection, so synchronous SQLite I/O never blocks the event
+    # loop that schedules the whole fleet. Reads use a separate read-only
+    # connection on the loop thread (WAL permits concurrent readers). Until the
+    # writer is started (tests / startup recovery), writes execute synchronously
+    # on the write connection — identical behaviour, no thread.
+
+    def start_async_writer(self) -> None:
+        """Open the read-only connection and start the writer thread. Called by
+        the service AFTER startup recovery (which runs synchronously on the write
+        connection while single-threaded)."""
+        if not self._conn or self._writer is not None:
+            return
+        try:
+            # A second connection for reads, used ONLY by the event-loop thread
+            # (SELECTs only — never writes). NOT opened mode=ro: a read-only
+            # connection on a WAL database can fail to read because it can't
+            # build the -shm index. WAL permits multiple connections; the writer
+            # thread owns self._conn, the loop owns self._read_conn — neither is
+            # shared across threads, so no locking is needed.
+            self._read_conn = sqlite3.connect(
+                self._db_path, isolation_level=None, check_same_thread=False)
+            self._read_conn.execute("PRAGMA busy_timeout=2500")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("read connection open failed (%s); reads use writer conn", exc)
+            self._read_conn = None
+        self._write_q = _queue.Queue()
+        self._writer = threading.Thread(
+            target=self._writer_loop, name="llmproxy-dbwriter", daemon=True)
+        self._writer.start()
+
+    def _writer_loop(self) -> None:
+        while True:
+            item = self._write_q.get()
+            try:
+                if item is None:  # shutdown sentinel
+                    return
+                sql, params = item
+                self._conn.execute(sql, params)
+            except Exception as exc:  # noqa: BLE001 — never let a bad write kill the writer
+                logger.warning("llmproxy db write failed: %s", exc)
+            finally:
+                self._write_q.task_done()
+
+    def _w(self, sql: str, params: tuple = ()) -> None:
+        """Submit a write: enqueue to the writer thread when running, else run
+        synchronously on the write connection (init / tests / pre-writer)."""
+        if not self._conn:
+            return
+        if self._writer is not None and self._writer.is_alive():
+            self._write_q.put((sql, params))
+        else:
+            self._conn.execute(sql, params)
+
+    def _reader(self) -> "sqlite3.Connection | None":
+        """Connection for read queries: the read-only conn on the loop thread,
+        falling back to the write conn (pre-writer / if RO open failed)."""
+        return self._read_conn or self._conn
+
+    def wal_size_bytes(self) -> int:
+        """Size of the WAL sidecar in bytes (0 if absent) — for the wal_growth
+        alert (Phase 2.5)."""
+        if not self._db_path:
+            return 0
+        try:
+            import os as _os
+            return _os.path.getsize(self._db_path + "-wal")
+        except OSError:
+            return 0
+
+    def flush(self, timeout: float = 10.0) -> None:
+        """Block until all queued writes have been applied (drain support)."""
+        if self._write_q is None:
+            return
+        try:
+            # queue.Queue has no join-with-timeout; poll unfinished_tasks.
+            import time as _t
+            deadline = _t.monotonic() + timeout
+            while self._write_q.unfinished_tasks and _t.monotonic() < deadline:
+                _t.sleep(0.02)
+        except Exception:  # noqa: BLE001
+            pass
+
     def close(self) -> None:
+        if self._writer is not None and self._writer.is_alive():
+            self.flush(timeout=5.0)
+            self._write_q.put(None)  # shutdown sentinel
+            self._writer.join(timeout=5.0)
+            self._writer = None
+        if self._read_conn:
+            try:
+                self._read_conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._read_conn = None
         if self._conn:
             self._conn.close()
             self._conn = None
@@ -179,14 +294,13 @@ class PersistentQueue:
     # ----- write operations -----
 
     def persist_enqueue(self, req: QueuedRequest) -> None:
-        if not self._conn:
-            return
-        self._conn.execute(
+        self._w(
             "INSERT OR REPLACE INTO proxy_queue "
             "(request_id, agent_id, endpoint, priority, call_site, "
             " payload_type, payload_json, status, enqueued_at, "
-            " timeout_deadline, estimated_cost, session_id, turn_id, stream) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " timeout_deadline, estimated_cost, session_id, turn_id, stream, "
+            " enqueued_wall, timeout_s, caller_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 req.request_id, req.agent_id, req.endpoint,
                 int(req.priority), req.call_site,
@@ -194,13 +308,12 @@ class PersistentQueue:
                 "queued", req.enqueued_at, req.timeout_deadline,
                 req.estimated_cost_ss, req.session_id, req.turn_id,
                 1 if req.stream else 0,
+                time.time(), req.timeout_s, req.caller_id,
             ),
         )
 
     def persist_dispatch(self, request_id: str) -> None:
-        if not self._conn:
-            return
-        self._conn.execute(
+        self._w(
             "UPDATE proxy_queue SET status='dispatched' WHERE request_id=?",
             (request_id,),
         )
@@ -227,13 +340,13 @@ class PersistentQueue:
         if not self._conn:
             return
         now = time.time()
-        self._conn.execute(
+        self._w(
             "DELETE FROM proxy_queue WHERE request_id=?",
             (request_id,),
         )
         payload_s = json.dumps(payload, separators=(",", ":")) if payload else None
         response_s = json.dumps(response, separators=(",", ":")) if response else None
-        self._conn.execute(
+        self._w(
             "INSERT OR REPLACE INTO proxy_completions "
             "(request_id, agent_id, endpoint, call_site, priority, "
             " input_tokens, output_tokens, duration_s, queue_wait_ms, "
@@ -270,9 +383,7 @@ class PersistentQueue:
         for a completed request, alongside the actual latency and the
         timeout actually applied.  Observational only — never on the
         caller's critical path."""
-        if not self._conn:
-            return
-        self._conn.execute(
+        self._w(
             "INSERT OR REPLACE INTO proxy_timeout_shadow "
             "(request_id, completed_at, endpoint, priority, est_in, est_out, "
             " actual_out, actual_total_ms, applied_timeout_s, recommended_ms, "
@@ -318,9 +429,7 @@ class PersistentQueue:
         ``backend`` (the model exceeded the deadline after dispatch), or
         ``stream``. ``under_recommended`` flags a timeout that fired below
         the data-driven recommended deadline (i.e. likely premature)."""
-        if not self._conn:
-            return
-        self._conn.execute(
+        self._w(
             "INSERT INTO proxy_timeouts "
             "(request_id, occurred_at, endpoint, priority, agent_id, call_site, "
             " layer, elapsed_s, applied_timeout_s, queue_wait_ms, in_flight, "
@@ -337,9 +446,7 @@ class PersistentQueue:
         )
 
     def persist_expire(self, request_id: str) -> None:
-        if not self._conn:
-            return
-        self._conn.execute(
+        self._w(
             "DELETE FROM proxy_queue WHERE request_id=?",
             (request_id,),
         )
@@ -350,17 +457,15 @@ class PersistentQueue:
     # ----- budget persistence -----
 
     def save_budgets(self, budgets: list[dict]) -> None:
-        if not self._conn:
-            return
         for b in budgets:
-            self._conn.execute(
+            self._w(
                 "INSERT OR REPLACE INTO proxy_agent_budgets "
                 "(agent_id, weight, balance, total_consumed, last_replenish_at) "
                 "VALUES (?,?,?,?,?)",
                 (
                     b["agent_id"], b.get("weight", 1.0),
                     b.get("balance_ss", 0.0), b.get("total_consumed_ss", 0.0),
-                    time.monotonic(),
+                    time.time(),
                 ),
             )
 
@@ -375,24 +480,42 @@ class PersistentQueue:
         # Clean up stale dispatched entries (in-flight at crash time)
         self._conn.execute("DELETE FROM proxy_queue WHERE status='dispatched'")
 
-        rows = self._conn.execute(
+        rows = self._reader().execute(
             "SELECT request_id, agent_id, endpoint, priority, call_site, "
             "       payload_type, payload_json, enqueued_at, timeout_deadline, "
-            "       estimated_cost, session_id, turn_id, stream "
+            "       estimated_cost, session_id, turn_id, stream, "
+            "       enqueued_wall, timeout_s, caller_id "
             "FROM proxy_queue WHERE status='queued'"
         ).fetchall()
 
         recovered: list[QueuedRequest] = []
         discarded = 0
+        wall_now = time.time()
 
         for row in rows:
-            (rid, aid, ep, pri, cs, pt, pj, ea, td, ec, sid, tid, st) = row
-            if td <= now:
-                self._conn.execute(
-                    "DELETE FROM proxy_queue WHERE request_id=?", (rid,),
-                )
-                discarded += 1
-                continue
+            (rid, aid, ep, pri, cs, pt, pj, ea, td, ec, sid, tid, st,
+             ew, ts_budget, cid) = row
+
+            # Phase 2.6: enqueued_at/timeout_deadline are time.monotonic() from a
+            # DEAD process — meaningless against this process's clock. Rebase via
+            # wall-clock: how much of the budget remains after the elapsed wall
+            # time, then re-anchor onto the new monotonic `now`. Rows written
+            # before this migration (no enqueued_wall) are re-anchored fresh
+            # rather than risk a bogus monotonic comparison mis-expiring them.
+            budget = ts_budget if ts_budget else 180.0
+            if ew:
+                elapsed = max(0.0, wall_now - ew)
+                remaining = budget - elapsed
+                if remaining <= 0:
+                    self._conn.execute(
+                        "DELETE FROM proxy_queue WHERE request_id=?", (rid,))
+                    discarded += 1
+                    continue
+                new_enqueued_at = now - elapsed
+                new_deadline = now + remaining
+            else:
+                new_enqueued_at = now
+                new_deadline = now + budget
 
             try:
                 payload = json.loads(pj)
@@ -408,11 +531,13 @@ class PersistentQueue:
                 call_site=cs,
                 payload_type=pt,
                 payload=payload,
-                timeout_deadline=td,
-                enqueued_at=ea,
+                timeout_deadline=new_deadline,
+                enqueued_at=new_enqueued_at,
                 estimated_cost_ss=ec or 0.0,
                 session_id=sid,
                 turn_id=tid,
+                caller_id=cid,
+                timeout_s=budget,
                 stream=bool(st),
             )
             recovered.append(req)
@@ -425,26 +550,15 @@ class PersistentQueue:
 
         return recovered
 
-    def cleanup_old_completions(self, max_age_s: float = 86400 * 7) -> int:
-        """Remove completion records older than max_age_s.  Trims the
-        timeout-shadow table on the same retention window."""
+    def cleanup_old_completions(self, max_age_s: float = 86400 * 7) -> None:
+        """Trim completions / timeout-shadow / timeouts past the retention
+        window. Enqueued to the writer thread (off the event loop)."""
         if not self._conn:
-            return 0
+            return
         cutoff = time.time() - max_age_s
-        cursor = self._conn.execute(
-            "DELETE FROM proxy_completions WHERE completed_at < ?",
-            (cutoff,),
-        )
-        removed = cursor.rowcount
-        self._conn.execute(
-            "DELETE FROM proxy_timeout_shadow WHERE completed_at < ?",
-            (cutoff,),
-        )
-        self._conn.execute(
-            "DELETE FROM proxy_timeouts WHERE occurred_at < ?",
-            (cutoff,),
-        )
-        return removed
+        self._w("DELETE FROM proxy_completions WHERE completed_at < ?", (cutoff,))
+        self._w("DELETE FROM proxy_timeout_shadow WHERE completed_at < ?", (cutoff,))
+        self._w("DELETE FROM proxy_timeouts WHERE occurred_at < ?", (cutoff,))
 
     def history_buckets(
         self, hours: float = 4.0, bucket_minutes: int = 5,
@@ -454,7 +568,7 @@ class PersistentQueue:
             return []
         cutoff = time.time() - (hours * 3600)
         bucket_s = bucket_minutes * 60
-        rows = self._conn.execute(
+        rows = self._reader().execute(
             "SELECT "
             "  CAST((completed_at - ?) / ? AS INTEGER) AS bucket_idx, "
             "  endpoint, agent_id, "
@@ -512,7 +626,7 @@ class PersistentQueue:
         """Return the most recent completed requests for the feed."""
         if not self._conn:
             return []
-        rows = self._conn.execute(
+        rows = self._reader().execute(
             "SELECT request_id, agent_id, endpoint, call_site, priority, "
             "       input_tokens, output_tokens, duration_s, queue_wait_ms, "
             "       status, completed_at "
@@ -541,7 +655,7 @@ class PersistentQueue:
         if not self._conn:
             return []
         cutoff = time.time() - (hours * 3600)
-        rows = self._conn.execute(
+        rows = self._reader().execute(
             "SELECT request_id, agent_id, endpoint, call_site, priority, "
             "       input_tokens, output_tokens, duration_s, queue_wait_ms, "
             "       status, completed_at "
@@ -568,7 +682,7 @@ class PersistentQueue:
         if not self._conn:
             return []
         cutoff = time.time() - (hours * 3600)
-        rows = self._conn.execute(
+        rows = self._reader().execute(
             "SELECT endpoint, priority, input_tokens, output_tokens, "
             "       duration_s, queue_wait_ms "
             "FROM proxy_completions "
@@ -594,7 +708,7 @@ class PersistentQueue:
         from .timeout_model import percentile
 
         cutoff = time.time() - (hours * 3600)
-        rows = self._conn.execute(
+        rows = self._reader().execute(
             "SELECT endpoint, priority, actual_total_ms, applied_timeout_s, "
             "       recommended_ms, would_timeout, source "
             "FROM proxy_timeout_shadow WHERE completed_at >= ?",
@@ -646,7 +760,7 @@ class PersistentQueue:
         from .timeout_model import percentile
 
         cutoff = time.time() - (hours * 3600)
-        rows = self._conn.execute(
+        rows = self._reader().execute(
             "SELECT endpoint, priority, layer, elapsed_s, in_flight, queued, "
             "       under_recommended, recommended_ms, caller_id, context_used_pct "
             "FROM proxy_timeouts WHERE occurred_at >= ?",
@@ -706,7 +820,7 @@ class PersistentQueue:
         if not self._conn:
             return []
         cutoff = time.time() - (hours * 3600)
-        rows = self._conn.execute(
+        rows = self._reader().execute(
             "SELECT endpoint, call_site, input_tokens, output_tokens, duration_s "
             "FROM proxy_completions "
             "WHERE completed_at >= ? AND status = 'ok' "
@@ -746,7 +860,7 @@ class PersistentQueue:
         if call_site:
             where.append("call_site LIKE ?")
             params.append(call_site.replace("*", "%"))
-        rows = self._conn.execute(
+        rows = self._reader().execute(
             "SELECT request_id, agent_id, endpoint, call_site, priority, "
             "       input_tokens, output_tokens, duration_s, queue_wait_ms, "
             "       completed_at, payload_json, response_json "

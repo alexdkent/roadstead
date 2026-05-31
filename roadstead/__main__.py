@@ -97,6 +97,11 @@ def main() -> None:
         port=args.port,
         log_level=args.log_level,
         access_log=False,
+        # Phase 2.1: bound the graceful (SIGTERM) shutdown so it can't hang
+        # forever behind a slow in-flight request — uvicorn waits at most this
+        # long for ASGI requests, and svc.shutdown() drains in-flight backend
+        # dispatches within _DRAIN_DEADLINE_S (30s) before force-cancelling.
+        timeout_graceful_shutdown=35,
     )
 
 

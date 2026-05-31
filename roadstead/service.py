@@ -34,6 +34,11 @@ from .config import (
 # after a short backoff, so a retry never starts work the caller will abandon.
 _MIN_RETRY_BUDGET_S = 5.0
 _RETRY_BACKOFF_S = 0.5
+
+# Phase 2.1 — bounded in-flight drain on graceful shutdown. The BOUND is the fix
+# for the historic SIGTERM hang (uvicorn waiting forever behind a slow request):
+# drain up to this long, then force-cancel stragglers.
+_DRAIN_DEADLINE_S = 30.0
 from .cost_model import CostModel, estimate_input_tokens
 from .timeout_model import TimeoutModel
 from .observability import (
@@ -41,6 +46,7 @@ from .observability import (
     RequestLogRecord,
     RequestLogger,
     RollingMetrics,
+    check_alerts,
 )
 from .queue import PersistentQueue
 from .scheduler import (
@@ -88,6 +94,7 @@ class ProxyService:
 
         # Async plumbing
         self._dispatch_event = asyncio.Event()
+        self._draining = asyncio.Event()  # set during shutdown drain (Phase 2.1)
         self._pending_futures: dict[str, asyncio.Future] = {}
         self._pending_streams: dict[str, asyncio.Queue] = {}
         # Dedupe set so a single request that races across two timeout
@@ -107,6 +114,16 @@ class ProxyService:
         }
         self._health_fail_threshold = 3
         self._transient_retry_max = 1
+        # Retention sweep cadence (Phase 2.3) — monotonic ts of the last DB trim.
+        self._last_cleanup_at = 0.0
+        # Load-shed threshold (Phase 2.4): per-(endpoint, band) queue depth at
+        # which NON-interactive submits are shed with 429 + Retry-After.
+        self._shed_depth = 50
+        # Alerting (Phase 2.5) — current triggered alerts (exposed on /v1/status)
+        # + the set already logged, so a sustained condition logs once not every
+        # poll tick.
+        self._alerts: list[dict] = []
+        self._alert_logged: set = set()
         self._scheduler_task: asyncio.Task | None = None
         self._poller_task: asyncio.Task | None = None
         self._started_at = time.monotonic()
@@ -152,6 +169,17 @@ class ProxyService:
 
         # Bootstrap timeout-advice model from the same history
         self._bootstrap_timeout_model()
+
+        # Phase 2.2: all startup recovery + bootstrap reads/writes are done
+        # synchronously above while single-threaded; from here, route DB writes
+        # to a dedicated writer thread so synchronous SQLite I/O never blocks the
+        # event loop that schedules the whole fleet.
+        self._queue_db.start_async_writer()
+
+        # Phase 2.3: initial retention sweep (then daily in the poller) so the
+        # completion corpus + timeout tables don't grow unbounded.
+        self._queue_db.cleanup_old_completions()
+        self._last_cleanup_at = time.monotonic()
 
         # Start background loops
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
@@ -212,12 +240,31 @@ class ProxyService:
         )
 
     async def shutdown(self) -> None:
+        # Phase 2.1: drain in-flight dispatches (bounded) before teardown so a
+        # graceful (SIGTERM) restart doesn't drop running LLM work. New submits
+        # are rejected (deferrable) while draining; the scheduler stops admitting.
+        self._draining.set()
         if self._scheduler_task:
             self._scheduler_task.cancel()
+        tasks = [t for t in self._inflight_tasks.values() if not t.done()]
+        if tasks:
+            logger.info(
+                "draining %d in-flight dispatch(es) (≤%.0fs)", len(tasks), _DRAIN_DEADLINE_S)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=_DRAIN_DEADLINE_S,
+                )
+            except asyncio.TimeoutError:
+                stragglers = [t for t in tasks if not t.done()]
+                logger.warning(
+                    "drain deadline hit — cancelling %d straggler(s)", len(stragglers))
+                for t in stragglers:
+                    t.cancel()
         if self._poller_task:
             self._poller_task.cancel()
         await self._backend.close()
-        self._queue_db.close()
+        self._queue_db.close()  # flushes the writer queue, then closes connections
         self._request_logger.close()
 
     # ----- handler: /v1/submit -----
@@ -259,6 +306,14 @@ class ProxyService:
         # the internal submit envelope. The enqueue / scheduler / grammar /
         # cache / DRR / telemetry path is identical. Default False keeps every
         # agent's /v1/submit response byte-identical.
+        if self._draining.is_set():
+            # Phase 2.1: refuse new work while draining for shutdown so it defers
+            # to the (about-to-restart) next instance instead of being dropped.
+            err = "proxy draining for shutdown"
+            if openai:
+                return self._openai_error(err, "backpressure", 503)
+            return JSONResponse({"status": "error", "error": err}, status_code=503)
+
         now = time.monotonic()
 
         req = QueuedRequest.create(
@@ -324,6 +379,25 @@ class ProxyService:
                 {"status": "error", "request_id": req.request_id, "error": err},
                 status_code=503,
             )
+
+        # Load-shed / backpressure (Phase 2.4): under sustained saturation, shed
+        # NON-interactive work with 429 + Retry-After so callers defer instead of
+        # all queuing until their deadlines and 504ing together. Interactive is
+        # never shed.
+        if req.band != PriorityBand.INTERACTIVE:
+            snap = self._scheduler.endpoint_snapshot(req.endpoint)
+            band_key = req.band.name.lower()
+            if snap.get("queue_by_band", {}).get(band_key, 0) >= self._shed_depth:
+                err = f"backpressure: {req.endpoint} {band_key} queue saturated"
+                retry_after = self._retry_after_s(req.endpoint)
+                if openai:
+                    resp = self._openai_error(err, "backpressure", 429)
+                else:
+                    resp = JSONResponse(
+                        {"status": "error", "request_id": req.request_id, "error": err},
+                        status_code=429)
+                resp.headers["Retry-After"] = str(retry_after)
+                return resp
 
         # Streaming vs non-streaming
         if req.stream:
@@ -626,6 +700,7 @@ class ProxyService:
         return JSONResponse({
             "endpoints": endpoints,
             "agents": agents,
+            "alerts": self._alerts,  # Phase 2.5 — health-verifier/log_scan surface
             "cache": self._cache.stats(),
             "coalesce": {
                 "saved_calls": self._coalescer.saved_calls,
@@ -1038,6 +1113,14 @@ class ProxyService:
         h = self._endpoint_health.get(normalize_endpoint(endpoint))
         return h["healthy"] if h else True
 
+    def _retry_after_s(self, endpoint: str) -> int:
+        """Retry-After for a shed (Phase 2.4), derived from the endpoint's
+        recent p95 backend latency (a drained slot frees on ~that cadence),
+        clamped to [5, 60]s."""
+        p95 = self._metrics.percentile(
+            "backend_latency_ms", 95, endpoint=endpoint, now=time.monotonic())
+        return max(5, min(60, int((p95 or 10000.0) / 1000.0)))
+
     @staticmethod
     def _is_transient_backend_error(exc: Exception) -> bool:
         """Infra-transient backend failures that should DEFER (retry within the
@@ -1120,6 +1203,36 @@ class ProxyService:
                     self._queue_db.persist_expire(req.request_id)
                     self._resolve_error(
                         req, f"backend {ep_name} unavailable (circuit open)")
+
+    def _evaluate_alerts(self, now: float) -> None:
+        """Evaluate proxy-internal alert conditions (Phase 2.5) and surface them
+        to logs (log_scan/health-verifier) + /v1/status. Never restarts a backend — a dead
+        backend is alerted, not killed (alert-don't-kill)."""
+        snaps: dict[str, dict] = {}
+        for ep in self._config.endpoints:
+            s = self._scheduler.endpoint_snapshot(ep)
+            s["paused"] = not self._endpoint_healthy(ep)  # real backend-down signal
+            snaps[ep] = s
+        alerts = check_alerts(
+            endpoint_snapshots=snaps,
+            agent_budgets=self._budget_mgr.snapshot(),
+            metrics=self._metrics,
+            cost_model_samples={},  # cost-model-stale is INFO-only; skip for now
+            queue_wal_size=self._queue_db.wal_size_bytes(),
+            now=now,
+        )
+        self._alerts = [
+            {"name": a.name, "severity": a.severity, "detail": a.detail}
+            for a in alerts
+        ]
+        current = {(a.name, a.detail) for a in alerts}
+        emit = {"CRITICAL": logger.critical, "ERROR": logger.error,
+                "WARNING": logger.warning}
+        for a in alerts:
+            if (a.name, a.detail) not in self._alert_logged:
+                emit.get(a.severity, logger.info)(
+                    "ALERT [%s] %s: %s", a.severity, a.name, a.detail)
+        self._alert_logged = current
 
     def _resolve_error(self, req: QueuedRequest, error: str) -> None:
         future = self._pending_futures.get(req.request_id)
@@ -1462,9 +1575,20 @@ class ProxyService:
                     await self._update_endpoint_health(ep_name, ep_cfg, probe_ok)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("health update %s failed: %s", ep_name, exc)
+            mono = time.monotonic()
+            # Retention sweep (Phase 2.3): daily DB trim, off-loop via the writer.
+            if mono - self._last_cleanup_at > 86400.0:
+                self._last_cleanup_at = mono
+                self._queue_db.cleanup_old_completions()
+            # Alerting (Phase 2.5): evaluate conditions → logs + /v1/status so
+            # health-verifier/log_scan see proxy-internal health. Never restarts a backend.
+            try:
+                self._evaluate_alerts(mono)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("alert evaluation failed: %s", exc)
             # Age out stale timeout-model samples (cheap; piggybacks the
             # 10s poller instead of a dedicated task).
-            self._timeout_model.prune(time.monotonic())
+            self._timeout_model.prune(mono)
             await asyncio.sleep(10.0)
 
     def _apply_discovered_props(

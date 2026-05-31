@@ -265,13 +265,12 @@ def check_alerts(
             f"{timeout_count} timeouts in last 5 minutes",
         ))
 
-    # Agent starvation
-    for b in agent_budgets:
-        if b.get("starving"):
-            alerts.append(AlertCondition(
-                "agent_starvation", "WARNING", True,
-                f"agent {b['agent_id']} has negative balance",
-            ))
+    # Agent starvation — REMOVED. The DRR fix (pick_agent on head-of-queue wait)
+    # made balance-sign "starving" a lie: a heavy consumer being served
+    # continuously has a perpetually-negative balance yet is NOT starved. Real
+    # starvation = denied-service wait, which lives in the scheduler, not this
+    # budget snapshot. Don't page on the misleading signal; a proper
+    # head-of-queue-wait alert is a future refinement.
 
     # Endpoint paused
     for ep, snap in endpoint_snapshots.items():
