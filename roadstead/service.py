@@ -54,46 +54,152 @@ _DEFAULT_TIMEOUT_S = 180.0
 _STREAM_TTFT_DEADLINE_S = 30.0
 
 
-def _strip_null_toolcall_names(data: str) -> str:
-    """Phase 5E — OpenAI streaming tool-call normalization.
+class _ToolCallStreamSanitizer:
+    """Per-stream sanitizer that makes vLLM ``qwen3_xml`` streaming tool-call
+    deltas safe for strict OpenAI clients — the Vercel AI SDK /
+    ``@ai-sdk/openai-compatible`` provider that opencode uses (Phase 5E, v2).
 
-    vLLM's ``qwen3_xml`` tool-call parser emits
-    ``"function": {"name": null, "arguments": "..."}`` in every CONTINUATION
-    delta. The OpenAI streaming convention is to send ``function.name`` only in
-    the FIRST delta and OMIT it afterward; strict clients (the Vercel AI SDK /
-    ``@ai-sdk/openai-compatible``) reject the explicit null with
-    "Expected 'function.name' to be a string". Drop any tool-call ``function``
-    ``name`` key whose value is null so the front door is spec-compliant —
-    without touching the inference server.
+    THE BUG. When one turn produces MORE THAN ONE tool call (made far more
+    likely by MTP speculative decoding, which the thinker runs), vLLM's
+    ``qwen3_xml`` parser emits a junk "phantom" tool-call delta between the real
+    ones: a fresh ``id``, ``"name": null`` and EMPTY arguments at an in-between
+    index that NEVER receives a name — the real next call lands at the following
+    index (observed live: real calls at index 0 and 2, phantom at 1). The AI
+    SDK opens a tool-call slot for that index, finds ``function.name == null``
+    (its check matches null AND undefined), and throws
+    ``AI_InvalidResponseDataError: Expected 'function.name' to be a string``,
+    aborting the whole turn. Upstream tracking: vLLM #39584 (open, parallel
+    tool calls + spec-decode); client side: opencode #24137 / vercel/ai #6687.
 
-    PURE PASS-THROUGH otherwise: a chunk with no ``tool_calls`` returns the
-    ORIGINAL string (no parse / no re-serialize), so the >99% of chunks that
-    carry plain content stay byte-identical at near-zero overhead. Re-serializes
-    ONLY when a null name was actually removed. Defensive against missing/odd
-    shapes; never raises (a normalization bug must not break the stream).
+    Note the v1 of this fix (strip the null ``name`` key from continuations) was
+    aimed at the wrong frame: the AI SDK only validates ``function.name`` when
+    OPENING a slot, never on a continuation, so stripping it there was a no-op
+    against the real crash.
+
+    The SAME parallel-call bug also corrupts the LAST call's arguments: it
+    appends an extra trailing ``}`` (observed live: ``{"path": "/tmp"}}``),
+    which is invalid JSON. Once the phantom no longer aborts the turn, the AI
+    SDK reaches that argument and fails with a JSON parse error instead. So we
+    also TRIM trailing junk: per slot we accumulate the emitted argument text
+    and, the moment it parses as a complete JSON value (``raw_decode`` — which
+    correctly ignores ``}`` inside string values), we emit exactly up to the end
+    of that value and drop anything after. The AI SDK marks the call finished on
+    the first valid parse and ignores later deltas, so this matches its model.
+
+    THE FIX — the opencode-maintainer-recommended client behaviour, applied at
+    the proxy so we neither patch the (custom) GB10 vLLM nor give up MTP
+    throughput: never let a tool-call index reach the client until it has a
+    STRING name, and never let its arguments exceed one complete JSON value. Per
+    (choice, index) slot we track whether it's been OPENED with a name and the
+    argument text emitted so far; we BUFFER the args of a not-yet-named slot and
+    emit a proper opener once a name arrives; a slot that closes without ever
+    being named (the phantom) is silently dropped. Indices are NOT renumbered —
+    the AI SDK keys tool calls by ``id`` and uses the numeric index only as an
+    accumulation slot, so the hole left by a dropped phantom is never touched.
+
+    ``feed(data)`` takes one raw backend SSE ``data:`` payload and returns the
+    payload to emit. PURE PASS-THROUGH (the ORIGINAL string object, no parse)
+    for the >99% of chunks with no ``tool_calls``. Defensive: never raises — on
+    any malformed/odd shape it returns the original bytes.
     """
-    if '"tool_calls"' not in data:
-        return data
-    try:
-        obj = json.loads(data)
-    except Exception:  # noqa: BLE001
-        return data
-    modified = False
-    for ch in (obj.get("choices") or []):
-        if not isinstance(ch, dict):
-            continue
-        delta = ch.get("delta")
-        if not isinstance(delta, dict):
-            continue
-        for tc in (delta.get("tool_calls") or []):
-            if not isinstance(tc, dict):
-                continue
-            fn = tc.get("function")
-            # key present AND null → drop it (string names + absent key untouched).
-            if isinstance(fn, dict) and "name" in fn and fn["name"] is None:
-                del fn["name"]
-                modified = True
-    return json.dumps(obj) if modified else data
+
+    def __init__(self) -> None:
+        # (choice_index, tool_index) -> {opened, id, type, buf, emitted, done}
+        self._slots: dict = {}
+
+    @staticmethod
+    def _advance(emitted: str, frag: str):
+        """Append ``frag`` to the already-emitted args ``emitted`` and return
+        ``(delta_to_emit, total_emitted, done)``. If the combined text contains
+        a complete JSON value, ``delta`` is only the part of ``frag`` up to the
+        end of that value (trailing junk like an extra ``}`` is dropped) and
+        ``done`` is True; otherwise the whole ``frag`` passes through."""
+        whole = emitted + frag
+        try:
+            _, end = json.JSONDecoder().raw_decode(whole)
+        except ValueError:
+            return frag, whole, False          # not a complete value yet
+        total = whole[:end]
+        return total[len(emitted):], total, True
+
+    def feed(self, data: str) -> str:
+        if '"tool_calls"' not in data:
+            return data
+        try:
+            obj = json.loads(data)
+            if not isinstance(obj, dict):
+                return data
+            changed = False
+            for ch in (obj.get("choices") or []):
+                if not isinstance(ch, dict):
+                    continue
+                delta = ch.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                tcs = delta.get("tool_calls")
+                if not isinstance(tcs, list):
+                    continue
+                ci = ch.get("index", 0)
+                kept: list = []
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        kept.append(tc)
+                        continue
+                    changed = True  # a tool_calls chunk is always re-serialized
+                    idx = tc.get("index")
+                    st = self._slots.get((ci, idx))
+                    if st is None:
+                        st = {"opened": False, "id": None, "type": None,
+                              "buf": "", "emitted": "", "done": False}
+                        self._slots[(ci, idx)] = st
+                    if st["id"] is None and isinstance(tc.get("id"), str):
+                        st["id"] = tc["id"]
+                    if st["type"] is None and isinstance(tc.get("type"), str):
+                        st["type"] = tc["type"]
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    rn = fn.get("name")
+                    name = rn if (isinstance(rn, str) and rn != "") else None
+                    ra = fn.get("arguments")
+                    args = ra if isinstance(ra, str) else ""
+                    if st["done"]:
+                        # Arguments already a complete JSON value — drop trailing
+                        # junk (the AI SDK ignores it too, via hasFinished).
+                        continue
+                    if st["opened"]:
+                        # Continuation — emit only the argument increment, trimmed
+                        # at the end of the first complete JSON value.
+                        if args:
+                            d, st["emitted"], st["done"] = self._advance(st["emitted"], args)
+                            if d:
+                                kept.append({"index": idx,
+                                             "function": {"arguments": d}})
+                        continue
+                    if name is not None:
+                        # Open the slot, merging any buffered pre-name args and
+                        # trimming if they already form a complete value.
+                        oargs, st["emitted"], st["done"] = self._advance("", st["buf"] + args)
+                        kept.append({
+                            "index": idx,
+                            "id": st["id"] or tc.get("id"),
+                            "type": st["type"] or "function",
+                            "function": {"name": name, "arguments": oargs},
+                        })
+                        st["opened"] = True
+                        st["buf"] = ""
+                    elif args:
+                        # Name-less and not yet opened: hold args until a name
+                        # arrives (a pure phantom has none → nothing held, and
+                        # the slot is dropped when the stream ends).
+                        st["buf"] += args
+                    # else: name-less, no args → phantom; emit nothing.
+                if changed:
+                    if kept:
+                        delta["tool_calls"] = kept
+                    elif "tool_calls" in delta:
+                        del delta["tool_calls"]
+            return json.dumps(obj) if changed else data
+        except Exception:  # noqa: BLE001 — a sanitizer bug must not break the stream
+            return data
 from .cost_model import CostModel, estimate_input_tokens
 from .timeout_model import TimeoutModel
 from .observability import (
@@ -653,6 +759,9 @@ class ProxyService:
         self._dispatch_event.set()
 
         async def stream_generator():
+            # Per-request tool-call stream sanitizer (OpenAI front door only;
+            # stateful across this one stream). See _ToolCallStreamSanitizer.
+            toolcall_sanitizer = _ToolCallStreamSanitizer()
             # Internal envelope consumers get the queued marker; OpenAI
             # consumers (goose-cli) get ONLY chat.completion.chunk frames, so
             # the queued/admitted markers are dropped — an OpenAI client chokes
@@ -669,10 +778,13 @@ class ProxyService:
                         etype = event.get("type")
                         if etype == "chunk":
                             # event["data"] is the backend's raw OpenAI
-                            # chat.completion.chunk line — re-emit verbatim, with
-                            # Phase 5E tool-call name-null normalization (no-op +
-                            # original bytes for non-tool-call chunks).
-                            yield f"data: {_strip_null_toolcall_names(event['data'])}\n\n"
+                            # chat.completion.chunk line. Plain content chunks
+                            # pass through byte-identical; streaming tool-call
+                            # deltas are sanitized so strict clients (the Vercel
+                            # AI SDK that opencode uses) don't choke on vLLM's
+                            # qwen3_xml phantom/name-less openers. See
+                            # _ToolCallStreamSanitizer.
+                            yield f"data: {toolcall_sanitizer.feed(event['data'])}\n\n"
                             continue
                         if etype == "done":
                             yield "data: [DONE]\n\n"

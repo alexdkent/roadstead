@@ -23,7 +23,7 @@ from originfleet.llmproxy.backend import (
     BackendStreamEvent,
 )
 from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import ProxyService, _strip_null_toolcall_names
+from originfleet.llmproxy.service import ProxyService, _ToolCallStreamSanitizer
 
 
 # A docker-bridge IP → ACL "internal" identity (so handle_openai_chat's
@@ -286,57 +286,169 @@ async def test_embeddings_returns_bare_openai_object_not_envelope():
         await svc.shutdown()
 
 
-# --- Phase 5E: tool-call name:null normalization ----------------------------
+# --- Phase 5E v2: streaming tool-call sanitizer -----------------------------
+#
+# Guards vLLM qwen3_xml's phantom/name-less streaming tool-call openers, which
+# made strict clients (the Vercel AI SDK opencode uses) throw
+# "Expected 'function.name' to be a string" mid-turn. See
+# _ToolCallStreamSanitizer for the bug + upstream refs (vLLM #39584).
 
-def test_strip_null_toolcall_names_removes_null_name():
-    data = ('{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,'
-            '"function":{"name":null,"arguments":"{\\"city\\": "}}]}}]}')
-    out = json.loads(_strip_null_toolcall_names(data))
-    fn = out["choices"][0]["delta"]["tool_calls"][0]["function"]
-    assert "name" not in fn          # null name dropped
-    assert fn["arguments"] == '{"city": '  # arguments untouched
-
-
-def test_strip_null_toolcall_names_keeps_string_name():
-    data = ('{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1",'
-            '"function":{"name":"get_weather","arguments":""}}]}}]}')
-    out = json.loads(_strip_null_toolcall_names(data))
-    tc = out["choices"][0]["delta"]["tool_calls"][0]
-    assert tc["function"]["name"] == "get_weather"  # string name preserved
-    assert tc["id"] == "c1" and tc["index"] == 0    # id + index preserved
+def _chunk(*tool_calls, choice_index=0):
+    """Build one raw SSE chat.completion.chunk payload with these tool_calls."""
+    return json.dumps({"id": "x", "object": "chat.completion.chunk", "choices": [
+        {"index": choice_index, "delta": {"tool_calls": list(tool_calls)},
+         "finish_reason": None}]})
 
 
-def test_strip_null_toolcall_names_passthrough_non_toolcall_is_identity():
-    # The >99% case: a plain content chunk → returns the ORIGINAL object (no
-    # parse/re-serialize), byte-identical.
+def _ai_sdk_replay(frames):
+    """Replay the @ai-sdk/openai-compatible streaming tool-call parser over a
+    list of sanitized SSE payloads. Mirrors the bundled SDK logic: a delta that
+    OPENS a new (index) slot must carry a string function.name, else it throws
+    'Expected function.name to be a string'. Returns {index: {"name","args"}}.
+    Raises AssertionError on the exact condition the real client aborts on."""
+    slots: dict = {}
+    for f in frames:
+        obj = json.loads(f)
+        for ch in obj.get("choices") or []:
+            for tc in (ch.get("delta") or {}).get("tool_calls") or []:
+                idx = tc.get("index")
+                fn = tc.get("function") or {}
+                if idx not in slots:                       # opening a NEW slot
+                    name = fn.get("name")
+                    assert isinstance(name, str) and name, \
+                        f"AI SDK would throw: opener idx={idx} name={name!r}"
+                    slots[idx] = {"name": name, "args": fn.get("arguments") or ""}
+                else:                                       # continuation
+                    slots[idx]["args"] += fn.get("arguments") or ""
+    return slots
+
+
+def test_sanitizer_passthrough_non_toolcall_is_identity():
+    # The >99% case: a plain content chunk → the ORIGINAL object, byte-identical.
+    s = _ToolCallStreamSanitizer()
     data = ('{"id":"x","object":"chat.completion.chunk",'
             '"choices":[{"index":0,"delta":{"content":"hi"}}]}')
-    assert _strip_null_toolcall_names(data) is data
-    assert _strip_null_toolcall_names("[DONE]") == "[DONE]"
-    assert _strip_null_toolcall_names(": keepalive") == ": keepalive"
+    assert s.feed(data) is data
+    assert s.feed("[DONE]") == "[DONE]"
+    assert s.feed(": keepalive") == ": keepalive"
 
 
-def test_strip_null_toolcall_names_defensive_shapes():
-    # malformed JSON, missing/odd shapes → returned unchanged, never raises.
-    for bad in ('{"tool_calls": not json',
-                '{"tool_calls":1,"choices":"nope"}',
-                '{"choices":[{"delta":{"tool_calls":[{"function":42}]}}],"x":"tool_calls"}'):
-        assert _strip_null_toolcall_names(bad) == bad
+def test_sanitizer_single_call_opens_with_name():
+    s = _ToolCallStreamSanitizer()
+    out = [
+        s.feed(_chunk({"index": 0, "id": "c1", "type": "function",
+                       "function": {"name": "get_weather", "arguments": ""}})),
+        s.feed(_chunk({"index": 0, "function": {"name": None, "arguments": '{"city":'}})),
+        s.feed(_chunk({"index": 0, "function": {"name": None, "arguments": '"Paris"}'}})),
+    ]
+    slots = _ai_sdk_replay(out)
+    assert slots[0]["name"] == "get_weather"
+    assert slots[0]["args"] == '{"city":"Paris"}'
 
 
-def test_strip_null_toolcall_names_multi_choice_multi_call():
-    data = json.dumps({"choices": [
-        {"index": 0, "delta": {"tool_calls": [
-            {"index": 0, "function": {"name": None, "arguments": "a"}},
-            {"index": 1, "function": {"name": "keep", "arguments": "b"}}]}},
-        {"index": 1, "delta": {"tool_calls": [
-            {"index": 0, "function": {"name": None, "arguments": "c"}}]}},
-    ]})
-    out = json.loads(_strip_null_toolcall_names(data))
-    tcs0 = out["choices"][0]["delta"]["tool_calls"]
-    assert "name" not in tcs0[0]["function"] and tcs0[0]["function"]["arguments"] == "a"
-    assert tcs0[1]["function"]["name"] == "keep"
-    assert "name" not in out["choices"][1]["delta"]["tool_calls"][0]["function"]
+def test_sanitizer_drops_phantom_opener_in_multi_call():
+    # The live failure shape: real calls at index 0 and 2, a phantom (fresh id,
+    # null name, empty args) at index 1 that never gets a name.
+    s = _ToolCallStreamSanitizer()
+    seq = [
+        _chunk({"index": 0, "id": "t0", "type": "function",
+                "function": {"name": "read_file", "arguments": ""}}),
+        _chunk({"index": 0, "function": {"name": None, "arguments": '{"path":"/a"}'}}),
+        _chunk({"index": 1, "id": "PHANTOM", "type": "function",
+                "function": {"name": None, "arguments": ""}}),
+        _chunk({"index": 2, "id": "t2", "type": "function",
+                "function": {"name": "list_dir", "arguments": ""}}),
+        _chunk({"index": 2, "function": {"name": None, "arguments": '{"path":"/b"}'}}),
+    ]
+    out = [s.feed(x) for x in seq]
+    # No emitted frame carries the phantom id (index 1 dropped entirely).
+    assert all("PHANTOM" not in f for f in out)
+    # The AI SDK replay must NOT throw and must see exactly the two real calls.
+    slots = _ai_sdk_replay(out)
+    assert slots[0]["name"] == "read_file" and slots[0]["args"] == '{"path":"/a"}'
+    assert slots[2]["name"] == "list_dir" and slots[2]["args"] == '{"path":"/b"}'
+    assert 1 not in slots
+
+
+def test_sanitizer_buffers_args_until_name_arrives():
+    # Defensive against the other documented shape (opencode #24137): args begin
+    # streaming for a new index BEFORE its name. The opener must carry the name
+    # and the full buffered args; nothing may open the slot name-less first.
+    s = _ToolCallStreamSanitizer()
+    out = [
+        s.feed(_chunk({"index": 0, "id": "c1", "type": "function",
+                       "function": {"name": None, "arguments": '{"ci'}})),
+        s.feed(_chunk({"index": 0, "function": {"name": None, "arguments": 'ty":'}})),
+        s.feed(_chunk({"index": 0, "id": "c1", "type": "function",
+                       "function": {"name": "geocode", "arguments": '"NYC"}'}})),
+    ]
+    slots = _ai_sdk_replay(out)
+    assert slots[0]["name"] == "geocode"
+    assert slots[0]["args"] == '{"city":"NYC"}'
+
+
+def test_sanitizer_trims_extra_trailing_brace():
+    # The other half of the vLLM parallel-call bug (correlated with the phantom):
+    # the last call's args stream ends with an extra '}' -> '{"path": "/tmp"}}',
+    # which is invalid JSON. The sanitizer must trim it so the AI SDK can parse.
+    s = _ToolCallStreamSanitizer()
+    out = [
+        s.feed(_chunk({"index": 0, "id": "t0", "type": "function",
+                       "function": {"name": "read_file", "arguments": ""}})),
+        s.feed(_chunk({"index": 0, "function": {"arguments": '{"path":"/a"}'}})),
+        s.feed(_chunk({"index": 1, "id": "PH", "type": "function",
+                       "function": {"name": None, "arguments": ""}})),
+        s.feed(_chunk({"index": 2, "id": "t2", "type": "function",
+                       "function": {"name": "list_dir", "arguments": ""}})),
+        s.feed(_chunk({"index": 2, "function": {"arguments": '{"path": "'}})),
+        s.feed(_chunk({"index": 2, "function": {"arguments": '/tmp'}})),
+        s.feed(_chunk({"index": 2, "function": {"arguments": '"'}})),
+        s.feed(_chunk({"index": 2, "function": {"arguments": '}}'}})),  # extra brace
+    ]
+    slots = _ai_sdk_replay(out)               # must not throw
+    assert slots[0]["name"] == "read_file"
+    assert json.loads(slots[0]["args"]) == {"path": "/a"}
+    assert slots[2]["name"] == "list_dir"
+    assert json.loads(slots[2]["args"]) == {"path": "/tmp"}   # extra '}' trimmed
+    assert 1 not in slots                                     # phantom dropped
+
+
+def test_sanitizer_brace_inside_string_value_not_mistrimmed():
+    # raw_decode (not brace-counting) must keep a literal '}' inside a string.
+    s = _ToolCallStreamSanitizer()
+    out = [
+        s.feed(_chunk({"index": 0, "id": "c1", "type": "function",
+                       "function": {"name": "run", "arguments": ""}})),
+        s.feed(_chunk({"index": 0, "function": {"arguments": '{"cmd":"echo }"'}})),
+        s.feed(_chunk({"index": 0, "function": {"arguments": '}'}})),
+    ]
+    slots = _ai_sdk_replay(out)
+    assert json.loads(slots[0]["args"]) == {"cmd": "echo }"}
+
+
+def test_sanitizer_pure_phantom_emits_no_toolcall():
+    # A name-less, args-less opener that never gets a name → no tool_call ever
+    # reaches the client (the frame may still carry other delta fields).
+    s = _ToolCallStreamSanitizer()
+    out = s.feed(json.dumps({"choices": [{"index": 0, "delta": {
+        "content": None,
+        "tool_calls": [{"index": 1, "id": "p", "type": "function",
+                        "function": {"name": None, "arguments": ""}}]}}]}))
+    obj = json.loads(out)
+    assert "tool_calls" not in obj["choices"][0]["delta"]   # dropped
+    assert _ai_sdk_replay([out]) == {}                       # nothing opened
+
+
+def test_sanitizer_defensive_shapes_never_raise():
+    s = _ToolCallStreamSanitizer()
+    # Malformed JSON / non-tool-call odd shapes → returned unchanged, never raise.
+    for unchanged in ('{"tool_calls": not json',
+                      '{"tool_calls":1,"choices":"nope"}'):
+        assert s.feed(unchanged) == unchanged
+    # Valid-but-degenerate tool_call (function isn't an object) → treated as a
+    # phantom and dropped; must not raise and must stay parseable JSON.
+    out = s.feed('{"choices":[{"delta":{"tool_calls":[{"function":42}]}}]}')
+    assert "tool_calls" not in json.loads(out)["choices"][0]["delta"]
 
 
 @pytest.mark.asyncio
