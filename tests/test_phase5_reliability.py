@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -31,6 +32,14 @@ from originfleet.llmproxy.service import ProxyService
 class _FakeRequest:
     class _Client:
         host = "172.16.0.5"
+
+    client = _Client()
+    headers: dict = {}
+
+
+class _DeniedRequest:  # public IP the ACL won't recognize → 403
+    class _Client:
+        host = "8.8.8.8"
 
     client = _Client()
     headers: dict = {}
@@ -282,6 +291,95 @@ async def test_transient_retry_records_exactly_one_completion():
         # ONE completion despite the retry — scheduler.complete fires once.
         assert svc._scheduler.stats()["total_completed"] == before + 1
     finally:
+        await svc.shutdown()
+
+
+# --- 5F operator drain: pause/resume an endpoint for maintenance ------------
+
+def _ibody():  # interactive (P0) thinker request
+    return {
+        "agent_id": "a", "endpoint": "llama-thinker", "priority": "P0_REALTIME",
+        "call_site": "t", "payload_type": "chat_completion",
+        "payload": {"messages": [{"role": "user", "content": "x"}]},
+        "timeout_s": 10.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_operator_pause_drains_then_resume_restores():
+    from originfleet.framework.nexus_errors import is_deferrable_llm_error
+    svc = ProxyService(ProxyConfig())
+    _stub_probes(svc)
+    await svc.startup()
+    try:
+        # PAUSE
+        resp = await svc.handle_admin_endpoint_pause(
+            "llama-thinker", _FakeRequest(), pause=True)
+        assert resp.status_code == 200
+        body = json.loads(resp.body.decode())
+        assert body["paused"] is True
+        assert "thinker" in body["paused_endpoints"]
+        assert svc._endpoint_healthy("llama-thinker") is False
+
+        # interactive fast-fails CLEANLY + DEFERRABLY (not a hang)
+        r = await svc.handle_submit(_ibody(), _FakeRequest())
+        assert r.status_code == 503
+        err = json.loads(r.body.decode())["error"]
+        assert "maintenance" in err
+        assert is_deferrable_llm_error(ConnectionError(err)), err
+
+        # RESUME restores health (poller takes back over)
+        resp2 = await svc.handle_admin_endpoint_pause(
+            "llama-thinker", _FakeRequest(), pause=False)
+        assert json.loads(resp2.body.decode())["paused"] is False
+        assert svc._endpoint_healthy("llama-thinker") is True
+        assert "thinker" not in svc._paused_endpoints
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_operator_pause_is_acl_gated():
+    svc = ProxyService(ProxyConfig())
+    _stub_probes(svc)
+    await svc.startup()
+    try:
+        resp = await svc.handle_admin_endpoint_pause(
+            "llama-thinker", _DeniedRequest(), pause=True)
+        assert resp.status_code == 403
+        assert "thinker" not in svc._paused_endpoints  # NOT paused by a denied caller
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_operator_pause_unknown_endpoint_404():
+    svc = ProxyService(ProxyConfig())
+    _stub_probes(svc)
+    await svc.startup()
+    try:
+        resp = await svc.handle_admin_endpoint_pause(
+            "no-such-model", _FakeRequest(), pause=True)
+        assert resp.status_code == 404
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_operator_pause_alerts_drained_not_outage():
+    # An intentional drain surfaces as endpoint_drained (WARNING), NOT the
+    # endpoint_paused (ERROR) page that signals an unexpected backend outage.
+    svc = ProxyService(ProxyConfig())
+    _stub_probes(svc)
+    await svc.startup()
+    try:
+        svc._paused_endpoints.add("thinker")
+        svc._evaluate_alerts(time.monotonic())
+        names = {(a["name"], a["severity"]) for a in svc._alerts}
+        assert ("endpoint_drained", "WARNING") in names
+        assert not any(a["name"] == "endpoint_paused" for a in svc._alerts)
+    finally:
+        svc._paused_endpoints.discard("thinker")
         await svc.shutdown()
 
 

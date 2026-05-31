@@ -168,6 +168,14 @@ class ProxyService:
             for ep in config.endpoints
         }
         self._health_fail_threshold = 3
+        # Phase 5F — operator drain: endpoints an operator has explicitly PAUSED
+        # for maintenance (e.g. a vLLM restart to change --max-model-len). A
+        # paused endpoint reads as unhealthy (→ background defers, interactive
+        # fast-fails deferrably) so NO request hits the backend while it's down,
+        # WITHOUT the ~30s auto-circuit-trip lag. Distinct from the auto-circuit
+        # so a planned drain never fires the endpoint_paused ERROR alert. The
+        # poller skips paused endpoints; /resume hands them back to the poller.
+        self._paused_endpoints: set[str] = set()
         self._transient_retry_max = 1
         # Retention sweep cadence (Phase 2.3) — monotonic ts of the last DB trim.
         self._last_cleanup_at = 0.0
@@ -486,7 +494,14 @@ class ProxyService:
         # background work queue so it defers until the backend recovers. (Cache
         # hits above are served regardless — they don't need the backend.)
         if not self._endpoint_healthy(req.endpoint) and req.band != PriorityBand.BACKGROUND:
-            err = f"backend {req.endpoint} unavailable (circuit open)"
+            # Phase 5F: distinguish an operator drain (planned) from an
+            # auto-circuit trip (backend unreachable). Both are DEFERRABLE
+            # ("circuit open" / "backpressure" are is_deferrable_llm_error
+            # markers) so the caller retries; the wording just aids triage.
+            if normalize_endpoint(req.endpoint) in self._paused_endpoints:
+                err = f"backend {req.endpoint} paused for maintenance (drain) — backpressure"
+            else:
+                err = f"backend {req.endpoint} unavailable (circuit open)"
             if openai:
                 return self._openai_error(err, "backend_unavailable", 503)
             return JSONResponse(
@@ -848,6 +863,53 @@ class ProxyService:
                 "writer_thread_restarts": self._queue_db.writer_restarts(),
                 "write_q_dropped": self._queue_db.write_q_dropped(),
             },
+            # Phase 5F — endpoints an operator has drained for maintenance.
+            "paused_endpoints": sorted(self._paused_endpoints),
+        })
+
+    # ----- handler: admin endpoint pause/resume (Phase 5F operator drain) -----
+
+    async def handle_admin_endpoint_pause(
+        self, endpoint: str, request: Request, *, pause: bool,
+    ) -> Response:
+        """Pause (drain) or resume an endpoint for maintenance — e.g. a vLLM
+        restart to change --max-model-len. Internal-only (ACL).
+
+        PAUSE marks the endpoint unhealthy NOW: background work defers (it
+        queues + drains on resume — no loss while deadlines exceed the restart),
+        interactive fast-fails with a deferrable error, and the poller stops
+        probing it — so no request hits a backend you're about to kill, with no
+        ~30s auto-circuit-trip lag. RESUME hands it back to the poller, which
+        re-probes, recovers on /health, re-discovers capacity (the new
+        max_model_len), and the deferred queue drains."""
+        remote_ip = request.client.host if request.client else "unknown"
+        if not self._acl.identify(remote_ip):
+            return JSONResponse(
+                {"error": f"access denied for {remote_ip}"}, status_code=403)
+        ep = normalize_endpoint(endpoint)
+        if ep not in self._config.endpoints:
+            return JSONResponse(
+                {"error": f"unknown endpoint {endpoint!r}"}, status_code=404)
+        if pause:
+            self._paused_endpoints.add(ep)
+            # Release any already-queued interactive/foreground immediately with
+            # a deferrable error (don't make them wait out their deadline).
+            self._fast_fail_interactive(ep)
+            logger.warning(
+                "endpoint %s PAUSED by operator (%s) — background defers, "
+                "interactive fast-fails; backend safe to restart", ep, remote_ip)
+        else:
+            self._paused_endpoints.discard(ep)
+            self._dispatch_event.set()  # nudge the scheduler to drain deferred work
+            logger.warning(
+                "endpoint %s RESUMED by operator (%s) — poller will re-probe / "
+                "recover / re-discover capacity; deferred queue draining",
+                ep, remote_ip)
+        return JSONResponse({
+            "endpoint": ep,
+            "paused": ep in self._paused_endpoints,
+            "healthy": self._endpoint_healthy(ep),
+            "paused_endpoints": sorted(self._paused_endpoints),
         })
 
     # ----- handler: metrics -----
@@ -1300,7 +1362,12 @@ class ProxyService:
     # ----- circuit breaker / integrity helpers (Phase 1) -----
 
     def _endpoint_healthy(self, endpoint: str) -> bool:
-        h = self._endpoint_health.get(normalize_endpoint(endpoint))
+        ep = normalize_endpoint(endpoint)
+        # Phase 5F: an operator drain overrides the auto-circuit — reads
+        # unhealthy so all the defer/fast-fail machinery applies immediately.
+        if ep in self._paused_endpoints:
+            return False
+        h = self._endpoint_health.get(ep)
         return h["healthy"] if h else True
 
     def _retry_after_s(self, endpoint: str) -> int:
@@ -1419,7 +1486,11 @@ class ProxyService:
         snaps: dict[str, dict] = {}
         for ep in self._config.endpoints:
             s = self._scheduler.endpoint_snapshot(ep)
-            s["paused"] = not self._endpoint_healthy(ep)  # real backend-down signal
+            # Phase 5F: the endpoint_paused ERROR alert is for an UNINTENDED
+            # backend-down. Exclude operator drains so a planned maintenance
+            # pause doesn't page as an outage — those surface as a separate
+            # informational endpoint_drained alert below.
+            s["paused"] = (not self._endpoint_healthy(ep)) and ep not in self._paused_endpoints
             snaps[ep] = s
         alerts = check_alerts(
             endpoint_snapshots=snaps,
@@ -1429,6 +1500,13 @@ class ProxyService:
             queue_wal_size=self._queue_db.wal_size_bytes(),
             now=now,
         )
+        # Phase 5F: operator drains — visible (so it's clear thinker is parked),
+        # but WARNING not ERROR (intentional, not an outage).
+        for ep in sorted(self._paused_endpoints):
+            alerts.append(AlertCondition(
+                name="endpoint_drained", severity="WARNING", triggered=True,
+                detail=f"endpoint {ep} paused for maintenance (operator drain)",
+            ))
         # Phase 5B.3: surface DB-writer-thread death (the single sanctioned bg
         # thread). If it dies, persistence degrades to loud sync fallback — page.
         if not self._queue_db.writer_alive():
@@ -1760,6 +1838,13 @@ class ProxyService:
         """Periodically probe backends for slot counts and context sizes."""
         while True:
             for ep_name, ep_cfg in self._config.endpoints.items():
+                # Phase 5F: an operator-paused endpoint is intentionally down
+                # (maintenance) — don't probe it (probes would fail + churn the
+                # circuit/logs). /resume removes it from the set; the next poll
+                # then re-probes, recovers, and re-discovers capacity (e.g. the
+                # new max_model_len after a vLLM restart).
+                if ep_name in self._paused_endpoints:
+                    continue
                 probe_ok = False
                 try:
                     # Capacity discovery is engine-specific. llama.cpp reports

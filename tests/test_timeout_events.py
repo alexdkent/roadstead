@@ -169,9 +169,9 @@ def test_timeout_event_records_identity_and_context(tmp_path):
     assert row[0] == "sess9"
     assert row[1] == "turn1"
     assert row[2] == "sidekick/sidekick.test/sess9"
-    assert row[3] == 32768  # thinker context_per_slot (vLLM max_model_len)
-    # est_in = 4000 chars / 4 = 1000 tokens; 1000 / 32768 * 100 ≈ 3.1%
-    assert row[4] == 3.1
+    assert row[3] == 131072  # thinker context_per_slot (vLLM max_model_len; 128K as of 2026-05-31)
+    # est_in = 4000 chars / 4 = 1000 tokens; 1000 / 131072 * 100 ≈ 0.8%
+    assert row[4] == 0.8
 
 
 def test_completion_persists_identity(tmp_path):
