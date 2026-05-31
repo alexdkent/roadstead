@@ -373,6 +373,13 @@ class ProxyService:
         if cache_key:
             cached = self._cache.get(cache_key)
             if cached:
+                # Phase 4.1: count cache hits in metrics. They bypass dispatch,
+                # so without this they're invisible in /v1/metrics and real
+                # traffic is undercounted (the cache's own hit_rate aside).
+                self._metrics.record(MetricsSample(
+                    timestamp=now, endpoint=req.endpoint, agent_id=req.agent_id,
+                    priority=req.priority.name, queue_wait_ms=0.0,
+                    backend_latency_ms=0.0, status="ok", slot_seconds=0.0))
                 # OpenAI consumers get the bare cached completion; internal
                 # consumers get the submit envelope (unchanged).
                 if openai:
@@ -1064,6 +1071,7 @@ class ProxyService:
         input_tokens = 0
         output_tokens = 0
         last_finish_reason: str | None = None
+        ttft_ms: float | None = None  # Phase 4.1 — time to first token
 
         # Phase 1.5: bound the stream to the caller's remaining deadline so an
         # abandoned stream can't hold its slot past the SLA.
@@ -1074,6 +1082,8 @@ class ProxyService:
                 req.request_id, timeout_s=stream_timeout,
             ):
                 if event.event_type == "chunk":
+                    if ttft_ms is None:
+                        ttft_ms = (time.monotonic() - t0) * 1000.0
                     await stream_q.put({
                         "type": "chunk",
                         "data": event.data,
@@ -1110,6 +1120,7 @@ class ProxyService:
             "type": "done",
             "queue_wait_ms": round(decision.queue_wait_ms, 1),
             "backend_latency_ms": round(duration * 1000, 1),
+            "ttft_ms": round(ttft_ms or 0.0, 1),  # Phase 4.1
             "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
         })
         # Phase 1.1: the chunks already streamed (can't un-send), but record
