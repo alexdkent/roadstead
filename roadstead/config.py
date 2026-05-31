@@ -259,7 +259,16 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         # Remeasure (vllm:num_preemptions_total, kv_cache_usage_perc) and pull back
         # max-num-seqs/max_slots together if thrashing appears.
         endpoint_class="thinker", role="llama-thinker",
-        max_slots=32, context_per_slot=32768,
+        # context_per_slot is the STARTUP SEED only — the capacity poller
+        # auto-discovers the live value from vLLM /v1/models max_model_len
+        # (service.py _update_endpoint_health), so this can't get ahead of the
+        # backend. 2026-05-31: raised 32768 → 131072 to match the vLLM
+        # --max-model-len 128K bump (opencode large-context coding). Zero extra
+        # memory — the fp8 KV pool (~647K tokens @ gpu-mem 0.50) is util-driven,
+        # not max-model-len-driven; 128K is well within the model's 256K native
+        # context (no rope-scaling). Fleet chunkers stay at 32K on purpose
+        # (framework _DEFAULT_CONTEXT_WINDOW) to keep extraction chunks small.
+        max_slots=32, context_per_slot=131072,
         # ~95% of thinker load is background (knowledge ingestion, forum-agent
         # proposals, hygiene), so let the background band use all but one slot
         # (max_slots - 1); DRR keeps that fair across agents. The single
