@@ -134,6 +134,16 @@ class EndpointConfig:
     # handled separately by the DRR scheduler, not this cap.
     fast_path_reserve_slots: int = 0
 
+    # Hard ceiling on CONCURRENT dispatch to this endpoint, independent of the
+    # discovered physical slot count. 0 -> use max_slots (no extra cap). Set
+    # BELOW max_slots for a concurrency-fragile backend to leave crash-headroom:
+    # the companion 80B (Strix Halo Vulkan, patched-cache) aborted under full
+    # 4-slot pressure with a llama.cpp KV-seq-removal assertion (2026-06-01, G1),
+    # so it runs at 3 to keep one slot of headroom and lower the peak
+    # seq-management concurrency. Caps DISPATCH only; capacity discovery and
+    # reporting still use max_slots.
+    dispatch_concurrency_cap: int = 0
+
     # --- backend connection ---
     host: str = ""
     port: int = 0
@@ -153,6 +163,15 @@ class EndpointConfig:
     backend_engine: str = "llama.cpp"
 
     @property
+    def effective_max_slots(self) -> int:
+        """Concurrency ceiling the scheduler dispatches against: max_slots,
+        clamped to dispatch_concurrency_cap when that is set (>0). Capacity
+        reporting/discovery keep using max_slots; only admission is capped."""
+        if self.dispatch_concurrency_cap > 0:
+            return min(self.max_slots, self.dispatch_concurrency_cap)
+        return self.max_slots
+
+    @property
     def background_floor_slots(self) -> int:
         return max(1, int(self.max_slots * self.background_floor_pct))
 
@@ -162,9 +181,11 @@ class EndpointConfig:
         set, background may use all but that many slots (leaving headroom for
         the occasional fast-path call) — scaling automatically with max_slots.
         Legacy default (reserve 0): the floor doubles as the cap. Never below
-        the floor."""
-        if self.fast_path_reserve_slots > 0 and self.max_slots > 0:
-            cap = self.max_slots - self.fast_path_reserve_slots
+        the floor. Computed against effective_max_slots so a concurrency cap
+        (G1) shrinks the background ceiling too, preserving the interactive
+        reserve (e.g. companion effective=3, reserve=1 -> background cap 2)."""
+        if self.fast_path_reserve_slots > 0 and self.effective_max_slots > 0:
+            cap = self.effective_max_slots - self.fast_path_reserve_slots
         else:
             cap = self.background_floor_slots
         return max(self.background_floor_slots, cap)
@@ -211,6 +232,12 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         # unreliable on the 80B, so this seed is load-bearing — keep it exact.
         endpoint_class="companion", role="qwen-composer",
         max_slots=4, context_per_slot=98304,
+        # G1 (2026-06-01): cap concurrent dispatch at 3 (of 4 physical slots).
+        # The patched-cache 80B aborted under full 4-slot pressure with a
+        # llama.cpp KV-seq-removal assertion; one slot of headroom lowers the
+        # peak seq-management concurrency that triggers it. Capacity discovery
+        # still sees 4 slots. Override via this field if the backend is patched.
+        dispatch_concurrency_cap=3,
         # Reserve 1 slot for interactive/chat rounds; background (composer
         # summaries + knowledge ingestion) uses the other 3. Mirrors the
         # thinker's fast_path_reserve pattern. background_floor_pct left at the

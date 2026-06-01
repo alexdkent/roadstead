@@ -500,7 +500,9 @@ class Scheduler:
         eq: EndpointQueue,
     ) -> int:
         """How many slots are available for requests in this band."""
-        total_free = ep_cfg.max_slots - current_in_flight
+        # effective_max_slots applies any per-endpoint concurrency cap (G1:
+        # companion runs at 3 of 4 physical slots for crash-headroom).
+        total_free = ep_cfg.effective_max_slots - current_in_flight
         if total_free <= 0:
             return 0
 
@@ -527,7 +529,7 @@ class Scheduler:
             # total_free<=0 early-return above still holds when the endpoint is
             # fully occupied; this only governs handing out a FREE slot, and the
             # dispatch loop processes INTERACTIVE before BACKGROUND.
-            ceiling = max(1, ep_cfg.max_slots - bg_floor)
+            ceiling = max(1, ep_cfg.effective_max_slots - bg_floor)
             non_bg_in_flight = current_in_flight - sum(
                 1 for ar in self._active.get(ep_cfg.endpoint_class, {}).values()
                 if ar.request.band == PriorityBand.BACKGROUND
@@ -555,6 +557,7 @@ class Scheduler:
         """
         if ep_cfg.max_slots <= 0:
             return False
-        if current_occupancy >= ep_cfg.max_slots:
+        # effective_max_slots applies any per-endpoint concurrency cap (G1).
+        if current_occupancy >= ep_cfg.effective_max_slots:
             return False
         return True

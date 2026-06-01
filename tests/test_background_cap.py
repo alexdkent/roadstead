@@ -14,10 +14,11 @@ from originfleet.llmproxy.config import DEFAULT_ENDPOINTS, EndpointConfig, Prior
 from originfleet.llmproxy.scheduler import Scheduler
 
 
-def _ep(max_slots: int, reserve: int) -> EndpointConfig:
+def _ep(max_slots: int, reserve: int, cap: int = 0) -> EndpointConfig:
     return EndpointConfig(
         endpoint_class="thinker", role="llama-thinker",
         max_slots=max_slots, fast_path_reserve_slots=reserve,
+        dispatch_concurrency_cap=cap,
     )
 
 
@@ -35,18 +36,49 @@ def test_no_endpoint_floor_starves_interactive():
     the thinker (6→32 slots made the 0.20 floor reserve 6 of 32). For EVERY
     endpoint the background floor must leave at least one slot for an
     interactive/fast-path call, and a reserve-configured endpoint's background
-    cap must equal max_slots - reserve. Fails loud if a future topology bump
-    changes a slot count without its dependents."""
+    cap must equal effective_max_slots - reserve. The cap is computed against
+    effective_max_slots (NOT max_slots) so a G1 dispatch_concurrency_cap shrinks
+    the background ceiling too, preserving the interactive reserve under the cap
+    (companion: effective 3, reserve 1 -> background cap 2). Fails loud if a
+    future topology bump changes a slot count without its dependents."""
     for name, ep in DEFAULT_ENDPOINTS.items():
-        assert ep.background_floor_slots <= max(1, ep.max_slots - 1), (
+        assert ep.effective_max_slots <= ep.max_slots, (
+            f"{name}: effective_max_slots {ep.effective_max_slots} exceeds "
+            f"physical max_slots {ep.max_slots}"
+        )
+        assert ep.background_floor_slots <= max(1, ep.effective_max_slots - 1), (
             f"{name}: floor {ep.background_floor_slots} would starve interactive "
-            f"on {ep.max_slots} slots"
+            f"on {ep.effective_max_slots} effective slots"
         )
         if ep.fast_path_reserve_slots:
-            assert ep.background_cap_slots == ep.max_slots - ep.fast_path_reserve_slots, (
-                f"{name}: cap {ep.background_cap_slots} != max_slots-reserve "
-                f"{ep.max_slots - ep.fast_path_reserve_slots}"
+            assert ep.background_cap_slots == ep.effective_max_slots - ep.fast_path_reserve_slots, (
+                f"{name}: cap {ep.background_cap_slots} != effective_max_slots-reserve "
+                f"{ep.effective_max_slots - ep.fast_path_reserve_slots}"
             )
+
+
+def test_companion_dispatch_concurrency_cap():
+    """G1 (2026-06-01): the companion is concurrency-fragile (a llama.cpp
+    KV-seq-removal assertion aborted it under full 4-slot pressure), so it runs
+    capped at 3 of 4 physical slots. effective_max_slots applies the cap;
+    capacity (max_slots) stays 4 for discovery/reporting; the interactive
+    reserve is preserved (background cap = 3 - 1 = 2)."""
+    comp = DEFAULT_ENDPOINTS["companion"]
+    assert comp.max_slots == 4               # physical, discovered
+    assert comp.dispatch_concurrency_cap == 3
+    assert comp.effective_max_slots == 3     # dispatch ceiling
+    assert comp.background_cap_slots == 2    # leaves 1 for interactive
+    # An uncapped endpoint is unaffected: effective == physical.
+    thinker = DEFAULT_ENDPOINTS["thinker"]
+    assert thinker.dispatch_concurrency_cap == 0
+    assert thinker.effective_max_slots == thinker.max_slots
+
+
+def test_effective_max_slots_clamps_to_min():
+    assert _ep(4, 1, cap=3).effective_max_slots == 3
+    assert _ep(4, 1, cap=10).effective_max_slots == 4   # cap above physical -> physical
+    assert _ep(4, 1, cap=0).effective_max_slots == 4    # 0 -> no cap
+    assert _ep(8, 1).effective_max_slots == 8           # default helper, uncapped
 
 
 def test_cap_scales_with_max_slots():
