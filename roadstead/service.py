@@ -5,6 +5,7 @@ queue, coalescing, and observability into a running service.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -1184,6 +1185,24 @@ class ProxyService:
         if not ep_cfg:
             self._resolve_error(req, f"unknown endpoint {req.endpoint}")
             return
+
+        if (
+            ep_cfg.slot_affinity
+            and req.payload_type == "chat_completion"
+            and req.session_id
+            and req.band == PriorityBand.INTERACTIVE
+        ):
+            slot_n = ep_cfg.dispatch_concurrency_cap or ep_cfg.max_slots or 1
+            slot_id = (
+                int.from_bytes(
+                    hashlib.md5(req.session_id.encode()).digest()[:4], "little"
+                ) % slot_n
+            )
+            req.payload = {**req.payload, "id_slot": slot_id}
+            logger.debug(
+                "slot_affinity: session=%s → id_slot=%d (n=%d) on %s",
+                req.session_id, slot_id, slot_n, ep_cfg.role,
+            )
 
         self._queue_db.persist_dispatch(req.request_id)
 

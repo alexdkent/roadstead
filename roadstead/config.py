@@ -162,6 +162,14 @@ class EndpointConfig:
     # (structured_outputs.grammar). Controls proxy-side payload normalization. ---
     backend_engine: str = "llama.cpp"
 
+    # When True, the proxy injects ``id_slot`` into chat_completion payloads
+    # for INTERACTIVE-band requests, keyed by a deterministic hash of
+    # session_id. This pins each conversation to one llama.cpp slot across
+    # turns so the patched KV-cache checkpoint is reused instead of
+    # re-prefilling from scratch. Only useful for multi-slot llama.cpp
+    # backends (not vLLM). Off by default; enabled on companion.
+    slot_affinity: bool = False
+
     @property
     def effective_max_slots(self) -> int:
         """Concurrency ceiling the scheduler dispatches against: max_slots,
@@ -244,6 +252,7 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         # default (0.20 → floor 1) so the floor never overrides the reserve:
         # background_cap = max(floor, max_slots - reserve) = max(1, 3) = 3.
         fast_path_reserve_slots=1,
+        slot_affinity=True,
         host="10.0.0.6", port=8081,
     ),
     "gemma": EndpointConfig(
