@@ -69,7 +69,11 @@ CREATE TABLE IF NOT EXISTS proxy_completions (
     response_json    TEXT,
     session_id       TEXT,
     turn_id          TEXT,
-    caller_id        TEXT
+    caller_id        TEXT,
+    -- 'llm' for native proxy traffic (chat/embed/rerank/vision), or the
+    -- non-LLM service class ('audio'/'imagegen'/'ocr'/'translate') for
+    -- calls pushed in via /v1/calls/log. NULL on pre-migration rows.
+    kind             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS proxy_timeout_shadow (
@@ -190,7 +194,13 @@ class PersistentQueue:
             "turn_id": "TEXT",
             "caller_id": "TEXT",
             "finish_reason": "TEXT",
+            "kind": "TEXT",
         })
+        # Index supporting the fleet-usage rollups (group by endpoint over a
+        # recent window) now that the table holds whole-fleet call metrics.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pc_endpoint_completed "
+            "ON proxy_completions(endpoint, completed_at)")
 
     @classmethod
     def _migrate_timeouts(cls, conn: sqlite3.Connection) -> None:
@@ -504,6 +514,7 @@ class PersistentQueue:
         turn_id: str | None = None,
         caller_id: str | None = None,
         finish_reason: str | None = None,
+        kind: str | None = "llm",
     ) -> None:
         if not self._conn:
             return
@@ -519,13 +530,13 @@ class PersistentQueue:
             "(request_id, agent_id, endpoint, call_site, priority, "
             " input_tokens, output_tokens, duration_s, queue_wait_ms, "
             " status, completed_at, payload_json, response_json, "
-            " session_id, turn_id, caller_id, finish_reason) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " session_id, turn_id, caller_id, finish_reason, kind) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 request_id, agent_id, endpoint, call_site, priority,
                 input_tokens, output_tokens, duration_s, queue_wait_ms,
                 status, now, payload_s, response_s,
-                session_id, turn_id, caller_id, finish_reason,
+                session_id, turn_id, caller_id, finish_reason, kind,
             ),
         )
 
@@ -846,6 +857,256 @@ class PersistentQueue:
             }
             for r in rows
         ]
+
+    # ----- non-LLM ingest (Phase 1: proxy = fleet call-metrics authority) -----
+
+    def persist_external_call(
+        self,
+        *,
+        request_id: str,
+        agent_id: str,
+        endpoint: str,
+        call_site: str,
+        kind: str,
+        input_tokens: int,
+        output_tokens: int,
+        duration_s: float,
+        status: str,
+        priority: int = int(LLMPriority.P2_POST_TURN),
+        caller_id: str | None = None,
+    ) -> None:
+        """Record a non-LLM service call (audio/imagegen/ocr/translate) that
+        never traversed the scheduler. Lands in proxy_completions tagged by
+        ``kind`` so the fleet rollups treat it as just another completion.
+        No payload/response bodies (no replay value)."""
+        if not self._conn:
+            return
+        self._w(
+            "INSERT OR REPLACE INTO proxy_completions "
+            "(request_id, agent_id, endpoint, call_site, priority, "
+            " input_tokens, output_tokens, duration_s, queue_wait_ms, "
+            " status, completed_at, caller_id, kind) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                request_id, agent_id, normalize_endpoint(endpoint), call_site,
+                int(priority), int(input_tokens), int(output_tokens),
+                float(duration_s), 0.0, status, time.time(), caller_id, kind,
+            ),
+        )
+
+    # ----- fleet usage rollups (Phase 1) -----
+
+    def fleet_activity(self, window_s: int = 86400, bin_s: int = 600) -> dict:
+        """Fleet-wide binned call activity for the top-of-page strip:
+        per-bin {n, fails, tokens_in, tokens_out, p95}, plus a per-endpoint
+        breakdown over the last hour. The USAGE half of the host daemon's
+        ``fleet_activity`` (host hardware series stays on the daemon)."""
+        if not self._conn:
+            return {"window_s": window_s, "bin_s": bin_s, "calls": [], "by_endpoint_1h": []}
+        from .timeout_model import percentile
+        now = time.time()
+        since = now - window_s
+        rows = self._reader().execute(
+            "SELECT CAST(completed_at / ? AS INTEGER) * ? AS bucket_ts, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN status!='ok' THEN 1 ELSE 0 END) AS fails, "
+            "       SUM(COALESCE(input_tokens,0)) AS tin, "
+            "       SUM(COALESCE(output_tokens,0)) AS tout, "
+            "       GROUP_CONCAT(CAST(duration_s*1000 AS INTEGER)) AS lats "
+            "FROM proxy_completions WHERE completed_at >= ? "
+            "GROUP BY bucket_ts ORDER BY bucket_ts ASC",
+            (bin_s, bin_s, since),
+        ).fetchall()
+        calls = []
+        for bucket_ts, n, fails, tin, tout, lats in rows:
+            lat_list = sorted(int(x) for x in (lats or "").split(",") if x)
+            calls.append({
+                "ts": int(bucket_ts), "n": int(n), "fails": int(fails or 0),
+                "tokens_in": int(tin or 0), "tokens_out": int(tout or 0),
+                "p95": round(percentile(lat_list, 95), 1) if lat_list else 0.0,
+            })
+        cutoff_1h = now - 3600
+        ep_rows = self._reader().execute(
+            "SELECT endpoint, COUNT(*) AS n, "
+            "       SUM(CASE WHEN status!='ok' THEN 1 ELSE 0 END) AS fails, "
+            "       GROUP_CONCAT(CAST(duration_s*1000 AS INTEGER)) AS lats "
+            "FROM proxy_completions WHERE completed_at >= ? "
+            "GROUP BY endpoint ORDER BY n DESC LIMIT 16",
+            (cutoff_1h,),
+        ).fetchall()
+        by_endpoint = []
+        for ep, n, fails, lats in ep_rows:
+            lat_list = sorted(int(x) for x in (lats or "").split(",") if x)
+            by_endpoint.append({
+                "endpoint": ep, "n": int(n), "fails": int(fails or 0),
+                "p95": round(percentile(lat_list, 95), 1) if lat_list else 0.0,
+            })
+        return {
+            "window_s": window_s, "bin_s": bin_s, "now": now,
+            "calls": calls, "by_endpoint_1h": by_endpoint,
+        }
+
+    def endpoint_series(
+        self, endpoint: str, window_s: int = 86400, bin_s: int = 600,
+    ) -> dict:
+        """Per-endpoint binned call stats for the detail-modal charts
+        (the USAGE half of the daemon's ``unit_series``): per bin
+        {n, fail_pct, tokens_in, tokens_out, p50, p95, p99, avg_in_toks}."""
+        if not self._conn:
+            return {"endpoint": endpoint, "window_s": window_s, "bin_s": bin_s, "calls_series": []}
+        from .timeout_model import percentile
+        ep = normalize_endpoint(endpoint)
+        now = time.time()
+        since = now - window_s
+        rows = self._reader().execute(
+            "SELECT CAST(completed_at / ? AS INTEGER) * ? AS bucket_ts, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN status!='ok' THEN 1 ELSE 0 END) AS fails, "
+            "       SUM(COALESCE(input_tokens,0)) AS tin, "
+            "       SUM(COALESCE(output_tokens,0)) AS tout, "
+            "       AVG(input_tokens) AS avg_in, "
+            "       GROUP_CONCAT(CAST(duration_s*1000 AS INTEGER)) AS lats "
+            "FROM proxy_completions "
+            "WHERE completed_at >= ? AND endpoint = ? "
+            "GROUP BY bucket_ts ORDER BY bucket_ts ASC",
+            (bin_s, bin_s, since, ep),
+        ).fetchall()
+        series = []
+        for bucket_ts, n, fails, tin, tout, avg_in, lats in rows:
+            lat_list = sorted(int(x) for x in (lats or "").split(",") if x)
+            series.append({
+                "ts": int(bucket_ts), "n": int(n),
+                "fail_pct": round(100.0 * int(fails or 0) / int(n), 1) if n else 0.0,
+                "tokens_in": int(tin or 0), "tokens_out": int(tout or 0),
+                "p50": round(percentile(lat_list, 50), 1) if lat_list else None,
+                "p95": round(percentile(lat_list, 95), 1) if lat_list else None,
+                "p99": round(percentile(lat_list, 99), 1) if lat_list else None,
+                "avg_in_toks": int(round(avg_in)) if avg_in is not None else None,
+            })
+        return {"endpoint": ep, "window_s": window_s, "bin_s": bin_s,
+                "now": now, "calls_series": series}
+
+    def top_callers(self, window_s: int = 3600, per_endpoint: int = 5) -> dict:
+        """Top calling agents per endpoint over a recent window:
+        ``{providers: {endpoint: [{agent, n, tokens_in, tokens_out}]}}``."""
+        if not self._conn:
+            return {"window_s": window_s, "providers": {}}
+        now = time.time()
+        since = now - window_s
+        rows = self._reader().execute(
+            "SELECT endpoint, agent_id, COUNT(*) AS n, "
+            "       SUM(COALESCE(input_tokens,0)) AS tin, "
+            "       SUM(COALESCE(output_tokens,0)) AS tout "
+            "FROM proxy_completions WHERE completed_at >= ? "
+            "GROUP BY endpoint, agent_id ORDER BY endpoint ASC, n DESC",
+            (since,),
+        ).fetchall()
+        merged: dict[str, list[dict]] = {}
+        for ep, agent, n, tin, tout in rows:
+            merged.setdefault(ep, [])
+            if len(merged[ep]) < per_endpoint:
+                merged[ep].append({
+                    "agent": agent or "—", "n": int(n),
+                    "tokens_in": int(tin or 0), "tokens_out": int(tout or 0),
+                })
+        return {"window_s": window_s, "now": now, "providers": merged}
+
+    def usage_rollup(self, dimension: str = "agent", hours: float = 24.0) -> list[dict]:
+        """Per-(agent|call_site|endpoint) usage rollup over a window:
+        requests, ok/errors, tokens, cloud-equivalent cost, p50/p95 latency.
+
+        Cost is the cloud-equivalent we did NOT pay (rates keyed per endpoint),
+        computed by grouping on (dim, endpoint) and summing up to the dim — so
+        an agent that spans endpoints gets each endpoint's rate. NOTE: the
+        proxy only sees LOCAL traffic, so this is savings, not Anthropic spend."""
+        if not self._conn:
+            return []
+        from .timeout_model import percentile
+        from .usage_rates import cloud_rate
+        col = {
+            "agent": "agent_id", "call_site": "call_site",
+            "endpoint": "endpoint", "provider": "endpoint",
+        }.get(dimension, "agent_id")
+        cutoff = time.time() - (hours * 3600)
+        rows = self._reader().execute(
+            f"SELECT {col} AS dim, endpoint, COUNT(*) AS n, "
+            "       SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok, "
+            "       SUM(COALESCE(input_tokens,0)) AS tin, "
+            "       SUM(COALESCE(output_tokens,0)) AS tout, "
+            "       GROUP_CONCAT(CAST((duration_s*1000 + COALESCE(queue_wait_ms,0)) AS INTEGER)) AS lats "
+            f"FROM proxy_completions WHERE completed_at >= ? GROUP BY {col}, endpoint",
+            (cutoff,),
+        ).fetchall()
+        agg: dict[str, dict] = {}
+        for dim, endpoint, n, ok, tin, tout, lats in rows:
+            key = dim if dim is not None else "—"
+            a = agg.setdefault(key, {
+                "key": key, "requests": 0, "ok": 0, "errors": 0,
+                "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "_lats": [],
+            })
+            in_rate, out_rate = cloud_rate(endpoint or "")
+            a["requests"] += int(n)
+            a["ok"] += int(ok or 0)
+            a["errors"] += int(n) - int(ok or 0)
+            a["tokens_in"] += int(tin or 0)
+            a["tokens_out"] += int(tout or 0)
+            a["cost_usd"] += (int(tin or 0) / 1e6) * in_rate + (int(tout or 0) / 1e6) * out_rate
+            a["_lats"].extend(int(x) for x in (lats or "").split(",") if x)
+        out: list[dict] = []
+        for a in agg.values():
+            lat_list = sorted(a.pop("_lats"))
+            a["cost_usd"] = round(a["cost_usd"], 4)
+            a["p50_ms"] = round(percentile(lat_list, 50), 1) if lat_list else 0.0
+            a["p95_ms"] = round(percentile(lat_list, 95), 1) if lat_list else 0.0
+            out.append(a)
+        out.sort(key=lambda r: -r["requests"])
+        return out
+
+    def savings_summary(self, today_start: float | None = None) -> dict:
+        """Cloud-equivalent cost avoided by running locally, within the
+        completion-retention window. Returns today + total (all retained)
+        USD and token totals, plus a per-endpoint breakdown. Ported from the
+        host daemon's ``fleet_savings`` (now proxy-authoritative)."""
+        if not self._conn:
+            return {"today_usd": 0.0, "total_usd": 0.0, "by_endpoint": []}
+        from .usage_rates import cloud_rate
+        if today_start is None:
+            lt = time.localtime()
+            today_start = time.mktime((
+                lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+        rows = self._reader().execute(
+            "SELECT endpoint, "
+            "  SUM(CASE WHEN completed_at >= ? THEN COALESCE(input_tokens,0) ELSE 0 END) AS in_today, "
+            "  SUM(CASE WHEN completed_at >= ? THEN COALESCE(output_tokens,0) ELSE 0 END) AS out_today, "
+            "  SUM(COALESCE(input_tokens,0)) AS in_total, "
+            "  SUM(COALESCE(output_tokens,0)) AS out_total "
+            "FROM proxy_completions GROUP BY endpoint",
+            (today_start, today_start),
+        ).fetchall()
+        today_usd = total_usd = 0.0
+        today_in = today_out = total_in = total_out = 0
+        by_endpoint: list[dict] = []
+        for ep, in_today, out_today, in_total, out_total in rows:
+            in_today, out_today = int(in_today or 0), int(out_today or 0)
+            in_total, out_total = int(in_total or 0), int(out_total or 0)
+            today_in += in_today; today_out += out_today
+            total_in += in_total; total_out += out_total
+            in_rate, out_rate = cloud_rate(ep or "")
+            t_today = (in_today / 1e6) * in_rate + (out_today / 1e6) * out_rate
+            t_total = (in_total / 1e6) * in_rate + (out_total / 1e6) * out_rate
+            today_usd += t_today; total_usd += t_total
+            by_endpoint.append({
+                "endpoint": ep, "today_usd": round(t_today, 4),
+                "total_usd": round(t_total, 4),
+                "tokens_in": in_total, "tokens_out": out_total,
+            })
+        by_endpoint.sort(key=lambda x: -x["total_usd"])
+        return {
+            "today_usd": round(today_usd, 2), "total_usd": round(total_usd, 2),
+            "today_tokens_in": today_in, "today_tokens_out": today_out,
+            "total_tokens_in": total_in, "total_tokens_out": total_out,
+            "today_start": int(today_start), "by_endpoint": by_endpoint,
+        }
 
     # ----- query (for simulation / observability) -----
 

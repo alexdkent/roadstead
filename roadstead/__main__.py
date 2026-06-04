@@ -64,6 +64,8 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
             # falling back to the ProxyConfig dataclass defaults.
             payload_retention_s=float(os.environ.get(
                 "LLM_PROXY_PAYLOAD_RETENTION_S", 48 * 3600.0)),
+            completions_retention_s=float(os.environ.get(
+                "LLM_PROXY_COMPLETIONS_RETENTION_S", 30 * 86400.0)),
             wal_checkpoint_interval_s=float(os.environ.get(
                 "LLM_PROXY_WAL_CHECKPOINT_INTERVAL_S", 300.0)),
             incremental_vacuum_interval_s=float(os.environ.get(

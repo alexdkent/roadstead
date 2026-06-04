@@ -85,6 +85,28 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         return await svc.handle_admin_endpoint_pause(
             request.path_params["endpoint"], request, pause=False)
 
+    # Phase 1 — proxy as fleet call-metrics authority.
+    async def handle_stream(request: Request) -> Response:
+        return await svc.handle_stream(request)
+
+    async def handle_calls_log(request: Request) -> Response:
+        return await svc.handle_calls_log(request)
+
+    async def handle_fleet_activity(request: Request) -> Response:
+        return await svc.handle_fleet_activity(request)
+
+    async def handle_fleet_savings(request: Request) -> Response:
+        return await svc.handle_fleet_savings(request)
+
+    async def handle_top_callers(request: Request) -> Response:
+        return await svc.handle_top_callers(request)
+
+    async def handle_usage(request: Request) -> Response:
+        return await svc.handle_usage(request)
+
+    async def handle_series(request: Request) -> Response:
+        return await svc.handle_series(request)
+
     return [
         Route("/v1/submit", handle_submit, methods=["POST"]),
         Route("/v1/chat/completions", handle_chat_completions, methods=["POST"]),
@@ -98,6 +120,15 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         Route("/v1/timeout-advice", handle_timeout_advice, methods=["GET"]),
         Route("/v1/timeout-advice/shadow-report", handle_timeout_shadow_report, methods=["GET"]),
         Route("/v1/timeouts", handle_timeouts_report, methods=["GET"]),
+        # Phase 1 — fleet call-metrics authority: real-time stream, non-LLM
+        # ingest, and the usage/savings rollups ported from the host daemon.
+        Route("/v1/stream", handle_stream, methods=["GET"]),
+        Route("/v1/calls/log", handle_calls_log, methods=["POST"]),
+        Route("/v1/fleet/activity", handle_fleet_activity, methods=["GET"]),
+        Route("/v1/fleet/savings", handle_fleet_savings, methods=["GET"]),
+        Route("/v1/fleet/top-callers", handle_top_callers, methods=["GET"]),
+        Route("/v1/usage", handle_usage, methods=["GET"]),
+        Route("/v1/series", handle_series, methods=["GET"]),
         # Phase 5F — operator drain for backend maintenance (internal-only/ACL).
         Route("/v1/admin/endpoints/{endpoint}/pause", handle_admin_pause, methods=["POST"]),
         Route("/v1/admin/endpoints/{endpoint}/resume", handle_admin_resume, methods=["POST"]),

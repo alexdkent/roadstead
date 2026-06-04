@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -218,8 +219,44 @@ from .scheduler import (
     QueuedRequest,
     Scheduler,
 )
+from .sse_hub import DROP_SENTINEL, SSEHub
 
 logger = logging.getLogger(__name__)
+
+# Map the scheduler's payload_type to the completion `kind` tag (so the unified
+# Inference page can group LLM sub-kinds; non-LLM calls pushed via /v1/calls/log
+# carry their own kind — audio/imagegen/ocr/translate).
+_PAYLOAD_KIND = {
+    "chat_completion": "chat",
+    "embedding": "embed",
+    "rerank": "rerank",
+}
+
+
+def _parse_duration(s: str, default: int) -> int:
+    """Parse a '24h'/'90m'/'3600s' duration to seconds (ported from the host
+    telemetry daemon so the unified frontend's window params are identical)."""
+    import re
+    m = re.match(r"^(\d+)([smhd])$", (s or "").strip())
+    if not m:
+        return default
+    n, u = int(m.group(1)), m.group(2)
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[u]
+
+
+def _clamp_window(s: str, default: int, *, cap: int = 7 * 86400) -> int:
+    return max(60, min(_parse_duration(s, default), cap))
+
+
+def _bin_seconds_for(window_s: int) -> int:
+    """Bin width that keeps a series in ~60-150 points (matches the daemon)."""
+    if window_s <= 3600:
+        return 60
+    if window_s <= 6 * 3600:
+        return 300
+    if window_s <= 86400:
+        return 600
+    return 3600
 
 
 class ProxyService:
@@ -253,6 +290,11 @@ class ProxyService:
         self._metrics = RollingMetrics(window_s=300.0)
         self._request_logger = RequestLogger(config.request_log_path or None)
         self._acl = IPIdentityMap.from_env()
+        # Real-time fan-out (Phase 1: proxy = fleet call-metrics authority).
+        # Every completion emits a `call.completed` event; the poller pushes a
+        # periodic `metrics` frame. Drives the unified Inference page's usage
+        # panels without 5-10s polling. No-op when nobody is subscribed.
+        self._sse = SSEHub()
 
         # Async plumbing
         self._dispatch_event = asyncio.Event()
@@ -394,7 +436,7 @@ class ProxyService:
 
         # Phase 2.3: initial retention sweep (then daily in the poller) so the
         # completion corpus + timeout tables don't grow unbounded.
-        self._queue_db.cleanup_old_completions()
+        self._queue_db.cleanup_old_completions(self._config.completions_retention_s)
         self._queue_db.cleanup_old_payloads(self._config.payload_retention_s)
         self._last_cleanup_at = time.monotonic()
 
@@ -461,6 +503,9 @@ class ProxyService:
         # graceful (SIGTERM) restart doesn't drop running LLM work. New submits
         # are rejected (deferrable) while draining; the scheduler stops admitting.
         self._draining.set()
+        # Signal SSE subscribers to drop so their handlers return promptly
+        # instead of holding uvicorn's graceful-shutdown budget open.
+        self._sse.close_all()
         if self._scheduler_task:
             self._scheduler_task.cancel()
         tasks = [t for t in self._inflight_tasks.values() if not t.done()]
@@ -1047,9 +1092,10 @@ class ProxyService:
 
     # ----- handler: metrics -----
 
-    async def handle_metrics(self, request: Request) -> Response:
-        now = time.monotonic()
-        return JSONResponse({
+    def _metrics_payload(self, now: float) -> dict:
+        """Rolling 5-min metrics — shared by GET /v1/metrics and the periodic
+        SSE `metrics` frame."""
+        return {
             "per_endpoint": {
                 ep: {
                     "requests": self._metrics.count(endpoint=ep, now=now),
@@ -1066,6 +1112,130 @@ class ProxyService:
                 aid: round(ss, 1)
                 for aid, ss in self._metrics.per_agent_consumed(now).items()
             },
+        }
+
+    async def handle_metrics(self, request: Request) -> Response:
+        return JSONResponse(self._metrics_payload(time.monotonic()))
+
+    # ----- handlers: fleet usage (Phase 1: proxy = fleet call-metrics authority) -----
+
+    async def handle_fleet_activity(self, request: Request) -> Response:
+        window_s = _clamp_window(request.query_params.get("window", "24h"), 86400)
+        bin_s = int(request.query_params.get("bin", _bin_seconds_for(window_s)))
+        return JSONResponse(self._queue_db.fleet_activity(window_s, bin_s))
+
+    async def handle_fleet_savings(self, request: Request) -> Response:
+        since_q = request.query_params.get("since")
+        today_start = float(since_q) if since_q and since_q.isdigit() else None
+        return JSONResponse(self._queue_db.savings_summary(today_start))
+
+    async def handle_top_callers(self, request: Request) -> Response:
+        window_s = _clamp_window(request.query_params.get("window", "1h"), 3600)
+        per_endpoint = max(1, min(int(request.query_params.get("per_endpoint", "5")), 20))
+        return JSONResponse(self._queue_db.top_callers(window_s, per_endpoint))
+
+    async def handle_usage(self, request: Request) -> Response:
+        dimension = request.query_params.get("by", "agent")
+        if dimension not in ("agent", "call_site", "endpoint", "provider"):
+            dimension = "agent"
+        hours = min(float(request.query_params.get("hours", "24")), 168)
+        return JSONResponse({
+            "dimension": dimension,
+            "hours": hours,
+            "rows": self._queue_db.usage_rollup(dimension, hours),
+        })
+
+    async def handle_series(self, request: Request) -> Response:
+        endpoint = request.query_params.get("endpoint", "")
+        if not endpoint:
+            return JSONResponse({"error": "endpoint query param required"}, status_code=400)
+        window_s = _clamp_window(request.query_params.get("window", "24h"), 86400)
+        bin_s = int(request.query_params.get("bin", _bin_seconds_for(window_s)))
+        return JSONResponse(self._queue_db.endpoint_series(endpoint, window_s, bin_s))
+
+    # ----- handler: calls ingest (non-LLM fleet calls) -----
+
+    async def handle_calls_log(self, request: Request) -> Response:
+        """Ingest a non-LLM service call (audio/imagegen/ocr/translate) that
+        never traversed the scheduler, so the proxy is the single fleet
+        call-metrics store. Internal/LAN — gated by the same ACL as admin.
+        Best-effort: validates the minimum, records, fans out, returns ok."""
+        remote_ip = request.client.host if request.client else "unknown"
+        if not self._acl.identify(remote_ip):
+            return JSONResponse({"error": f"access denied for {remote_ip}"}, status_code=403)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        endpoint = str(body.get("endpoint") or body.get("provider") or body.get("unit") or "").strip()
+        kind = str(body.get("kind") or "").strip() or "external"
+        if not endpoint:
+            return JSONResponse({"error": "endpoint/provider/unit required"}, status_code=400)
+        if kind in _PAYLOAD_KIND.values() or kind == "llm":
+            # The proxy is authoritative for LLM traffic via native recording;
+            # refuse a pushed LLM call so the two paths can't double-count.
+            return JSONResponse(
+                {"error": f"kind {kind!r} is proxy-native; do not push LLM calls"},
+                status_code=409)
+        status = str(body.get("status") or ("ok" if body.get("success", True) else "error"))
+        request_id = str(body.get("request_id") or f"ext-{uuid.uuid4().hex}")
+        in_tok = int(body.get("input_tokens") or 0)
+        out_tok = int(body.get("output_tokens") or 0)
+        latency_ms = float(body.get("latency_ms") or 0.0)
+        duration_s = float(body.get("duration_s") or (latency_ms / 1000.0))
+        agent_id = str(body.get("agent") or body.get("agent_id") or "unknown")
+        call_site = str(body.get("call_site") or kind)
+        try:
+            self._queue_db.persist_external_call(
+                request_id=request_id, agent_id=agent_id, endpoint=endpoint,
+                call_site=call_site, kind=kind, input_tokens=in_tok,
+                output_tokens=out_tok, duration_s=duration_s, status=status,
+                caller_id=body.get("caller_id"),
+            )
+            self._sse.publish("call.completed", {
+                "request_id": request_id, "agent": agent_id,
+                "endpoint": normalize_endpoint(endpoint), "call_site": call_site,
+                "kind": kind, "priority": "P2_POST_TURN",
+                "input_tokens": in_tok, "output_tokens": out_tok,
+                "duration_s": round(duration_s, 3), "queue_wait_ms": 0.0,
+                "status": status, "ts": time.time(),
+            })
+        except Exception as exc:  # noqa: BLE001 — never fail the pusher
+            logger.warning("calls/log ingest failed: %s", exc)
+            return JSONResponse({"error": "ingest failed"}, status_code=500)
+        return JSONResponse({"ok": True, "request_id": request_id})
+
+    # ----- handler: SSE stream -----
+
+    async def handle_stream(self, request: Request) -> Response:
+        """Server-Sent Events: real-time `call.completed` + periodic `metrics`
+        frames. Slow clients are dropped (the browser reconnects + re-syncs via
+        the REST endpoints). Mirrors the host-telemetry /stream/v2 shape."""
+        q = self._sse.subscribe()
+
+        async def event_gen():
+            try:
+                yield f"event: hello\ndata: {json.dumps({'ts': time.time()})}\n\n".encode()
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        event, data = await asyncio.wait_for(q.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield b": keepalive\n\n"
+                        continue
+                    if (event, data) == DROP_SENTINEL:
+                        break
+                    yield f"event: {event}\ndata: {data}\n\n".encode()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self._sse.unsubscribe(q)
+
+        return StreamingResponse(event_gen(), media_type="text/event-stream", headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
         })
 
     async def handle_cost_model(self, request: Request) -> Response:
@@ -1729,6 +1899,7 @@ class ProxyService:
         # Skip corpus capture for embedding/rerank — large vectors bloat
         # the DB and aren't useful for replay testing.
         capture = req.payload_type == "chat_completion"
+        kind = _PAYLOAD_KIND.get(req.payload_type, "llm")
         self._queue_db.persist_complete(
             req.request_id, req.agent_id, req.endpoint,
             req.call_site, int(req.priority),
@@ -1740,6 +1911,7 @@ class ProxyService:
             turn_id=req.turn_id,
             caller_id=req.caller_id,
             finish_reason=finish_reason,
+            kind=kind,
         )
 
         # Log
@@ -1786,6 +1958,27 @@ class ProxyService:
             self._record_timeout_shadow(req, now, duration_s, output_tokens, status)
         except Exception as exc:  # noqa: BLE001
             logger.warning("timeout shadow record failed for %s: %s", req.request_id, exc)
+
+        # Real-time fan-out — emit the completed call to /v1/stream subscribers.
+        # Synchronous + no-op when no clients; guarded so a fault never disturbs
+        # the caller or the scheduler.
+        try:
+            self._sse.publish("call.completed", {
+                "request_id": req.request_id,
+                "agent": req.agent_id,
+                "endpoint": req.endpoint,
+                "call_site": req.call_site,
+                "kind": kind,
+                "priority": req.priority.name,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "duration_s": round(duration_s, 3),
+                "queue_wait_ms": round(decision.queue_wait_ms, 1),
+                "status": status,
+                "ts": time.time(),
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sse call.completed publish failed for %s: %s", req.request_id, exc)
 
         # Trigger scheduler (a slot freed up)
         self._dispatch_event.set()
@@ -2036,9 +2229,18 @@ class ProxyService:
             # Retention sweep (Phase 2.3): daily DB trim, off-loop via the writer.
             if mono - self._last_cleanup_at > 86400.0:
                 self._last_cleanup_at = mono
-                self._queue_db.cleanup_old_completions()
+                self._queue_db.cleanup_old_completions(
+                    self._config.completions_retention_s)
                 self._queue_db.cleanup_old_payloads(
                     self._config.payload_retention_s)
+            # Periodic SSE `metrics` frame so /v1/stream subscribers get an
+            # aggregate refresh between individual call.completed events
+            # (no-op when nobody is subscribed).
+            if self._sse.client_count:
+                try:
+                    self._sse.publish("metrics", self._metrics_payload(mono))
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("sse metrics publish failed: %s", exc)
             # WAL TRUNCATE-checkpoint so the -wal sidecar can't camp at a burst
             # high-water mark (persistence cleanup).
             if (mono - self._last_wal_checkpoint_at

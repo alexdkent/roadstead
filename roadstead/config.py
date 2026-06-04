@@ -344,6 +344,12 @@ class ProxyConfig:
     # replay/AB harness --hours 4); NULL them after this window while completion
     # METADATA keeps its full retention. Sheds the bulk of the DB weight.
     payload_retention_s: float = 48 * 3600.0
+    # Completion METADATA retention (rows, not payload bodies). Now that
+    # proxy_completions is the whole-fleet call-metrics store (Phase 1: LLM
+    # native + non-LLM pushed), keep 30 days to back the fleet usage/savings
+    # rollups (the host daemon's `calls` table kept 90d — we trade history
+    # depth for the proxy's much higher row volume). Override via env.
+    completions_retention_s: float = 30 * 86400.0
     # TRUNCATE-checkpoint the WAL on this cadence so the -wal sidecar can't camp
     # at a burst high-water mark (auto-checkpoint only resets it for reuse, never
     # shrinks the file).
