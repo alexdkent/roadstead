@@ -18,6 +18,11 @@ from typing import TextIO
 
 logger = logging.getLogger(__name__)
 
+# Request statuses that are an ACTUAL failure worth surfacing in the text log +
+# docker logs. Everything else (ok, cancelled=client-disconnect) is silent there
+# — the JSONL is the authoritative per-request record. (persistence cleanup)
+_PROBLEM_STATUSES = frozenset({"error", "timeout", "truncated"})
+
 
 # ---------------------------------------------------------------------------
 # Request log record
@@ -83,7 +88,9 @@ class RequestLogRecord:
 
 
 class RequestLogger:
-    """Writes JSONL request logs to a rotating file and stderr."""
+    """Writes JSONL request logs to a file (the authoritative per-request
+    record). Genuine failures also surface to the text log / docker logs; ok /
+    cancelled requests do not (the JSONL is the source of truth)."""
 
     def __init__(self, log_path: str | None = None) -> None:
         self._file: TextIO | None = None
@@ -96,7 +103,10 @@ class RequestLogger:
         line = record.to_json()
         if self._file:
             self._file.write(line + "\n")
-        logger.info("req: %s", line)
+        # JSONL is authoritative; only surface genuine failures in the text log /
+        # docker logs (was an unconditional INFO that triplicated every request).
+        if record.status in _PROBLEM_STATUSES:
+            logger.warning("req: %s", line)
 
     def close(self) -> None:
         if self._file:
