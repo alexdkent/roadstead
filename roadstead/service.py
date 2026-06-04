@@ -288,6 +288,10 @@ class ProxyService:
         self._last_cleanup_at = 0.0
         # DRR-balance persistence cadence (Phase 3.4).
         self._last_budget_save_at = 0.0
+        # queue.db maintenance cadences (persistence cleanup): WAL truncate +
+        # incremental freelist return.
+        self._last_wal_checkpoint_at = 0.0
+        self._last_incr_vacuum_at = 0.0
         # Load-shed threshold (Phase 2.4): per-(endpoint, band) queue depth at
         # which NON-interactive submits are shed with 429 + Retry-After.
         self._shed_depth = 50
@@ -367,6 +371,21 @@ class ProxyService:
         # Bootstrap timeout-advice model from the same history
         self._bootstrap_timeout_model()
 
+        # One-time persistence reclaim (pre-writer, single-threaded): a gated full
+        # VACUUM reclaims dead freelist + truncates the WAL AND commits the
+        # auto_vacuum=INCREMENTAL conversion so future freed pages return to the
+        # OS via the poller's incremental_vacuum. Normally a no-op (freelist below
+        # threshold); runs HERE because VACUUM's exclusive lock can never touch
+        # the live loop.
+        try:
+            reclaimed = self._queue_db.vacuum_full_blocking(
+                self._config.startup_vacuum_freelist_threshold_bytes)
+            if reclaimed:
+                logger.info(
+                    "llmproxy startup VACUUM reclaimed %.0f MB", reclaimed / 1e6)
+        except Exception as exc:  # noqa: BLE001 — never block startup on maintenance
+            logger.warning("llmproxy startup VACUUM skipped: %s", exc)
+
         # Phase 2.2: all startup recovery + bootstrap reads/writes are done
         # synchronously above while single-threaded; from here, route DB writes
         # to a dedicated writer thread so synchronous SQLite I/O never blocks the
@@ -376,6 +395,7 @@ class ProxyService:
         # Phase 2.3: initial retention sweep (then daily in the poller) so the
         # completion corpus + timeout tables don't grow unbounded.
         self._queue_db.cleanup_old_completions()
+        self._queue_db.cleanup_old_payloads(self._config.payload_retention_s)
         self._last_cleanup_at = time.monotonic()
 
         # Start background loops
@@ -2017,6 +2037,20 @@ class ProxyService:
             if mono - self._last_cleanup_at > 86400.0:
                 self._last_cleanup_at = mono
                 self._queue_db.cleanup_old_completions()
+                self._queue_db.cleanup_old_payloads(
+                    self._config.payload_retention_s)
+            # WAL TRUNCATE-checkpoint so the -wal sidecar can't camp at a burst
+            # high-water mark (persistence cleanup).
+            if (mono - self._last_wal_checkpoint_at
+                    > self._config.wal_checkpoint_interval_s):
+                self._last_wal_checkpoint_at = mono
+                self._queue_db.checkpoint_truncate()
+            # Return freed pages to the OS gradually (cheap; no full VACUUM lock).
+            if (mono - self._last_incr_vacuum_at
+                    > self._config.incremental_vacuum_interval_s):
+                self._last_incr_vacuum_at = mono
+                self._queue_db.incremental_vacuum(
+                    self._config.incremental_vacuum_pages)
             # Periodic DRR-balance persistence (Phase 3.4) so a SIGKILL loses at
             # most ~60s of fairness state.
             if mono - self._last_budget_save_at > 60.0:

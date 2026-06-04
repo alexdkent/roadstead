@@ -112,3 +112,113 @@ def test_write_queue_overflow_drops_not_blocks(tmp_path):
     pq._writer = None  # avoid close() touching the stub
     pq._writer_started_once = False
     pq.close()
+
+
+# --- persistence cleanup: payload retention + WAL/vacuum maintenance ---------
+
+_BIG = {"messages": [{"role": "user", "content": "x" * 2000}]}
+
+
+def _pc_big(pq, rid, status="ok"):
+    """A completion carrying payload+response blobs (the bytes we shed)."""
+    pq.persist_complete(rid, "agentA", "chat", "site", 3, 10, 5, 1.0, 2.0,
+                        status, payload=_BIG, response=_BIG)
+
+
+def test_cleanup_old_payloads_nulls_old_keeps_recent_and_metadata(tmp_path):
+    import time
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    _pc_big(pq, "old")
+    _pc_big(pq, "new")
+    # Backdate "old" well past the retention window.
+    pq._conn.execute(
+        "UPDATE proxy_completions SET completed_at=? WHERE request_id=?",
+        (time.time() - 100_000, "old"))
+    pq.cleanup_old_payloads(max_age_s=3600)
+    rows = {r[0]: r for r in pq._conn.execute(
+        "SELECT request_id, payload_json, response_json FROM proxy_completions"
+    ).fetchall()}
+    # old: blobs gone; new: blobs intact.
+    assert rows["old"][1] is None and rows["old"][2] is None
+    assert rows["new"][1] is not None and rows["new"][2] is not None
+    # The METADATA row for "old" is RETAINED (not deleted) and still queryable.
+    assert pq._conn.execute(
+        "SELECT COUNT(*) FROM proxy_completions").fetchone()[0] == 2
+    assert any(r["request_id"] == "old" for r in pq.recent_requests(10))
+    # Idempotent: a second sweep is a cheap no-op (guard clause), no error.
+    pq.cleanup_old_payloads(max_age_s=3600)
+    pq.close()
+
+
+def test_open_sets_incremental_auto_vacuum(tmp_path):
+    # On a fresh DB the _open PRAGMA takes effect immediately (2 == INCREMENTAL).
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    assert pq._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+    pq.close()
+
+
+def test_checkpoint_truncate_shrinks_wal(tmp_path):
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    for i in range(500):
+        _pc_big(pq, f"r{i}")
+    before = pq.wal_size_bytes()
+    assert before > 0
+    pq.checkpoint_truncate()  # pre-writer → runs synchronously on the conn
+    assert pq.wal_size_bytes() < before
+    pq.close()
+
+
+def test_incremental_vacuum_reduces_freelist(tmp_path):
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    for i in range(800):
+        _pc_big(pq, f"r{i}")
+    pq.cleanup_old_completions(max_age_s=-1)  # delete all → build freelist
+    pq.checkpoint_truncate()
+    before = pq.freelist_bytes()
+    assert before > 0
+    pq.incremental_vacuum(1_000_000)
+    pq.checkpoint_truncate()
+    assert pq.freelist_bytes() < before
+    pq.close()
+
+
+def test_vacuum_full_blocking_reclaims_and_threshold_gates(tmp_path):
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    for i in range(800):
+        _pc_big(pq, f"r{i}")
+    pq.cleanup_old_completions(max_age_s=-1)
+    pq.checkpoint_truncate()
+    # threshold 0 → vacuums; reclaims the dead pages built above.
+    reclaimed = pq.vacuum_full_blocking(threshold_bytes=0)
+    assert reclaimed > 0
+    # An astronomically high threshold → skip (returns 0, no-op).
+    assert pq.vacuum_full_blocking(threshold_bytes=10**12) == 0
+    pq.close()
+
+
+def test_vacuum_full_blocking_refuses_post_writer(tmp_path):
+    import pytest
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    pq.start_async_writer()  # writer now owns the connection
+    with pytest.raises(RuntimeError):
+        pq.vacuum_full_blocking(0)
+    pq.close()
+
+
+def test_submit_writer_call_runs_on_writer_thread(tmp_path):
+    import threading
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    pq.start_async_writer()
+    seen = {}
+
+    def op(conn):
+        seen["tid"] = threading.get_ident()
+        conn.execute("CREATE TABLE IF NOT EXISTS probe(x)")
+        conn.execute("INSERT INTO probe VALUES (1)")
+
+    pq._submit_writer_call(op)
+    pq.flush(timeout=5.0)
+    # Ran on the writer thread, NOT the caller (single-writer invariant).
+    assert seen.get("tid") and seen["tid"] != threading.get_ident()
+    assert pq._reader().execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 1
+    pq.close()

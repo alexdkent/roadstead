@@ -338,6 +338,26 @@ class ProxyConfig:
     stats_db_path: str = ""
     request_log_path: str = ""
 
+    # --- queue.db maintenance (persistence cleanup) ---
+    # Payload bodies (payload_json/response_json on proxy_completions) are only
+    # read by recent-data consumers (llm_health_sweep last 100-300 rows, the
+    # replay/AB harness --hours 4); NULL them after this window while completion
+    # METADATA keeps its full retention. Sheds the bulk of the DB weight.
+    payload_retention_s: float = 48 * 3600.0
+    # TRUNCATE-checkpoint the WAL on this cadence so the -wal sidecar can't camp
+    # at a burst high-water mark (auto-checkpoint only resets it for reuse, never
+    # shrinks the file).
+    wal_checkpoint_interval_s: float = 300.0
+    # Return freed pages (deletes + payload NULLs) to the OS gradually via
+    # incremental_vacuum — only effective once auto_vacuum=INCREMENTAL is
+    # committed by the one-time startup VACUUM.
+    incremental_vacuum_interval_s: float = 600.0
+    incremental_vacuum_pages: int = 4000
+    # One-time full VACUUM at startup (pre-writer, single-threaded) when the
+    # freelist exceeds this — reclaims dead space AND commits the auto_vacuum mode
+    # change. Normally a no-op on a healthy DB.
+    startup_vacuum_freelist_threshold_bytes: int = 200 * 1024 * 1024
+
     # --- timeout-advice model (see timeout_model.py) ---
     # ``recommended = max(p99 * margin, floor)``.  Margin is the one
     # policy knob; window/min_samples govern the empirical distribution.

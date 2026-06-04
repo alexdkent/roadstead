@@ -153,6 +153,13 @@ class PersistentQueue:
 
     def _open(self, path: str) -> sqlite3.Connection:
         conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        # Incremental auto-vacuum MUST be set before journal_mode=WAL writes the
+        # db header — on a fresh DB it then takes effect on the first CREATE; on a
+        # legacy auto_vacuum=NONE DB it stays INERT until the one-time startup
+        # VACUUM commits the mode change (see vacuum_full_blocking). Freed pages
+        # (deletes + payload NULLs) are then returned to the OS via the poller's
+        # incremental_vacuum.
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=2500")
@@ -248,8 +255,14 @@ class PersistentQueue:
             try:
                 if item is None:  # shutdown sentinel
                     return
-                sql, params = item
-                self._conn.execute(sql, params)
+                if callable(item):
+                    # Maintenance op that must run on the writer connection
+                    # (wal_checkpoint/incremental_vacuum return rows _w can't
+                    # carry). Same single-writer invariant as every other write.
+                    item(self._conn)
+                else:
+                    sql, params = item
+                    self._conn.execute(sql, params)
             except Exception as exc:  # noqa: BLE001 — never let a bad write kill the writer
                 logger.warning("llmproxy db write failed: %s", exc)
             finally:
@@ -312,6 +325,34 @@ class PersistentQueue:
         except Exception as exc:  # noqa: BLE001
             logger.error("llmproxy degraded sync write failed: %s", exc)
 
+    def _submit_writer_call(self, fn) -> None:
+        """Run ``fn(conn)`` on the writer thread (or synchronously pre-writer).
+
+        For maintenance PRAGMAs (wal_checkpoint, incremental_vacuum) that return
+        rows and so can't go through ``_w`` (which only execute()s and discards
+        them). Same three-case routing + single-writer invariant as ``_w``.
+        """
+        if not self._conn:
+            return
+        if self._writer is not None and self._writer.is_alive():
+            try:
+                self._write_q.put_nowait(fn)
+            except _queue.Full:
+                self._write_q_dropped += 1
+            return
+        if not self._writer_started_once:
+            # Pre-writer window — single-threaded, safe.
+            fn(self._conn)
+            return
+        # Writer started and DIED — best-effort maintenance runs synchronously
+        # and loudly (rare; _w's self-heal path covers normal writes).
+        logger.critical(
+            "llmproxy db writer dead — running maintenance op synchronously")
+        try:
+            fn(self._conn)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("llmproxy maintenance op failed: %s", exc)
+
     def writer_alive(self) -> bool:
         """True if the async writer thread is running (or not yet started)."""
         if not self._writer_started_once:
@@ -339,6 +380,55 @@ class PersistentQueue:
             return _os.path.getsize(self._db_path + "-wal")
         except OSError:
             return 0
+
+    def checkpoint_truncate(self) -> None:
+        """TRUNCATE-checkpoint the WAL so the -wal sidecar returns to ~0 instead
+        of camping at a burst high-water mark. The PRAGMA returns
+        (busy, log, checkpointed) — consumed via fetchall(); a non-zero busy just
+        means a reader held it this tick, it truncates on the next."""
+        self._submit_writer_call(
+            lambda c: c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall())
+
+    def incremental_vacuum(self, pages: int) -> None:
+        """Return up to ``pages`` freelist pages to the OS. No-op unless
+        auto_vacuum=INCREMENTAL is committed and free pages exist."""
+        n = int(pages)
+        self._submit_writer_call(
+            lambda c: c.execute(f"PRAGMA incremental_vacuum({n})").fetchall())
+
+    def freelist_bytes(self) -> int:
+        """Dead (free) space in the main DB file, in bytes (read path)."""
+        if not self._conn:
+            return 0
+        try:
+            r = self._reader()
+            fl = r.execute("PRAGMA freelist_count").fetchone()[0]
+            ps = r.execute("PRAGMA page_size").fetchone()[0]
+            return int(fl) * int(ps)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def vacuum_full_blocking(self, threshold_bytes: int) -> int:
+        """One-time reclaim: full VACUUM + WAL truncate when the freelist exceeds
+        ``threshold_bytes``. MUST run pre-writer (single-threaded) — VACUUM takes
+        an exclusive lock and rewrites the whole file, so it can never touch the
+        live loop. Also commits a pending auto_vacuum=INCREMENTAL mode change.
+        Returns bytes reclaimed (0 if skipped)."""
+        if not self._conn:
+            return 0
+        if self._writer is not None:
+            raise RuntimeError(
+                "vacuum_full_blocking must run pre-writer (single-threaded)")
+        ps = self._conn.execute("PRAGMA page_size").fetchone()[0]
+        free_before = self._conn.execute(
+            "PRAGMA freelist_count").fetchone()[0] * ps
+        if free_before < threshold_bytes:
+            return 0
+        pages_before = self._conn.execute("PRAGMA page_count").fetchone()[0]
+        self._conn.execute("VACUUM")
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        pages_after = self._conn.execute("PRAGMA page_count").fetchone()[0]
+        return max(0, (pages_before - pages_after) * ps)
 
     def flush(self, timeout: float = 10.0) -> None:
         """Block until all queued writes have been applied (drain support)."""
@@ -652,6 +742,22 @@ class PersistentQueue:
         self._w("DELETE FROM proxy_completions WHERE completed_at < ?", (cutoff,))
         self._w("DELETE FROM proxy_timeout_shadow WHERE completed_at < ?", (cutoff,))
         self._w("DELETE FROM proxy_timeouts WHERE occurred_at < ?", (cutoff,))
+
+    def cleanup_old_payloads(self, max_age_s: float) -> None:
+        """NULL out payload/response bodies older than the window while KEEPING
+        the completion metadata row (7-day retention is separate). The only
+        readers of these blobs use recent rows (health-sweep last 100-300,
+        replay/AB --hours 4). The IS NOT NULL guard keeps re-runs cheap. Freed
+        pages go to the freelist → returned to the OS by incremental_vacuum."""
+        if not self._conn:
+            return
+        cutoff = time.time() - max_age_s
+        self._w(
+            "UPDATE proxy_completions SET payload_json=NULL, response_json=NULL "
+            "WHERE completed_at < ? AND "
+            "(payload_json IS NOT NULL OR response_json IS NOT NULL)",
+            (cutoff,),
+        )
 
     def history_buckets(
         self, hours: float = 4.0, bucket_minutes: int = 5,

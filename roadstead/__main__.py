@@ -60,6 +60,18 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
             # Missing file → empty dict → proxy lazy-creates agent
             # configs at AgentQuotaConfig dataclass defaults.
             agents=load_agent_configs(),
+            # queue.db maintenance knobs (persistence cleanup) — env overrides,
+            # falling back to the ProxyConfig dataclass defaults.
+            payload_retention_s=float(os.environ.get(
+                "LLM_PROXY_PAYLOAD_RETENTION_S", 48 * 3600.0)),
+            wal_checkpoint_interval_s=float(os.environ.get(
+                "LLM_PROXY_WAL_CHECKPOINT_INTERVAL_S", 300.0)),
+            incremental_vacuum_interval_s=float(os.environ.get(
+                "LLM_PROXY_INCR_VACUUM_INTERVAL_S", 600.0)),
+            incremental_vacuum_pages=int(os.environ.get(
+                "LLM_PROXY_INCR_VACUUM_PAGES", 4000)),
+            startup_vacuum_freelist_threshold_bytes=int(os.environ.get(
+                "LLM_PROXY_STARTUP_VACUUM_FREELIST_BYTES", 200 * 1024 * 1024)),
         )
 
     svc = ProxyService(config)
