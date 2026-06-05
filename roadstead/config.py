@@ -417,6 +417,18 @@ def thinking_enabled() -> bool:
     )
 
 
+def shadow_egress_detect_enabled() -> bool:
+    """WS-4 (2026-06-05): run ``verify_conformance`` on EVERY grammar-bearing
+    structured response in SHADOW — log + count silent grammar-drops (parse
+    fail / markdown-fence / non-conformance, i.e. llama.cpp dropped the grammar
+    and ran free-form), but NEVER mutate the response. Zero caller risk, so
+    default ON: the whole point is to collect a baseline silent-drop rate per
+    call_site from live traffic. Env kill-switch ``COLLECTIVE_PROXY_SHADOW_EGRESS``."""
+    return os.environ.get("COLLECTIVE_PROXY_SHADOW_EGRESS", "1").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
 def thinking_reasoning_budget() -> int:
     """Tokens of reasoning headroom ADDED to a thinking request's max_tokens.
     Reasoning is generated <think> output and counts against max_tokens, so too

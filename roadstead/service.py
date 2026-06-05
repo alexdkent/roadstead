@@ -41,6 +41,7 @@ from .config import (
     StructMechanism,
     StructMode,
     normalize_endpoint,
+    shadow_egress_detect_enabled,
     struct_policy_for,
     thinking_enabled,
     thinking_reasoning_budget,
@@ -333,6 +334,11 @@ class ProxyService:
         self._thinking_recovered = 0   # stray-brace artifact deterministically cleaned
         self._thinking_truncated = 0   # finish=length (raise budget) — failed safe
         self._thinking_fallback = 0    # unrecoverable structured output — failed safe
+        # WS-4 shadow egress detector: per-call_site silent grammar-drop tally
+        # over ALL grammar-bearing responses (read-only; NEVER mutates a
+        # response). {call_site: {"checked": int, "dropped": int}}. Populated by
+        # _shadow_egress_detect when COLLECTIVE_PROXY_SHADOW_EGRESS is on (default).
+        self._shadow_drop: dict[str, dict] = {}
         # Dedupe set so a single request that races across two timeout
         # layers (e.g. admission expiry + client-wait) is logged once.
         self._timed_out_ids: set[str] = set()
@@ -882,6 +888,52 @@ class ProxyService:
         except Exception:  # noqa: BLE001 — never break the response on a strip-write error
             logger.exception("struct: strip-write failed (call_site=%s)", req.call_site)
 
+    def _shadow_egress_detect(self, req: "QueuedRequest", result: dict) -> None:
+        """WS-4: SHADOW silent-drop detector over ALL grammar-bearing responses.
+
+        Runs ``verify_conformance`` on every grammar-bearing structured response
+        whose call_site is NOT already covered by a registry SHADOW/ACTIVE policy
+        (those are handled by ``_finalize_struct_output`` — skip to avoid double
+        counting). Tallies per-call_site checked/dropped so ``/v1/status`` can
+        surface a silent-drop rate to health→health-verifier. This closes the
+        no-silent-failure gap fleet-wide: a markdown fence / non-JSON / wrong-keys
+        response means llama.cpp dropped the grammar and ran free-form.
+
+        READ-ONLY: it never mutates ``result`` (zero caller risk), and any error
+        is swallowed so the detector can never break a real response."""
+        try:
+            if not shadow_egress_detect_enabled():
+                return
+            if result.get("status") != "ok":
+                return
+            if req.stream or req.payload_type != "chat_completion":
+                return
+            # Registry SHADOW/ACTIVE call_sites already run a conformance check in
+            # _finalize_struct_output; OFF/None fall through to this blanket pass.
+            pol = struct_policy_for(req.call_site)
+            if pol is not None and pol.mode != StructMode.OFF:
+                return
+            grammar, _loc = self._extract_grammar(req.payload)
+            if not grammar:
+                return
+            resp = result.get("response", {}) or {}
+            ch = (resp.get("choices") or [{}])[0]
+            content = (ch.get("message", {}) or {}).get("content")
+            if not isinstance(content, str) or not content:
+                return
+            ok, reason = verify_conformance(content, grammar)
+            cs = req.call_site or "unknown"
+            tally = self._shadow_drop.setdefault(cs, {"checked": 0, "dropped": 0})
+            tally["checked"] += 1
+            if not ok:
+                tally["dropped"] += 1
+                logger.warning(
+                    "shadow_egress: silent grammar-drop call_site=%s endpoint=%s "
+                    "reason=%s", cs, req.endpoint, reason,
+                )
+        except Exception:  # noqa: BLE001 — detector must never break a response
+            logger.debug("shadow_egress_detect failed", exc_info=True)
+
     def _thinking_allowed_keys(self, payload: dict) -> list[str]:
         """Top-level object keys the structured constraint permits — used to
         anchor response recovery. Covers GBNF (top / extra_body /
@@ -1067,6 +1119,11 @@ class ProxyService:
         # stray-brace recovery; fail-safe if unrecoverable). Before the cache so a
         # repaired (or failed-safe) response is what gets cached, never the noise.
         self._finalize_thinking(req, result)
+        # WS-4: SHADOW silent-drop detector over ALL grammar-bearing responses
+        # (read-only; never mutates). Runs after the finalizers so it observes the
+        # baseline content callers receive, and before the cache so every response
+        # is seen exactly once.
+        self._shadow_egress_detect(req, result)
 
         # Cache if deterministic
         if cache_key and result.get("status") == "ok":
@@ -1322,6 +1379,18 @@ class ProxyService:
                 "thinking_recovered": self._thinking_recovered,
                 "thinking_truncated": self._thinking_truncated,
                 "thinking_fallback": self._thinking_fallback,
+                # WS-4 shadow egress detector — silent grammar-drop over ALL
+                # grammar-bearing responses (read-only/zero-risk). Per-call_site
+                # rate + a flat fleet rate (health-verifier thresholds the scalar).
+                "silent_drop_by_call_site": {
+                    cs: {**t, "rate": round(t["dropped"] / t["checked"], 4)}
+                    for cs, t in self._shadow_drop.items() if t["checked"]
+                },
+                "silent_drop_rate": round(
+                    sum(t["dropped"] for t in self._shadow_drop.values())
+                    / max(1, sum(t["checked"] for t in self._shadow_drop.values())),
+                    4,
+                ),
             },
             # Phase 5F — endpoints an operator has drained for maintenance.
             "paused_endpoints": sorted(self._paused_endpoints),
