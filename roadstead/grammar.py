@@ -516,3 +516,46 @@ def verify_conformance(
     if extra:
         return False, f"unexpected_keys:{sorted(extra)}"
     return True, "ok"
+
+
+def recover_structured_object(
+    output: str, *, grammar: str | None = None, allowed_keys: list[str] | None = None
+) -> str | None:
+    """Deterministic noisy-output recovery for object-root structured responses.
+
+    Some backend/decoder corner cases emit a small amount of junk *before* the
+    constrained object — notably the bounded (<=~4 char) stray opening-brace
+    artifact vLLM produces at the reasoning->JSON boundary under MTP spec-decode
+    (PR #44142 fixes `</think>` detection but the one-step-deferred FSM advance
+    lets the model emit its own ``{`` before the grammar's ``{``). The object
+    itself is well-formed and conformant; only a tiny prefix is noise.
+
+    This scans for the first ``{`` whose JSON object's top-level keys fall within
+    the allowed set (the grammar/schema root keys) and returns it re-serialized
+    and clean. It NEVER guesses: a partial/duplicate prefix fails ``raw_decode``
+    and is skipped; if nothing structurally matches, returns ``None`` so the
+    caller falls back (2-call / deferrable error) — clean-then-verify, never
+    parse-and-hope. The caller should still run :func:`verify_conformance` on the
+    result. ``allowed_keys`` (e.g. a JSON-schema's ``properties``) takes
+    precedence; otherwise keys are derived from ``grammar`` via
+    :func:`root_object_keys`."""
+    if allowed_keys is None and grammar is not None:
+        allowed_keys = root_object_keys(grammar)
+    allowed = set(allowed_keys or [])
+    if not allowed:
+        return None  # object-root recovery only; nothing to anchor on
+    text = output or ""
+    dec = json.JSONDecoder()
+    i = 0
+    while True:
+        b = text.find("{", i)
+        if b < 0:
+            return None
+        try:
+            obj, _ = dec.raw_decode(text, b)
+        except Exception:  # noqa: BLE001
+            i = b + 1
+            continue
+        if isinstance(obj, dict) and obj and set(obj.keys()) <= allowed:
+            return json.dumps(obj, ensure_ascii=False)
+        i = b + 1

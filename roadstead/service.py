@@ -27,6 +27,8 @@ from .grammar import (
     grammar_hash,
     inject_reason_field,
     normalize_and_validate,
+    recover_structured_object,
+    root_object_keys,
     strip_top_field,
     verify_conformance,
 )
@@ -40,6 +42,8 @@ from .config import (
     StructMode,
     normalize_endpoint,
     struct_policy_for,
+    thinking_enabled,
+    thinking_reasoning_budget,
 )
 
 # Phase 1.3 — bounded in-proxy retry for transient backend failures (defer,
@@ -319,6 +323,16 @@ class ProxyService:
         self._struct_inject: dict[str, dict] = {}
         self._struct_egress_failures = 0   # ACTIVE egress double-check failures
         self._struct_shadow_diffs = 0      # SHADOW non-conformances (no caller impact)
+        # Thinking option (per-request native reasoning): per-request state keyed
+        # by request_id — set on dispatch, consumed on the response path for
+        # structured-output recovery. {request_id: {"allowed_keys": [...]}}.
+        # Stays EMPTY unless a caller opts in with thinking:true.
+        self._thinking_active: dict[str, dict] = {}
+        self._thinking_requests = 0    # opted-in thinking requests seen
+        self._thinking_clean = 0       # structured output already conformant (no fix)
+        self._thinking_recovered = 0   # stray-brace artifact deterministically cleaned
+        self._thinking_truncated = 0   # finish=length (raise budget) — failed safe
+        self._thinking_fallback = 0    # unrecoverable structured output — failed safe
         # Dedupe set so a single request that races across two timeout
         # layers (e.g. admission expiry + client-wait) is logged once.
         self._timed_out_ids: set[str] = set()
@@ -868,6 +882,125 @@ class ProxyService:
         except Exception:  # noqa: BLE001 — never break the response on a strip-write error
             logger.exception("struct: strip-write failed (call_site=%s)", req.call_site)
 
+    def _thinking_allowed_keys(self, payload: dict) -> list[str]:
+        """Top-level object keys the structured constraint permits — used to
+        anchor response recovery. Covers GBNF (top / extra_body /
+        structured_outputs.grammar) and response_format json_schema. Empty list
+        means 'no object-root structured constraint' (a plain thinking request —
+        nothing to recover; content is already the clean answer)."""
+        grammar, _ = self._extract_grammar(payload)
+        if grammar is None:
+            so = payload.get("structured_outputs")
+            if isinstance(so, dict) and isinstance(so.get("grammar"), str):
+                grammar = so["grammar"]
+        if isinstance(grammar, str) and grammar.strip():
+            try:
+                return root_object_keys(grammar)
+            except Exception:  # noqa: BLE001
+                return []
+        rf = payload.get("response_format")
+        if isinstance(rf, dict) and rf.get("type") == "json_schema":
+            sch = (rf.get("json_schema") or {}).get("schema") or {}
+            props = sch.get("properties")
+            if isinstance(props, dict):
+                return list(props.keys())
+        return []
+
+    def _apply_thinking(self, req: QueuedRequest) -> None:
+        """Request-side: honor a per-request ``thinking: true`` opt-in. On a vLLM
+        (reasoning-parser) backend, enable native <think> and add a GENEROUS
+        reasoning budget to max_tokens (reasoning is generated output → counts
+        against the cap; operator directive is to prefer slowness over cutoffs).
+        Records the request for response-side structured-output recovery. Strips
+        the ``thinking`` control field (not a backend param) regardless. Fully
+        transparent when not requested, feature-disabled, streaming, or non-vLLM."""
+        p = req.payload
+        if not isinstance(p, dict):
+            return
+        want = bool(p.get("thinking"))
+        eb = p.get("extra_body")
+        if isinstance(eb, dict):
+            want = want or bool(eb.get("thinking"))
+            eb.pop("thinking", None)
+        p.pop("thinking", None)  # control field — never forward to the backend
+        if not want or req.stream or req.payload_type != "chat_completion":
+            return
+        if not thinking_enabled():
+            return
+        ep = self._config.endpoints.get(normalize_endpoint(req.endpoint))
+        engine = ep.backend_engine if ep is not None else "llama.cpp"
+        if engine != "vllm":   # reasoning parser is vLLM-only; llama.cpp ignores
+            return
+        ck = p.get("chat_template_kwargs")
+        ck = dict(ck) if isinstance(ck, dict) else {}
+        ck["enable_thinking"] = True
+        p["chat_template_kwargs"] = ck
+        budget = thinking_reasoning_budget()
+        cur = p.get("max_tokens")
+        p["max_tokens"] = (cur if isinstance(cur, int) and cur > 0 else 800) + budget
+        self._thinking_active[req.request_id] = {
+            "allowed_keys": self._thinking_allowed_keys(p)}
+
+    def _finalize_thinking(self, req: QueuedRequest, result: dict) -> None:
+        """Response-side normalization for an opted-in thinking request (mutates
+        ``result`` in place). vLLM already splits reasoning into
+        ``message.reasoning`` (content stays clean of CoT). This repairs the one
+        residual artifact: the bounded stray opening-brace that PR#44142's
+        one-step-deferred FSM advance leaves before the constrained object. If the
+        content already parses+conforms → no-op. Else deterministically recover
+        the object (clean-then-verify, never guess) and write it back. If nothing
+        recovers (truncation / genuine garbage) → FAIL SAFE to caller retry rather
+        than pass noise. No-op when the caller didn't opt in."""
+        info = self._thinking_active.pop(req.request_id, None)
+        if info is None or result.get("status") != "ok":
+            return
+        response = result.get("response")
+        if not isinstance(response, dict):
+            return
+        try:
+            ch0 = response["choices"][0]
+            content = ch0["message"]["content"]
+            finish = ch0.get("finish_reason")
+        except Exception:  # noqa: BLE001 — not a chat.completion shape; leave untouched
+            return
+        if not isinstance(content, str):
+            return
+        self._thinking_requests += 1
+        allowed = info.get("allowed_keys") or []
+        if not allowed:
+            return  # plain thinking (no object-root constraint) — content is the answer
+        # Already clean + conformant?
+        try:
+            obj = json.loads(content)
+            if isinstance(obj, dict) and set(obj.keys()) <= set(allowed):
+                self._thinking_clean += 1
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        recovered = recover_structured_object(content, allowed_keys=allowed)
+        if recovered is not None:
+            self._thinking_recovered += 1
+            try:
+                choices = list(response.get("choices") or [])
+                c0 = dict(choices[0]); msg = dict(c0.get("message") or {})
+                msg["content"] = recovered; c0["message"] = msg; choices[0] = c0
+                new_resp = dict(response); new_resp["choices"] = choices
+                result["response"] = new_resp
+            except Exception:  # noqa: BLE001 — never break the response on a write error
+                logger.exception("thinking: recovery-write failed (call_site=%s)", req.call_site)
+            return
+        # Unrecoverable → fail safe (caller retry / 2-call), never pass noise.
+        if finish == "length":
+            self._thinking_truncated += 1
+            why = "thinking output truncated (finish=length) — raise COLLECTIVE_PROXY_THINKING_BUDGET"
+        else:
+            self._thinking_fallback += 1
+            why = "thinking structured output unrecoverable"
+        logger.warning("thinking egress FAIL (call_site=%s): %s — failing safe", req.call_site, why)
+        result["status"] = "error"
+        result["error"] = f"thinking structured-output recovery failed: {why}"
+        result.pop("response", None)
+
     async def _handle_sync_submit(
         self, req: QueuedRequest, cache_key: str | None, *, openai: bool = False,
     ) -> Response:
@@ -880,6 +1013,9 @@ class ProxyService:
         # enqueue) so the cache key stays the caller's ORIGINAL request and the
         # response path can strip what we inject.
         self._apply_struct_policy(req)
+        # Thinking option: honor a per-request `thinking:true` opt-in (enable
+        # native <think> on vLLM + generous budget bump). No-op otherwise.
+        self._apply_thinking(req)
 
         self._scheduler.enqueue(req)
         self._queue_db.persist_enqueue(req)
@@ -894,6 +1030,7 @@ class ProxyService:
             self._queue_db.persist_expire(req.request_id)
             self._pending_futures.pop(req.request_id, None)
             self._struct_inject.pop(req.request_id, None)  # no _finalize on timeout
+            self._thinking_active.pop(req.request_id, None)
             # The caller's deadline fired — work may still be in flight.
             self._record_timeout_event(req, layer="client_wait", elapsed_s=req.timeout_s)
             if openai:
@@ -911,6 +1048,7 @@ class ProxyService:
         # timeout result — already logged there; surface the same 504.
         if result.get("status") == "timeout":
             self._struct_inject.pop(req.request_id, None)  # no _finalize on timeout
+            self._thinking_active.pop(req.request_id, None)
             if openai:
                 return self._openai_error(
                     f"proxy timeout after {req.timeout_s:.0f}s", "proxy_timeout", 504,
@@ -925,6 +1063,10 @@ class ProxyService:
         # egress failure this flips result→error (fail-safe to caller retry); so
         # it must run BEFORE the cache so we never cache a leaky/failed response.
         self._finalize_struct_output(req, result)
+        # Thinking option: normalize the structured response (deterministic
+        # stray-brace recovery; fail-safe if unrecoverable). Before the cache so a
+        # repaired (or failed-safe) response is what gets cached, never the noise.
+        self._finalize_thinking(req, result)
 
         # Cache if deterministic
         if cache_key and result.get("status") == "ok":
@@ -1172,6 +1314,14 @@ class ProxyService:
                 # Both stay 0 until a call_site policy is flipped on.
                 "struct_egress_failures": self._struct_egress_failures,
                 "struct_shadow_diffs": self._struct_shadow_diffs,
+                # Thinking option (per-request native reasoning) health. All 0
+                # until a caller opts in with thinking:true. Watch
+                # thinking_truncated to tune COLLECTIVE_PROXY_THINKING_BUDGET down.
+                "thinking_requests": self._thinking_requests,
+                "thinking_clean": self._thinking_clean,
+                "thinking_recovered": self._thinking_recovered,
+                "thinking_truncated": self._thinking_truncated,
+                "thinking_fallback": self._thinking_fallback,
             },
             # Phase 5F — endpoints an operator has drained for maintenance.
             "paused_endpoints": sorted(self._paused_endpoints),

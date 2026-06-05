@@ -399,6 +399,37 @@ def struct_policy_for(call_site: str) -> StructPolicy | None:
     return STRUCTURED_OUTPUT_POLICY.get(call_site)
 
 
+# --- Thinking option (per-request opt-in native reasoning) ---------------------
+# Callers opt in per request with ``thinking: true``; default OFF is fully
+# transparent (backend.py forces enable_thinking=False), so existing traffic is
+# unaffected. On a vLLM (reasoning-parser) backend the proxy then enables native
+# <think>, adds a GENEROUS reasoning budget to max_tokens, and normalizes the
+# structured response (deterministic recovery of the bounded stray-brace artifact
+# that vLLM emits at the reason→JSON boundary under MTP spec-decode — see
+# grammar.recover_structured_object + vLLM #34650/PR #44142).
+
+def thinking_enabled() -> bool:
+    """Feature kill-switch (default ON). Per-request opt-in is the real gate;
+    nothing reasons until a caller sets ``thinking: true``, so this only exists
+    to disable the path fleet-wide in an incident."""
+    return os.environ.get("COLLECTIVE_PROXY_THINKING", "1").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
+def thinking_reasoning_budget() -> int:
+    """Tokens of reasoning headroom ADDED to a thinking request's max_tokens.
+    Reasoning is generated <think> output and counts against max_tokens, so too
+    small a budget truncates mid-reasoning (finish=length). Operator directive
+    (2026-06-05): prefer short-term slowness over cutoff failures — start
+    generous, watch the truncation metric, tune DOWN over time. Env override
+    ``COLLECTIVE_PROXY_THINKING_BUDGET``."""
+    try:
+        return max(0, int(os.environ.get("COLLECTIVE_PROXY_THINKING_BUDGET", "8000")))
+    except ValueError:
+        return 8000
+
+
 @dataclass
 class ProxyConfig:
     """Top-level proxy configuration."""
