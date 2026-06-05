@@ -234,23 +234,23 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
     ),
     "companion": EndpointConfig(
         # nexus llama-companion — Huihui Qwen3-Next-80B-A3B abliterated
-        # (served id companion.gguf) on :8081. Live: --ctx-size 393216
-        # --parallel 4 → 98304/slot, 4 slots. The fleet's high-capability
-        # summarizer/composer (qwen-composer role). /props discovery is
-        # unreliable on the 80B, so this seed is load-bearing — keep it exact.
+        # (served id companion.gguf) on :8081. Live (2026-06-05): --ctx-size
+        # 98304 --parallel 3 → 32768/slot, 3 slots — downsized from 4×98304 to
+        # free nexus memory for the Chatterbox Turbo TTS. The fleet's
+        # high-capability summarizer/composer (qwen-composer role). /props
+        # discovery is unreliable on the 80B, so this seed is load-bearing —
+        # keep it exact.
         endpoint_class="companion", role="qwen-composer",
-        max_slots=4, context_per_slot=98304,
-        # G1 (2026-06-01): cap concurrent dispatch at 3 (of 4 physical slots).
+        max_slots=3, context_per_slot=32768,
         # The patched-cache 80B aborted under full 4-slot pressure with a
-        # llama.cpp KV-seq-removal assertion; one slot of headroom lowers the
-        # peak seq-management concurrency that triggers it. Capacity discovery
-        # still sees 4 slots. Override via this field if the backend is patched.
+        # llama.cpp KV-seq-removal assertion, so it's served --parallel 3; this
+        # cap (== max_slots) keeps the proven-safe 3-wide ceiling explicit.
         dispatch_concurrency_cap=3,
         # Reserve 1 slot for interactive/chat rounds; background (composer
-        # summaries + knowledge ingestion) uses the other 3. Mirrors the
+        # summaries + knowledge ingestion) uses the other 2. Mirrors the
         # thinker's fast_path_reserve pattern. background_floor_pct left at the
-        # default (0.20 → floor 1) so the floor never overrides the reserve:
-        # background_cap = max(floor, max_slots - reserve) = max(1, 3) = 3.
+        # default (0.20 → floor 1): background_cap = max(floor, max_slots -
+        # reserve) = max(1, 2) = 2.
         fast_path_reserve_slots=1,
         slot_affinity=True,
         host="10.0.0.6", port=8081,
@@ -278,8 +278,8 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         host="10.0.0.3", port=9084,
     ),
     "embed": EndpointConfig(
-        # anvil bge-m3 embed :9087 — n_ctx 8192/slot, 4 slots (CANONICAL
-        # fleet embed; nexus's local copy on :8091 is being removed).
+        # anvil bge-m3 embed :9087 — n_ctx 8192/slot, 4 slots (the CANONICAL
+        # fleet embed; the nexus CPU copy on :8091 was removed 2026-06-05).
         endpoint_class="embed", role="bge-m3-embed",
         max_slots=4, context_per_slot=8192,
         host="10.0.0.3", port=9087,
@@ -324,6 +324,79 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         backend_engine="vllm",
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Structured-output policy — the proxy-centralized "reason-then-constrain"
+# layer (CRANE-style). Per-call_site policy, applied IN the proxy and
+# transparent to callers (the proxy injects a leading free-text `reason` field
+# into the grammar on the way IN, and strips it on the way OUT, so the caller's
+# schema is unchanged). EVERYTHING SHIPS OFF (mode=OFF) — the transform is dead
+# until an operator flips a call_site to SHADOW/ACTIVE after the offline A/B in
+# a downtime window. See ~/.claude/plans/sparkling-petting-wilkinson.md.
+# ---------------------------------------------------------------------------
+
+from enum import Enum  # noqa: E402
+
+
+class StructMode(str, Enum):
+    OFF = "off"        # no transformation — fully transparent (the default)
+    SHADOW = "shadow"  # transform + egress-check + LOG discrepancies, but return
+                       # the baseline (untransformed) response — zero caller risk
+    ACTIVE = "active"  # transform + strip + return the transformed response
+
+
+class StructKind(str, Enum):
+    JUDGMENT = "judgment"      # consequential decision — gets reason-injection
+    EXTRACTION = "extraction"  # NER firehose — throughput-critical, NOT injected
+    TOOL_LOOP = "tool_loop"    # orchestrator inner loop — tool-format axis (deferred)
+
+
+class StructMechanism(str, Enum):
+    REASON_FIELD = "reason_field"  # Arm-1: in-schema leading reason field (validated)
+    # THINK_PARSER (Arm-2: native <think>/two-call) is DEFERRED — needs the
+    # offline decision-quality A/B before it can be wired/activated.
+
+
+@dataclass(frozen=True)
+class StructPolicy:
+    """Per-call_site structured-output policy. Frozen — edit the registry, not
+    instances. ``mode`` is the live switch; it ships OFF for every call_site."""
+    call_site: str
+    kind: StructKind
+    mode: StructMode = StructMode.OFF
+    mechanism: StructMechanism = StructMechanism.REASON_FIELD
+    reason_field: str = "reason"
+    # Bounded reason length for vLLM (guidance) backends. The proxy emits an
+    # UNBOUNDED rchar* on llama.cpp endpoints (b9357 rejects large {0,N}); see
+    # grammar.inject_reason_field. None here forces unbounded everywhere.
+    reason_max_chars: int | None = 400
+    # Bump the request's max_tokens by this much when injecting, so the added
+    # reason tokens never truncate the real payload (validated: +150 left a ~2-6%
+    # truncation tail at 800-budget proposal; +200 cleared it).
+    max_tokens_bump: int = 200
+
+
+# The consequential JUDGMENT grammars (call_site strings from the live queue.db).
+# ALL ship OFF. NOTE: verify each call_site string against the proxy queue.db
+# (proxy_completions.call_site) before flipping to SHADOW/ACTIVE — a wrong key
+# silently no-ops (stays OFF), which is safe but means the policy never applies.
+# proposal_emitter is queue-verified (1497 rows); the rest are inferred from the
+# grammar headers and are low-volume/monthly so scarce in the queue.
+STRUCTURED_OUTPUT_POLICY: dict[str, StructPolicy] = {
+    "forum-agent.proposal_emitter":             StructPolicy("forum-agent.proposal_emitter", StructKind.JUDGMENT),
+    "knowledge.dedup_check":                StructPolicy("knowledge.dedup_check", StructKind.JUDGMENT),
+    "knowledge.hygiene_monthly_merge":      StructPolicy("knowledge.hygiene_monthly_merge", StructKind.JUDGMENT),
+    "temporal.trip_resolve":                StructPolicy("temporal.trip_resolve", StructKind.JUDGMENT),
+    "temporal.trip_business_classify":      StructPolicy("temporal.trip_business_classify", StructKind.JUDGMENT),
+    "mail-agent.calendar_flight_extract": StructPolicy("mail-agent.calendar_flight_extract", StructKind.JUDGMENT),
+}
+
+
+def struct_policy_for(call_site: str) -> StructPolicy | None:
+    """The structured-output policy for a call_site, or None if unmanaged.
+    Returns None (→ no transformation) for everything not in the registry."""
+    return STRUCTURED_OUTPUT_POLICY.get(call_site)
 
 
 @dataclass

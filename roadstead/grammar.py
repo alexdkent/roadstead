@@ -29,6 +29,7 @@ this module agrees. Re-capture those fixtures on every llama.cpp upgrade.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -347,3 +348,171 @@ def normalize_and_validate(src: str) -> GrammarResult:
 
 def grammar_hash(src: str) -> str:
     return hashlib.sha256(src.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Reasoning-field injection — CRANE-style "reason-then-constrain".
+#
+# Grammars constrain decoding from token 0 (every root opens with `"{"`), which
+# forces the model to emit the decision field with ZERO reasoning tokens. For
+# consequential JUDGMENT grammars the structured-output policy layer prepends a
+# short free-text `reason` field as the FIRST object member so the model
+# reasons before it commits, then the proxy STRIPS the field on egress so the
+# caller's schema is unchanged. This is a pure transform; the proxy re-validates
+# the result with normalize_and_validate() and fails loud if anything is off.
+#
+# Backend tolerance: older llama.cpp (b9357-class — the anvil companion/gemma
+# llama-servers) silently drop grammars containing large bounded `{0,N}` string
+# repetitions (see agents/forum-agent/grammars/proposal.gbnf). vLLM's guidance
+# backend accepts them. So `max_chars=None` emits an UNBOUNDED `rchar*` for
+# llama.cpp endpoints; a bound is used for vLLM. The proxy picks per endpoint.
+# ---------------------------------------------------------------------------
+
+REASON_FIELD = "reason"
+REASON_MAX_CHARS = 400                # bounded default; well under MAX_REPETITION_THRESHOLD
+_REASON_RCHAR = r'[^"\\\x00-\x1f]'    # JSON-safe string char (matches the grammars' own `char`)
+
+
+@dataclass
+class InjectionResult:
+    grammar: str          # transformed grammar (or the original when not injected)
+    injected: bool        # False when the root is not an object (bare enum) or field present
+    field: str            # the injected field name (the egress layer strips this)
+
+
+def _free_rule_name(base: str, defined: set[str]) -> str:
+    """A rule name not already defined in the grammar (avoids collisions)."""
+    if base not in defined:
+        return base
+    i = 2
+    while f"{base}{i}" in defined:
+        i += 1
+    return f"{base}{i}"
+
+
+def inject_reason_field(
+    src: str,
+    field: str = REASON_FIELD,
+    max_chars: int | None = REASON_MAX_CHARS,
+) -> InjectionResult:
+    """Insert a leading free-text `field` as the FIRST member of an object-root
+    GBNF so the model reasons before the constrained decision.
+
+    Returns injected=False (original grammar untouched) when the root is not an
+    object (bare-enum grammars like classify_document), when the grammar has no
+    `root` rule, or when the field key is already present.
+
+    `max_chars=None` emits an UNBOUNDED string (`rchar*`) for backends that
+    reject large bounded repetitions; otherwise `rchar{0,max_chars}`.
+    """
+    if not isinstance(src, str) or "root" not in src:
+        return InjectionResult(src, False, field)
+
+    headers = list(_RULE_HEADER_RE.finditer(src))
+    root_h = next((h for h in headers if h.group(1) == "root"), None)
+    if root_h is None:
+        return InjectionResult(src, False, field)
+
+    ri = headers.index(root_h)
+    start = root_h.start()
+    end = headers[ri + 1].start() if ri + 1 < len(headers) else len(src)
+    block = src[start:end]
+    define_at = block.find("::=")
+    head, rhs = block[: define_at + 3], block[define_at + 3 :]
+
+    key_literal = '"\\"%s\\""' % field            # GBNF literal for the JSON key, e.g. "\"reason\""
+    if key_literal in rhs or '"{"' not in rhs:     # already present, or not an object root
+        return InjectionResult(src, False, field)
+
+    defined, _ = _defined_and_referenced(src)
+    sname = _free_rule_name("reasonstr", defined)
+    cname = _free_rule_name("rchar", defined)
+    wsx = "ws " if "ws" in defined else ""
+
+    # ` ws "<key>" ws ":" ws <reasonstr> ws ,` inserted right after the opening brace.
+    insertion = ' %s%s %s":" %s%s %s","' % (wsx, key_literal, wsx, wsx, sname, wsx)
+    new_rhs = rhs.replace('"{"', '"{"' + insertion, 1)
+    new_block = head + new_rhs
+
+    rep = "*" if max_chars is None else "{0,%d}" % max_chars
+    rules = '\n%s ::= "\\"" %s%s "\\""\n%s ::= %s\n' % (sname, cname, rep, cname, _REASON_RCHAR)
+
+    new_src = src[:start] + new_block + src[end:] + rules
+    return InjectionResult(new_src, True, field)
+
+
+def root_object_keys(src: str) -> list[str]:
+    """Ordered list of top-level JSON object keys the `root` rule emits
+    (best-effort: the `"\\"key\\""` string literals in the root RHS, in order).
+
+    Used by the egress double-check to confirm a stripped response carries only
+    the caller's original keys (no leaked `reason`/injected artifact), and by
+    tests to assert field ordering.
+    """
+    headers = list(_RULE_HEADER_RE.finditer(src))
+    root_h = next((h for h in headers if h.group(1) == "root"), None)
+    if root_h is None:
+        return []
+    ri = headers.index(root_h)
+    end = headers[ri + 1].start() if ri + 1 < len(headers) else len(src)
+    rhs = src[root_h.start():end].split("::=", 1)[-1]
+    keys: list[str] = []
+    for t in _tokenize(rhs):
+        if t.kind != "string":
+            continue
+        inner = t.text[1:-1]                       # strip surrounding GBNF quotes
+        # A JSON key literal looks like \"name\" or \"name\": (combined colon).
+        m = re.match(r'\\"([A-Za-z0-9_]+)\\"', inner)
+        if m:
+            keys.append(m.group(1))
+    return keys
+
+
+def strip_top_field(output: str, field: str) -> tuple[str, bool]:
+    """Remove a single top-level JSON field from a model output string (the
+    egress strip for the injected ``reason``). Returns (stripped_output,
+    removed). On JSON-parse failure or field-absent returns (output, False) —
+    the caller's verify_conformance then catches a genuinely malformed output."""
+    try:
+        obj = json.loads(output)
+    except Exception:
+        return output, False
+    if not isinstance(obj, dict) or field not in obj:
+        return output, False
+    obj.pop(field, None)
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False), True
+
+
+def verify_conformance(
+    output: str, grammar: str, *, forbid_field: str | None = None
+) -> tuple[bool, str]:
+    """Egress double-check: confirm a (stripped) model output conforms to the
+    caller's ORIGINAL grammar — best-effort, structural (NOT a full GBNF parse).
+
+    Catches the two failure modes the proxy layer must never pass through:
+    silent grammar-drop (non-JSON / markdown-fenced output) and a leaked
+    injected field. Checks, in order: (1) not markdown-fenced; (2) for an
+    object-root grammar, JSON-parses to a dict; (3) its top-level keys are a
+    subset of the keys the grammar's root can emit; (4) ``forbid_field`` absent.
+    Bare-enum / non-object roots only get the fence + forbid checks (we can't
+    structurally validate a bare token here). Returns (ok, reason)."""
+    s = (output or "").strip()
+    if s.startswith("`"):
+        return False, "markdown_fenced(grammar_not_enforced)"
+    keys = root_object_keys(grammar)
+    if not keys:
+        if forbid_field and forbid_field in s:
+            return False, f"forbidden_field_present:{forbid_field}"
+        return True, "ok_non_object_root"
+    try:
+        obj = json.loads(s)
+    except Exception as e:  # noqa: BLE001
+        return False, f"not_json:{type(e).__name__}"
+    if not isinstance(obj, dict):
+        return False, "not_object"
+    if forbid_field and forbid_field in obj:
+        return False, f"forbidden_field_present:{forbid_field}"
+    extra = set(obj.keys()) - set(keys)
+    if extra:
+        return False, f"unexpected_keys:{sorted(extra)}"
+    return True, "ok"
