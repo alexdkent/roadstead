@@ -104,44 +104,68 @@ class _ToolCallStreamSanitizer:
     of that value and drop anything after. The AI SDK marks the call finished on
     the first valid parse and ignores later deltas, so this matches its model.
 
-    THE FIX — the opencode-maintainer-recommended client behaviour, applied at
-    the proxy so we neither patch the (custom) GB10 vLLM nor give up MTP
-    throughput: never let a tool-call index reach the client until it has a
-    STRING name, and never let its arguments exceed one complete JSON value. Per
-    (choice, index) slot we track whether it's been OPENED with a name and the
-    argument text emitted so far; we BUFFER the args of a not-yet-named slot and
-    emit a proper opener once a name arrives; a slot that closes without ever
-    being named (the phantom) is silently dropped. Indices are NOT renumbered —
-    the AI SDK keys tool calls by ``id`` and uses the numeric index only as an
-    accumulation slot, so the hole left by a dropped phantom is never touched.
+    THIRD DEFECT (truncation — the residual leak this version closes). When a
+    big tool argument (a long ``bash`` command / heredoc) is cut off at
+    ``max_tokens`` mid-JSON-string, the arguments NEVER form a complete value AND
+    vLLM mislabels ``finish_reason`` as ``tool_calls`` (not ``length``) — so the
+    old per-fragment passthrough emitted broken JSON the client's ``JSON.parse``
+    then threw on (measured: 6/10 big-arg turns leaked through). No structural
+    recovery is possible — the data is genuinely incomplete.
+
+    THE FIX — buffer-then-emit-atomically, applied at the proxy so we neither
+    patch the (custom) GB10 vLLM nor give up MTP throughput. Per (choice, index)
+    slot we ACCUMULATE the argument fragments and emit NOTHING until the buffer
+    forms ONE complete JSON value; then we emit the whole call (string name +
+    complete args) in a single delta and ignore any trailing junk. A
+    truncated/partial/broken argument therefore never reaches the client. At the
+    finish chunk we finalize every still-pending slot for the choice: a named
+    slot with empty args is a legitimate no-arg call (emit ``{}``); a named slot
+    with INCOMPLETE args is truncated → dropped, and ``finish_reason`` is
+    relabeled ``length`` so the client retries instead of dispatching a
+    half-command; a name-less slot (the phantom) is dropped silently. Indices are
+    NOT renumbered — the AI SDK keys tool calls by ``id`` and uses the numeric
+    index only as an accumulation slot, so a dropped phantom's hole is harmless.
+    (Emitting a call atomically on completion rather than streaming arg fragments
+    is invisible to the AI SDK, which dispatches only once args parse anyway.)
 
     ``feed(data)`` takes one raw backend SSE ``data:`` payload and returns the
-    payload to emit. PURE PASS-THROUGH (the ORIGINAL string object, no parse)
-    for the >99% of chunks with no ``tool_calls``. Defensive: never raises — on
-    any malformed/odd shape it returns the original bytes.
+    payload to emit. PURE PASS-THROUGH (the ORIGINAL string object, no parse) for
+    the >99% of chunks with no ``tool_calls`` while no call is mid-accumulation.
+    Defensive: never raises — on any malformed/odd shape it returns the original
+    bytes.
     """
 
     def __init__(self) -> None:
-        # (choice_index, tool_index) -> {opened, id, type, buf, emitted, done}
+        # (choice_index, tool_index) -> {id, type, name, buf, done}
         self._slots: dict = {}
 
     @staticmethod
-    def _advance(emitted: str, frag: str):
-        """Append ``frag`` to the already-emitted args ``emitted`` and return
-        ``(delta_to_emit, total_emitted, done)``. If the combined text contains
-        a complete JSON value, ``delta`` is only the part of ``frag`` up to the
-        end of that value (trailing junk like an extra ``}`` is dropped) and
-        ``done`` is True; otherwise the whole ``frag`` passes through."""
-        whole = emitted + frag
+    def _complete_value(text: str):
+        """If ``text`` (leading whitespace allowed) begins with a COMPLETE JSON
+        value, return ``(value_str, True)`` — trimming any trailing junk such as
+        the extra ``}`` the parallel-call bug appends (``raw_decode`` correctly
+        ignores ``}`` inside string values). Else ``(None, False)``. An empty /
+        whitespace-only buffer is NOT complete (arguments may still be
+        streaming)."""
+        if text.strip() == "":
+            return None, False
         try:
-            _, end = json.JSONDecoder().raw_decode(whole)
+            _, end = json.JSONDecoder().raw_decode(text)
         except ValueError:
-            return frag, whole, False          # not a complete value yet
-        total = whole[:end]
-        return total[len(emitted):], total, True
+            return None, False
+        return text[:end], True
+
+    def _pending(self) -> bool:
+        """True while any slot is still accumulating — so the finish chunk and
+        intervening content chunks get inspected to finalize. False in the
+        steady state, which keeps ``feed`` a pure pass-through."""
+        return any(not st["done"] for st in self._slots.values())
 
     def feed(self, data: str) -> str:
-        if '"tool_calls"' not in data:
+        # Fast path: only engage when this chunk carries tool_calls OR a call is
+        # mid-accumulation (then we must watch for its completion + the finish
+        # chunk). >99% of chunks short-circuit here untouched (original object).
+        if '"tool_calls"' not in data and not self._pending():
             return data
         try:
             obj = json.loads(data)
@@ -151,70 +175,80 @@ class _ToolCallStreamSanitizer:
             for ch in (obj.get("choices") or []):
                 if not isinstance(ch, dict):
                     continue
-                delta = ch.get("delta")
-                if not isinstance(delta, dict):
-                    continue
-                tcs = delta.get("tool_calls")
-                if not isinstance(tcs, list):
-                    continue
                 ci = ch.get("index", 0)
-                kept: list = []
-                for tc in tcs:
-                    if not isinstance(tc, dict):
-                        kept.append(tc)
-                        continue
-                    changed = True  # a tool_calls chunk is always re-serialized
-                    idx = tc.get("index")
-                    st = self._slots.get((ci, idx))
-                    if st is None:
-                        st = {"opened": False, "id": None, "type": None,
-                              "buf": "", "emitted": "", "done": False}
-                        self._slots[(ci, idx)] = st
-                    if st["id"] is None and isinstance(tc.get("id"), str):
-                        st["id"] = tc["id"]
-                    if st["type"] is None and isinstance(tc.get("type"), str):
-                        st["type"] = tc["type"]
-                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-                    rn = fn.get("name")
-                    name = rn if (isinstance(rn, str) and rn != "") else None
-                    ra = fn.get("arguments")
-                    args = ra if isinstance(ra, str) else ""
-                    if st["done"]:
-                        # Arguments already a complete JSON value — drop trailing
-                        # junk (the AI SDK ignores it too, via hasFinished).
-                        continue
-                    if st["opened"]:
-                        # Continuation — emit only the argument increment, trimmed
-                        # at the end of the first complete JSON value.
-                        if args:
-                            d, st["emitted"], st["done"] = self._advance(st["emitted"], args)
-                            if d:
-                                kept.append({"index": idx,
-                                             "function": {"arguments": d}})
-                        continue
-                    if name is not None:
-                        # Open the slot, merging any buffered pre-name args and
-                        # trimming if they already form a complete value.
-                        oargs, st["emitted"], st["done"] = self._advance("", st["buf"] + args)
-                        kept.append({
-                            "index": idx,
-                            "id": st["id"] or tc.get("id"),
-                            "type": st["type"] or "function",
-                            "function": {"name": name, "arguments": oargs},
-                        })
-                        st["opened"] = True
-                        st["buf"] = ""
-                    elif args:
-                        # Name-less and not yet opened: hold args until a name
-                        # arrives (a pure phantom has none → nothing held, and
-                        # the slot is dropped when the stream ends).
-                        st["buf"] += args
-                    # else: name-less, no args → phantom; emit nothing.
-                if changed:
-                    if kept:
-                        delta["tool_calls"] = kept
+                delta = ch.get("delta") if isinstance(ch.get("delta"), dict) else None
+                emit: list = []  # (idx, slot, args) — calls to emit on THIS chunk
+
+                # 1) Buffer tool-call fragments per slot. Emit NOTHING until a
+                #    slot's arguments form a COMPLETE JSON value, then emit the
+                #    whole call (name + complete args) atomically. A partial /
+                #    truncated / broken-JSON argument therefore NEVER reaches the
+                #    client (defect B: vLLM truncates big args mid-string and
+                #    mislabels finish_reason as tool_calls).
+                if delta is not None and isinstance(delta.get("tool_calls"), list):
+                    changed = True  # a tool_calls chunk is always rebuilt
+                    for tc in delta["tool_calls"]:
+                        if not isinstance(tc, dict):
+                            continue
+                        idx = tc.get("index")
+                        st = self._slots.get((ci, idx))
+                        if st is None:
+                            st = {"id": None, "type": None, "name": None,
+                                  "buf": "", "done": False}
+                            self._slots[(ci, idx)] = st
+                        if st["id"] is None and isinstance(tc.get("id"), str):
+                            st["id"] = tc["id"]
+                        if st["type"] is None and isinstance(tc.get("type"), str):
+                            st["type"] = tc["type"]
+                        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                        rn = fn.get("name")
+                        if st["name"] is None and isinstance(rn, str) and rn != "":
+                            st["name"] = rn
+                        ra = fn.get("arguments")
+                        if isinstance(ra, str):
+                            st["buf"] += ra
+                        if st["done"] or st["name"] is None:
+                            continue  # phantom (no name) or already emitted
+                        args, ok = self._complete_value(st["buf"])
+                        if ok:
+                            emit.append((idx, st, args))
+                            st["done"] = True
+
+                # 2) On the finish chunk, finalize every still-pending slot for
+                #    this choice: a named slot with NO args is a legitimate
+                #    no-arg call (emit "{}"); a named slot with INCOMPLETE args is
+                #    TRUNCATED — drop it and relabel finish_reason to "length" so
+                #    the client retries instead of dispatching a half-command or
+                #    throwing on broken JSON; a name-less slot is a phantom (vLLM
+                #    #39584) — drop it silently.
+                fr = ch.get("finish_reason")
+                if fr is not None:
+                    truncated = False
+                    for (cci, sidx), st in self._slots.items():
+                        if cci != ci or st["done"]:
+                            continue
+                        if st["name"] is not None and st["buf"].strip() == "":
+                            emit.append((sidx, st, "{}"))
+                        elif st["name"] is not None:
+                            truncated = True
+                        st["done"] = True
+                    if truncated and fr in ("tool_calls", "stop"):
+                        ch["finish_reason"] = "length"
+                        changed = True
+
+                # 3) Rebuild this choice's tool_calls delta from completed calls.
+                if delta is not None and ("tool_calls" in delta or emit):
+                    if emit:
+                        delta["tool_calls"] = [
+                            {"index": eidx, "id": est["id"],
+                             "type": est["type"] or "function",
+                             "function": {"name": est["name"], "arguments": eargs}}
+                            for (eidx, est, eargs) in emit
+                        ]
+                        changed = True
                     elif "tool_calls" in delta:
                         del delta["tool_calls"]
+                        changed = True
             return json.dumps(obj) if changed else data
         except Exception:  # noqa: BLE001 — a sanitizer bug must not break the stream
             return data
