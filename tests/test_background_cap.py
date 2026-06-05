@@ -59,14 +59,17 @@ def test_no_endpoint_floor_starves_interactive():
 
 def test_companion_dispatch_concurrency_cap():
     """G1 (2026-06-01): the companion is concurrency-fragile (a llama.cpp
-    KV-seq-removal assertion aborted it under full 4-slot pressure), so it runs
-    capped at 3 of 4 physical slots. effective_max_slots applies the cap;
-    capacity (max_slots) stays 4 for discovery/reporting; the interactive
-    reserve is preserved (background cap = 3 - 1 = 2)."""
+    KV-seq-removal assertion aborted it under full pressure), so the 3-wide
+    ceiling is kept explicit via dispatch_concurrency_cap.
+
+    2026-06-05 (1ca82e2f): companion was downsized from 4×98304 to --parallel 3
+    (3×32768) to free nexus memory for Chatterbox Turbo TTS, so the PHYSICAL
+    slot count is now 3 — cap == max_slots. effective_max_slots == 3; the
+    interactive reserve is preserved (background cap = 3 - 1 = 2)."""
     comp = DEFAULT_ENDPOINTS["companion"]
-    assert comp.max_slots == 4               # physical, discovered
+    assert comp.max_slots == 3               # physical (downsized 2026-06-05)
     assert comp.dispatch_concurrency_cap == 3
-    assert comp.effective_max_slots == 3     # dispatch ceiling
+    assert comp.effective_max_slots == 3     # dispatch ceiling (== physical now)
     assert comp.background_cap_slots == 2    # leaves 1 for interactive
     # An uncapped endpoint is unaffected: effective == physical.
     thinker = DEFAULT_ENDPOINTS["thinker"]
