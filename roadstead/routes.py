@@ -107,6 +107,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_series(request: Request) -> Response:
         return await svc.handle_series(request)
 
+    async def handle_inflight(request: Request) -> Response:
+        return await svc.handle_inflight(request)
+
     return [
         Route("/v1/submit", handle_submit, methods=["POST"]),
         Route("/v1/chat/completions", handle_chat_completions, methods=["POST"]),
@@ -117,6 +120,7 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         Route("/v1/metrics/cost-model", handle_cost_model, methods=["GET"]),
         Route("/v1/history", handle_history, methods=["GET"]),
         Route("/v1/recent", handle_recent, methods=["GET"]),
+        Route("/v1/inflight", handle_inflight, methods=["GET"]),
         Route("/v1/timeout-advice", handle_timeout_advice, methods=["GET"]),
         Route("/v1/timeout-advice/shadow-report", handle_timeout_shadow_report, methods=["GET"]),
         Route("/v1/timeouts", handle_timeouts_report, methods=["GET"]),

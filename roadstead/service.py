@@ -387,6 +387,7 @@ class ProxyService:
                                             # shutdown drain deadline
         self._scheduler_task: asyncio.Task | None = None
         self._poller_task: asyncio.Task | None = None
+        self._inflight_task: asyncio.Task | None = None
         self._started_at = time.monotonic()
 
     # ----- lifecycle -----
@@ -481,6 +482,7 @@ class ProxyService:
         # Start background loops
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
         self._poller_task = asyncio.create_task(self._capacity_poller_loop())
+        self._inflight_task = asyncio.create_task(self._inflight_stream_loop())
 
         logger.info(
             "llmproxy started: %d endpoints, %d total slots",
@@ -578,6 +580,8 @@ class ProxyService:
                         len([t for t in pending if not t.done()]))
         if self._poller_task:
             self._poller_task.cancel()
+        if self._inflight_task:
+            self._inflight_task.cancel()
         # Persist DRR balances so fairness survives the restart (Phase 3.4); the
         # writer flushes this during close().
         try:
@@ -1610,6 +1614,17 @@ class ProxyService:
         rows = self._queue_db.recent_requests(limit)
         return JSONResponse({"requests": rows})
 
+    # ----- handler: live in-flight (what's executing right now) -----
+
+    async def handle_inflight(self, request: Request) -> Response:
+        """Live list of currently-executing requests + per-endpoint occupancy —
+        the proxy is the dispatch authority, so this is the authoritative
+        real-time "what's flowing through the LLM systems" view. Pure in-memory
+        snapshot; also pushed via the SSE `inflight` frame for sub-second feel."""
+        snap = self._scheduler.inflight_snapshot(time.monotonic())
+        snap["ts"] = time.time()
+        return JSONResponse(snap)
+
     # ----- handler: timeout advice -----
 
     async def handle_timeout_advice(self, request: Request) -> Response:
@@ -1746,6 +1761,26 @@ class ProxyService:
             )
 
         self._queue_db.persist_dispatch(req.request_id)
+
+        # Real-time fan-out — a request just started executing. Lets /v1/stream
+        # subscribers render the live in-flight board the instant work begins
+        # (the `call.completed` event later removes it). Synchronous + no-op when
+        # no clients; guarded so a fault never disturbs the dispatch path.
+        try:
+            self._sse.publish("call.dispatched", {
+                "request_id": req.request_id,
+                "agent": req.agent_id,
+                "endpoint": req.endpoint,
+                "call_site": req.call_site,
+                "priority": req.priority.name,
+                "band": req.band.name.lower(),
+                "input_tokens": req.est_input_tokens,
+                "estimated_remaining_s": round(req.estimated_cost_ss, 2),
+                "queue_wait_ms": round(decision.queue_wait_ms, 1),
+                "ts": time.time(),
+            })
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sse call.dispatched publish failed for %s: %s", req.request_id, exc)
 
         t0 = time.monotonic()
         try:
@@ -2526,6 +2561,27 @@ class ProxyService:
             except asyncio.QueueFull:
                 pass
         self._queue_db.persist_expire(req.request_id)
+
+    # ----- live in-flight streamer -----
+
+    async def _inflight_stream_loop(self) -> None:
+        """Fast SSE `inflight` frame so /v1/stream subscribers see what's
+        executing right now in (near) real time. The instant signals are the
+        per-request `call.dispatched`/`call.completed` events; this periodic
+        snapshot reconciles missed events and refreshes elapsed/queue/occupancy.
+        Cheap + gated on client_count (no work when nobody's watching), so it
+        never touches the dispatch hot path."""
+        while True:
+            try:
+                if self._sse.client_count:
+                    snap = self._scheduler.inflight_snapshot(time.monotonic())
+                    snap["ts"] = time.time()
+                    self._sse.publish("inflight", snap)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("sse inflight publish failed: %s", exc)
+            await asyncio.sleep(self._config.inflight_stream_interval_s)
 
     # ----- capacity poller -----
 

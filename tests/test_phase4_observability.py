@@ -86,3 +86,19 @@ async def test_stream_done_event_has_ttft():
         assert "ttft_ms" in done[0] and done[0]["ttft_ms"] >= 0
     finally:
         await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_inflight_handler_shape():
+    """GET /v1/inflight returns the live-board shape (requests + per-endpoint)
+    even when nothing is executing. No startup needed — it's a pure in-memory
+    read off the scheduler."""
+    svc = ProxyService(ProxyConfig())
+    resp = await svc.handle_inflight(_FakeRequest())
+    body = json.loads(resp.body)
+    assert body["requests"] == []
+    assert isinstance(body["per_endpoint"], dict) and body["per_endpoint"]
+    # every configured endpoint reports its slot/queue shape
+    for ep, snap in body["per_endpoint"].items():
+        assert set(snap) >= {"max_slots", "in_flight", "queued", "queue_by_band"}
+    assert "ts" in body

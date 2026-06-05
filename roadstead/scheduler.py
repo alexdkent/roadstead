@@ -49,6 +49,7 @@ class QueuedRequest:
     timeout_deadline: float    # monotonic deadline
     enqueued_at: float         # monotonic timestamp
     estimated_cost_ss: float = 0.0
+    est_input_tokens: int = 0  # cached at enqueue (context size) for the live in-flight view
     session_id: str | None = None
     turn_id: str | None = None
     caller_id: str | None = None
@@ -279,6 +280,7 @@ class Scheduler:
 
         # Estimate cost
         input_tokens = estimate_input_tokens(req.payload)
+        req.est_input_tokens = input_tokens  # cache for the live in-flight view (context size)
         max_output = req.payload.get("max_tokens", 256)
         occupancy = len(self._active.get(ep, {}))
         req.estimated_cost_ss = self._cost.estimate_cost(
@@ -392,6 +394,35 @@ class Scheduler:
             "queue_by_band": {
                 b.name.lower(): eq.band_depth(b) if eq else 0
                 for b in PriorityBand
+            },
+        }
+
+    def inflight_snapshot(self, now: float) -> dict:
+        """Live snapshot of every in-flight (dispatched, not-yet-completed)
+        request plus per-endpoint occupancy/queue state. Pure in-memory read —
+        safe to call on a fast cadence (powers GET /v1/inflight + the SSE
+        `inflight` frame). `now` is a monotonic timestamp (matches
+        ActiveRequest.dispatched_at) for the elapsed computation."""
+        requests: list[dict] = []
+        for ep, active_map in self._active.items():
+            for ar in active_map.values():
+                req = ar.request
+                requests.append({
+                    "request_id": req.request_id,
+                    "endpoint": ep,
+                    "agent": req.agent_id,
+                    "call_site": req.call_site,
+                    "priority": req.priority.name,
+                    "band": req.band.name.lower(),
+                    "input_tokens": req.est_input_tokens,
+                    "elapsed_s": round(max(0.0, now - ar.dispatched_at), 2),
+                    "estimated_remaining_s": round(ar.estimated_remaining_s, 2),
+                })
+        requests.sort(key=lambda r: r["elapsed_s"], reverse=True)
+        return {
+            "requests": requests,
+            "per_endpoint": {
+                ep: self.endpoint_snapshot(ep) for ep in self._config.endpoints
             },
         }
 

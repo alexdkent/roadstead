@@ -333,3 +333,50 @@ class TestQueueWaitMetrics:
         assert len(decisions) == 1
         assert decisions[0].queue_wait_ms >= 45  # ~50ms wait
         assert decisions[0].queue_wait_ms <= 60
+
+
+class TestInflightSnapshot:
+    def test_enqueue_caches_input_tokens(self):
+        sched, *_ = _make_scheduler()
+        req = _req(agent_id="agent_a")
+        sched.enqueue(req)
+        # est_input_tokens cached at enqueue (powers the live in-flight context size)
+        assert req.est_input_tokens > 0
+
+    def test_inflight_snapshot_lists_dispatched_requests(self):
+        sched, *_ = _make_scheduler()
+        now = time.monotonic()
+        req = _req(agent_id="agent_a", endpoint="qwen-analyst", now=now)
+        sched.enqueue(req)
+        # Not yet dispatched → not in-flight.
+        assert sched.inflight_snapshot(now)["requests"] == []
+
+        sched.tick(now + 0.01)  # dispatch
+        snap = sched.inflight_snapshot(now + 1.0)
+        reqs = snap["requests"]
+        assert len(reqs) == 1
+        row = reqs[0]
+        assert row["request_id"] == req.request_id
+        assert row["endpoint"] == "chat"        # qwen-analyst normalizes to the chat class
+        assert row["agent"] == "agent_a"
+        assert row["input_tokens"] > 0          # context size flowing through
+        assert 0.9 <= row["elapsed_s"] <= 1.2   # ~1s since dispatch
+        assert snap["per_endpoint"]["chat"]["in_flight"] == 1
+
+    def test_inflight_snapshot_drops_completed(self):
+        sched, *_ = _make_scheduler()
+        now = time.monotonic()
+        req = _req(agent_id="agent_a", endpoint="qwen-analyst", now=now)
+        sched.enqueue(req)
+        sched.tick(now + 0.01)
+        assert len(sched.inflight_snapshot(now)["requests"]) == 1
+
+        sched.complete(
+            CompletionRecord(
+                request_id=req.request_id, duration_s=0.5,
+                input_tokens=10, output_tokens=20, success=True, occupancy_during=1,
+            ),
+            now + 0.5,
+        )
+        assert sched.inflight_snapshot(now + 0.6)["requests"] == []
+        assert sched.inflight_snapshot(now + 0.6)["per_endpoint"]["chat"]["in_flight"] == 0

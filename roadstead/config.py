@@ -442,6 +442,18 @@ def thinking_reasoning_budget() -> int:
         return 8000
 
 
+def _inflight_stream_interval_s() -> float:
+    """Cadence of the SSE ``inflight`` reconcile frame that powers the live
+    in-flight board. The instant ``call.dispatched``/``call.completed`` events do
+    the real work; this just refreshes elapsed/queue/occupancy and recovers any
+    missed event. Gated on connected clients (free when nobody's watching). Env
+    override ``COLLECTIVE_PROXY_INFLIGHT_INTERVAL_S`` (clamped ≥0.25s)."""
+    try:
+        return max(0.25, float(os.environ.get("COLLECTIVE_PROXY_INFLIGHT_INTERVAL_S", "1.5")))
+    except ValueError:
+        return 1.5
+
+
 @dataclass
 class ProxyConfig:
     """Top-level proxy configuration."""
@@ -450,6 +462,8 @@ class ProxyConfig:
     agents: dict[str, AgentQuotaConfig] = field(default_factory=dict)
     starvation_timeout_s: float = 30.0
     drr_tick_interval_s: float = 0.01
+    # Live in-flight SSE frame cadence (see _inflight_stream_interval_s).
+    inflight_stream_interval_s: float = field(default_factory=_inflight_stream_interval_s)
     queue_db_path: str = ""
     stats_db_path: str = ""
     request_log_path: str = ""
