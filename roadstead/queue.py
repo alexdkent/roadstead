@@ -139,6 +139,15 @@ class PersistentQueue:
         self._db_path = str(db_path) if db_path else ""
         self._conn: sqlite3.Connection | None = None
         self._read_conn: sqlite3.Connection | None = None
+        # Off-loop dashboard reads (§5c): heavy GROUP-BY aggregations over the
+        # whole-fleet completions table run via asyncio.to_thread so they never
+        # block the event loop that schedules all fleet LLM traffic. A sqlite
+        # connection can't be shared across threads, so each pool thread gets
+        # its OWN read connection here (WAL permits concurrent readers). The
+        # loop thread keeps using _read_conn; the single-WRITER-thread invariant
+        # is untouched — these are read-only.
+        self._tlocal = threading.local()
+        self._loop_thread: threading.Thread | None = None
         self._write_q: "_queue.Queue | None" = None
         self._writer: threading.Thread | None = None
         # Phase 5B.3 writer-thread hardening:
@@ -246,6 +255,9 @@ class PersistentQueue:
         except Exception as exc:  # noqa: BLE001
             logger.warning("read connection open failed (%s); reads use writer conn", exc)
             self._read_conn = None
+        # Record the loop thread so _reader() can hand off-loop (to_thread)
+        # dashboard reads their own per-thread connection (§5c).
+        self._loop_thread = threading.current_thread()
         # Bounded (Phase 5B.3): an unbounded queue grows without limit if the
         # writer falls behind; 20k is far above any real burst (the writer keeps
         # the queue near-empty under normal load), so hitting the cap means
@@ -376,9 +388,25 @@ class PersistentQueue:
         return self._write_q_dropped
 
     def _reader(self) -> "sqlite3.Connection | None":
-        """Connection for read queries: the read-only conn on the loop thread,
-        falling back to the write conn (pre-writer / if RO open failed)."""
-        return self._read_conn or self._conn
+        """Connection for read queries.
+
+        Loop thread (and the pre-writer single-threaded window): the dedicated
+        read-only conn, falling back to the write conn. Off-loop pool threads
+        (dashboard aggregations dispatched via ``asyncio.to_thread``, §5c): a
+        per-thread connection — a sqlite connection can't be shared across
+        threads, and WAL permits concurrent readers. Read-only, so the
+        single-WRITER-thread invariant is preserved."""
+        rconn = self._read_conn or self._conn
+        lt = self._loop_thread
+        if lt is None or threading.current_thread() is lt:
+            return rconn
+        conn = getattr(self._tlocal, "conn", None)
+        if conn is None and self._db_path:
+            conn = sqlite3.connect(
+                self._db_path, isolation_level=None, check_same_thread=False)
+            conn.execute("PRAGMA busy_timeout=2500")
+            self._tlocal.conn = conn
+        return conn or rconn
 
     def wal_size_bytes(self) -> int:
         """Size of the WAL sidecar in bytes (0 if absent) — for the wal_growth
@@ -629,9 +657,6 @@ class PersistentQueue:
             "DELETE FROM proxy_queue WHERE request_id=?",
             (request_id,),
         )
-
-    def persist_cancel(self, request_id: str) -> None:
-        self.persist_expire(request_id)
 
     # ----- budget persistence -----
 
@@ -1110,29 +1135,6 @@ class PersistentQueue:
 
     # ----- query (for simulation / observability) -----
 
-    def recent_completions(self, hours: float = 4.0) -> list[dict]:
-        """Return recent completions for simulation replay."""
-        if not self._conn:
-            return []
-        cutoff = time.time() - (hours * 3600)
-        rows = self._reader().execute(
-            "SELECT request_id, agent_id, endpoint, call_site, priority, "
-            "       input_tokens, output_tokens, duration_s, queue_wait_ms, "
-            "       status, completed_at "
-            "FROM proxy_completions WHERE completed_at >= ? "
-            "ORDER BY completed_at",
-            (cutoff,),
-        ).fetchall()
-        return [
-            {
-                "request_id": r[0], "agent_id": r[1], "endpoint": r[2],
-                "call_site": r[3], "priority": r[4], "input_tokens": r[5],
-                "output_tokens": r[6], "duration_s": r[7],
-                "queue_wait_ms": r[8], "status": r[9], "completed_at": r[10],
-            }
-            for r in rows
-        ]
-
     def timeout_samples(self, hours: float = 168.0) -> list[dict]:
         """Successful completions for bootstrapping the timeout model.
 
@@ -1187,26 +1189,52 @@ class PersistentQueue:
             g["would_timeout"] += int(wt or 0)
             g["sources"][source] = g["sources"].get(source, 0) + 1
 
+        # Survivorship-bias fix (2026-06-06): the shadow log only records
+        # status==ok completions, so ``would_timeout`` is computed over
+        # survivors and reads a misleading ~0 even while requests are actually
+        # timing out. Join in the ACTUAL timeout counts (the censored samples)
+        # from proxy_timeouts for the same window so the report is honest.
+        actual_to: dict[tuple[str, int], int] = {}
+        for ep, pri, cnt in self._reader().execute(
+            "SELECT endpoint, priority, COUNT(*) FROM proxy_timeouts "
+            "WHERE occurred_at >= ? GROUP BY endpoint, priority",
+            (cutoff,),
+        ).fetchall():
+            actual_to[(ep, pri)] = cnt
+
         out: list[dict] = []
-        for (ep, pri), g in groups.items():
-            n = len(g["actual"])
-            actual = sorted(g["actual"])
-            rec = sorted(g["recommended"])
-            head = sorted(g["headroom"])
-            out.append({
+        for key in set(groups) | set(actual_to):
+            ep, pri = key
+            g = groups.get(key)
+            n_to = actual_to.get(key, 0)
+            n = len(g["actual"]) if g else 0
+            # observed_timeout_rate counts the censored timeouts in the
+            # denominator (completions + timeouts) — the true rate, vs the
+            # survivor-only would_timeout_rate.
+            denom = n + n_to
+            row = {
                 "endpoint": ep,
                 "priority": pri,
                 "samples": n,
-                "would_timeout": g["would_timeout"],
+                "actual_timeouts": n_to,
+                "would_timeout": g["would_timeout"] if g else 0,
                 "would_timeout_rate": round(g["would_timeout"] / n, 4) if n else 0.0,
-                "recommended_ms_p50": round(percentile(rec, 50), 1),
-                "recommended_ms_p95": round(percentile(rec, 95), 1),
-                "actual_total_ms_p50": round(percentile(actual, 50), 1),
-                "actual_total_ms_p95": round(percentile(actual, 95), 1),
-                "headroom_vs_applied_ms_p50": round(percentile(head, 50), 1),
-                "headroom_vs_applied_ms_p95": round(percentile(head, 95), 1),
-                "sources": g["sources"],
-            })
+                "observed_timeout_rate": round(n_to / denom, 4) if denom else 0.0,
+            }
+            if g:
+                rec = sorted(g["recommended"])
+                actual = sorted(g["actual"])
+                head = sorted(g["headroom"])
+                row.update({
+                    "recommended_ms_p50": round(percentile(rec, 50), 1),
+                    "recommended_ms_p95": round(percentile(rec, 95), 1),
+                    "actual_total_ms_p50": round(percentile(actual, 50), 1),
+                    "actual_total_ms_p95": round(percentile(actual, 95), 1),
+                    "headroom_vs_applied_ms_p50": round(percentile(head, 50), 1),
+                    "headroom_vs_applied_ms_p95": round(percentile(head, 95), 1),
+                    "sources": g["sources"],
+                })
+            out.append(row)
         out.sort(key=lambda r: (r["endpoint"], r["priority"]))
         return out
 

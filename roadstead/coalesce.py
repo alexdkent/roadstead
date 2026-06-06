@@ -97,10 +97,6 @@ class DeterministicCache:
     def size(self) -> int:
         return len(self._cache)
 
-    @property
-    def evictions_approx(self) -> int:
-        return max(0, self._hits + self._misses - self._max_size)
-
     def stats(self) -> dict:
         return {
             "hit_rate_pct": round(self.hit_rate_pct, 1),

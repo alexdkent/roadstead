@@ -71,6 +71,15 @@ _DEFAULT_TIMEOUT_S = 180.0
 # caller's own deadline so a legitimately short request isn't over-waited.
 _STREAM_TTFT_DEADLINE_S = 30.0
 
+# Inter-token no-progress watchdog (stall resilience, 2026-06-06). The TTFT
+# bound above guards only the FIRST token; a backend that streams a few tokens
+# then STALLS mid-generation (observed during the thinker contention episode:
+# generation throughput collapsing to ~0 tok/s with the request resident) would
+# still burn the rest of the SLA. Each token resets this gap deadline (bounded
+# by the caller's remaining SLA), so a mid-stream stall aborts in ~this many
+# seconds and frees the slot with a deferrable error instead of hanging to 180s.
+_STREAM_INTERTOKEN_GAP_S = 30.0
+
 
 class _ToolCallStreamSanitizer:
     """Per-stream sanitizer that makes vLLM ``qwen3_xml`` streaming tool-call
@@ -307,6 +316,24 @@ def _bin_seconds_for(window_s: int) -> int:
     if window_s <= 86400:
         return 600
     return 3600
+
+
+def _to_int(value: object, default: int) -> int:
+    """Parse a query-param / body field to int, falling back to ``default``
+    on anything malformed — so a bad ``?bin=abc`` uses the default instead of
+    escaping as an unhandled 500 from these read-only/best-effort handlers."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(value: object, default: float) -> float:
+    """Float counterpart to ``_to_int`` — default on malformed input."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
 
 class ProxyService:
@@ -679,6 +706,18 @@ class ProxyService:
 
         now = time.monotonic()
 
+        # Robust timeout_s: a malformed value must default, not 500 the request.
+        # (priority is soft-defaulted inside QueuedRequest.create; payload/
+        # endpoint/call_site already use safe .get defaults.)
+        try:
+            timeout_s = float(body.get("timeout_s", _DEFAULT_TIMEOUT_S))
+            if not (timeout_s > 0) or timeout_s != timeout_s:  # non-positive / NaN
+                raise ValueError("timeout_s must be a positive number")
+        except (TypeError, ValueError) as exc:
+            logger.warning("submit: bad timeout_s %r (%s); using default %.0fs",
+                           body.get("timeout_s"), exc, _DEFAULT_TIMEOUT_S)
+            timeout_s = _DEFAULT_TIMEOUT_S
+
         req = QueuedRequest.create(
             agent_id=body.get("agent_id", "unknown"),
             endpoint=self._resolve_endpoint(body),
@@ -686,7 +725,7 @@ class ProxyService:
             call_site=body.get("call_site", "unknown"),
             payload_type=body.get("payload_type", "chat_completion"),
             payload=body.get("payload", {}),
-            timeout_s=float(body.get("timeout_s", _DEFAULT_TIMEOUT_S)),
+            timeout_s=timeout_s,
             session_id=body.get("session_id"),
             turn_id=body.get("turn_id"),
             caller_id=body.get("caller_id"),
@@ -1382,6 +1421,13 @@ class ProxyService:
             h = self._endpoint_health.get(ep_name, {})
             snap["healthy"] = h.get("healthy", True)
             snap["paused"] = not h.get("healthy", True)  # check_alerts (Phase 2.5) keys on this
+            # Survivorship fix (2026-06-06): the timeout-advice model + shadow
+            # only ingest status==ok, so they reported a misleading "0 would
+            # timeout" while requests were actually timing out. Surface the real
+            # 5-min timeout count per endpoint so a partial stall is VISIBLE
+            # (feeds the endpoint_stalled alert + health-verifier/dashboards).
+            snap["recent_timeouts"] = self._metrics.count(
+                endpoint=ep_name, status="timeout", now=now)
             endpoints[ep_name] = snap
 
         agents = {
@@ -1510,28 +1556,34 @@ class ProxyService:
 
     async def handle_fleet_activity(self, request: Request) -> Response:
         window_s = _clamp_window(request.query_params.get("window", "24h"), 86400)
-        bin_s = int(request.query_params.get("bin", _bin_seconds_for(window_s)))
-        return JSONResponse(self._queue_db.fleet_activity(window_s, bin_s))
+        bin_s = _to_int(request.query_params.get("bin"), _bin_seconds_for(window_s))
+        # §5c: heavy GROUP-BY over the whole-fleet completions table runs off the
+        # event loop so it can't stall fleet LLM scheduling under a hot dashboard.
+        data = await asyncio.to_thread(self._queue_db.fleet_activity, window_s, bin_s)
+        return JSONResponse(data)
 
     async def handle_fleet_savings(self, request: Request) -> Response:
         since_q = request.query_params.get("since")
         today_start = float(since_q) if since_q and since_q.isdigit() else None
-        return JSONResponse(self._queue_db.savings_summary(today_start))
+        data = await asyncio.to_thread(self._queue_db.savings_summary, today_start)
+        return JSONResponse(data)
 
     async def handle_top_callers(self, request: Request) -> Response:
         window_s = _clamp_window(request.query_params.get("window", "1h"), 3600)
-        per_endpoint = max(1, min(int(request.query_params.get("per_endpoint", "5")), 20))
-        return JSONResponse(self._queue_db.top_callers(window_s, per_endpoint))
+        per_endpoint = max(1, min(_to_int(request.query_params.get("per_endpoint"), 5), 20))
+        data = await asyncio.to_thread(self._queue_db.top_callers, window_s, per_endpoint)
+        return JSONResponse(data)
 
     async def handle_usage(self, request: Request) -> Response:
         dimension = request.query_params.get("by", "agent")
         if dimension not in ("agent", "call_site", "endpoint", "provider"):
             dimension = "agent"
-        hours = min(float(request.query_params.get("hours", "24")), 168)
+        hours = min(_to_float(request.query_params.get("hours"), 24), 168)
+        rows = await asyncio.to_thread(self._queue_db.usage_rollup, dimension, hours)
         return JSONResponse({
             "dimension": dimension,
             "hours": hours,
-            "rows": self._queue_db.usage_rollup(dimension, hours),
+            "rows": rows,
         })
 
     async def handle_series(self, request: Request) -> Response:
@@ -1539,8 +1591,10 @@ class ProxyService:
         if not endpoint:
             return JSONResponse({"error": "endpoint query param required"}, status_code=400)
         window_s = _clamp_window(request.query_params.get("window", "24h"), 86400)
-        bin_s = int(request.query_params.get("bin", _bin_seconds_for(window_s)))
-        return JSONResponse(self._queue_db.endpoint_series(endpoint, window_s, bin_s))
+        bin_s = _to_int(request.query_params.get("bin"), _bin_seconds_for(window_s))
+        data = await asyncio.to_thread(
+            self._queue_db.endpoint_series, endpoint, window_s, bin_s)
+        return JSONResponse(data)
 
     # ----- handler: calls ingest (non-LLM fleet calls) -----
 
@@ -1568,10 +1622,10 @@ class ProxyService:
                 status_code=409)
         status = str(body.get("status") or ("ok" if body.get("success", True) else "error"))
         request_id = str(body.get("request_id") or f"ext-{uuid.uuid4().hex}")
-        in_tok = int(body.get("input_tokens") or 0)
-        out_tok = int(body.get("output_tokens") or 0)
-        latency_ms = float(body.get("latency_ms") or 0.0)
-        duration_s = float(body.get("duration_s") or (latency_ms / 1000.0))
+        in_tok = _to_int(body.get("input_tokens"), 0)
+        out_tok = _to_int(body.get("output_tokens"), 0)
+        latency_ms = _to_float(body.get("latency_ms"), 0.0)
+        duration_s = _to_float(body.get("duration_s"), latency_ms / 1000.0)
         agent_id = str(body.get("agent") or body.get("agent_id") or "unknown")
         call_site = str(body.get("call_site") or kind)
         try:
@@ -1633,19 +1687,17 @@ class ProxyService:
     # ----- handler: history -----
 
     async def handle_history(self, request: Request) -> Response:
-        hours = float(request.query_params.get("hours", "4"))
-        bucket_minutes = int(request.query_params.get("bucket_minutes", "5"))
-        hours = min(hours, 168)
-        bucket_minutes = max(1, min(bucket_minutes, 60))
-        buckets = self._queue_db.history_buckets(hours, bucket_minutes)
+        hours = min(_to_float(request.query_params.get("hours"), 4), 168)
+        bucket_minutes = max(1, min(_to_int(request.query_params.get("bucket_minutes"), 5), 60))
+        buckets = await asyncio.to_thread(
+            self._queue_db.history_buckets, hours, bucket_minutes)
         return JSONResponse({"buckets": buckets})
 
     # ----- handler: recent requests (for feed) -----
 
     async def handle_recent(self, request: Request) -> Response:
-        limit = int(request.query_params.get("limit", "50"))
-        limit = min(limit, 200)
-        rows = self._queue_db.recent_requests(limit)
+        limit = min(_to_int(request.query_params.get("limit"), 50), 200)
+        rows = await asyncio.to_thread(self._queue_db.recent_requests, limit)
         return JSONResponse({"requests": rows})
 
     # ----- handler: live in-flight (what's executing right now) -----
@@ -1707,18 +1759,18 @@ class ProxyService:
     async def handle_timeout_shadow_report(self, request: Request) -> Response:
         """Per-(model, tier) shadow summary: would-timeout rate and
         headroom reclaimed vs. the timeout actually applied."""
-        hours = float(request.query_params.get("hours", "24"))
+        hours = _to_float(request.query_params.get("hours"), 24)
         hours = min(max(hours, 0.1), 168)
-        report = self._queue_db.timeout_shadow_report(hours)
+        report = await asyncio.to_thread(self._queue_db.timeout_shadow_report, hours)
         return JSONResponse({"hours": hours, "report": report})
 
     async def handle_timeouts_report(self, request: Request) -> Response:
         """Calls that hit their timeout instead of finishing, per
         (model, tier, layer), with the load context when they gave up and
         how many fired below the recommended deadline (premature)."""
-        hours = float(request.query_params.get("hours", "24"))
+        hours = _to_float(request.query_params.get("hours"), 24)
         hours = min(max(hours, 0.1), 168)
-        report = self._queue_db.timeouts_report(hours)
+        report = await asyncio.to_thread(self._queue_db.timeouts_report, hours)
         return JSONResponse({"hours": hours, **report})
 
     # ----- handler: health -----
@@ -2027,7 +2079,9 @@ class ProxyService:
         # the first token, reschedule to the full SLA. A 0-token hang then aborts
         # in ~TTFT seconds (freeing the slot) instead of burning the whole 180s.
         ttft_deadline_s = min(_STREAM_TTFT_DEADLINE_S, stream_timeout)
+        gap_deadline_s = min(_STREAM_INTERTOKEN_GAP_S, stream_timeout)
         loop = asyncio.get_event_loop()
+        last_chunk_at = t0
         try:
             async with asyncio.timeout(ttft_deadline_s) as _cm:
                 async for event in self._backend.stream(
@@ -2035,11 +2089,18 @@ class ProxyService:
                     req.request_id, timeout_s=stream_timeout,
                 ):
                     if event.event_type == "chunk":
+                        now_m = time.monotonic()
                         if ttft_ms is None:
-                            ttft_ms = (time.monotonic() - t0) * 1000.0
-                            # First token — extend the watchdog to the full SLA.
-                            _cm.reschedule(loop.time() + max(
-                                0.1, stream_timeout - (time.monotonic() - t0)))
+                            ttft_ms = (now_m - t0) * 1000.0
+                        last_chunk_at = now_m
+                        # Per-token no-progress watchdog: each token resets a gap
+                        # deadline bounded by the caller's remaining SLA. A
+                        # 0-token hang aborts in ~TTFT; a MID-STREAM stall aborts
+                        # in ~gap — both free the slot instead of burning 180s.
+                        remaining = stream_timeout - (now_m - t0)
+                        if remaining <= 0:
+                            raise asyncio.TimeoutError
+                        _cm.reschedule(loop.time() + min(gap_deadline_s, remaining))
                         await stream_q.put({
                             "type": "chunk",
                             "data": event.data,
@@ -2064,6 +2125,10 @@ class ProxyService:
             if ttft_ms is None and isinstance(exc, asyncio.TimeoutError):
                 err = ("backend produced no output within "
                        f"{ttft_deadline_s:.0f}s (ttft timeout) — backpressure")
+            elif (isinstance(exc, asyncio.TimeoutError)
+                  and (time.monotonic() - last_chunk_at) >= gap_deadline_s - 0.5):
+                err = ("backend stalled mid-stream (no token for "
+                       f"{gap_deadline_s:.0f}s) — backpressure")
             else:
                 err = f"stream deadline exceeded — backpressure ({exc})"
             await stream_q.put({"type": "error", "error": err})
@@ -2353,7 +2418,7 @@ class ProxyService:
             total_latency_ms=(now - req.enqueued_at) * 1000,
             occupancy_at_dispatch=decision.occupancy_at_dispatch,
             status=status,
-            estimated_input_tokens=estimate_input_tokens(req.payload),
+            estimated_input_tokens=req.est_input_tokens or estimate_input_tokens(req.payload),
             max_output_tokens=req.payload.get("max_tokens", 0),
             session_id=req.session_id,
             turn_id=req.turn_id,
@@ -2415,7 +2480,7 @@ class ProxyService:
         ``recommended`` would have been for this call vs. the actual
         end-to-end latency and the timeout actually applied."""
         end_to_end_ms = (now - req.enqueued_at) * 1000.0
-        est_in = estimate_input_tokens(req.payload)
+        est_in = req.est_input_tokens or estimate_input_tokens(req.payload)
         est_out = int(req.payload.get("max_tokens", 0) or 0)
         priority = int(req.priority)
 
@@ -2485,7 +2550,7 @@ class ProxyService:
         try:
             now = time.monotonic()
             snap = self._scheduler.endpoint_snapshot(req.endpoint)
-            est_in = estimate_input_tokens(req.payload)
+            est_in = req.est_input_tokens or estimate_input_tokens(req.payload)
             est_out = int(req.payload.get("max_tokens", 0) or 0)
             priority = int(req.priority)
             ep_cfg = self._config.endpoints.get(normalize_endpoint(req.endpoint))
@@ -2674,6 +2739,13 @@ class ProxyService:
                     self._config.completions_retention_s)
                 self._queue_db.cleanup_old_payloads(
                     self._config.payload_retention_s)
+                # Evict one-off agent_ids (ad-hoc tools / smoke scripts /
+                # probe-*) idle >1h so the DRR budget map can't grow unbounded;
+                # a returning agent is recreated at the identical idle state.
+                pruned = self._budget_mgr.prune_idle(mono, idle_ttl_s=3600.0)
+                if pruned:
+                    logger.info("budget: pruned %d idle agent(s): %s",
+                                len(pruned), ", ".join(sorted(pruned)[:20]))
             # Periodic SSE `metrics` frame so /v1/stream subscribers get an
             # aggregate refresh between individual call.completed events
             # (no-op when nobody is subscribed).

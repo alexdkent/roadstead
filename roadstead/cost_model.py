@@ -133,19 +133,6 @@ class EndpointCostModel:
 
         return prefill_s + decode_s
 
-    def degradation_factor(self, current_occupancy: int) -> float:
-        """How much slower requests become when going from current to
-        current+1 occupancy.  Returns a multiplier >=1.0."""
-        if current_occupancy <= 0 or current_occupancy >= self.max_slots or not self.decode_tps:
-            return 1.0
-        curr_idx = min(current_occupancy, len(self.decode_tps)) - 1
-        next_idx = min(current_occupancy + 1, len(self.decode_tps)) - 1
-        curr_tps = self.decode_tps[curr_idx]
-        next_tps = self.decode_tps[next_idx]
-        if next_tps <= 0 or curr_tps <= 0:
-            return 1.0
-        return curr_tps / next_tps
-
     def update_from_completion(
         self,
         call_site: str,
@@ -252,12 +239,6 @@ class CostModel:
         return model.estimate_cost_ss(
             input_tokens, max_output_tokens, call_site, current_occupancy,
         )
-
-    def degradation_factor(self, endpoint: str, current_occupancy: int) -> float:
-        model = self._models.get(endpoint)
-        if model is None:
-            return 1.0
-        return model.degradation_factor(current_occupancy)
 
     def record_completion(
         self,

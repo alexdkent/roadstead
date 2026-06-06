@@ -73,14 +73,6 @@ class TestEndpointCostModel:
         # After calibration, estimate should be lower (output EWMA < max_tokens)
         assert cost_after < cost_before
 
-    def test_degradation_factor(self):
-        m = EndpointCostModel(endpoint="chat", max_slots=4)
-        m.decode_tps = [57.0, 50.0, 43.0, 38.0]
-
-        factor = m.degradation_factor(1)
-        assert factor > 1.0  # Going from 1→2 occupancy degrades
-        assert factor < 1.5  # But not by more than 50%
-
     def test_calibration_updates_decode_tps(self):
         m = EndpointCostModel(endpoint="chat", max_slots=4)
         m.decode_tps = [50.0, 45.0, 40.0, 35.0]

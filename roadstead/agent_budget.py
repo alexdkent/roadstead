@@ -28,6 +28,7 @@ class AgentBudget:
     total_consumed: float = 0.0       # lifetime consumed slot-seconds
     total_requests: int = 0
     last_replenish_at: float = 0.0    # monotonic timestamp
+    last_active_at: float = 0.0       # monotonic ts of last charge (for idle prune)
     negative_since: float = 0.0       # monotonic ts when balance first went negative (0 = not negative)
 
     def charge(self, cost_ss: float, now: float) -> None:
@@ -35,6 +36,7 @@ class AgentBudget:
         self.balance -= cost_ss
         self.total_consumed += cost_ss
         self.total_requests += 1
+        self.last_active_at = now
         if self.balance < 0 and self.negative_since == 0:
             self.negative_since = now
 
@@ -85,11 +87,13 @@ class BudgetManager:
         now: float | None = None,
     ) -> AgentBudget:
         if agent_id not in self._agents:
+            ts = now if now is not None else time.monotonic()
             self._agents[agent_id] = AgentBudget(
                 agent_id=agent_id,
                 weight=weight,
                 max_balance=max_balance,
-                last_replenish_at=now if now is not None else time.monotonic(),
+                last_replenish_at=ts,
+                last_active_at=ts,
             )
             self._recalculate_rates()
         return self._agents[agent_id]
@@ -97,6 +101,22 @@ class BudgetManager:
     def remove(self, agent_id: str) -> None:
         self._agents.pop(agent_id, None)
         self._recalculate_rates()
+
+    def prune_idle(self, now: float, idle_ttl_s: float) -> list[str]:
+        """Evict agents with no charged request in ``idle_ttl_s`` so the map
+        can't grow unbounded with one-off ``agent_id``s (ad-hoc tools / smoke
+        scripts / ``probe-*``). Safe: an idle agent's balance has fully
+        replenished to ``max_balance``, so if it ever returns it is recreated
+        at the identical state — no fairness loss. Recalculates rates once."""
+        stale = [
+            aid for aid, b in self._agents.items()
+            if b.last_active_at and (now - b.last_active_at) > idle_ttl_s
+        ]
+        for aid in stale:
+            self._agents.pop(aid, None)
+        if stale:
+            self._recalculate_rates()
+        return stale
 
     def set_total_capacity(self, total_slots: float) -> None:
         """Update the total fleet capacity (sum of all endpoint max_slots)

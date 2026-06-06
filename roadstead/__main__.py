@@ -16,14 +16,35 @@ import sys
 
 os.environ.setdefault("COLLECTIVE_AGENT_NAME", "llmproxy")
 
+import json
+
 import uvicorn
 from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from .config import ProxyConfig, load_agent_configs
 from .routes import make_routes
 from .service import _DRAIN_DEADLINE_S, ProxyService
 
 logger = logging.getLogger("originfleet.llmproxy")
+
+
+async def _on_invalid_json(request: Request, exc: Exception) -> JSONResponse:
+    """Malformed request body → clean 400 (not an unhandled ASGI 500)."""
+    return JSONResponse({"status": "error", "error": "invalid JSON body"},
+                        status_code=400)
+
+
+async def _on_unhandled(request: Request, exc: Exception) -> JSONResponse:
+    """Backstop for ANY uncaught route exception: log it and return a clean
+    JSON 500 instead of a raw ASGI 500. This is the front door for all fleet
+    LLM traffic — a malformed field from any caller must never surface as an
+    unhandled `Exception in ASGI application`."""
+    logger.exception("unhandled proxy error in %s %s",
+                     request.method, request.url.path)
+    return JSONResponse({"status": "error", "error": "internal proxy error"},
+                        status_code=500)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -82,6 +103,14 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
         routes=routes,
         on_startup=[svc.startup],
         on_shutdown=[svc.shutdown],
+        # Robustness backstop: malformed JSON → 400; any other uncaught route
+        # exception → logged clean 500 (never a raw ASGI 500). Per-field
+        # coercions (priority/timeout_s/query-params) are handled at the source;
+        # this catches anything they miss.
+        exception_handlers={
+            json.JSONDecodeError: _on_invalid_json,
+            Exception: _on_unhandled,
+        },
     )
     app.state.proxy_service = svc
     return app

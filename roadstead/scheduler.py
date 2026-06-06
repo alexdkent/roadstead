@@ -73,7 +73,9 @@ class QueuedRequest:
         request_id: str | None = None,
         now: float | None = None,
     ) -> QueuedRequest:
-        pri = LLMPriority.coerce(priority)
+        # Soft-default a malformed priority to P1 (never raise on the request
+        # path — a bad label must not 500 the caller's LLM call).
+        pri = LLMPriority.coerce(priority, default=LLMPriority.P1_TURN_SUPPORT)
         ep = normalize_endpoint(endpoint)
         ts = now if now is not None else time.monotonic()
         return cls(
@@ -365,12 +367,6 @@ class Scheduler:
 
     def active_count(self, endpoint: str) -> int:
         return len(self._active.get(endpoint, {}))
-
-    def active_background_count(self, endpoint: str) -> int:
-        return sum(
-            1 for ar in self._active.get(endpoint, {}).values()
-            if ar.request.band == PriorityBand.BACKGROUND
-        )
 
     def queue_depth(self, endpoint: str) -> int:
         eq = self._queues.get(endpoint)

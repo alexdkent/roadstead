@@ -155,3 +155,29 @@ class TestBudgetManager:
         assert len(snap) == 1
         assert snap[0]["agent_id"] == "a"
         assert "balance_ss" in snap[0]
+
+
+class TestPruneIdle:
+    def test_prunes_only_idle_agents(self):
+        bm = BudgetManager()
+        bm.set_total_capacity(32.0)
+        now = 1000.0
+        # 'active' charged recently; 'stale' created long ago, never returned.
+        bm.get_or_create("active", now=now)
+        bm.get_or_create("stale", now=now - 7200.0)
+        bm.charge("active", 1.0, now)               # active_at = now
+        pruned = bm.prune_idle(now, idle_ttl_s=3600.0)
+        assert pruned == ["stale"]
+        assert "active" in bm.agents
+        assert "stale" not in bm.agents
+
+    def test_returning_agent_recreates_clean(self):
+        bm = BudgetManager()
+        bm.set_total_capacity(32.0)
+        now = 1000.0
+        bm.get_or_create("oneoff", now=now - 7200.0)
+        bm.prune_idle(now, idle_ttl_s=3600.0)
+        # If it ever returns, get_or_create rebuilds it at full (idle) balance.
+        b = bm.get_or_create("oneoff", max_balance=60.0, now=now)
+        assert b.agent_id == "oneoff"
+        assert "oneoff" in bm.agents

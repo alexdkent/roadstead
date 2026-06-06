@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
@@ -37,16 +38,46 @@ class LLMPriority(IntEnum):
     P4_HYGIENE = 4
 
     @classmethod
-    def coerce(cls, value: "LLMPriority | str | int | None") -> "LLMPriority":
+    def coerce(
+        cls,
+        value: "LLMPriority | str | int | None",
+        *,
+        default: "LLMPriority | None" = None,
+    ) -> "LLMPriority":
+        """Map a priority value to a member — three tiers of robustness.
+
+        1. **Deterministically correct** a known-correctable class: exact and
+           case-insensitive member names, band names (interactive / foreground /
+           background), the legacy aliases, and *any* ``P<n>_<suffix>`` label by
+           its numeric prefix — so a non-canonical ``P3_BACKGROUND`` resolves to
+           ``P3_INGESTION`` instead of erroring. Out-of-range ints are clamped.
+        2. **Soft-default** when a ``default`` is supplied: log a WARNING and
+           return it instead of raising. The request path (``QueuedRequest``)
+           passes ``default=P1_TURN_SUPPORT`` so a malformed ``priority`` field
+           never escapes as an unhandled 500 / fails the caller's LLM call.
+        3. **Hard-raise** only when no ``default`` is given (config-load
+           strictness — a misconfigured quota file should fail loud).
+        """
         if isinstance(value, cls):
             return value
         if value is None:
-            return cls.P1_TURN_SUPPORT
+            return default if default is not None else cls.P1_TURN_SUPPORT
+        if isinstance(value, bool):
+            # bool is an int subclass; a JSON `true`/`false` is not a priority.
+            value = str(value)
         if isinstance(value, int):
-            return cls(value)
+            if value in cls._value2member_map_:
+                return cls(value)
+            clamped = max(0, min(int(value), 4))
+            logger.warning("out-of-range LLM priority int %r -> %s",
+                           value, cls(clamped).name)
+            return cls(clamped)
         text = str(value).strip()
         if text in cls.__members__:
             return cls[text]
+        upper = text.upper()
+        if upper in cls.__members__:          # case-insensitive member name
+            return cls[upper]
         lowered = text.lower()
         aliases = {
             "realtime": cls.P0_REALTIME,
@@ -56,9 +87,24 @@ class LLMPriority(IntEnum):
             "ingestion": cls.P3_INGESTION,
             "hygiene": cls.P4_HYGIENE,
             "background": cls.P3_INGESTION,
+            # band names → the representative priority of that band
+            "interactive": cls.P1_TURN_SUPPORT,
+            "foreground": cls.P2_POST_TURN,
         }
         if lowered in aliases:
             return aliases[lowered]
+        # Deterministic-correct any "P<n>_<suffix>" label by its numeric prefix
+        # (covers non-canonical band-suffixed names like P3_BACKGROUND → P3).
+        m = re.match(r"^p(\d+)(?:[_-]|$)", lowered)
+        if m and 0 <= int(m.group(1)) <= 4:
+            corrected = cls(int(m.group(1)))
+            logger.warning("non-canonical LLM priority %r -> %s",
+                           value, corrected.name)
+            return corrected
+        if default is not None:
+            logger.warning("unknown LLM priority %r; defaulting to %s",
+                           value, default.name)
+            return default
         raise ValueError(f"unknown LLM priority {value!r}")
 
 
@@ -95,7 +141,7 @@ CLASS_TO_ROLE: dict[str, str] = {v: k for k, v in ROLE_TO_CLASS.items()}
 
 def normalize_endpoint(endpoint: str) -> str:
     """Collapse a role name to its QoS endpoint class."""
-    text = endpoint.strip().lower()
+    text = str(endpoint).strip().lower()
     if text.startswith("nexus-"):
         text = text.split("-", 1)[1]
     if text == "nexus":

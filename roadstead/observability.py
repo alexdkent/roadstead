@@ -275,6 +275,28 @@ def check_alerts(
             f"{timeout_count} timeouts in last 5 minutes",
         ))
 
+    # Endpoint stall (alive-but-not-generating): a burst of timeouts on an
+    # endpoint that has FREE slots and NOTHING queued ⇒ requests are hanging on
+    # a backend that isn't saturated. This is the signature the /health probe
+    # CANNOT see (the backend answers /health while generation throughput
+    # collapses — the 2026-06-06 thinker contention episode). Surfaced as an
+    # ERROR for operator response; deliberately NOT an auto-circuit-trip — the
+    # backend is usually only PARTIALLY degraded (most requests still succeed),
+    # so fast-failing all of its traffic would be worse than letting the healthy
+    # majority through. Distinct from admission_timeout_spike (global, load).
+    for ep, snap in endpoint_snapshots.items():
+        ep_timeouts = metrics.count(endpoint=ep, status="timeout", now=now)
+        max_slots = snap.get("max_slots", 0) or 0
+        if (ep_timeouts >= 3
+                and snap.get("queued", 0) == 0
+                and (max_slots == 0 or snap.get("in_flight", 0) < max_slots)):
+            alerts.append(AlertCondition(
+                "endpoint_stalled", "ERROR", True,
+                f"endpoint {ep}: {ep_timeouts} timeouts in 5min with free slots "
+                f"(in_flight={snap.get('in_flight', 0)}/{max_slots or '?'}, "
+                f"queued=0) — backend likely stalling, not saturated",
+            ))
+
     # Agent starvation — REMOVED. The DRR fix (pick_agent on head-of-queue wait)
     # made balance-sign "starving" a lie: a heavy consumer being served
     # continuously has a perpetually-negative balance yet is NOT starved. Real
