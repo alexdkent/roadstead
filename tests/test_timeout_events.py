@@ -25,6 +25,25 @@ class _FakeRequest:
         self.query_params = {k: str(v) for k, v in params.items()}
 
 
+class _FakeClient:
+    def __init__(self, host):
+        self.host = host
+
+
+class _FakeJSONRequest:
+    """POST-like request with a JSON body and a client IP (for ACL)."""
+    def __init__(self, body, *, host="127.0.0.1", method="POST", **params):
+        self._body = body
+        self.client = _FakeClient(host)
+        self.method = method
+        self.query_params = {k: str(v) for k, v in params.items()}
+
+    async def json(self):
+        if self._body is None:
+            raise ValueError("no body")
+        return self._body
+
+
 def _svc(tmp_path) -> ProxyService:
     return ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db")))
 
@@ -246,4 +265,135 @@ async def test_timeouts_report_endpoint(tmp_path):
     assert resp.status_code == 200
     assert body["total"] == 1
     assert body["premature"] == 1
+    assert body["planned"] == 0
     assert body["rows"][0]["layer"] == "admission"
+
+
+# ----- maintenance-window tagging (planned-restart annotation) -----
+
+def _to_event(svc, request_id="m0", endpoint="thinker"):
+    svc._queue_db.persist_timeout_event(
+        request_id=request_id, endpoint=endpoint, priority=2, agent_id="forum-agent",
+        call_site="forum-agent.proposal_emitter", layer="client_wait", elapsed_s=180.0,
+        applied_timeout_s=180.0, queue_wait_ms=0.0, in_flight=3, queued=0,
+        max_slots=32, est_in=9000, est_out=800, recommended_ms=180000.0,
+        under_recommended=True,
+    )
+
+
+def test_report_tags_event_inside_window_as_planned(tmp_path):
+    svc = _svc(tmp_path)
+    _to_event(svc)
+    now = time.time()
+    # window covering "now" (when the event was recorded)
+    svc._queue_db.maintenance_record(
+        endpoint="thinker", started_at=now - 60, ended_at=now + 60,
+        reason="thinker restart: 128K bump", operator="op")
+    rep = svc._queue_db.timeouts_report(24)
+    assert rep["total"] == 1
+    assert rep["planned"] == 1
+    assert rep["rows"][0]["planned"] == 1
+    assert rep["maintenance_windows"][0]["reason"] == "thinker restart: 128K bump"
+
+
+def test_report_does_not_tag_event_outside_window(tmp_path):
+    svc = _svc(tmp_path)
+    _to_event(svc)
+    now = time.time()
+    # window that ended well before the event
+    svc._queue_db.maintenance_record(
+        endpoint="thinker", started_at=now - 7200, ended_at=now - 3600,
+        reason="earlier maintenance", operator="op")
+    rep = svc._queue_db.timeouts_report(24)
+    assert rep["planned"] == 0
+    assert rep["rows"][0]["planned"] == 0
+
+
+def test_wildcard_window_tags_any_endpoint(tmp_path):
+    svc = _svc(tmp_path)
+    _to_event(svc, request_id="e1", endpoint="thinker")
+    _to_event(svc, request_id="e2", endpoint="companion")
+    now = time.time()
+    svc._queue_db.maintenance_record(
+        endpoint="*", started_at=now - 60, ended_at=now + 60,
+        reason="full proxy bounce", operator="op")
+    rep = svc._queue_db.timeouts_report(24)
+    assert rep["planned"] == 2
+
+
+def test_role_name_window_normalizes_to_endpoint_class(tmp_path):
+    svc = _svc(tmp_path)
+    _to_event(svc, endpoint="thinker")
+    now = time.time()
+    # a window keyed by the ROLE name should still match the 'thinker' class
+    svc._queue_db.maintenance_record(
+        endpoint="llama-thinker", started_at=now - 60, ended_at=now + 60,
+        reason="role-keyed", operator="op")
+    rep = svc._queue_db.timeouts_report(24)
+    assert rep["planned"] == 1
+
+
+def test_open_window_extends_to_now(tmp_path):
+    svc = _svc(tmp_path)
+    now = time.time()
+    svc._queue_db.maintenance_open(
+        endpoint="thinker", reason="restarting", operator="op", source="drain",
+        started_at=now - 30)
+    _to_event(svc)  # recorded at ~now, inside the still-open window
+    rep = svc._queue_db.timeouts_report(24)
+    assert rep["planned"] == 1
+    # closing it leaves the (now closed) window present in the report
+    svc._queue_db.maintenance_close(endpoint="thinker")
+    win = svc._queue_db.maintenance_windows(24)[0]
+    assert win["ended_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_drain_pause_opens_and_resume_closes_window(tmp_path):
+    svc = _svc(tmp_path)
+    await svc.handle_admin_endpoint_pause(
+        "thinker", _FakeJSONRequest({"reason": "128K bump"}), pause=True)
+    wins = svc._queue_db.maintenance_windows(24)
+    assert len(wins) == 1
+    assert wins[0]["endpoint"] == "thinker"
+    assert wins[0]["reason"] == "128K bump"
+    assert wins[0]["source"] == "drain"
+    assert wins[0]["ended_at"] is None  # still open
+    await svc.handle_admin_endpoint_pause(
+        "thinker", _FakeJSONRequest(None), pause=False)
+    assert svc._queue_db.maintenance_windows(24)[0]["ended_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_manual_annotate_backdates_closed_window(tmp_path):
+    svc = _svc(tmp_path)
+    _to_event(svc)  # a timeout that already happened
+    resp = await svc.handle_maintenance(_FakeJSONRequest(
+        {"endpoint": "thinker", "reason": "raw restart", "duration_s": 600}))
+    assert resp.status_code == 200
+    rep = svc._queue_db.timeouts_report(24)
+    assert rep["planned"] == 1
+    assert rep["rows"][0]["planned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_annotate_rejects_unknown_endpoint(tmp_path):
+    svc = _svc(tmp_path)
+    resp = await svc.handle_maintenance(_FakeJSONRequest(
+        {"endpoint": "nope", "reason": "x", "duration_s": 60}))
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_manual_annotate_requires_endpoint(tmp_path):
+    svc = _svc(tmp_path)
+    resp = await svc.handle_maintenance(_FakeJSONRequest({"reason": "x"}))
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_manual_annotate_denied_for_external_ip(tmp_path):
+    svc = _svc(tmp_path)
+    resp = await svc.handle_maintenance(_FakeJSONRequest(
+        {"endpoint": "thinker"}, host="8.8.8.8"))
+    assert resp.status_code == 403
