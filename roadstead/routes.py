@@ -11,6 +11,7 @@ Provides:
   - GET  /v1/timeout-advice — recommended timeout for a model/tier/size
   - GET  /v1/timeout-advice/shadow-report — shadow-mode impact summary
   - GET  /v1/timeouts      — calls that hit their timeout (per model/tier/layer)
+  - GET/POST /v1/admin/maintenance — annotate/list planned-restart windows
   - GET  /health           — health check
 """
 
@@ -85,6 +86,11 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         return await svc.handle_admin_endpoint_pause(
             request.path_params["endpoint"], request, pause=False)
 
+    async def handle_maintenance(request: Request) -> Response:
+        if request.method == "GET":
+            return await svc.handle_maintenance_list(request)
+        return await svc.handle_maintenance(request)
+
     # Phase 1 — proxy as fleet call-metrics authority.
     async def handle_stream(request: Request) -> Response:
         return await svc.handle_stream(request)
@@ -136,5 +142,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         # Phase 5F — operator drain for backend maintenance (internal-only/ACL).
         Route("/v1/admin/endpoints/{endpoint}/pause", handle_admin_pause, methods=["POST"]),
         Route("/v1/admin/endpoints/{endpoint}/resume", handle_admin_resume, methods=["POST"]),
+        # Maintenance-window annotation: tag a deliberate restart as PLANNED so
+        # its timeout burst doesn't read as an incident in /v1/timeouts.
+        # POST records a window; GET lists recent windows. (internal-only/ACL)
+        Route("/v1/admin/maintenance", handle_maintenance, methods=["GET", "POST"]),
         Route("/health", handle_health, methods=["GET"]),
     ]

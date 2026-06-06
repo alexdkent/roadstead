@@ -1503,17 +1503,35 @@ class ProxyService:
         if ep not in self._config.endpoints:
             return JSONResponse(
                 {"error": f"unknown endpoint {endpoint!r}"}, status_code=404)
+        # Optional free-text reason on PAUSE, recorded on the maintenance window
+        # so the timeout burst during the restart reads as PLANNED (with the
+        # reason) in /v1/timeouts. Body is optional — never fail the drain on it.
+        reason = ""
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                reason = str(body.get("reason") or "")
+        except Exception:  # noqa: BLE001 — empty/invalid body is fine
+            pass
         if pause:
             self._paused_endpoints.add(ep)
             # Release any already-queued interactive/foreground immediately with
             # a deferrable error (don't make them wait out their deadline).
             self._fast_fail_interactive(ep)
+            # Open a maintenance window so timeouts during the restart are tagged
+            # planned. Closed on RESUME (below).
+            if self._queue_db is not None:
+                self._queue_db.maintenance_open(
+                    endpoint=ep, reason=reason, operator=remote_ip, source="drain")
             logger.warning(
                 "endpoint %s PAUSED by operator (%s) — background defers, "
-                "interactive fast-fails; backend safe to restart", ep, remote_ip)
+                "interactive fast-fails; backend safe to restart%s", ep, remote_ip,
+                f" (reason: {reason})" if reason else "")
         else:
             self._paused_endpoints.discard(ep)
             self._dispatch_event.set()  # nudge the scheduler to drain deferred work
+            if self._queue_db is not None:
+                self._queue_db.maintenance_close(endpoint=ep)
             logger.warning(
                 "endpoint %s RESUMED by operator (%s) — poller will re-probe / "
                 "recover / re-discover capacity; deferred queue draining",
@@ -1524,6 +1542,93 @@ class ProxyService:
             "healthy": self._endpoint_healthy(ep),
             "paused_endpoints": sorted(self._paused_endpoints),
         })
+
+    # ----- handler: maintenance-window annotation (planned-restart tag) -----
+
+    async def handle_maintenance(self, request: Request) -> Response:
+        """Annotate a maintenance window so a timeout burst during a DELIBERATE
+        backend restart reads as PLANNED (not an incident) in /v1/timeouts.
+        Internal-only (ACL). Use this when you restart a backend WITHOUT the
+        pause/resume drain (which records the window automatically).
+
+        Body (JSON):
+          endpoint:    str | [str] | "*"   (required) class(es) under maintenance
+          reason:      str                 free-text ("thinker restart: 128K")
+          duration_s:  float (optional)    backdate a CLOSED window [now-d, now]
+          started_at / ended_at: epoch s   explicit bounds (override duration_s)
+        With none of duration_s/started_at/ended_at, opens an OPEN window now
+        (close it later via the drain resume, or re-POST with ended_at)."""
+        remote_ip = request.client.host if request.client else "unknown"
+        if not self._acl.identify(remote_ip):
+            return JSONResponse(
+                {"error": f"access denied for {remote_ip}"}, status_code=403)
+        if self._queue_db is None:
+            return JSONResponse({"error": "no persistence backend"}, status_code=503)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        raw_eps = body.get("endpoint")
+        if not raw_eps:
+            return JSONResponse({"error": "endpoint required"}, status_code=400)
+        eps = raw_eps if isinstance(raw_eps, list) else [raw_eps]
+        norm_eps: list[str] = []
+        for e in eps:
+            if str(e) == "*":
+                norm_eps.append("*")
+                continue
+            ne = normalize_endpoint(str(e))
+            if ne not in self._config.endpoints:
+                return JSONResponse(
+                    {"error": f"unknown endpoint {e!r}"}, status_code=404)
+            norm_eps.append(ne)
+        reason = str(body.get("reason") or "")
+        started_at = body.get("started_at")
+        ended_at = body.get("ended_at")
+        duration_s = body.get("duration_s")
+        now = time.time()
+        recorded: list[dict] = []
+        try:
+            for ep in norm_eps:
+                if started_at is not None or ended_at is not None:
+                    s = float(started_at) if started_at is not None else now
+                    en = float(ended_at) if ended_at is not None else now
+                    self._queue_db.maintenance_record(
+                        endpoint=ep, started_at=s, ended_at=en,
+                        reason=reason, operator=remote_ip)
+                    recorded.append({"endpoint": ep, "started_at": s,
+                                     "ended_at": en, "reason": reason})
+                elif duration_s is not None:
+                    s = now - float(duration_s)
+                    self._queue_db.maintenance_record(
+                        endpoint=ep, started_at=s, ended_at=now,
+                        reason=reason, operator=remote_ip)
+                    recorded.append({"endpoint": ep, "started_at": s,
+                                     "ended_at": now, "reason": reason})
+                else:
+                    self._queue_db.maintenance_open(
+                        endpoint=ep, reason=reason, operator=remote_ip,
+                        source="manual")
+                    recorded.append({"endpoint": ep, "started_at": now,
+                                     "ended_at": None, "reason": reason})
+        except (TypeError, ValueError) as exc:
+            return JSONResponse(
+                {"error": f"bad window bounds: {exc}"}, status_code=400)
+        logger.warning(
+            "maintenance window(s) recorded by operator (%s): %s reason=%r",
+            remote_ip, [r["endpoint"] for r in recorded], reason)
+        return JSONResponse({"recorded": recorded})
+
+    async def handle_maintenance_list(self, request: Request) -> Response:
+        """List maintenance windows overlapping the last ``hours`` (default 24)."""
+        if self._queue_db is None:
+            return JSONResponse({"hours": 0, "windows": []})
+        hours = _to_float(request.query_params.get("hours"), 24)
+        hours = min(max(hours, 0.1), 168)
+        windows = await asyncio.to_thread(self._queue_db.maintenance_windows, hours)
+        return JSONResponse({"hours": hours, "windows": windows})
 
     # ----- handler: metrics -----
 

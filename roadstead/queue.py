@@ -120,10 +120,27 @@ CREATE TABLE IF NOT EXISTS proxy_timeouts (
     context_used_pct  REAL
 );
 
+-- Operator maintenance windows: deliberate backend restarts/drains. Timeout
+-- events that fall inside a window are tagged ``planned`` by timeouts_report,
+-- so an intentional restart reads as PLANNED instead of looking like an
+-- incident. Written by the pause/resume drain control (source='drain') and the
+-- manual /v1/admin/maintenance annotate API (source='manual'). ``endpoint`` is
+-- an endpoint class or '*' (all endpoints); ``ended_at`` NULL = still open.
+CREATE TABLE IF NOT EXISTS proxy_maintenance (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    endpoint    TEXT NOT NULL,
+    started_at  REAL NOT NULL,
+    ended_at    REAL,
+    reason      TEXT,
+    operator    TEXT,
+    source      TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_pq_status ON proxy_queue(status);
 CREATE INDEX IF NOT EXISTS idx_pc_completed ON proxy_completions(completed_at);
 CREATE INDEX IF NOT EXISTS idx_pts_completed ON proxy_timeout_shadow(completed_at);
 CREATE INDEX IF NOT EXISTS idx_pto_occurred ON proxy_timeouts(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_pm_endpoint_started ON proxy_maintenance(endpoint, started_at);
 """
 
 
@@ -657,6 +674,78 @@ class PersistentQueue:
             "DELETE FROM proxy_queue WHERE request_id=?",
             (request_id,),
         )
+
+    # ----- maintenance windows (planned-restart annotation) -----
+
+    @staticmethod
+    def _norm_maint_endpoint(endpoint: str) -> str:
+        """'*' (all endpoints) passes through; everything else normalizes to its
+        QoS endpoint class so a window keyed by a role ('llama-thinker') matches
+        the class ('thinker') that timeout events are recorded under."""
+        return "*" if str(endpoint) == "*" else normalize_endpoint(endpoint)
+
+    def maintenance_open(
+        self, *, endpoint: str, reason: str = "", operator: str = "",
+        source: str = "manual", started_at: float | None = None,
+    ) -> None:
+        """Open an (unbounded) maintenance window for ``endpoint`` (a class, or
+        '*' for all). Timeout events inside the window are tagged ``planned`` in
+        timeouts_report. Stays open (ended_at NULL) until ``maintenance_close``."""
+        self._w(
+            "INSERT INTO proxy_maintenance "
+            "(endpoint, started_at, ended_at, reason, operator, source) "
+            "VALUES (?,?,?,?,?,?)",
+            (self._norm_maint_endpoint(endpoint),
+             started_at if started_at is not None else time.time(),
+             None, reason or None, operator or None, source),
+        )
+
+    def maintenance_close(
+        self, *, endpoint: str, ended_at: float | None = None,
+    ) -> None:
+        """Close any open maintenance window(s) for ``endpoint`` (or '*')."""
+        self._w(
+            "UPDATE proxy_maintenance SET ended_at=? "
+            "WHERE endpoint=? AND ended_at IS NULL",
+            (ended_at if ended_at is not None else time.time(),
+             self._norm_maint_endpoint(endpoint)),
+        )
+
+    def maintenance_record(
+        self, *, endpoint: str, started_at: float, ended_at: float,
+        reason: str = "", operator: str = "", source: str = "manual",
+    ) -> None:
+        """Record a CLOSED window — e.g. a backdated annotation of a restart
+        already performed outside the drain path."""
+        self._w(
+            "INSERT INTO proxy_maintenance "
+            "(endpoint, started_at, ended_at, reason, operator, source) "
+            "VALUES (?,?,?,?,?,?)",
+            (self._norm_maint_endpoint(endpoint), started_at, ended_at,
+             reason or None, operator or None, source),
+        )
+
+    def maintenance_windows(self, hours: float = 24.0) -> list[dict]:
+        """Maintenance windows overlapping the last ``hours``. An open window
+        (ended_at NULL) is treated as extending to now."""
+        if not self._conn:
+            return []
+        now = time.time()
+        cutoff = now - (hours * 3600)
+        rows = self._reader().execute(
+            "SELECT id, endpoint, started_at, ended_at, reason, operator, source "
+            "FROM proxy_maintenance WHERE COALESCE(ended_at, ?) >= ? "
+            "ORDER BY started_at",
+            (now, cutoff),
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "endpoint": r[1], "started_at": r[2],
+                "ended_at": r[3], "reason": r[4], "operator": r[5],
+                "source": r[6],
+            }
+            for r in rows
+        ]
 
     # ----- budget persistence -----
 
@@ -1247,28 +1336,49 @@ class PersistentQueue:
             return {"total": 0, "premature": 0, "rows": []}
         from .timeout_model import percentile
 
-        cutoff = time.time() - (hours * 3600)
+        now = time.time()
+        cutoff = now - (hours * 3600)
         rows = self._reader().execute(
             "SELECT endpoint, priority, layer, elapsed_s, in_flight, queued, "
-            "       under_recommended, recommended_ms, caller_id, context_used_pct "
+            "       under_recommended, recommended_ms, caller_id, context_used_pct, "
+            "       occurred_at "
             "FROM proxy_timeouts WHERE occurred_at >= ?",
             (cutoff,),
         ).fetchall()
 
+        # Tag each event that falls inside an operator maintenance window
+        # (deliberate restart/drain) so a planned burst doesn't read as an
+        # incident. A window matches its own endpoint class or '*' (all).
+        windows = self.maintenance_windows(hours)
+
+        def _planned(ep: str, ts: float) -> bool:
+            for w in windows:
+                if w["endpoint"] not in (ep, "*"):
+                    continue
+                end = w["ended_at"] if w["ended_at"] is not None else now
+                if w["started_at"] <= ts <= end:
+                    return True
+            return False
+
         groups: dict[tuple[str, int, str], dict] = {}
         total = 0
         premature = 0
-        for ep, pri, layer, elapsed, in_flight, queued, under, rec_ms, caller, ctx_pct in rows:
+        planned_total = 0
+        for ep, pri, layer, elapsed, in_flight, queued, under, rec_ms, caller, ctx_pct, occurred in rows:
             total += 1
             premature += int(under or 0)
+            is_planned = _planned(ep, occurred or 0.0)
+            planned_total += int(is_planned)
             g = groups.setdefault((ep, pri, layer), {
                 "elapsed": [], "in_flight": [], "queued": [],
-                "premature": 0, "recommended": [], "callers": {}, "ctx_pct": [],
+                "premature": 0, "planned": 0, "recommended": [],
+                "callers": {}, "ctx_pct": [],
             })
             g["elapsed"].append(elapsed or 0.0)
             g["in_flight"].append(in_flight or 0)
             g["queued"].append(queued or 0)
             g["premature"] += int(under or 0)
+            g["planned"] += int(is_planned)
             g["recommended"].append(rec_ms or 0.0)
             if caller:
                 g["callers"][caller] = g["callers"].get(caller, 0) + 1
@@ -1288,6 +1398,7 @@ class PersistentQueue:
                 "layer": layer,
                 "count": n,
                 "premature": g["premature"],
+                "planned": g["planned"],
                 "elapsed_s_p50": round(percentile(elapsed, 50), 2),
                 "elapsed_s_p95": round(percentile(elapsed, 95), 2),
                 "avg_in_flight": round(sum(g["in_flight"]) / n, 1) if n else 0.0,
@@ -1300,7 +1411,13 @@ class PersistentQueue:
                 "top_callers": top_callers,
             })
         out.sort(key=lambda r: (-r["count"], r["endpoint"], r["priority"], r["layer"]))
-        return {"total": total, "premature": premature, "rows": out}
+        return {
+            "total": total,
+            "premature": premature,
+            "planned": planned_total,
+            "rows": out,
+            "maintenance_windows": windows,
+        }
 
     def completions_for_calibration(self, hours: float = 24.0) -> list[dict]:
         """Return successful completions with non-zero token counts
