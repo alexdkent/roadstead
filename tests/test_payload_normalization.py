@@ -11,7 +11,10 @@ This is the test that would have caught the original bug.
 
 from __future__ import annotations
 
-from originfleet.llmproxy.backend import _normalize_chat_payload
+from originfleet.llmproxy.backend import (
+    _normalize_chat_payload,
+    _translate_anthropic_image_blocks,
+)
 from originfleet.llmproxy.coalesce import DeterministicCache
 
 
@@ -150,6 +153,97 @@ def test_vllm_thinking_default_does_not_mutate_input():
     payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
     _normalize_chat_payload(payload, vllm=True)
     assert "chat_template_kwargs" not in payload  # input untouched (corpus capture)
+
+
+# --- vision: Anthropic image blocks → OAI image_url ---
+# ProxyLLMClient forwards vision messages in Anthropic shape ({type:image,
+# source:{type:base64,...}}); both llama.cpp and vLLM reject that with
+# "400 unsupported content[].type", silently dropping every image upload's
+# description + OCR. The proxy must translate to {type:image_url, image_url:{url}}.
+
+_ANTHROPIC_IMG_MSG = {
+    "role": "user",
+    "content": [
+        {"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": "QUJD",
+        }},
+        {"type": "text", "text": "Analyze the image above."},
+    ],
+}
+
+
+def test_normalize_translates_anthropic_image_block():
+    payload = {
+        "model": "qwen-analyst",
+        "system": "You are an image-vision assistant.",
+        "messages": [_ANTHROPIC_IMG_MSG],
+    }
+    out = _normalize_chat_payload(payload)
+    # system inlined first; user message is second
+    user = out["messages"][1]
+    img = user["content"][0]
+    assert img == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,QUJD"},
+    }
+    # the text block is preserved verbatim
+    assert user["content"][1] == {"type": "text", "text": "Analyze the image above."}
+
+
+def test_normalize_translates_image_without_system():
+    # No system/grammar/extra_body — the presence of an image block alone
+    # must defeat the early-return guard so the translation still runs.
+    payload = {
+        "model": "qwen-analyst",
+        "messages": [_ANTHROPIC_IMG_MSG],
+    }
+    out = _normalize_chat_payload(payload)
+    assert out["messages"][0]["content"][0]["type"] == "image_url"
+    assert (
+        out["messages"][0]["content"][0]["image_url"]["url"]
+        == "data:image/png;base64,QUJD"
+    )
+
+
+def test_normalize_vision_does_not_mutate_input():
+    payload = {"model": "qwen-analyst", "messages": [_ANTHROPIC_IMG_MSG]}
+    _normalize_chat_payload(payload)
+    # original Anthropic block untouched (corpus capture stores req.payload)
+    assert payload["messages"][0]["content"][0]["type"] == "image"
+    assert payload["messages"][0]["content"][0]["source"]["data"] == "QUJD"
+
+
+def test_normalize_passthrough_existing_image_url():
+    # A payload already in OAI image_url shape carries no Anthropic image
+    # block, so it stays wire-correct and passes through untouched.
+    payload = {
+        "model": "qwen-analyst",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url",
+                 "image_url": {"url": "data:image/jpeg;base64,ZZZ"}},
+                {"type": "text", "text": "hi"},
+            ],
+        }],
+    }
+    out = _normalize_chat_payload(payload)
+    assert out == payload
+
+
+def test_translate_helper_handles_url_source():
+    # An Anthropic image block with a url source (not base64) maps to image_url.
+    msgs = [{
+        "role": "user",
+        "content": [{"type": "image", "source": {
+            "type": "url", "url": "https://example.com/x.jpg",
+        }}],
+    }]
+    out = _translate_anthropic_image_blocks(msgs)
+    assert out[0]["content"][0] == {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/x.jpg"},
+    }
 
 
 # --- cache key must reflect system (cache-poisoning fix) ---

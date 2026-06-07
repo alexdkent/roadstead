@@ -20,6 +20,57 @@ from .config import EndpointConfig
 logger = logging.getLogger(__name__)
 
 
+def _has_anthropic_image_block(messages: Any) -> bool:
+    """True when any message carries an Anthropic-shaped image content block
+    (``{"type": "image", "source": {...}}``) that needs OAI translation."""
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image":
+                    return True
+    return False
+
+
+def _translate_anthropic_image_blocks(messages: Any) -> list:
+    """Rewrite Anthropic image blocks → OpenAI ``image_url`` for the backend.
+
+    ``ProxyLLMClient`` forwards vision messages verbatim in Anthropic shape
+    (``{"type": "image", "source": {"type": "base64", "media_type", "data"}}``)
+    — the same shape the knowledge image-ingest path builds. Neither llama.cpp
+    nor vLLM understands that block type; they want
+    ``{"type": "image_url", "image_url": {"url": "data:<mt>;base64,<data>"}}``
+    and otherwise reject the request with ``400 unsupported content[].type``,
+    silently dropping every image upload's description + OCR. Mirrors
+    ``framework.nexus_translate._translate_content_block`` (kept local so the
+    proxy package stays self-contained). Builds new dicts — never mutates the
+    caller's message objects (corpus capture stores ``req.payload``). A block
+    already in ``image_url`` shape, or any non-image block, passes through.
+    """
+    out: list = []
+    for msg in messages or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            out.append(msg)
+            continue
+        new_content = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image":
+                source = block.get("source") or {}
+                if source.get("type") == "base64":
+                    mt = source.get("media_type", "image/jpeg")
+                    url = f"data:{mt};base64,{source.get('data', '')}"
+                else:
+                    url = source.get("url", "")
+                new_content.append({"type": "image_url", "image_url": {"url": url}})
+            else:
+                new_content.append(block)
+        out.append({**msg, "content": new_content})
+    return out
+
+
 def _normalize_chat_payload(
     payload: dict, vllm: bool = False, model_id: str | None = None,
 ) -> dict:
@@ -60,12 +111,14 @@ def _normalize_chat_payload(
         return payload
     needs_model_set = bool(vllm and model_id and payload.get("model") != model_id)
     needs_thinking_default = bool(vllm and not _has_enable_thinking(payload))
+    needs_vision_xlate = _has_anthropic_image_block(payload.get("messages"))
     if (
         "system" not in payload
         and "extra_body" not in payload
         and not (vllm and "grammar" in payload)
         and not needs_model_set
         and not needs_thinking_default
+        and not needs_vision_xlate
     ):
         return payload
     p = dict(payload)
@@ -75,6 +128,11 @@ def _normalize_chat_payload(
     if system:
         content = system if isinstance(system, str) else str(system)
         p["messages"] = [{"role": "system", "content": content}, *(p.get("messages") or [])]
+    # Anthropic vision blocks → OAI image_url (both backends reject the
+    # Anthropic shape with 400 unsupported content[].type). After the system
+    # inline so the prepended system message is walked too (it's a no-op there).
+    if needs_vision_xlate:
+        p["messages"] = _translate_anthropic_image_blocks(p.get("messages"))
     extra_body = p.pop("extra_body", None)
     if isinstance(extra_body, dict):
         p.update(extra_body)
