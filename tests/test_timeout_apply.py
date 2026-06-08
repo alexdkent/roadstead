@@ -120,8 +120,8 @@ def test_create_applies_extend_only(monkeypatch):
 def test_floor_for_known_and_unknown():
     from originfleet.framework.timeout_advice import floor_for
     assert floor_for("llama-thinker") == 180.0   # normalizes to "thinker"
-    assert floor_for("gemma-hot") == 8.0
-    assert floor_for("gemma-greeter") == 8.0      # role → gemma-hot
+    assert floor_for("gemma-hot") == 8.0          # retained legacy floor (class removed 2026-06-08)
+    assert floor_for("gemma-greeter") == 60.0     # role → "gemma" class (E4B) since 2026-06-08 (was gemma-hot/8.0)
     assert floor_for("totally-unknown") == 60.0   # default floor
 
 

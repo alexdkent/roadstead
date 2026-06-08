@@ -129,8 +129,16 @@ def priority_to_band(p: LLMPriority) -> PriorityBand:
 ROLE_TO_CLASS: dict[str, str] = {
     "qwen-analyst":  "chat",
     "qwen-composer": "companion",
+    # 2026-06-08: gemma-greeter consolidated onto the E4B "gemma" backend (:9091);
+    # the E2B-hot unit (:9090, llama-gemma-hot) was DECOMMISSIONED to reclaim ~2GB of
+    # anvil's unified pool. It served ~1.2K tokens over 2.4d — the Tier-1.5 LLM
+    # router/classifier fallback rarely fires (keyword routers handle the common path).
+    # The role NAME is kept so the ~8 agent callers (health-verifier / mail-agent /
+    # homeassistant / infrastructure / knowledge / sidekick / orchestrator / temporal) are
+    # untouched — their make_nexus_client("gemma-greeter") calls now land on E4B.
+    # Listed before gemma-router so CLASS_TO_ROLE["gemma"] stays "gemma-router".
+    "gemma-greeter": "gemma",
     "gemma-router":  "gemma",
-    "gemma-greeter": "gemma-hot",
     "bge-reranker":  "rerank",
     "bge-m3-embed":  "embed",
     "llama-thinker": "thinker",
@@ -303,18 +311,20 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
     ),
     "gemma": EndpointConfig(
         # anvil Gemma-4-E4B (cold classifier + vision) :9091 — n_ctx
-        # 16384/slot, 2 slots.
+        # 16384/slot, 2 slots. Since 2026-06-08 this backend ALSO serves the
+        # gemma-greeter role (Tier-1.5 router/classifier fallback) — the E2B-hot
+        # :9090 backend was decommissioned (see ROLE_TO_CLASS note above). E4B is
+        # lightly loaded (~177K tok/day, n_busy≈1.0 of 2 slots) so it absorbs the
+        # rare greeter fallbacks with headroom; the only cost is slightly slower
+        # first-token (4B vs 2B) on those infrequent calls.
         endpoint_class="gemma", role="gemma-router",
         max_slots=2, context_per_slot=16384,
         host="10.0.0.3", port=9091,
     ),
-    "gemma-hot": EndpointConfig(
-        # anvil Gemma-4-E2B (greeter / tier-1.5 router) :9090 — n_ctx
-        # 4096/slot, 2 slots.
-        endpoint_class="gemma-hot", role="gemma-greeter",
-        max_slots=2, context_per_slot=4096,
-        host="10.0.0.3", port=9090,
-    ),
+    # NOTE: the "gemma-hot" endpoint class (anvil Gemma-4-E2B :9090) was REMOVED
+    # 2026-06-08. The llama-gemma-hot.service unit is stopped+disabled on anvil.
+    # gemma-greeter now routes to the "gemma" class above. Do NOT re-add a probe of
+    # :9090 — it is dark by design.
     "rerank": EndpointConfig(
         # anvil bge-reranker shim :9084 (infinity backend behind it on :9085)
         # — n_ctx 8192/slot, 1 slot.

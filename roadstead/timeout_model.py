@@ -45,6 +45,11 @@ FLOOR_S: dict[str, float] = {
     "companion": 180.0,
     "thinker": 180.0,
     "gemma": 60.0,
+    # 2026-06-08: the "gemma-hot" endpoint class was removed from DEFAULT_ENDPOINTS
+    # (E2B :9090 decommissioned; gemma-greeter consolidated onto the "gemma"/E4B
+    # backend). This floor is RETAINED as a harmless legacy label — the forward-only
+    # doctrine (test_every_endpoint_class_has_a_floor) doesn't require it, and several
+    # timeout tests still exercise the model mechanics with a "gemma-hot" label.
     "gemma-hot": 8.0,
     "rerank": 10.0,
     "embed": 15.0,
