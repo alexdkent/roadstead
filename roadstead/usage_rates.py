@@ -28,7 +28,7 @@ _RATES_BY_CLASS: dict[str, tuple[float, float]] = {
 # Non-LLM units (pushed via /v1/calls/log) keyed by their unit name.
 _RATES_BY_UNIT: dict[str, tuple[float, float]] = {
     "whisper-1":  (0.36, 0.0),    # ASR → OpenAI Whisper
-    # diarize-gpu / chatterbox-tts / got-ocr / stream → $0 (no clean analog)
+    # diarize-gpu / orpheus-tts / got-ocr / stream → $0 (local; no clean analog)
 }
 
 # Role-name aliases for the same rate (the proxy stores classes, but a row
