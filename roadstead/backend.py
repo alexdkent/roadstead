@@ -203,25 +203,59 @@ class BackendClientPool:
     """Manages httpx.AsyncClient instances for backend connections."""
 
     def __init__(self) -> None:
-        self._clients: dict[str, httpx.AsyncClient] = {}
+        # key -> (client, max_connections it was built with)
+        self._clients: dict[str, tuple[httpx.AsyncClient, int]] = {}
+        # Clients superseded by a larger pool (slot discovery raised an
+        # endpoint's concurrency after first use). They stay open so their
+        # in-flight requests finish unharmed; closed at shutdown.
+        self._retired: list[httpx.AsyncClient] = []
 
-    def _client_for(self, host: str, port: int) -> httpx.AsyncClient:
+    def _client_for(
+        self, host: str, port: int, min_pool: int = 0,
+    ) -> httpx.AsyncClient:
+        """Connection-pooled client for a backend, sized to its concurrency.
+
+        ``min_pool`` is the caller's concurrency requirement — the dispatch
+        path passes ``effective_max_slots + headroom`` so the pool can never
+        be smaller than the scheduler's admission ceiling. The historic flat
+        20 starved the 32-slot thinker: dispatches 21+ queued on the httpx
+        pool (pool=5.0s) and failed as PoolTimeout even though the backend
+        had free slots. If a later call needs a BIGGER pool than the cached
+        client has (slot discovery raised max_slots), the old client is
+        retired (not closed — in-flight requests finish on it) and replaced.
+        """
         key = f"{host}:{port}"
-        if key not in self._clients:
-            self._clients[key] = httpx.AsyncClient(
-                base_url=f"http://{host}:{port}",
-                timeout=httpx.Timeout(connect=5.0, read=600.0, write=10.0, pool=5.0),
-                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-            )
-        return self._clients[key]
+        want = max(20, min_pool)
+        cur = self._clients.get(key)
+        if cur is not None:
+            client, built_with = cur
+            if built_with >= want:
+                return client
+            self._retired.append(client)
+        client = httpx.AsyncClient(
+            base_url=f"http://{host}:{port}",
+            timeout=httpx.Timeout(connect=5.0, read=600.0, write=10.0, pool=5.0),
+            limits=httpx.Limits(
+                max_connections=want,
+                max_keepalive_connections=max(10, want // 2),
+            ),
+        )
+        self._clients[key] = (client, want)
+        return client
 
     async def close(self) -> None:
-        for client in self._clients.values():
+        for client, _size in self._clients.values():
             try:
                 await client.aclose()
             except Exception:
                 pass
         self._clients.clear()
+        for client in self._retired:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+        self._retired.clear()
 
     async def call(
         self,
@@ -232,7 +266,8 @@ class BackendClientPool:
         timeout_s: float = 180.0,
     ) -> BackendResponse:
         """Make a non-streaming backend call."""
-        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        client = self._client_for(
+            ep_cfg.host, ep_cfg.port, ep_cfg.effective_max_slots + 4)
         path = self._path_for(payload_type)
         headers = {"X-Request-ID": request_id}
         if payload_type == "chat_completion":
@@ -250,6 +285,13 @@ class BackendClientPool:
             raise BackendTimeout(f"backend {ep_cfg.role} timeout after {timeout_s}s")
         except httpx.ConnectError as exc:
             raise BackendUnavailable(f"backend {ep_cfg.role} unreachable: {exc}")
+        except httpx.PoolTimeout as exc:
+            # Local connection-pool exhaustion, NOT a backend fault. With the
+            # slot-sized pool above this should be unreachable; if it ever
+            # fires, it's transient by nature → BackendUnavailable so the
+            # in-proxy retry + caller deferral engage instead of a hard 502.
+            raise BackendUnavailable(
+                f"backend {ep_cfg.role} connection pool exhausted: {exc}")
         except httpx.HTTPError as exc:
             raise BackendError(502, f"backend {ep_cfg.role} http error: {exc}")
 
@@ -308,7 +350,8 @@ class BackendClientPool:
         timeout_s: float = 180.0,
     ) -> AsyncIterator[BackendStreamEvent]:
         """Make a streaming backend call.  Yields SSE events."""
-        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        client = self._client_for(
+            ep_cfg.host, ep_cfg.port, ep_cfg.effective_max_slots + 4)
         path = self._path_for(payload_type)
         headers = {"X-Request-ID": request_id}
         if payload_type == "chat_completion":
@@ -350,6 +393,11 @@ class BackendClientPool:
             # surface, map it to a clean BackendUnavailable instead of letting
             # the raw httpx error propagate (parity with call()).
             raise BackendUnavailable(f"backend {ep_cfg.role} disconnected mid-stream: {exc}")
+        except httpx.PoolTimeout as exc:
+            # Local pool exhaustion (see call()) — transient, NOT a stream
+            # timeout; must precede the TimeoutException catch below.
+            raise BackendUnavailable(
+                f"backend {ep_cfg.role} connection pool exhausted: {exc}")
         except (httpx.TimeoutException, asyncio.TimeoutError):
             # stream() bounds reads via httpx.Timeout, which raises
             # httpx.ReadTimeout (a TimeoutException) — not asyncio.TimeoutError.

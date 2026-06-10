@@ -37,32 +37,30 @@ class DeterministicCache:
         self._misses: int = 0
 
     def cache_key(self, endpoint: str, payload: dict) -> str | None:
-        """Return a cache key if this request is cacheable, else None."""
+        """Return a cache key if this request is cacheable, else None.
+
+        The key hashes the ENTIRE canonical payload, not an enumerated field
+        subset. The old enumeration (system/messages/grammar/max_tokens) had
+        poisoning blind spots: two temperature=0 requests with identical
+        messages but different ``response_format`` / ``structured_outputs`` /
+        ``tools`` (or any future field) collided, and the second caller got
+        the first's response. "Identical payload" is the docstring promise —
+        hashing the whole thing makes it structurally true and can only
+        REDUCE spurious hits, never add them."""
         temp = payload.get("temperature")
         if temp is None or temp != 0:
             return None
         if payload.get("stream"):
             return None
-
-        # NOTE: cache_key runs on the pre-normalization payload (before
-        # backend._normalize_chat_payload inlines `system` into messages),
-        # so a top-level `system` field is NOT reflected in `messages`
-        # here. It MUST be in the key independently — otherwise two
-        # temperature=0 requests with identical messages but different
-        # system prompts (e.g. different extraction schemas) collide and
-        # the second gets the first's response. That's a correctness/
-        # cache-poisoning bug for structured extraction.
-        canonical = json.dumps(
-            {
-                "endpoint": endpoint,
-                "system": payload.get("system"),
-                "messages": payload.get("messages"),
-                "grammar": payload.get("grammar") or payload.get("extra_body", {}).get("grammar"),
-                "max_tokens": payload.get("max_tokens"),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        try:
+            canonical = json.dumps(
+                {"endpoint": endpoint, "payload": payload},
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,  # payload arrived as JSON, so this never fires in practice
+            )
+        except (TypeError, ValueError):
+            return None  # uncacheable beats a wrong key
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     def get(self, key: str) -> dict | None:

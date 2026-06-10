@@ -281,9 +281,32 @@ class CostModel:
 
 def estimate_input_tokens(payload: dict) -> int:
     """Rough token count from a chat-completion payload.  4 chars ≈ 1
-    token.  Good enough for cost estimation — we calibrate from actuals."""
-    messages = payload.get("messages") or []
+    token.  Good enough for cost estimation — we calibrate from actuals.
+
+    Counts the top-level Anthropic-shaped ``system`` field (which
+    ``backend._normalize_chat_payload`` later inlines into ``messages``) and
+    serialized ``tools`` schemas — both invisible to the old messages-only
+    walk, which undercounted est_in for exactly the big-prompt callers
+    (orchestrator tool loops) where the estimate matters most."""
+    import json as _json
+
     total_chars = 0
+    system = payload.get("system")
+    if isinstance(system, str):
+        total_chars += len(system)
+    elif isinstance(system, list):
+        for part in system:
+            if isinstance(part, dict):
+                total_chars += len(str(part.get("text", "")))
+            elif isinstance(part, str):
+                total_chars += len(part)
+    tools = payload.get("tools")
+    if tools:
+        try:
+            total_chars += len(_json.dumps(tools))
+        except (TypeError, ValueError):
+            pass
+    messages = payload.get("messages") or []
     for msg in messages:
         content = msg.get("content", "")
         if isinstance(content, str):

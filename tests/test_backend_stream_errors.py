@@ -27,10 +27,13 @@ EP = EndpointConfig(endpoint_class="chat", role="thinker", host="h", port=1234)
 
 def _pool_with(handler) -> BackendClientPool:
     pool = BackendClientPool()
-    pool._clients[f"{EP.host}:{EP.port}"] = httpx.AsyncClient(
+    client = httpx.AsyncClient(
         base_url=f"http://{EP.host}:{EP.port}",
         transport=httpx.MockTransport(handler),
     )
+    # Cache shape is (client, pool size it was built with); a huge size keeps
+    # _client_for from retiring this mock for a slot-sized rebuild.
+    pool._clients[f"{EP.host}:{EP.port}"] = (client, 10_000)
     return pool
 
 

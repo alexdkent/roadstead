@@ -136,6 +136,46 @@ class TestEstimateInputTokens:
         total_chars = len("You are a helpful assistant.") + len("Tell me about cats.")
         assert tokens == total_chars // 4
 
+    def test_top_level_system_string_counted(self):
+        # The Anthropic-shaped `system` field (inlined into messages later by
+        # backend._normalize_chat_payload) must count toward est_in.
+        msg = "Tell me about cats."
+        system = "S" * 400
+        base = estimate_input_tokens({"messages": [{"role": "user", "content": msg}]})
+        with_sys = estimate_input_tokens({
+            "system": system,
+            "messages": [{"role": "user", "content": msg}],
+        })
+        assert with_sys == base + len(system) // 4
+
+    def test_top_level_system_list_counted(self):
+        parts = [{"type": "text", "text": "A" * 100}, {"type": "text", "text": "B" * 60}]
+        tokens = estimate_input_tokens({"system": parts, "messages": []})
+        assert tokens == 160 // 4
+
+    def test_tools_schemas_counted(self):
+        import json as _json
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "search_files",
+                "description": "Search the corpus for matching files.",
+                "parameters": {"type": "object", "properties": {
+                    "query": {"type": "string"}, "limit": {"type": "integer"}}},
+            },
+        }]
+        msg = "find the report"
+        with_tools = estimate_input_tokens({
+            "tools": tools,
+            "messages": [{"role": "user", "content": msg}],
+        })
+        assert with_tools == (len(msg) + len(_json.dumps(tools))) // 4
+
+    def test_messages_only_unchanged(self):
+        # No system/tools → identical to the historic messages-only estimate.
+        payload = {"messages": [{"role": "user", "content": "x" * 80}]}
+        assert estimate_input_tokens(payload) == 80 // 4
+
 
 class TestRetroactiveAdjustment:
     def test_overestimate_refunds(self):
