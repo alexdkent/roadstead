@@ -77,6 +77,13 @@ def _req():
     r.request_id = "rid-1"
     r.call_site = "sidekick.craft_song"
     r.timeout_deadline = time.monotonic() + 120
+    # Phase 5 accounting fields (metrics sample + corrected-row persist).
+    r.agent_id = "sidekick"
+    r.priority = importlib.import_module(
+        "originfleet.llmproxy.config").LLMPriority.P2_POST_TURN
+    r.session_id = None
+    r.turn_id = None
+    r.caller_id = None
     return r
 
 
@@ -86,6 +93,12 @@ def _mock_self(backend_call):
     m._degeneration_recovered = 0
     m._degeneration_unrecovered = 0
     m._degeneration_by_call_site = {}
+    # Phase 5 accounting surfaces.
+    m._degen_redispatch_inflight = 0
+    m._metrics = types.SimpleNamespace(record=lambda sample: None)
+    m._persisted = []
+    m._queue_db = types.SimpleNamespace(
+        persist_complete=lambda *a, **k: m._persisted.append((a, k)))
     ep = types.SimpleNamespace(role="thinker")
     m._config = types.SimpleNamespace(endpoints={"thinker": ep})
     m._backend = types.SimpleNamespace(call=backend_call)
@@ -101,7 +114,9 @@ def _backend_returning(*bodies):
     async def _call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
         calls.append(payload)
         body = seq.pop(0) if seq else {"choices": [{"message": {"content": DEGEN}}]}
-        return types.SimpleNamespace(body=body)
+        return types.SimpleNamespace(
+            body=body, duration_s=0.4, input_tokens=10, output_tokens=20,
+            finish_reason="stop")
 
     _call.calls = calls
     return _call
@@ -179,3 +194,44 @@ if __name__ == "__main__":
         passed += 1
         print(f"ok {fn.__name__}")
     print(f"\n{passed}/{len(fns)} passed")
+
+
+# ---- Phase 5: re-dispatch accounting ----------------------------------------
+
+def test_redispatch_concurrency_guard_fails_open():
+    backend = _backend_returning()
+    m = _mock_self(backend)
+    m._degen_redispatch_inflight = 2  # two already running fleet-wide
+    res = _result(DEGEN)
+    asyncio.run(m._maybe_correct_degenerate(_req(), res))
+    assert backend.calls == []                       # no third re-dispatch
+    assert res["_degenerate_unrecovered"] is True    # fail-open, never cached
+    assert m._degeneration_unrecovered == 1
+    assert m._degen_redispatch_inflight == 2         # untouched
+
+
+def test_recovery_persists_corrected_row_same_request_id():
+    clean_body = {"choices": [{"message": {"content": CLEAN}}]}
+    backend = _backend_returning(clean_body)
+    m = _mock_self(backend)
+    res = _result(DEGEN)
+    asyncio.run(m._maybe_correct_degenerate(_req(), res))
+    assert m._degeneration_recovered == 1
+    assert len(m._persisted) == 1
+    args, kwargs = m._persisted[0]
+    assert args[0] == "rid-1"                        # SAME request_id → row replaced
+    assert kwargs["response"] is clean_body          # the corrected body, not the garbage
+    assert args[5] == 10 and args[6] == 20           # re-dispatch token counts
+    assert m._degen_redispatch_inflight == 0         # released
+
+
+def test_redispatch_metrics_sample_emitted():
+    samples = []
+    clean_body = {"choices": [{"message": {"content": CLEAN}}]}
+    backend = _backend_returning(clean_body)
+    m = _mock_self(backend)
+    m._metrics = types.SimpleNamespace(record=samples.append)
+    asyncio.run(m._maybe_correct_degenerate(_req(), _result(DEGEN)))
+    assert len(samples) == 1
+    assert samples[0].status == "degen_retry"
+    assert samples[0].endpoint == "thinker"

@@ -456,6 +456,11 @@ class ProxyService:
         self._degeneration_recovered = 0     # …fixed by an anti-repetition re-dispatch
         self._degeneration_unrecovered = 0   # …still degenerate after re-dispatch(es)
         self._degeneration_by_call_site: dict[str, dict] = {}
+        # Re-dispatches run OUTSIDE scheduler slot accounting (the original
+        # slot was freed when the degenerate 200 completed), so bound their
+        # fleet-wide concurrency with a plain counter — single event loop, no
+        # lock needed; NOT a semaphore (waiting would queue caller responses).
+        self._degen_redispatch_inflight = 0
         # Dedupe set so a single request that races across two timeout
         # layers (e.g. admission expiry + client-wait) is logged once.
         self._timed_out_ids: set[str] = set()
@@ -507,6 +512,10 @@ class ProxyService:
         # can't route (today that request rots to its deadline — the bug
         # enforce mode fixes with a fast 404).
         self._unknown_endpoint_submits: dict[str, dict] = {}
+        # Context-overflow gate counter (shadow): endpoint → {count, callers,
+        # max_est_in}. Feeds the context_gate_enforce flip check — compared
+        # against ACTUAL backend overflow errors before enforcement flips.
+        self._context_overflows: dict[str, dict] = {}
         # Phase 5B observability counters (exposed on /v1/status).
         self._slot_leak_reclaimed = 0       # streaming dispatches cancelled on
                                             # consumer-disconnect → slot freed
@@ -883,6 +892,52 @@ class ProxyService:
                     status_code=422,
                 )
 
+        # Context-window pre-admission gate (M1). The proxy KNOWS the live
+        # per-slot context (poller-discovered for thinker, config-seeded
+        # elsewhere) and estimates input tokens anyway — an oversized prompt
+        # should fail fast with an actionable message, not queue, dispatch,
+        # and die as a confusing backend 400. Shadow (default): WARN + counter
+        # only. Enforce (runtime flag, flipped after the shadow window shows
+        # no false positives): 422 whose message embeds the canonical
+        # context-overflow marker ("exceeds the available context size") so
+        # chunking callers' re-chunk handling engages exactly as it does for
+        # the backend's own overflow error. Known undercounts are all in the
+        # SAFE direction (false-negative): the struct-policy/thinking
+        # max_tokens bumps apply after this check, and image blocks contribute
+        # ~0 chars to the estimate.
+        if req.payload_type == "chat_completion":
+            gate_cfg = self._config.endpoints.get(req.endpoint)
+            ctx_limit = gate_cfg.context_per_slot if gate_cfg else 0
+            if ctx_limit > 0:
+                est_in = estimate_input_tokens(req.payload)
+                mt = req.payload.get("max_tokens")
+                est_out = mt if isinstance(mt, int) and mt > 0 else 0
+                if est_in + est_out > ctx_limit:
+                    caller = str(body.get("caller_id") or req.agent_id)
+                    tally = self._context_overflows.setdefault(
+                        req.endpoint, {"count": 0, "callers": {}, "max_est_in": 0})
+                    tally["count"] += 1
+                    tally["callers"][caller] = tally["callers"].get(caller, 0) + 1
+                    tally["max_est_in"] = max(tally["max_est_in"], est_in)
+                    err = (
+                        f"request (est {est_in} input tokens + max_tokens "
+                        f"{est_out}) exceeds the available context size "
+                        f"({ctx_limit}/slot on {req.endpoint}) — chunk the "
+                        f"input or route to a larger-context endpoint")
+                    if self._flags.get("context_gate_enforce"):
+                        if openai:
+                            return self._openai_error(
+                                err, "invalid_request_error", 422,
+                                code="context_overflow")
+                        return JSONResponse(
+                            {"status": "error", "request_id": req.request_id,
+                             "error": err, "code": "context_overflow"},
+                            status_code=422)
+                    logger.warning(
+                        "context gate SHADOW: %s (caller=%s call_site=%s) — "
+                        "request admitted; flip context_gate_enforce for a "
+                        "fast 422", err, caller, req.call_site)
+
         # Check deterministic cache
         cache_key = self._cache.cache_key(req.endpoint, req.payload)
         if cache_key:
@@ -1194,43 +1249,93 @@ class ProxyService:
             if ep_cfg is None:
                 return
 
+            # Concurrency bound (fail-open): the original slot was already
+            # freed, so these extra backend calls are over-commit — cap them
+            # fleet-wide rather than pile onto a backend that's likely already
+            # struggling (degeneration correlates with contention).
+            if self._degen_redispatch_inflight >= 2:
+                logger.warning(
+                    "degeneration re-dispatch skipped (2 already in flight) — "
+                    "returning original (call_site=%s)", cs)
+                self._degeneration_unrecovered += 1
+                result["_degenerate_unrecovered"] = True
+                return
+
             # Escalating anti-repetition penalties. vLLM honors frequency/presence
             # penalty on the OpenAI surface; a small bump breaks the loop without
             # gutting legitimate chorus repetition on the retry.
-            for i, extra in enumerate(
-                ({"frequency_penalty": 0.6, "presence_penalty": 0.3},
-                 {"frequency_penalty": 1.0, "presence_penalty": 0.5}), start=1,
-            ):
-                remaining = req.timeout_deadline - time.monotonic()
-                if remaining < _MIN_RETRY_BUDGET_S:
-                    break
-                payload = {**req.payload, **extra}
-                try:
-                    resp = await self._backend.call(
-                        ep_cfg, payload, req.payload_type,
-                        f"{req.request_id}-degen{i}", timeout_s=max(2.0, remaining),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "degeneration re-dispatch %d failed (call_site=%s): %s",
-                        i, cs, exc)
-                    continue
-                new_text = _chat_completion_text(resp.body)
-                if new_text and not _is_degenerate_text(new_text):
-                    result["response"] = resp.body
-                    self._degeneration_recovered += 1
-                    tally["recovered"] += 1
-                    logger.info(
-                        "DEGENERATION recovered via re-dispatch %d "
-                        "(call_site=%s frequency_penalty=%.1f)",
-                        i, cs, extra["frequency_penalty"])
-                    return
-            # Exhausted — leave the original; flag so we don't cache the garbage.
-            self._degeneration_unrecovered += 1
-            result["_degenerate_unrecovered"] = True
-            logger.warning(
-                "DEGENERATION unrecovered after re-dispatch (call_site=%s) — "
-                "returning best-effort", cs)
+            self._degen_redispatch_inflight += 1
+            try:
+                for i, extra in enumerate(
+                    ({"frequency_penalty": 0.6, "presence_penalty": 0.3},
+                     {"frequency_penalty": 1.0, "presence_penalty": 0.5}), start=1,
+                ):
+                    remaining = req.timeout_deadline - time.monotonic()
+                    if remaining < _MIN_RETRY_BUDGET_S:
+                        break
+                    payload = {**req.payload, **extra}
+                    rt0 = time.monotonic()
+                    try:
+                        resp = await self._backend.call(
+                            ep_cfg, payload, req.payload_type,
+                            f"{req.request_id}-degen{i}", timeout_s=max(2.0, remaining),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "degeneration re-dispatch %d failed (call_site=%s): %s",
+                            i, cs, exc)
+                        self._metrics.record(MetricsSample(
+                            timestamp=time.monotonic(), endpoint=req.endpoint,
+                            agent_id=req.agent_id, priority=req.priority.name,
+                            queue_wait_ms=0.0,
+                            backend_latency_ms=(time.monotonic() - rt0) * 1000.0,
+                            status="degen_retry", slot_seconds=time.monotonic() - rt0))
+                        continue
+                    # Visibility: each re-dispatch is real backend work that ran
+                    # outside slot accounting — surface it in the 5-min metrics.
+                    self._metrics.record(MetricsSample(
+                        timestamp=time.monotonic(), endpoint=req.endpoint,
+                        agent_id=req.agent_id, priority=req.priority.name,
+                        queue_wait_ms=0.0,
+                        backend_latency_ms=resp.duration_s * 1000.0,
+                        status="degen_retry", slot_seconds=resp.duration_s))
+                    new_text = _chat_completion_text(resp.body)
+                    if new_text and not _is_degenerate_text(new_text):
+                        result["response"] = resp.body
+                        self._degeneration_recovered += 1
+                        tally["recovered"] += 1
+                        # Persist the TRUTH: the completion row was already
+                        # written with the degenerate body before this guard
+                        # ran — replace it (INSERT OR REPLACE on request_id)
+                        # with what the caller actually received, so the audit
+                        # corpus / health sweeps don't keep the garbage.
+                        try:
+                            self._queue_db.persist_complete(
+                                req.request_id, req.agent_id, req.endpoint,
+                                req.call_site, int(req.priority),
+                                resp.input_tokens, resp.output_tokens,
+                                resp.duration_s, 0.0, "ok",
+                                payload=req.payload, response=resp.body,
+                                session_id=req.session_id, turn_id=req.turn_id,
+                                caller_id=req.caller_id,
+                                finish_reason=resp.finish_reason,
+                            )
+                        except Exception:  # noqa: BLE001 — accounting must not break the response
+                            logger.debug("degen corrected-row persist failed",
+                                         exc_info=True)
+                        logger.info(
+                            "DEGENERATION recovered via re-dispatch %d "
+                            "(call_site=%s frequency_penalty=%.1f)",
+                            i, cs, extra["frequency_penalty"])
+                        return
+                # Exhausted — leave the original; flag so we don't cache the garbage.
+                self._degeneration_unrecovered += 1
+                result["_degenerate_unrecovered"] = True
+                logger.warning(
+                    "DEGENERATION unrecovered after re-dispatch (call_site=%s) — "
+                    "returning best-effort", cs)
+            finally:
+                self._degen_redispatch_inflight -= 1
         except Exception:  # noqa: BLE001 — guard must never break a response
             logger.debug("degeneration guard failed", exc_info=True)
 
@@ -1725,6 +1830,10 @@ class ProxyService:
                 # Unknown-endpoint submits since boot (shadow counter for the
                 # unknown_endpoint_enforce flip check). Empty = safe to flip.
                 "unknown_endpoint_submits": self._unknown_endpoint_submits,
+                # Context-gate hits since boot (shadow counter for the
+                # context_gate_enforce flip check — compare against actual
+                # backend overflow errors before flipping).
+                "context_overflows_shadow": self._context_overflows,
                 # Structured-output policy (reason-then-constrain) egress health.
                 # Both stay 0 until a call_site policy is flipped on.
                 "struct_egress_failures": self._struct_egress_failures,
@@ -2535,6 +2644,29 @@ class ProxyService:
             "queue_wait_ms": round(decision.queue_wait_ms, 1),
         })
 
+        # Streaming usage accounting (2026-06-10): without
+        # stream_options.include_usage most backends emit NO usage in the
+        # stream, so streaming completions recorded 0 tokens (live: 495
+        # zero-token orchestrator rows/day) — undercounting every usage/savings
+        # rollup and starving the cost model. Inject it into the BACKEND
+        # payload on a LOCAL COPY (req.payload is corpus-persisted and must
+        # stay the caller's bytes). If the CALLER didn't ask for usage, the
+        # usage-only frame (usage present, empty choices) is captured and
+        # DROPPED below so strict OpenAI clients see a byte-identical stream.
+        # Kill-switch: runtime flag inject_stream_usage.
+        payload = req.payload
+        so = payload.get("stream_options") if isinstance(payload, dict) else None
+        client_wants_usage = bool(isinstance(so, dict) and so.get("include_usage"))
+        inject_usage = (
+            req.payload_type == "chat_completion"
+            and not client_wants_usage
+            and self._flags.get("inject_stream_usage")
+        )
+        if inject_usage:
+            so = dict(so) if isinstance(so, dict) else {}
+            so["include_usage"] = True
+            payload = {**payload, "stream_options": so}
+
         t0 = time.monotonic()
         input_tokens = 0
         output_tokens = 0
@@ -2554,7 +2686,7 @@ class ProxyService:
         try:
             async with asyncio.timeout(ttft_deadline_s) as _cm:
                 async for event in self._backend.stream(
-                    ep_cfg, req.payload, req.payload_type,
+                    ep_cfg, payload, req.payload_type,
                     req.request_id, timeout_s=stream_timeout,
                 ):
                     if event.event_type == "chunk":
@@ -2570,20 +2702,28 @@ class ProxyService:
                         if remaining <= 0:
                             raise asyncio.TimeoutError
                         _cm.reschedule(loop.time() + min(gap_deadline_s, remaining))
-                        await stream_q.put({
-                            "type": "chunk",
-                            "data": event.data,
-                        })
+                        usage_only = False
                         if event.parsed:
                             usage = event.parsed.get("usage")
+                            choices = event.parsed.get("choices") or []
                             if usage:
                                 input_tokens = usage.get("prompt_tokens", input_tokens)
                                 output_tokens = usage.get("completion_tokens", output_tokens)
-                            choices = event.parsed.get("choices") or []
+                                # The synthetic usage frame (usage, no choices)
+                                # exists because WE injected include_usage —
+                                # capture it but never relay it to a client
+                                # that didn't ask. Usage riding on a normal
+                                # content/finish chunk passes through.
+                                usage_only = inject_usage and not choices
                             if choices and isinstance(choices[0], dict):
                                 fr = choices[0].get("finish_reason")
                                 if fr:
                                     last_finish_reason = fr
+                        if not usage_only:
+                            await stream_q.put({
+                                "type": "chunk",
+                                "data": event.data,
+                            })
                     elif event.event_type == "done":
                         break
         except (asyncio.TimeoutError, BackendTimeout) as exc:

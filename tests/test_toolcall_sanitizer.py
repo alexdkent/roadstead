@@ -183,3 +183,25 @@ if __name__ == "__main__":
         fn()
         print(f"ok {fn.__name__}")
     print(f"\n{len(fns)}/{len(fns)} passed")
+
+
+def test_trailing_usage_frame_passes_through_untouched():
+    """Phase 4: with injected stream_options.include_usage the backend appends
+    a usage-only frame (empty choices) AFTER the finish chunk. The sanitizer
+    must fast-path it — same object back, no rebuild — including right after a
+    tool-call stream where slots were finalized by the finish chunk."""
+    import json as _json
+    from originfleet.llmproxy.service import _ToolCallStreamSanitizer
+
+    s = _ToolCallStreamSanitizer()
+    open_call = _json.dumps({"choices": [{"index": 0, "delta": {"tool_calls": [
+        {"index": 0, "id": "c1", "type": "function",
+         "function": {"name": "ls", "arguments": "{}"}}]}}]})
+    finish = _json.dumps({"choices": [{"index": 0, "delta": {},
+                                       "finish_reason": "tool_calls"}]})
+    usage = _json.dumps({"choices": [],
+                         "usage": {"prompt_tokens": 9, "completion_tokens": 4}})
+    s.feed(open_call)
+    s.feed(finish)
+    out = s.feed(usage)
+    assert out is usage  # pure pass-through (no pending slots, no tool_calls key)
