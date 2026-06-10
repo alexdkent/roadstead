@@ -1,0 +1,181 @@
+"""Unit tests for the egress degeneration guard
+(`ProxyService._maybe_correct_degenerate` + `_is_degenerate_text`).
+
+A repetition-LOOP response ("… the song of ## … the song of ## …") is a 200 with
+syntactically-valid content, so the transient-error retry and the grammar egress
+check both miss it. The guard detects it and re-dispatches with an anti-repetition
+penalty. Invariants pinned here:
+  - the detector flags a real loop but NOT a normal chorus / short reply / varied text;
+  - on a degenerate response the guard re-dispatches (with frequency_penalty) and
+    swaps in the first clean result, tallying recovered;
+  - a clean response is a no-op (backend never re-called);
+  - shadow mode detects-only (no re-dispatch); the kill-switch disables it entirely;
+  - an unrecoverable loop is left untouched + flagged (never cached), fail-open.
+
+Self-contained (binds the real method to a mock `self`); runs under pytest OR as a
+plain script.
+"""
+import asyncio
+import importlib
+import os
+import sys
+import time
+import types
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]  # originfleet/
+sys.path.insert(0, str(REPO))
+
+service = importlib.import_module("originfleet.llmproxy.service")
+S = service.ProxyService
+
+# A repetition loop: the same 6-word shingle dominates the whole output.
+DEGEN = "the song of the night and " * 30
+# A normal song: a chorus repeats a few times but is a tiny fraction of varied text.
+CHORUS = "oh carry me home through the rain\n"
+CLEAN = (
+    "Salt crusted stone against the restless tide\n"
+    "A solitary eye that never sleeps\n" + CHORUS +
+    "Glass and neon in a slow parade\n"
+    "Memories the passing years remade\n" + CHORUS +
+    "Somewhere out there a stranger hears\n"
+    "The same old melody across the years\n" + CHORUS
+)
+
+
+# ---- detector ----
+def test_detects_repetition_loop():
+    assert service._is_degenerate_text(DEGEN)
+
+
+def test_passes_normal_chorus():
+    assert not service._is_degenerate_text(CLEAN)
+
+
+def test_passes_short_and_varied():
+    assert not service._is_degenerate_text("Two short sentences. Nothing repeats here at all.")
+    assert not service._is_degenerate_text(
+        " ".join(f"distinct word number {i} here now" for i in range(40)))
+
+
+def test_top_shingle_reps():
+    reps, total = service._top_shingle_reps(DEGEN)
+    assert reps >= 6 and total > 0
+
+
+# ---- guard (async) ----
+def _result(content, status="ok"):
+    return {"status": status,
+            "response": {"choices": [{"message": {"content": content}}]}}
+
+
+def _req():
+    r = types.SimpleNamespace()
+    r.payload_type = "chat_completion"
+    r.payload = {"messages": [], "max_tokens": 500, "temperature": 0.85}
+    r.endpoint = "thinker"
+    r.request_id = "rid-1"
+    r.call_site = "sidekick.craft_song"
+    r.timeout_deadline = time.monotonic() + 120
+    return r
+
+
+def _mock_self(backend_call):
+    m = types.SimpleNamespace()
+    m._degeneration_detected = 0
+    m._degeneration_recovered = 0
+    m._degeneration_unrecovered = 0
+    m._degeneration_by_call_site = {}
+    ep = types.SimpleNamespace(role="thinker")
+    m._config = types.SimpleNamespace(endpoints={"thinker": ep})
+    m._backend = types.SimpleNamespace(call=backend_call)
+    m._maybe_correct_degenerate = S._maybe_correct_degenerate.__get__(m, S)
+    return m
+
+
+def _backend_returning(*bodies):
+    """An async backend.call that yields the given response bodies in order."""
+    seq = list(bodies)
+    calls = []
+
+    async def _call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
+        calls.append(payload)
+        body = seq.pop(0) if seq else {"choices": [{"message": {"content": DEGEN}}]}
+        return types.SimpleNamespace(body=body)
+
+    _call.calls = calls
+    return _call
+
+
+def test_degenerate_is_recovered_by_redispatch():
+    clean_body = {"choices": [{"message": {"content": CLEAN}}]}
+    backend = _backend_returning(clean_body)
+    m = _mock_self(backend)
+    res = _result(DEGEN)
+    asyncio.run(m._maybe_correct_degenerate(_req(), res))
+    assert m._degeneration_detected == 1
+    assert m._degeneration_recovered == 1
+    assert res["response"] is clean_body                      # swapped in
+    assert backend.calls and "frequency_penalty" in backend.calls[0]
+
+
+def test_clean_response_is_noop():
+    backend = _backend_returning()  # would raise if popped wrongly; must NOT be called
+    m = _mock_self(backend)
+    res = _result(CLEAN)
+    asyncio.run(m._maybe_correct_degenerate(_req(), res))
+    assert m._degeneration_detected == 0
+    assert backend.calls == []                                # backend never re-called
+
+
+def test_shadow_mode_detects_only():
+    backend = _backend_returning()
+    m = _mock_self(backend)
+    res = _result(DEGEN)
+    os.environ["COLLECTIVE_PROXY_DEGENERATION_SHADOW"] = "1"
+    try:
+        asyncio.run(m._maybe_correct_degenerate(_req(), res))
+    finally:
+        os.environ.pop("COLLECTIVE_PROXY_DEGENERATION_SHADOW", None)
+    assert m._degeneration_detected == 1
+    assert m._degeneration_recovered == 0
+    assert backend.calls == []                                # no re-dispatch in shadow
+    assert res["response"]["choices"][0]["message"]["content"] == DEGEN
+
+
+def test_kill_switch_disables():
+    backend = _backend_returning()
+    m = _mock_self(backend)
+    res = _result(DEGEN)
+    os.environ["COLLECTIVE_PROXY_DEGENERATION_GUARD"] = "off"
+    try:
+        asyncio.run(m._maybe_correct_degenerate(_req(), res))
+    finally:
+        os.environ.pop("COLLECTIVE_PROXY_DEGENERATION_GUARD", None)
+    assert m._degeneration_detected == 0
+    assert backend.calls == []
+
+
+def test_unrecoverable_is_flagged_not_mutated():
+    # Both re-dispatches still come back degenerate → leave original + flag.
+    d1 = {"choices": [{"message": {"content": DEGEN}}]}
+    d2 = {"choices": [{"message": {"content": DEGEN}}]}
+    backend = _backend_returning(d1, d2)
+    m = _mock_self(backend)
+    res = _result(DEGEN)
+    asyncio.run(m._maybe_correct_degenerate(_req(), res))
+    assert m._degeneration_detected == 1
+    assert m._degeneration_recovered == 0
+    assert m._degeneration_unrecovered == 1
+    assert res.get("_degenerate_unrecovered") is True
+    assert res["response"]["choices"][0]["message"]["content"] == DEGEN  # untouched
+
+
+if __name__ == "__main__":
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    passed = 0
+    for fn in fns:
+        fn()
+        passed += 1
+        print(f"ok {fn.__name__}")
+    print(f"\n{passed}/{len(fns)} passed")

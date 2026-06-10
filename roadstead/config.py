@@ -485,6 +485,28 @@ def shadow_egress_detect_enabled() -> bool:
     )
 
 
+def degeneration_guard_enabled() -> bool:
+    """Egress repetition-LOOP guard (2026-06-10): detect a degenerate response —
+    the same long n-gram repeated many times ('… the song of ## … the song of ##
+    …'), a model failure mode any caller can hit on a long prompt — and RE-DISPATCH
+    with an anti-repetition penalty. A 200-with-garbage is invisible to the
+    transient-error and grammar checks, so this is the layer that catches it.
+    Default ON. Env kill-switch ``COLLECTIVE_PROXY_DEGENERATION_GUARD``."""
+    return os.environ.get("COLLECTIVE_PROXY_DEGENERATION_GUARD", "1").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
+def degeneration_shadow_only() -> bool:
+    """When set, the degeneration guard only DETECTS + logs + counts (no
+    re-dispatch) — the shadow-measure phase to confirm it never false-flags
+    legitimate repetition (a song chorus) before it acts. Default OFF (the guard
+    actively corrects). Env ``COLLECTIVE_PROXY_DEGENERATION_SHADOW``."""
+    return os.environ.get("COLLECTIVE_PROXY_DEGENERATION_SHADOW", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def thinking_reasoning_budget() -> int:
     """Tokens of reasoning headroom ADDED to a thinking request's max_tokens.
     Reasoning is generated <think> output and counts against max_tokens, so too

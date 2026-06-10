@@ -40,6 +40,8 @@ from .config import (
     StructKind,
     StructMechanism,
     StructMode,
+    degeneration_guard_enabled,
+    degeneration_shadow_only,
     normalize_endpoint,
     shadow_egress_detect_enabled,
     struct_policy_for,
@@ -79,6 +81,49 @@ _STREAM_TTFT_DEADLINE_S = 30.0
 # by the caller's remaining SLA), so a mid-stream stall aborts in ~this many
 # seconds and frees the slot with a deferrable error instead of hanging to 180s.
 _STREAM_INTERTOKEN_GAP_S = 30.0
+
+# --- Egress repetition-loop (degeneration) detection ------------------------
+# A degenerate response loops a long n-gram many times ("… the song of ## … the
+# song of ## …"). We flag it when the most-common N-word shingle BOTH repeats a
+# lot AND dominates the text — two axes so a normal song chorus (repeats 2-4×,
+# tiny fraction of the whole) is never flagged.
+_DEGEN_GRAM = 6              # shingle length (words)
+_DEGEN_MIN_WORDS = 40        # ignore short replies (a chorus/classification)
+_DEGEN_MIN_REPS = 6          # the top shingle must repeat at least this many times
+_DEGEN_MIN_FRACTION = 0.10   # …AND be ≥ this fraction of all shingles
+
+
+def _top_shingle_reps(text: str) -> tuple[int, int]:
+    """Return (max repeats of any `_DEGEN_GRAM`-word shingle, total shingles)."""
+    words = (text or "").split()
+    n = len(words) - _DEGEN_GRAM + 1
+    if n <= 0:
+        return (0, 0)
+    from collections import Counter
+    c = Counter(tuple(words[i:i + _DEGEN_GRAM]) for i in range(n))
+    return (c.most_common(1)[0][1], n)
+
+
+def _is_degenerate_text(text: str) -> bool:
+    """True iff `text` is a repetition LOOP — the same long shingle repeated many
+    times AND dominating the output. Conservative on both axes so legitimate
+    repetition (a chorus) passes through untouched."""
+    words = (text or "").split()
+    if len(words) < _DEGEN_MIN_WORDS:
+        return False
+    reps, total = _top_shingle_reps(text)
+    if total <= 0:
+        return False
+    return reps >= _DEGEN_MIN_REPS and (reps / total) >= _DEGEN_MIN_FRACTION
+
+
+def _chat_completion_text(body: dict) -> str:
+    """Extract the assistant text from a chat.completion body (or '')."""
+    try:
+        msg = ((body.get("choices") or [{}])[0] or {}).get("message") or {}
+        return (msg.get("content") or "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 class _ToolCallStreamSanitizer:
@@ -400,6 +445,11 @@ class ProxyService:
         # response). {call_site: {"checked": int, "dropped": int}}. Populated by
         # _shadow_egress_detect when COLLECTIVE_PROXY_SHADOW_EGRESS is on (default).
         self._shadow_drop: dict[str, dict] = {}
+        # Egress degeneration guard tallies (repetition-loop detect + re-dispatch).
+        self._degeneration_detected = 0      # responses flagged as a repetition loop
+        self._degeneration_recovered = 0     # …fixed by an anti-repetition re-dispatch
+        self._degeneration_unrecovered = 0   # …still degenerate after re-dispatch(es)
+        self._degeneration_by_call_site: dict[str, dict] = {}
         # Dedupe set so a single request that races across two timeout
         # layers (e.g. admission expiry + client-wait) is logged once.
         self._timed_out_ids: set[str] = set()
@@ -1011,6 +1061,91 @@ class ProxyService:
         except Exception:  # noqa: BLE001 — detector must never break a response
             logger.debug("shadow_egress_detect failed", exc_info=True)
 
+    async def _maybe_correct_degenerate(
+        self, req: "QueuedRequest", result: dict,
+    ) -> None:
+        """Egress degeneration guard: if a non-streaming chat response is a
+        repetition LOOP, RE-DISPATCH to the same backend with an escalating
+        anti-repetition penalty and swap in the first clean result. A 200 full of
+        repeated garbage is invisible to the transient-error retry and the grammar
+        egress check (it's syntactically valid), so this is the layer that catches
+        the failure mode that produced 8× overall=0 song-compose iterations.
+
+        FAIL-OPEN: any error (or all re-dispatches still degenerate) leaves the
+        original result untouched — the guard can never make a response worse or
+        break the response path. Bounded by the caller's own remaining deadline.
+        Kill-switch ``COLLECTIVE_PROXY_DEGENERATION_GUARD``; shadow (detect-only)
+        ``COLLECTIVE_PROXY_DEGENERATION_SHADOW``."""
+        try:
+            if not degeneration_guard_enabled():
+                return
+            if result.get("status") != "ok" or req.payload_type != "chat_completion":
+                return
+            response = result.get("response")
+            if not isinstance(response, dict):
+                return
+            text = _chat_completion_text(response)
+            if not _is_degenerate_text(text):
+                return
+
+            # Flagged. Record + per-call-site tally.
+            self._degeneration_detected += 1
+            cs = req.call_site or "?"
+            tally = self._degeneration_by_call_site.setdefault(
+                cs, {"detected": 0, "recovered": 0})
+            tally["detected"] += 1
+            reps, total = _top_shingle_reps(text)
+            logger.warning(
+                "DEGENERATION detected call_site=%s endpoint=%s words=%d "
+                "top_shingle=%d/%d", cs, req.endpoint, len(text.split()), reps, total)
+
+            if degeneration_shadow_only():
+                return  # measure-only phase — never re-dispatch
+
+            ep_cfg = self._config.endpoints.get(req.endpoint)
+            if ep_cfg is None:
+                return
+
+            # Escalating anti-repetition penalties. vLLM honors frequency/presence
+            # penalty on the OpenAI surface; a small bump breaks the loop without
+            # gutting legitimate chorus repetition on the retry.
+            for i, extra in enumerate(
+                ({"frequency_penalty": 0.6, "presence_penalty": 0.3},
+                 {"frequency_penalty": 1.0, "presence_penalty": 0.5}), start=1,
+            ):
+                remaining = req.timeout_deadline - time.monotonic()
+                if remaining < _MIN_RETRY_BUDGET_S:
+                    break
+                payload = {**req.payload, **extra}
+                try:
+                    resp = await self._backend.call(
+                        ep_cfg, payload, req.payload_type,
+                        f"{req.request_id}-degen{i}", timeout_s=max(2.0, remaining),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "degeneration re-dispatch %d failed (call_site=%s): %s",
+                        i, cs, exc)
+                    continue
+                new_text = _chat_completion_text(resp.body)
+                if new_text and not _is_degenerate_text(new_text):
+                    result["response"] = resp.body
+                    self._degeneration_recovered += 1
+                    tally["recovered"] += 1
+                    logger.info(
+                        "DEGENERATION recovered via re-dispatch %d "
+                        "(call_site=%s frequency_penalty=%.1f)",
+                        i, cs, extra["frequency_penalty"])
+                    return
+            # Exhausted — leave the original; flag so we don't cache the garbage.
+            self._degeneration_unrecovered += 1
+            result["_degenerate_unrecovered"] = True
+            logger.warning(
+                "DEGENERATION unrecovered after re-dispatch (call_site=%s) — "
+                "returning best-effort", cs)
+        except Exception:  # noqa: BLE001 — guard must never break a response
+            logger.debug("degeneration guard failed", exc_info=True)
+
     def _thinking_allowed_keys(self, payload: dict) -> list[str]:
         """Top-level object keys the structured constraint permits — used to
         anchor response recovery. Covers GBNF (top / extra_body /
@@ -1196,14 +1331,20 @@ class ProxyService:
         # stray-brace recovery; fail-safe if unrecoverable). Before the cache so a
         # repaired (or failed-safe) response is what gets cached, never the noise.
         self._finalize_thinking(req, result)
+        # Egress degeneration guard: detect a repetition-loop response and
+        # re-dispatch with an anti-repetition penalty (fail-open). Runs before the
+        # shadow detector + cache so they see the CORRECTED content.
+        await self._maybe_correct_degenerate(req, result)
         # WS-4: SHADOW silent-drop detector over ALL grammar-bearing responses
         # (read-only; never mutates). Runs after the finalizers so it observes the
         # baseline content callers receive, and before the cache so every response
         # is seen exactly once.
         self._shadow_egress_detect(req, result)
 
-        # Cache if deterministic
-        if cache_key and result.get("status") == "ok":
+        # Cache if deterministic — but NEVER cache an unrecovered degenerate
+        # response (don't serve the same garbage for the cache TTL).
+        degen_unrecovered = result.pop("_degenerate_unrecovered", False)
+        if cache_key and result.get("status") == "ok" and not degen_unrecovered:
             self._cache.put(cache_key, result.get("response", {}))
 
         # OpenAI consumers get the bare chat.completion (or an OpenAI-shaped
@@ -1475,6 +1616,15 @@ class ProxyService:
                     / max(1, sum(t["checked"] for t in self._shadow_drop.values())),
                     4,
                 ),
+                # Egress degeneration guard — repetition-loop responses detected,
+                # and how many an anti-repetition re-dispatch recovered.
+                "degeneration_detected": self._degeneration_detected,
+                "degeneration_recovered": self._degeneration_recovered,
+                "degeneration_unrecovered": self._degeneration_unrecovered,
+                "degeneration_by_call_site": {
+                    cs: t for cs, t in self._degeneration_by_call_site.items()
+                    if t["detected"]
+                },
             },
             # Phase 5F — endpoints an operator has drained for maintenance.
             "paused_endpoints": sorted(self._paused_endpoints),
