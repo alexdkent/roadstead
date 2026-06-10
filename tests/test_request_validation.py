@@ -139,3 +139,86 @@ async def test_invalid_json_handler_returns_400():
 async def test_unhandled_handler_returns_500_envelope():
     resp = await proxy_main._on_unhandled(_FakeRequest(), RuntimeError("boom"))
     assert resp.status_code == 500
+
+
+# --- Phase 3 hardening: unknown-endpoint gate on /v1/submit -------------------
+
+import asyncio
+import json as _json
+
+from originfleet.llmproxy.service import ProxyService as _Svc
+from originfleet.llmproxy.config import ProxyConfig as _Cfg
+
+
+class _LoopbackReq:
+    class _Client:
+        host = "127.0.0.1"
+
+    client = _Client()
+    headers: dict = {}
+
+
+def _submit_body(endpoint):
+    return {
+        "agent_id": "a", "endpoint": endpoint, "priority": "P3_INGESTION",
+        "call_site": "t", "payload_type": "chat_completion",
+        "payload": {"messages": [{"role": "user", "content": "x"}]},
+        "timeout_s": 0.2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_unknown_endpoint_shadow_counts_and_proceeds():
+    svc = _Svc(_Cfg())
+    assert svc._flags.get("unknown_endpoint_enforce") is False
+    resp = await svc.handle_submit(_submit_body("qwen-composr-typo"), _LoopbackReq())
+    # Shadow: behaviour unchanged — the request waits out its (short) deadline
+    # and 504s, but the counter recorded the offender for the flip check.
+    assert resp.status_code == 504
+    tally = svc._unknown_endpoint_submits["qwen-composr-typo"]
+    assert tally["count"] == 1
+    assert tally["callers"] == {"a": 1}
+    status = _json.loads((await svc.handle_status(_LoopbackReq())).body)
+    assert "qwen-composr-typo" in status["reliability"]["unknown_endpoint_submits"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_endpoint_enforce_fast_404():
+    svc = _Svc(_Cfg())
+    svc._flags.set_many({"unknown_endpoint_enforce": True})
+    import time as _t
+    t0 = _t.monotonic()
+    resp = await svc.handle_submit(_submit_body("qwen-composr-typo"), _LoopbackReq())
+    assert resp.status_code == 404
+    assert _t.monotonic() - t0 < 0.1  # fast-fail, not deadline-rot
+    body = _json.loads(resp.body)
+    assert body["code"] == "unknown_endpoint"
+    assert "known" not in body  # message carries the list, envelope stays lean
+
+
+@pytest.mark.asyncio
+async def test_known_roles_and_aliases_pass_the_gate():
+    svc = _Svc(_Cfg())
+    svc._flags.set_many({"unknown_endpoint_enforce": True})
+
+    async def ok_call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
+        from originfleet.llmproxy.backend import BackendResponse
+        return BackendResponse(
+            status_code=200,
+            body={"choices": [{"message": {"content": "y"}, "finish_reason": "stop"}],
+                  "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+            duration_s=0.01, input_tokens=1, output_tokens=1, finish_reason="stop")
+
+    svc._backend.call = ok_call
+    await svc.startup()
+    try:
+        for role in ("bge-m3-embed", "bge-reranker", "llama-thinker",
+                     "qwen-composer", "nexus-chat", "gemma-greeter", "chat"):
+            body = _submit_body(role)
+            body["timeout_s"] = 10.0
+            resp = await asyncio.wait_for(
+                svc.handle_submit(body, _LoopbackReq()), timeout=10.0)
+            assert resp.status_code == 200, f"role {role} blocked by the gate"
+        assert svc._unknown_endpoint_submits == {}
+    finally:
+        await svc.shutdown()

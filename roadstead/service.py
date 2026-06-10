@@ -501,6 +501,12 @@ class ProxyService:
         # /v1/status so the ACL-tightening go/no-go can read the live set
         # instead of grepping logs. First hit per (route, ip) also logs INFO.
         self._admin_ips_seen: dict[str, set[str]] = {}
+        # Unknown-endpoint submits (shadow counter): endpoint → {count,
+        # callers}. Feeds the scheduled flip-check for unknown_endpoint_enforce
+        # via /v1/status; non-empty means some caller submits a role the proxy
+        # can't route (today that request rots to its deadline — the bug
+        # enforce mode fixes with a fast 404).
+        self._unknown_endpoint_submits: dict[str, dict] = {}
         # Phase 5B observability counters (exposed on /v1/status).
         self._slot_leak_reclaimed = 0       # streaming dispatches cancelled on
                                             # consumer-disconnect → slot freed
@@ -798,10 +804,40 @@ class ProxyService:
             # SIGTERM surfaced a hard error instead of deferring cleanly.
             err = "proxy draining for shutdown — backpressure"
             if openai:
-                return self._openai_error(err, "backpressure", 503)
-            return JSONResponse({"status": "error", "error": err}, status_code=503)
+                return self._openai_error(err, "backpressure", 503, code="draining")
+            return JSONResponse(
+                {"status": "error", "error": err, "code": "draining"},
+                status_code=503)
 
         now = time.monotonic()
+
+        # Unknown-endpoint gate. Without it a typo'd role enqueues into a
+        # queue the dispatch loop never visits and the caller blocks its FULL
+        # timeout_s before a useless 504 (the OpenAI front door already 404s).
+        # Shadow (flag off): count + WARN, behaviour unchanged. Enforce: fast
+        # 404 whose message deliberately carries NO deferrable marker — a
+        # typo is deterministic and must surface, not defer-loop.
+        endpoint = self._resolve_endpoint(body)
+        if endpoint not in self._config.endpoints:
+            caller = str(body.get("caller_id") or body.get("agent_id") or "unknown")
+            tally = self._unknown_endpoint_submits.setdefault(
+                endpoint, {"count": 0, "callers": {}})
+            tally["count"] += 1
+            tally["callers"][caller] = tally["callers"].get(caller, 0) + 1
+            if self._flags.get("unknown_endpoint_enforce"):
+                err = (f"unknown endpoint {endpoint!r} — no such model/role "
+                       f"(known: {sorted(self._config.endpoints)})")
+                if openai:
+                    return self._openai_error(
+                        err, "model_not_found", 404, code="unknown_endpoint")
+                return JSONResponse(
+                    {"status": "error", "error": err, "code": "unknown_endpoint"},
+                    status_code=404)
+            logger.warning(
+                "unknown endpoint %r submitted by %s (call_site=%s) — SHADOW: "
+                "request will wait out its full deadline; flip "
+                "unknown_endpoint_enforce for a fast 404",
+                endpoint, caller, body.get("call_site"))
 
         # Robust timeout_s: a malformed value must default, not 500 the request.
         # (priority is soft-defaulted inside QueuedRequest.create; payload/
@@ -817,7 +853,7 @@ class ProxyService:
 
         req = QueuedRequest.create(
             agent_id=body.get("agent_id", "unknown"),
-            endpoint=self._resolve_endpoint(body),
+            endpoint=endpoint,
             priority=body.get("priority"),
             call_site=body.get("call_site", "unknown"),
             payload_type=body.get("payload_type", "chat_completion"),
@@ -839,10 +875,11 @@ class ProxyService:
                 if openai:
                     return self._openai_error(
                         grammar_err.get("detail", "invalid grammar"),
-                        "invalid_request_error", 422,
+                        "invalid_request_error", 422, code="invalid_grammar",
                     )
                 return JSONResponse(
-                    {"status": "error", "request_id": req.request_id, **grammar_err},
+                    {"status": "error", "request_id": req.request_id,
+                     "code": "invalid_grammar", **grammar_err},
                     status_code=422,
                 )
 
@@ -884,12 +921,15 @@ class ProxyService:
             # markers) so the caller retries; the wording just aids triage.
             if normalize_endpoint(req.endpoint) in self._paused_endpoints:
                 err = f"backend {req.endpoint} paused for maintenance (drain) — backpressure"
+                code = "draining"
             else:
                 err = f"backend {req.endpoint} unavailable (circuit open)"
+                code = "circuit_open"
             if openai:
-                return self._openai_error(err, "backend_unavailable", 503)
+                return self._openai_error(err, "backend_unavailable", 503, code=code)
             return JSONResponse(
-                {"status": "error", "request_id": req.request_id, "error": err},
+                {"status": "error", "request_id": req.request_id, "error": err,
+                 "code": code},
                 status_code=503,
             )
 
@@ -904,10 +944,11 @@ class ProxyService:
                 err = f"backpressure: {req.endpoint} {band_key} queue saturated"
                 retry_after = self._retry_after_s(req.endpoint)
                 if openai:
-                    resp = self._openai_error(err, "backpressure", 429)
+                    resp = self._openai_error(err, "backpressure", 429, code="backpressure")
                 else:
                     resp = JSONResponse(
-                        {"status": "error", "request_id": req.request_id, "error": err},
+                        {"status": "error", "request_id": req.request_id, "error": err,
+                         "code": "backpressure"},
                         status_code=429)
                 resp.headers["Retry-After"] = str(retry_after)
                 return resp
@@ -1347,9 +1388,11 @@ class ProxyService:
             if openai:
                 return self._openai_error(
                     f"proxy timeout after {req.timeout_s:.0f}s", "proxy_timeout", 504,
+                    code="proxy_timeout",
                 )
             return JSONResponse(
-                {"error": "timeout", "request_id": req.request_id},
+                {"error": "timeout", "request_id": req.request_id,
+                 "code": "proxy_timeout"},
                 status_code=504,
             )
         finally:
@@ -1363,9 +1406,11 @@ class ProxyService:
             if openai:
                 return self._openai_error(
                     f"proxy timeout after {req.timeout_s:.0f}s", "proxy_timeout", 504,
+                    code="proxy_timeout",
                 )
             return JSONResponse(
-                {"error": "timeout", "request_id": req.request_id},
+                {"error": "timeout", "request_id": req.request_id,
+                 "code": "proxy_timeout"},
                 status_code=504,
             )
 
@@ -1401,10 +1446,13 @@ class ProxyService:
                 return JSONResponse(result.get("response", {}))
             return self._openai_error(
                 result.get("error", "backend error"), "backend_error", 502,
+                code="backend_error",
             )
 
-        status_code = 200 if result.get("status") == "ok" else 502
-        return JSONResponse(result, status_code=status_code)
+        if result.get("status") == "ok":
+            return JSONResponse(result, status_code=200)
+        result.setdefault("code", "backend_error")
+        return JSONResponse(result, status_code=502)
 
     async def _handle_streaming_submit(
         self, req: QueuedRequest, *, openai: bool = False,
@@ -1499,13 +1547,17 @@ class ProxyService:
     # ----- handler: OpenAI compat -----
 
     @staticmethod
-    def _openai_error(message: str, err_type: str, status_code: int) -> JSONResponse:
+    def _openai_error(
+        message: str, err_type: str, status_code: int, code: str | None = None,
+    ) -> JSONResponse:
         """OpenAI-shaped error envelope for the /v1/chat/completions front door
-        (goose-cli + any OpenAI client expects ``{"error": {...}}``)."""
-        return JSONResponse(
-            {"error": {"message": str(message), "type": err_type}},
-            status_code=status_code,
-        )
+        (goose-cli + any OpenAI client expects ``{"error": {...}}``). ``code``
+        is the machine-readable taxonomy field (M2) — additive; the message
+        substrings the fleet's deferral classifier sniffs are unchanged."""
+        err: dict = {"message": str(message), "type": err_type}
+        if code:
+            err["code"] = code
+        return JSONResponse({"error": err}, status_code=status_code)
 
     async def handle_openai_chat(self, body: dict, request: Request) -> Response:
         remote_ip = request.client.host if request.client else "unknown"
@@ -1514,7 +1566,8 @@ class ProxyService:
             # Phase 5D: OpenAI-shaped 403 (was a bare {"error": "<str>"} that a
             # strict OpenAI client crashes on doing resp.error.message).
             return self._openai_error(
-                f"access denied for {remote_ip}", "access_denied", 403)
+                f"access denied for {remote_ip}", "access_denied", 403,
+                code="access_denied")
         agent_id, default_priority = identity
         model = body.get("model", "qwen-analyst")
         # Phase 5D: validate the model maps to a known endpoint BEFORE enqueue.
@@ -1522,7 +1575,8 @@ class ProxyService:
         # fails late with a confusing 502; OpenAI clients expect 404/model_not_found.
         if normalize_endpoint(str(model)) not in self._config.endpoints:
             return self._openai_error(
-                f"unknown model {model!r}", "model_not_found", 404)
+                f"unknown model {model!r}", "model_not_found", 404,
+                code="unknown_endpoint")
 
         # Honor a client-supplied deadline (goose recipes can run long): a
         # ``timeout_s`` body field or an ``X-Timeout-S`` header overrides the
@@ -1551,7 +1605,8 @@ class ProxyService:
         identity = self._acl.identify(remote_ip)
         if not identity:
             return self._openai_error(
-                f"access denied for {remote_ip}", "access_denied", 403)
+                f"access denied for {remote_ip}", "access_denied", 403,
+                code="access_denied")
         agent_id, default_priority = identity
 
         submit_body = {
@@ -1667,6 +1722,9 @@ class ProxyService:
                     route: sorted(ips)
                     for route, ips in self._admin_ips_seen.items()
                 },
+                # Unknown-endpoint submits since boot (shadow counter for the
+                # unknown_endpoint_enforce flip check). Empty = safe to flip.
+                "unknown_endpoint_submits": self._unknown_endpoint_submits,
                 # Structured-output policy (reason-then-constrain) egress health.
                 # Both stay 0 until a call_site policy is flipped on.
                 "struct_egress_failures": self._struct_egress_failures,
