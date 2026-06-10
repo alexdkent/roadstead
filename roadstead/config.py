@@ -224,6 +224,14 @@ class EndpointConfig:
     # backends (not vLLM). Off by default; enabled on companion.
     slot_affinity: bool = False
 
+    # When True, the capacity poller probes ONLY /health for this endpoint —
+    # no /props, /v1/models, or vLLM capacity discovery. For non-OpenAI
+    # FastAPI shims (embed :9087, rerank :9084) that have neither route:
+    # without this they 404 both discovery probes every 10s forever (httpx
+    # log spam + a consecutive_failures counter that cycles 1-2-3-reset and
+    # never means anything). max_slots/context stay config-seeded.
+    skip_discovery: bool = False
+
     @property
     def effective_max_slots(self) -> int:
         """Concurrency ceiling the scheduler dispatches against: max_slots,
@@ -332,6 +340,8 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         max_slots=1, context_per_slot=8192,
         background_floor_pct=0.0,
         host="10.0.0.3", port=9084,
+        # FastAPI shim — no /props or /v1/models; health-probe only.
+        skip_discovery=True,
     ),
     "embed": EndpointConfig(
         # anvil bge-m3 embed :9087 — n_ctx 8192/slot, 4 slots (the CANONICAL
@@ -339,6 +349,8 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         endpoint_class="embed", role="bge-m3-embed",
         max_slots=4, context_per_slot=8192,
         host="10.0.0.3", port=9087,
+        # FastAPI shim — no /props or /v1/models; health-probe only.
+        skip_discovery=True,
     ),
     "thinker": EndpointConfig(
         # vLLM-NVFP4 on GB10 (Qwen3.6-27B-Text-NVFP4-MTP since 2026-05-30).
@@ -545,6 +557,12 @@ class ProxyConfig:
     queue_db_path: str = ""
     stats_db_path: str = ""
     request_log_path: str = ""
+    # Runtime-mutable feature flags (flags.py): persisted JSON, mutated via
+    # POST /v1/admin/flags. Empty path → in-memory defaults (tests).
+    runtime_flags_path: str = ""
+    # Capacity-poller cadence. Production default 10s; tests shrink it so
+    # poller-loop behaviour is observable without 10s waits.
+    poller_interval_s: float = 10.0
 
     # --- queue.db maintenance (persistence cleanup) ---
     # Payload bodies (payload_json/response_json on proxy_completions) are only

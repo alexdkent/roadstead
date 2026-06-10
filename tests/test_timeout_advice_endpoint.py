@@ -87,13 +87,16 @@ async def test_advice_normalizes_role_name(tmp_path):
 @pytest.mark.asyncio
 async def test_advice_cold_model_returns_floor(tmp_path):
     svc = _make_service(tmp_path)
+    # ("gemma-hot" was the original subject here; that endpoint class was
+    # decommissioned 2026-06-08, so the cold-floor behaviour is pinned on the
+    # surviving "gemma" class instead.)
     resp = await svc.handle_timeout_advice(
-        _FakeRequest(model="gemma-hot", priority="P0_REALTIME", est_in=50, est_out=32)
+        _FakeRequest(model="gemma", priority="P0_REALTIME", est_in=50, est_out=32)
     )
     body = json.loads(resp.body.decode())
     assert resp.status_code == 200
     assert body["source"] == "floor"
-    assert body["recommended_timeout_s"] == 8  # gemma-hot floor
+    assert body["recommended_timeout_s"] == 60  # gemma floor (FLOOR_S)
 
 
 @pytest.mark.asyncio

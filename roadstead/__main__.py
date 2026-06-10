@@ -71,6 +71,12 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
                 "LLM_PROXY_QUEUE_DB",
                 os.path.join(data_dir, "queue.db"),
             ),
+            # Runtime-mutable feature flags (flags.py) — persisted next to the
+            # queue DB, flipped via POST /v1/admin/flags (no env gates).
+            runtime_flags_path=os.environ.get(
+                "LLM_PROXY_RUNTIME_FLAGS",
+                os.path.join(data_dir, "runtime_flags.json"),
+            ),
             request_log_path=os.environ.get(
                 "LLM_PROXY_REQUEST_LOG",
                 os.path.join(log_dir, "llmproxy_requests.jsonl"),
@@ -124,6 +130,10 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         stream=sys.stderr,
     )
+    # httpx logs every backend request at INFO ("HTTP Request: POST ..."), an
+    # order-of-magnitude log inflation the proxy's own per-request INFO line
+    # was already removed for. Failures still surface via our own handlers.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     # Emit a ship_version line on startup so the ship harness'
     # restart-phase health-poll can confirm the new build is running.
@@ -184,6 +194,7 @@ def _test_cli() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         stream=sys.stderr,
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     from .test_harness import ProxyTestHarness, ShapingConfig
 

@@ -307,6 +307,7 @@ class _ToolCallStreamSanitizer:
         except Exception:  # noqa: BLE001 — a sanitizer bug must not break the stream
             return data
 from .cost_model import CostModel, estimate_input_tokens
+from .flags import RuntimeFlags
 from .timeout_model import TimeoutModel
 from .observability import (
     AlertCondition,
@@ -398,6 +399,11 @@ class ProxyService:
         self._scheduler = Scheduler(config, self._cost_model, self._budget_mgr)
         self._backend = BackendClientPool()
         self._queue_db = PersistentQueue(config.queue_db_path or None)
+
+        # Runtime-mutable feature flags (flags.py) — shadow→enforce switches +
+        # kill-switches that must be flippable without a process restart (no
+        # env gates). Reads are dict lookups; mutation only via /v1/admin/flags.
+        self._flags = RuntimeFlags(config.runtime_flags_path or None)
 
         # Deterministic response cache (temperature=0).
         self._cache = DeterministicCache()
@@ -491,6 +497,10 @@ class ProxyService:
         # poll tick.
         self._alerts: list[dict] = []
         self._alert_logged: set = set()
+        # Admin-surface audit: source IPs seen per admin-ish route, exposed on
+        # /v1/status so the ACL-tightening go/no-go can read the live set
+        # instead of grepping logs. First hit per (route, ip) also logs INFO.
+        self._admin_ips_seen: dict[str, set[str]] = {}
         # Phase 5B observability counters (exposed on /v1/status).
         self._slot_leak_reclaimed = 0       # streaming dispatches cancelled on
                                             # consumer-disconnect → slot freed
@@ -590,9 +600,16 @@ class ProxyService:
         self._queue_db.cleanup_old_payloads(self._config.payload_retention_s)
         self._last_cleanup_at = time.monotonic()
 
-        # Start background loops
+        # Start background loops. The done-callbacks make an UNEXPECTED loop
+        # exit loud (CRITICAL) — the iteration guards inside the loops should
+        # make this unreachable, but a dead scheduler loop is a total outage
+        # that uvicorn happily serves 503s through, so belt and braces.
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+        self._scheduler_task.add_done_callback(
+            lambda t: self._on_loop_task_exit("scheduler", t))
         self._poller_task = asyncio.create_task(self._capacity_poller_loop())
+        self._poller_task.add_done_callback(
+            lambda t: self._on_loop_task_exit("capacity poller", t))
         self._inflight_task = asyncio.create_task(self._inflight_stream_loop())
 
         logger.info(
@@ -1576,10 +1593,29 @@ class ProxyService:
             for b in self._budget_mgr.snapshot()
         }
 
+        # Loop liveness is computed AT READ TIME: the poller is what evaluates
+        # self._alerts, so a dead poller (or scheduler) can never report itself
+        # through that path — only through this one.
+        alerts = list(self._alerts)
+        if not self._scheduler_loop_alive():
+            alerts.append({
+                "name": "scheduler_loop_dead", "severity": "CRITICAL",
+                "detail": "scheduler loop task not running — dispatch is DOWN",
+            })
+        if not self._poller_alive():
+            alerts.append({
+                "name": "poller_dead", "severity": "CRITICAL",
+                "detail": "capacity poller task not running — health probing, "
+                          "alerting, and budget persistence have stopped",
+            })
+
         return JSONResponse({
             "endpoints": endpoints,
             "agents": agents,
-            "alerts": self._alerts,  # Phase 2.5 — health-verifier/log_scan surface
+            "alerts": alerts,  # Phase 2.5 — health-verifier/log_scan surface
+            # Runtime feature flags (flags.py) — read by dashboards + the
+            # scheduled shadow→enforce flip checks.
+            "flags": self._flags.as_dict(),
             "cache": self._cache.stats(),
             "scheduler": {
                 **self._scheduler.stats(),
@@ -1592,6 +1628,15 @@ class ProxyService:
                 "writer_thread_alive": self._queue_db.writer_alive(),
                 "writer_thread_restarts": self._queue_db.writer_restarts(),
                 "write_q_dropped": self._queue_db.write_q_dropped(),
+                # Critical-loop liveness (read-time; see alerts note above).
+                "scheduler_alive": self._scheduler_loop_alive(),
+                "poller_alive": self._poller_alive(),
+                # Source IPs seen on admin-ish routes since boot — the
+                # ACL-tightening go/no-go reads this instead of grepping logs.
+                "admin_ips_seen": {
+                    route: sorted(ips)
+                    for route, ips in self._admin_ips_seen.items()
+                },
                 # Structured-output policy (reason-then-constrain) egress health.
                 # Both stay 0 until a call_site policy is flipped on.
                 "struct_egress_failures": self._struct_egress_failures,
@@ -1632,6 +1677,40 @@ class ProxyService:
 
     # ----- handler: admin endpoint pause/resume (Phase 5F operator drain) -----
 
+    def _audit_admin_ip(self, route: str, remote_ip: str) -> None:
+        """Track source IPs per admin-ish route (exposed on /v1/status) and log
+        the FIRST hit per (route, ip) — the data the ACL-tightening go/no-go
+        needs, without per-hit log volume."""
+        seen = self._admin_ips_seen.setdefault(route, set())
+        if remote_ip not in seen:
+            seen.add(remote_ip)
+            logger.info("admin-audit: first hit on %s from %s", route, remote_ip)
+
+    async def handle_admin_flags(self, request: Request) -> Response:
+        """GET: current runtime flags. POST: update a subset (JSON object of
+        flag→bool), persisted across restarts. Internal-only (ACL). This is the
+        flip surface for the shadow→enforce switches and kill-switches — flags
+        change behaviour immediately, no process restart."""
+        remote_ip = request.client.host if request.client else "unknown"
+        self._audit_admin_ip("/v1/admin/flags", remote_ip)
+        if not self._acl.identify(remote_ip):
+            return JSONResponse(
+                {"error": f"access denied for {remote_ip}"}, status_code=403)
+        if request.method == "GET":
+            return JSONResponse({"flags": self._flags.as_dict()})
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            # File write runs off-loop; flag reads elsewhere are plain dict
+            # lookups on the loop thread (single mutation source — this handler).
+            updated = await asyncio.to_thread(self._flags.set_many, body)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        logger.warning("runtime flags updated by %s: %s", remote_ip, body)
+        return JSONResponse({"flags": updated})
+
     async def handle_admin_endpoint_pause(
         self, endpoint: str, request: Request, *, pause: bool,
     ) -> Response:
@@ -1646,6 +1725,7 @@ class ProxyService:
         re-probes, recovers on /health, re-discovers capacity (the new
         max_model_len), and the deferred queue drains."""
         remote_ip = request.client.host if request.client else "unknown"
+        self._audit_admin_ip("/v1/admin/endpoints", remote_ip)
         if not self._acl.identify(remote_ip):
             return JSONResponse(
                 {"error": f"access denied for {remote_ip}"}, status_code=403)
@@ -1709,6 +1789,7 @@ class ProxyService:
         With none of duration_s/started_at/ended_at, opens an OPEN window now
         (close it later via the drain resume, or re-POST with ended_at)."""
         remote_ip = request.client.host if request.client else "unknown"
+        self._audit_admin_ip("/v1/admin/maintenance", remote_ip)
         if not self._acl.identify(remote_ip):
             return JSONResponse(
                 {"error": f"access denied for {remote_ip}"}, status_code=403)
@@ -1859,6 +1940,7 @@ class ProxyService:
         call-metrics store. Internal/LAN — gated by the same ACL as admin.
         Best-effort: validates the minimum, records, fans out, returns ok."""
         remote_ip = request.client.host if request.client else "unknown"
+        self._audit_admin_ip("/v1/calls/log", remote_ip)
         if not self._acl.identify(remote_ip):
             return JSONResponse({"error": f"access denied for {remote_ip}"}, status_code=403)
         try:
@@ -2030,13 +2112,22 @@ class ProxyService:
 
     # ----- handler: health -----
 
+    def _scheduler_loop_alive(self) -> bool:
+        return self._scheduler_task is not None and not self._scheduler_task.done()
+
+    def _poller_alive(self) -> bool:
+        return self._poller_task is not None and not self._poller_task.done()
+
     async def handle_health(self, request: Request) -> Response:
-        ok = self._scheduler_task is not None and not self._scheduler_task.done()
+        ok = self._scheduler_loop_alive()
+        poller_ok = self._poller_alive()
         unhealthy = [ep for ep, h in self._endpoint_health.items() if not h["healthy"]]
         # The proxy is UP iff its scheduler is alive (200). A dead BACKEND
         # degrades status but must NOT 503 the proxy — that would make a monitor
         # restart a healthy front door over a backend blip (alert-don't-kill).
-        status = "ok" if (ok and not unhealthy) else ("degraded" if ok else "down")
+        # A dead POLLER also only degrades: dispatch still works, but health
+        # probing / alerting / budget persistence have stopped — surface it.
+        status = "ok" if (ok and poller_ok and not unhealthy) else ("degraded" if ok else "down")
         return JSONResponse(
             {
                 "status": status,
@@ -2045,14 +2136,33 @@ class ProxyService:
                 "endpoints": len(self._config.endpoints),
                 "total_slots": self._config.total_fleet_slots,
                 "unhealthy_endpoints": unhealthy,
+                "scheduler_alive": ok,
+                "poller_alive": poller_ok,
             },
             status_code=200 if ok else 503,
         )
 
     # ----- scheduler loop -----
 
+    def _on_loop_task_exit(self, name: str, task: asyncio.Task) -> None:
+        """A critical background loop ended. Normal only during shutdown
+        (cancellation while draining); anything else is a silent total/partial
+        outage — uvicorn keeps serving, run_agent.sh sees no exit — so scream."""
+        if task.cancelled():
+            return  # shutdown path
+        exc = task.exception()
+        logger.critical(
+            "llmproxy %s loop EXITED unexpectedly%s — proxy degraded until restart",
+            name, f": {exc!r}" if exc else " (clean return — should be impossible)",
+        )
+
     async def _scheduler_loop(self) -> None:
-        """Main scheduling loop — runs dispatch on every event or interval."""
+        """Main scheduling loop — runs dispatch on every event or interval.
+
+        The iteration body is guarded: one poisoned tick (a scheduler bug, a
+        corrupt request) must not kill dispatching for the WHOLE fleet. On an
+        escaped exception we log CRITICAL and back off 1s; CancelledError
+        (shutdown) propagates."""
         while True:
             try:
                 await asyncio.wait_for(
@@ -2063,16 +2173,23 @@ class ProxyService:
                 pass
             self._dispatch_event.clear()
 
-            now = time.monotonic()
-            decisions = self._scheduler.tick(now)
+            try:
+                now = time.monotonic()
+                decisions = self._scheduler.tick(now)
 
-            for decision in decisions:
-                rid = decision.request.request_id
-                task = asyncio.create_task(self._execute_dispatch(decision))
-                self._inflight_tasks[rid] = task
-                task.add_done_callback(
-                    lambda t, _rid=rid: self._inflight_tasks.pop(_rid, None)
+                for decision in decisions:
+                    rid = decision.request.request_id
+                    task = asyncio.create_task(self._execute_dispatch(decision))
+                    self._inflight_tasks[rid] = task
+                    task.add_done_callback(
+                        lambda t, _rid=rid: self._inflight_tasks.pop(_rid, None)
+                    )
+            except Exception:  # noqa: BLE001 — keep the fleet dispatching
+                logger.critical(
+                    "scheduler loop iteration failed — dispatch continues after "
+                    "1s backoff", exc_info=True,
                 )
+                await asyncio.sleep(1.0)
 
     async def _execute_dispatch(self, decision: DispatchDecision) -> None:
         """Execute a dispatch decision: call the backend and resolve the
@@ -2939,103 +3056,133 @@ class ProxyService:
 
     # ----- capacity poller -----
 
+    async def _poll_endpoint_once(self, ep_name: str, ep_cfg: EndpointConfig) -> None:
+        """One poller pass for one endpoint: capacity discovery (or a plain
+        health probe for skip_discovery shims) + the circuit-breaker update."""
+        probe_ok = False
+        try:
+            if ep_cfg.skip_discovery:
+                # Non-OpenAI FastAPI shim (embed/rerank): no /props or
+                # /v1/models to discover — a /health probe IS the signal.
+                # Without this branch the discovery probes 404 every cycle
+                # forever (log spam + a meaningless failure counter).
+                probe_ok = await self._backend.probe_health(ep_cfg)
+            elif ep_cfg.backend_engine == "vllm":
+                # Capacity discovery is engine-specific. llama.cpp reports
+                # slots + context via /props; vLLM has no /props or /slots,
+                # so the per-request context ceiling comes from /v1/models
+                # max_model_len (concurrency/max_slots stays config-driven).
+                cap = await self._backend.probe_vllm_capacity(ep_cfg)
+                if cap:
+                    self._apply_discovered_vllm_capacity(ep_name, ep_cfg, cap)
+                    probe_ok = True
+            else:
+                props = await self._backend.probe_props(ep_cfg)
+                if props:
+                    self._apply_discovered_props(ep_name, ep_cfg, props)
+                    probe_ok = True
+            if not ep_cfg.skip_discovery:
+                # Discover the served model id (the name the backend
+                # answers to). vLLM validates it, so the proxy sends
+                # this — not the caller's role/alias — on dispatch.
+                served = await self._backend.probe_models(ep_cfg)
+                if served:
+                    probe_ok = True
+                    if served != ep_cfg.served_model_id:
+                        logger.info(
+                            "endpoint %s: served model id = %s (was %s)",
+                            ep_name, served, ep_cfg.served_model_id or "<role>",
+                        )
+                        ep_cfg.served_model_id = served
+        except Exception as exc:
+            logger.debug("poller probe %s failed: %s", ep_name, exc)
+        # Circuit-breaker health update (Phase 1.2). Guarded so a fault
+        # here never stalls discovery.
+        try:
+            await self._update_endpoint_health(ep_name, ep_cfg, probe_ok)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("health update %s failed: %s", ep_name, exc)
+
     async def _capacity_poller_loop(self) -> None:
-        """Periodically probe backends for slot counts and context sizes."""
+        """Periodically probe backends for slot counts and context sizes.
+
+        The iteration body is guarded: the poller also drives alerting, budget
+        persistence, retention, and WAL maintenance — one escaped exception
+        must not silently kill all of that until the next restart. The sleep
+        sits OUTSIDE the guard so a failing iteration can't hot-spin, and
+        CancelledError (shutdown) propagates from either."""
         while True:
-            for ep_name, ep_cfg in self._config.endpoints.items():
-                # Phase 5F: an operator-paused endpoint is intentionally down
-                # (maintenance) — don't probe it (probes would fail + churn the
-                # circuit/logs). /resume removes it from the set; the next poll
-                # then re-probes, recovers, and re-discovers capacity (e.g. the
-                # new max_model_len after a vLLM restart).
-                if ep_name in self._paused_endpoints:
-                    continue
-                probe_ok = False
-                try:
-                    # Capacity discovery is engine-specific. llama.cpp reports
-                    # slots + context via /props; vLLM has no /props or /slots,
-                    # so the per-request context ceiling comes from /v1/models
-                    # max_model_len (concurrency/max_slots stays config-driven).
-                    if ep_cfg.backend_engine == "vllm":
-                        cap = await self._backend.probe_vllm_capacity(ep_cfg)
-                        if cap:
-                            self._apply_discovered_vllm_capacity(ep_name, ep_cfg, cap)
-                            probe_ok = True
-                    else:
-                        props = await self._backend.probe_props(ep_cfg)
-                        if props:
-                            self._apply_discovered_props(ep_name, ep_cfg, props)
-                            probe_ok = True
-                    # Discover the served model id (the name the backend
-                    # answers to). vLLM validates it, so the proxy sends
-                    # this — not the caller's role/alias — on dispatch.
-                    served = await self._backend.probe_models(ep_cfg)
-                    if served:
-                        probe_ok = True
-                        if served != ep_cfg.served_model_id:
-                            logger.info(
-                                "endpoint %s: served model id = %s (was %s)",
-                                ep_name, served, ep_cfg.served_model_id or "<role>",
-                            )
-                            ep_cfg.served_model_id = served
-                except Exception as exc:
-                    logger.debug("poller probe %s failed: %s", ep_name, exc)
-                # Circuit-breaker health update (Phase 1.2). Guarded so a fault
-                # here never stalls discovery.
-                try:
-                    await self._update_endpoint_health(ep_name, ep_cfg, probe_ok)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("health update %s failed: %s", ep_name, exc)
-            mono = time.monotonic()
-            # Retention sweep (Phase 2.3): daily DB trim, off-loop via the writer.
-            if mono - self._last_cleanup_at > 86400.0:
-                self._last_cleanup_at = mono
-                self._queue_db.cleanup_old_completions(
-                    self._config.completions_retention_s)
-                self._queue_db.cleanup_old_payloads(
-                    self._config.payload_retention_s)
-                # Evict one-off agent_ids (ad-hoc tools / smoke scripts /
-                # probe-*) idle >1h so the DRR budget map can't grow unbounded;
-                # a returning agent is recreated at the identical idle state.
-                pruned = self._budget_mgr.prune_idle(mono, idle_ttl_s=3600.0)
-                if pruned:
-                    logger.info("budget: pruned %d idle agent(s): %s",
-                                len(pruned), ", ".join(sorted(pruned)[:20]))
-            # Periodic SSE `metrics` frame so /v1/stream subscribers get an
-            # aggregate refresh between individual call.completed events
-            # (no-op when nobody is subscribed).
-            if self._sse.client_count:
-                try:
-                    self._sse.publish("metrics", self._metrics_payload(mono))
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("sse metrics publish failed: %s", exc)
-            # WAL TRUNCATE-checkpoint so the -wal sidecar can't camp at a burst
-            # high-water mark (persistence cleanup).
-            if (mono - self._last_wal_checkpoint_at
-                    > self._config.wal_checkpoint_interval_s):
-                self._last_wal_checkpoint_at = mono
-                self._queue_db.checkpoint_truncate()
-            # Return freed pages to the OS gradually (cheap; no full VACUUM lock).
-            if (mono - self._last_incr_vacuum_at
-                    > self._config.incremental_vacuum_interval_s):
-                self._last_incr_vacuum_at = mono
-                self._queue_db.incremental_vacuum(
-                    self._config.incremental_vacuum_pages)
-            # Periodic DRR-balance persistence (Phase 3.4) so a SIGKILL loses at
-            # most ~60s of fairness state.
-            if mono - self._last_budget_save_at > 60.0:
-                self._last_budget_save_at = mono
-                self._queue_db.save_budgets(self._budget_mgr.snapshot())
-            # Alerting (Phase 2.5): evaluate conditions → logs + /v1/status so
-            # health-verifier/log_scan see proxy-internal health. Never restarts a backend.
             try:
-                self._evaluate_alerts(mono)
+                await self._poller_iteration()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — keep probing/alerting alive
+                logger.critical(
+                    "capacity poller iteration failed — continuing next cycle",
+                    exc_info=True,
+                )
+            await asyncio.sleep(self._config.poller_interval_s)
+
+    async def _poller_iteration(self) -> None:
+        """One full poller pass: probe every endpoint, then the periodic chores."""
+        for ep_name, ep_cfg in self._config.endpoints.items():
+            # Phase 5F: an operator-paused endpoint is intentionally down
+            # (maintenance) — don't probe it (probes would fail + churn the
+            # circuit/logs). /resume removes it from the set; the next poll
+            # then re-probes, recovers, and re-discovers capacity (e.g. the
+            # new max_model_len after a vLLM restart).
+            if ep_name in self._paused_endpoints:
+                continue
+            await self._poll_endpoint_once(ep_name, ep_cfg)
+        mono = time.monotonic()
+        # Retention sweep (Phase 2.3): daily DB trim, off-loop via the writer.
+        if mono - self._last_cleanup_at > 86400.0:
+            self._last_cleanup_at = mono
+            self._queue_db.cleanup_old_completions(
+                self._config.completions_retention_s)
+            self._queue_db.cleanup_old_payloads(
+                self._config.payload_retention_s)
+            # Evict one-off agent_ids (ad-hoc tools / smoke scripts /
+            # probe-*) idle >1h so the DRR budget map can't grow unbounded;
+            # a returning agent is recreated at the identical idle state.
+            pruned = self._budget_mgr.prune_idle(mono, idle_ttl_s=3600.0)
+            if pruned:
+                logger.info("budget: pruned %d idle agent(s): %s",
+                            len(pruned), ", ".join(sorted(pruned)[:20]))
+        # Periodic SSE `metrics` frame so /v1/stream subscribers get an
+        # aggregate refresh between individual call.completed events
+        # (no-op when nobody is subscribed).
+        if self._sse.client_count:
+            try:
+                self._sse.publish("metrics", self._metrics_payload(mono))
             except Exception as exc:  # noqa: BLE001
-                logger.debug("alert evaluation failed: %s", exc)
-            # Age out stale timeout-model samples (cheap; piggybacks the
-            # 10s poller instead of a dedicated task).
-            self._timeout_model.prune(mono)
-            await asyncio.sleep(10.0)
+                logger.debug("sse metrics publish failed: %s", exc)
+        # WAL TRUNCATE-checkpoint so the -wal sidecar can't camp at a burst
+        # high-water mark (persistence cleanup).
+        if (mono - self._last_wal_checkpoint_at
+                > self._config.wal_checkpoint_interval_s):
+            self._last_wal_checkpoint_at = mono
+            self._queue_db.checkpoint_truncate()
+        # Return freed pages to the OS gradually (cheap; no full VACUUM lock).
+        if (mono - self._last_incr_vacuum_at
+                > self._config.incremental_vacuum_interval_s):
+            self._last_incr_vacuum_at = mono
+            self._queue_db.incremental_vacuum(
+                self._config.incremental_vacuum_pages)
+        # Periodic DRR-balance persistence (Phase 3.4) so a SIGKILL loses at
+        # most ~60s of fairness state.
+        if mono - self._last_budget_save_at > 60.0:
+            self._last_budget_save_at = mono
+            self._queue_db.save_budgets(self._budget_mgr.snapshot())
+        # Alerting (Phase 2.5): evaluate conditions → logs + /v1/status so
+        # health-verifier/log_scan see proxy-internal health. Never restarts a backend.
+        try:
+            self._evaluate_alerts(mono)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("alert evaluation failed: %s", exc)
+        # Age out stale timeout-model samples (cheap; piggybacks the
+        # poller cadence instead of a dedicated task).
+        self._timeout_model.prune(mono)
 
     def _apply_discovered_props(
         self, ep_name: str, ep_cfg: EndpointConfig, props: dict,

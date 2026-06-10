@@ -91,6 +91,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
             return await svc.handle_maintenance_list(request)
         return await svc.handle_maintenance(request)
 
+    async def handle_admin_flags(request: Request) -> Response:
+        return await svc.handle_admin_flags(request)
+
     # Phase 1 — proxy as fleet call-metrics authority.
     async def handle_stream(request: Request) -> Response:
         return await svc.handle_stream(request)
@@ -146,5 +149,7 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         # its timeout burst doesn't read as an incident in /v1/timeouts.
         # POST records a window; GET lists recent windows. (internal-only/ACL)
         Route("/v1/admin/maintenance", handle_maintenance, methods=["GET", "POST"]),
+        # Runtime feature flags: the shadow→enforce flip surface (internal/ACL).
+        Route("/v1/admin/flags", handle_admin_flags, methods=["GET", "POST"]),
         Route("/health", handle_health, methods=["GET"]),
     ]
