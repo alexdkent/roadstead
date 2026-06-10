@@ -209,15 +209,18 @@ class ProxyTestHarness:
     # --- Mode 1: Simulation (delegates to existing SimRunner) ---
 
     def run_sim(self, scenario_name: str, **overrides: Any) -> Any:
-        from .simulation import BUILTIN_SCENARIOS as SCENARIOS, SimRunner
+        from .simulation import BUILTIN_SCENARIOS as SCENARIOS, run_scenario
         if scenario_name not in SCENARIOS:
             raise ValueError(
                 f"unknown scenario {scenario_name!r}; "
                 f"available: {sorted(SCENARIOS)}"
             )
-        scenario = SCENARIOS[scenario_name]
-        runner = SimRunner(scenario)
-        return runner.run()
+        # run_scenario (not a bare SimRunner) so the per-scenario relaxed
+        # expire thresholds apply — the deliberate-overload scenarios
+        # (cascade_timeout 4x load, long_tail) exist to verify no-deadlock +
+        # priority ordering, not that infinite demand fits finite capacity;
+        # judging them at the default 10% loss bar false-fails them.
+        return run_scenario(scenario_name, SCENARIOS[scenario_name])
 
     # --- Mode 2: Recorded replay through the proxy ---
 

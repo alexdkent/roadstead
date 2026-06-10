@@ -198,7 +198,9 @@ def _test_cli() -> None:
 
     from .test_harness import ProxyTestHarness, ShapingConfig
 
-    db_path = args.db or os.path.join(
+    # `sim` defines no --db (pure in-process); replay/ab do. getattr keeps the
+    # shared path computation from AttributeError-ing the sim mode.
+    db_path = getattr(args, "db", None) or os.path.join(
         os.environ.get("COLLECTIVE_HOT_ROOT", "/tmp"),
         "agents", "llmproxy", "queue.db",
     )

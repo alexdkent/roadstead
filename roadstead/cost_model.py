@@ -150,6 +150,12 @@ class EndpointCostModel:
             self.output_length_ewma[call_site] = EWMATracker(alpha=0.1)
         self.output_length_ewma[call_site].update(float(output_tokens))
 
+        # No capacity curve to calibrate against (an endpoint discovery set to
+        # 0 slots mid-flight clears decode_tps) — the indexing below would
+        # IndexError on the empty curve when a late completion lands.
+        if self.max_slots < 1 or not self.decode_tps:
+            return
+
         # Estimate how much time was prefill vs decode
         est_prefill = self.prefill_k * input_tokens
         est_decode = max(0.01, duration_s - est_prefill)
