@@ -1890,7 +1890,7 @@ class ProxyService:
         change behaviour immediately, no process restart."""
         remote_ip = request.client.host if request.client else "unknown"
         self._audit_admin_ip("/v1/admin/flags", remote_ip)
-        if not self._acl.identify(remote_ip):
+        if not self._acl.is_admin(remote_ip):
             return JSONResponse(
                 {"error": f"access denied for {remote_ip}"}, status_code=403)
         if request.method == "GET":
@@ -1923,7 +1923,7 @@ class ProxyService:
         max_model_len), and the deferred queue drains."""
         remote_ip = request.client.host if request.client else "unknown"
         self._audit_admin_ip("/v1/admin/endpoints", remote_ip)
-        if not self._acl.identify(remote_ip):
+        if not self._acl.is_admin(remote_ip):
             return JSONResponse(
                 {"error": f"access denied for {remote_ip}"}, status_code=403)
         ep = normalize_endpoint(endpoint)
@@ -1987,7 +1987,7 @@ class ProxyService:
         (close it later via the drain resume, or re-POST with ended_at)."""
         remote_ip = request.client.host if request.client else "unknown"
         self._audit_admin_ip("/v1/admin/maintenance", remote_ip)
-        if not self._acl.identify(remote_ip):
+        if not self._acl.is_admin(remote_ip):
             return JSONResponse(
                 {"error": f"access denied for {remote_ip}"}, status_code=403)
         if self._queue_db is None:
@@ -2050,7 +2050,13 @@ class ProxyService:
         return JSONResponse({"recorded": recorded})
 
     async def handle_maintenance_list(self, request: Request) -> Response:
-        """List maintenance windows overlapping the last ``hours`` (default 24)."""
+        """List maintenance windows overlapping the last ``hours`` (default 24).
+        Admin surface (was unauthenticated — tightened with the rest)."""
+        remote_ip = request.client.host if request.client else "unknown"
+        self._audit_admin_ip("/v1/admin/maintenance", remote_ip)
+        if not self._acl.is_admin(remote_ip):
+            return JSONResponse(
+                {"error": f"access denied for {remote_ip}"}, status_code=403)
         if self._queue_db is None:
             return JSONResponse({"hours": 0, "windows": []})
         hours = _to_float(request.query_params.get("hours"), 24)
@@ -2138,7 +2144,7 @@ class ProxyService:
         Best-effort: validates the minimum, records, fans out, returns ok."""
         remote_ip = request.client.host if request.client else "unknown"
         self._audit_admin_ip("/v1/calls/log", remote_ip)
-        if not self._acl.identify(remote_ip):
+        if not self._acl.is_admin(remote_ip):
             return JSONResponse({"error": f"access denied for {remote_ip}"}, status_code=403)
         try:
             body = await request.json()

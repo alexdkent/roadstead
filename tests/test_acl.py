@@ -52,3 +52,93 @@ def test_malformed_env_entry_skipped(monkeypatch):
     monkeypatch.setenv("LLM_PROXY_ACL", "garbage-no-equals,10.4.0.0/16=ok")
     acl = IPIdentityMap.from_env()           # must not raise
     assert acl.identify("10.4.1.1") == ("ok", LLMPriority.P3_INGESTION)
+
+
+# --- Phase 8 hardening: admin surfaces are loopback/docker-only ---------------
+
+import json as _json
+
+import pytest as _pytest
+
+from originfleet.llmproxy.config import ProxyConfig as _PCfg
+from originfleet.llmproxy.service import ProxyService as _PSvc
+
+
+class _IpReq:
+    def __init__(self, host, method="GET", body=None):
+        class _C:
+            pass
+
+        _C.host = host
+        self.client = _C()
+        self.method = method
+        self.headers: dict = {}
+        self.query_params: dict = {}
+        self._body = body
+
+    async def json(self):
+        if self._body is None:
+            raise ValueError("no body")
+        return self._body
+
+
+def test_is_admin_loopback_and_docker_only():
+    acl = IPIdentityMap.from_env()
+    assert acl.is_admin("127.0.0.1")
+    assert acl.is_admin("172.17.0.5")      # docker bridge
+    assert not acl.is_admin("10.0.0.42")   # LAN device — identify() passes, admin doesn't
+    assert acl.identify("10.0.0.42") is not None
+    assert not acl.is_admin("8.8.8.8")
+    assert not acl.is_admin("not-an-ip")
+
+
+@_pytest.mark.asyncio
+async def test_admin_routes_deny_lan_allow_loopback():
+    svc = _PSvc(_PCfg())
+    lan, loop = "10.0.0.42", "127.0.0.1"
+
+    # Pause/resume.
+    resp = await svc.handle_admin_endpoint_pause("gemma", _IpReq(lan, "POST"), pause=True)
+    assert resp.status_code == 403
+    resp = await svc.handle_admin_endpoint_pause("gemma", _IpReq(loop, "POST"), pause=True)
+    assert resp.status_code == 200
+    await svc.handle_admin_endpoint_pause("gemma", _IpReq(loop, "POST"), pause=False)
+
+    # Flags.
+    assert (await svc.handle_admin_flags(_IpReq(lan, "GET"))).status_code == 403
+    assert (await svc.handle_admin_flags(_IpReq(loop, "GET"))).status_code == 200
+
+    # Maintenance annotate + list.
+    assert (await svc.handle_maintenance(_IpReq(lan, "POST", {"endpoint": "gemma"}))).status_code == 403
+    assert (await svc.handle_maintenance_list(_IpReq(lan, "GET"))).status_code == 403
+    assert (await svc.handle_maintenance_list(_IpReq(loop, "GET"))).status_code == 200
+
+    # calls/log ingest.
+    body = {"endpoint": "whisper-1", "kind": "audio", "duration_s": 1.0}
+    assert (await svc.handle_calls_log(_IpReq(lan, "POST", body))).status_code == 403
+    assert (await svc.handle_calls_log(_IpReq(loop, "POST", body))).status_code == 200
+
+
+@_pytest.mark.asyncio
+async def test_inference_routes_still_open_to_lan():
+    svc = _PSvc(_PCfg())
+
+    async def ok_call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
+        from originfleet.llmproxy.backend import BackendResponse
+        return BackendResponse(
+            status_code=200,
+            body={"choices": [{"message": {"content": "y"}, "finish_reason": "stop"}],
+                  "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+            duration_s=0.01, input_tokens=1, output_tokens=1, finish_reason="stop")
+
+    svc._backend.call = ok_call
+    await svc.startup()
+    try:
+        import asyncio as _aio
+        resp = await _aio.wait_for(svc.handle_openai_chat(
+            {"model": "llama-thinker", "max_tokens": 8,
+             "messages": [{"role": "user", "content": "hi"}]},
+            _IpReq("10.0.0.42", "POST")), timeout=10.0)
+        assert resp.status_code == 200  # LAN inference unaffected by the tightening
+    finally:
+        await svc.shutdown()

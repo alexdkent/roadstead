@@ -72,6 +72,23 @@ class IPIdentityMap:
     def is_allowed(self, remote_ip: str) -> bool:
         return self.identify(remote_ip) is not None
 
+    def is_admin(self, remote_ip: str) -> bool:
+        """Admin surfaces (drain/pause, maintenance windows, runtime flags,
+        calls-log ingest) accept ONLY loopback + docker-internal sources.
+
+        The generic ``identify`` ACL passes the whole LAN (the
+        ``10.0.0.0/24 → lan-generic`` entry), which is fine for INFERENCE but
+        let any LAN device pause a backend fleet-wide. :42161 is container-
+        internal (port not published) and every legitimate admin caller goes
+        through ``docker exec curl localhost`` (restart_llm.sh) or the gateway
+        on loopback — verified by the admin-audit IP log before tightening
+        (2026-06-10: 127.0.0.1 only)."""
+        try:
+            addr = ipaddress.ip_address(remote_ip)
+        except ValueError:
+            return False
+        return any(addr in net for net in self._internal_nets)
+
     @classmethod
     def from_env(cls) -> "IPIdentityMap":
         """Build from environment variables.
