@@ -25,4 +25,33 @@ forum-agent:
   max_balance_ss: 180.0
   default_priority: P3_INGESTION
 
+# 2026-06-10 data-driven pass (7d /v1/usage?by=agent — the proxy hardening
+# uplift). Weights only matter UNDER CONTENTION; the head-of-queue-wait
+# starvation rescue already prevents pathology, so these are deliberate
+# nudges, not load-bearing knobs.
+
+sidekick:
+  # The user-facing companion: 14.7K req/wk, interactive turns. Weight 2 so a
+  # user turn wins a contended slot against same-band periodic traffic.
+  weight: 2.0
+  max_balance_ss: 120.0
+
+orchestrator:
+  # The inner tool-calling loop behind live user turns (companion streams,
+  # 4.5K req/wk, several calls per turn). Same interactive privilege as sidekick;
+  # the larger balance absorbs a multi-iteration turn without DRR throttling
+  # mid-conversation.
+  weight: 2.0
+  max_balance_ss: 120.0
+
+knowledge:
+  # The fleet's biggest caller (48.5K req/wk, 35M tokens in) — almost all P3
+  # background ingestion that fans out in chunked storms. Default weight (it
+  # should NOT be privileged), but a deeper balance so a legitimate
+  # extraction burst isn't throttled against its own long-run average; the
+  # background band cap still protects interactive headroom.
+  weight: 1.0
+  max_balance_ss: 240.0
+  default_priority: P3_INGESTION
+
 # (Other agents not listed here use AgentQuotaConfig defaults.)
