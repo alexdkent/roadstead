@@ -788,6 +788,22 @@ class PersistentQueue:
         # Clean up stale dispatched entries (in-flight at crash time)
         self._conn.execute("DELETE FROM proxy_queue WHERE status='dispatched'")
 
+        # Drop queued STREAMING requests outright: their SSE consumer died
+        # with the old process, so a recovered dispatch has nobody to relay
+        # to — _execute_streaming would early-return without recording a
+        # completion and the scheduler slot leaked PERMANENTLY (audit
+        # 2026-06-10). Sync recovery stays: it completes + records, and a
+        # temp-0 result still populates the cache.
+        dropped_streams = self._conn.execute(
+            "SELECT COUNT(*) FROM proxy_queue WHERE status='queued' AND stream=1"
+        ).fetchone()[0]
+        if dropped_streams:
+            self._conn.execute(
+                "DELETE FROM proxy_queue WHERE status='queued' AND stream=1")
+            logger.info(
+                "queue recovery: dropped %d queued streaming request(s) "
+                "(consumer died with the old process)", dropped_streams)
+
         rows = self._reader().execute(
             "SELECT request_id, agent_id, endpoint, priority, call_site, "
             "       payload_type, payload_json, enqueued_at, timeout_deadline, "

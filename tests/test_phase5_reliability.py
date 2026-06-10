@@ -403,3 +403,46 @@ async def test_drain_503_body_is_deferrable():
     finally:
         svc._draining.clear()
         await svc.shutdown()
+
+
+# --- Phase 2 hardening: paused-endpoint persistence across restart ----------
+
+@pytest.mark.asyncio
+async def test_open_drain_window_repauses_endpoint_on_startup(tmp_path):
+    db = str(tmp_path / "q.db")
+    seed = PersistentQueue(db)
+    seed.maintenance_open(endpoint="thinker", reason="vLLM restart",
+                          source="drain")
+    seed.close()
+
+    svc = ProxyService(ProxyConfig(queue_db_path=db))
+    _stub_probes(svc)
+    await svc.startup()
+    try:
+        assert "thinker" in svc._paused_endpoints
+        assert svc._endpoint_healthy("thinker") is False  # drain semantics apply
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stale_or_closed_or_manual_windows_do_not_repause(tmp_path):
+    db = str(tmp_path / "q.db")
+    seed = PersistentQueue(db)
+    # >24h-old open drain: the forgot-to-resume guard skips it.
+    seed.maintenance_open(endpoint="thinker", source="drain",
+                          started_at=time.time() - 25 * 3600)
+    # Closed drain window: restart finished cleanly.
+    seed.maintenance_record(endpoint="chat", started_at=time.time() - 600,
+                            ended_at=time.time() - 300, source="drain")
+    # Open MANUAL annotation: informational, not a drain.
+    seed.maintenance_open(endpoint="gemma", source="manual")
+    seed.close()
+
+    svc = ProxyService(ProxyConfig(queue_db_path=db))
+    _stub_probes(svc)
+    await svc.startup()
+    try:
+        assert svc._paused_endpoints == set()
+    finally:
+        await svc.shutdown()

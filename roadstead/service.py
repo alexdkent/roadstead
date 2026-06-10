@@ -567,6 +567,36 @@ class ProxyService:
         for req in recovered:
             self._scheduler.enqueue(req)
 
+        # Re-derive operator drains that were open when the process died.
+        # _paused_endpoints was in-memory only: a proxy restart mid-drain
+        # forgot the pause, the poller probed the intentionally-down backend,
+        # tripped the circuit, and endpoint_paused fired as an UNPLANNED
+        # outage despite the open maintenance window saying otherwise.
+        try:
+            now_wall = time.time()
+            for w in self._queue_db.maintenance_windows(hours=24.0):
+                if w.get("ended_at") is not None or w.get("source") != "drain":
+                    continue
+                ep = w.get("endpoint") or ""
+                if ep == "*" or ep not in self._config.endpoints:
+                    continue
+                age_h = (now_wall - (w.get("started_at") or now_wall)) / 3600.0
+                if age_h > 24.0:
+                    # Forgot-to-resume guard: a day-old open drain is almost
+                    # certainly stale — don't re-park the endpoint on it.
+                    logger.warning(
+                        "ignoring stale open drain window for %s (%.1fh old) — "
+                        "endpoint NOT re-paused; close it via "
+                        "/v1/admin/endpoints/%s/resume", ep, age_h, ep)
+                    continue
+                self._paused_endpoints.add(ep)
+                logger.warning(
+                    "endpoint %s re-PAUSED from open drain window (%.1fh old, "
+                    "reason: %s) — resume via /v1/admin/endpoints/%s/resume",
+                    ep, age_h, w.get("reason") or "-", ep)
+        except Exception:  # noqa: BLE001 — never block startup on this
+            logger.warning("paused-endpoint rederivation failed", exc_info=True)
+
         # Bootstrap cost model from recent completion history
         self._bootstrap_cost_model()
 
@@ -2431,6 +2461,15 @@ class ProxyService:
     ) -> None:
         stream_q = self._pending_streams.get(req.request_id)
         if not stream_q:
+            # No consumer for this stream (it died with a previous process, or
+            # any future no-consumer path). The dispatch already claimed a
+            # scheduler slot — record a completion so it's FREED instead of
+            # leaking until the next proxy restart (recovery now drops queued
+            # stream rows, so this is the belt-and-braces layer).
+            logger.warning(
+                "streaming dispatch %s has no consumer — reclaiming slot",
+                req.request_id)
+            self._record_completion(req, decision, 0.0, 0, 0, "cancelled")
             return
 
         await stream_q.put({

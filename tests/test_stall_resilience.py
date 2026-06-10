@@ -65,3 +65,48 @@ def test_intertoken_gap_constant_present():
     # first-token-only TTFT watchdog).
     from originfleet.llmproxy import service
     assert service._STREAM_INTERTOKEN_GAP_S > 0
+
+
+# --- Phase 2 hardening: no-consumer streaming dispatch frees its slot --------
+
+import asyncio
+import pytest
+
+from originfleet.llmproxy.config import ProxyConfig
+from originfleet.llmproxy.scheduler import QueuedRequest
+from originfleet.llmproxy.service import ProxyService
+
+
+@pytest.mark.asyncio
+async def test_streaming_dispatch_without_consumer_records_completion():
+    """A streaming dispatch whose _pending_streams entry is missing (the
+    recovered-after-restart shape) must record a 'cancelled' completion so the
+    scheduler slot frees instead of leaking until the next proxy restart."""
+    svc = ProxyService(ProxyConfig())
+    await svc.startup()
+    try:
+        req = QueuedRequest.create(
+            agent_id="a", endpoint="thinker", priority="P3_INGESTION",
+            call_site="t", payload_type="chat_completion",
+            payload={"messages": [{"role": "user", "content": "x"}],
+                     "stream": True},
+            timeout_s=30.0,
+        )
+        # Enqueue WITHOUT handle_submit → no _pending_streams entry, exactly
+        # like a recovered row dispatched by the scheduler loop.
+        svc._scheduler.enqueue(req)
+        svc._dispatch_event.set()
+
+        for _ in range(200):
+            snap = svc._scheduler.endpoint_snapshot("thinker")
+            if snap["queued"] == 0 and snap["in_flight"] == 0 \
+                    and svc._scheduler.stats()["total_completed"] >= 1:
+                break
+            await asyncio.sleep(0.01)
+
+        snap = svc._scheduler.endpoint_snapshot("thinker")
+        assert snap["in_flight"] == 0, "slot leaked for the consumer-less stream"
+        assert snap["queued"] == 0
+        assert svc._scheduler.stats()["total_completed"] == 1
+    finally:
+        await svc.shutdown()

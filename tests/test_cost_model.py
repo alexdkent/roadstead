@@ -177,6 +177,23 @@ class TestEstimateInputTokens:
         assert estimate_input_tokens(payload) == 80 // 4
 
 
+class TestZeroSlotEndpoint:
+    def test_completion_after_slots_drop_to_zero_does_not_crash(self):
+        # endpoint_loss regression: update_max_slots(0) clears decode_tps; a
+        # late completion for that endpoint then IndexError'd on the empty
+        # curve inside scheduler.complete (crashed the endpoint_loss sim, and
+        # would have crashed a live dispatch task the same way).
+        cm = CostModel()
+        cm.register_endpoint("chat", 4)
+        cm.update_max_slots("chat", 0)
+        cm.record_completion(
+            endpoint="chat", call_site="t", input_tokens=500,
+            output_tokens=200, duration_s=3.0, occupancy_during=2,
+        )  # must not raise
+        # Estimation still serves the fallback path.
+        assert cm.estimate_cost(("chat"), 500, 200, "t", 0) > 0
+
+
 class TestRetroactiveAdjustment:
     def test_overestimate_refunds(self):
         cm = CostModel()

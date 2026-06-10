@@ -222,3 +222,35 @@ def test_submit_writer_call_runs_on_writer_thread(tmp_path):
     assert seen.get("tid") and seen["tid"] != threading.get_ident()
     assert pq._reader().execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 1
     pq.close()
+
+
+def test_recover_queued_drops_stream_rows(tmp_path):
+    """Phase 2 hardening: a queued STREAMING request recovered after a restart
+    has no SSE consumer (it died with the old process) — recovery must DROP it,
+    not re-dispatch into a permanent scheduler-slot leak. Sync rows recover."""
+    from originfleet.llmproxy.scheduler import QueuedRequest
+
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    sync_req = QueuedRequest.create(
+        agent_id="a", endpoint="thinker", priority="P3_INGESTION",
+        call_site="t", payload_type="chat_completion",
+        payload={"messages": [{"role": "user", "content": "x"}]},
+        timeout_s=120.0,
+    )
+    stream_req = QueuedRequest.create(
+        agent_id="a", endpoint="thinker", priority="P3_INGESTION",
+        call_site="t", payload_type="chat_completion",
+        payload={"messages": [{"role": "user", "content": "y"}], "stream": True},
+        timeout_s=120.0,
+    )
+    assert stream_req.stream and not sync_req.stream
+    pq.persist_enqueue(sync_req)
+    pq.persist_enqueue(stream_req)
+
+    recovered = pq.recover_queued(now=0.0)
+    assert [r.request_id for r in recovered] == [sync_req.request_id]
+    # The stream row is gone from the table, not just unreturned.
+    remaining = pq._conn.execute(
+        "SELECT COUNT(*) FROM proxy_queue WHERE stream=1").fetchone()[0]
+    assert remaining == 0
+    pq.close()
