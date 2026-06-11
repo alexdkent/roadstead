@@ -206,3 +206,43 @@ async def test_calls_log_rejects_llm_kind():
         assert resp.status_code == 409   # proxy-native; refuse double-count
     finally:
         await svc.shutdown()
+
+
+# --- 2026-06-11: calls/log refuses pushes for proxy-native LLM endpoints -----
+
+import pytest as _pt
+
+
+class _LoopReq:
+    def __init__(self, body):
+        class _C:
+            host = "127.0.0.1"
+
+        self.client = _C()
+        self.headers: dict = {}
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+@_pt.mark.asyncio
+async def test_calls_log_409_for_llm_class_endpoints():
+    """A pushed call whose endpoint normalizes to a proxy-native LLM class
+    duplicates a natively-recorded row (the 2026-06-11 rerank double-count
+    arrived as kind='external' + endpoint='rerank') — refuse it regardless of
+    the kind label. Genuine non-LLM units still ingest."""
+    from originfleet.llmproxy.config import ProxyConfig
+    from originfleet.llmproxy.service import ProxyService
+
+    svc = ProxyService(ProxyConfig())
+    for ep in ("rerank", "bge-reranker", "nexus-rerank", "embed",
+               "bge-m3-embed", "llama-thinker", "chat"):
+        resp = await svc.handle_calls_log(_LoopReq(
+            {"endpoint": ep, "kind": "external", "duration_s": 0.1}))
+        assert resp.status_code == 409, ep
+    for ep in ("whisper-1", "orpheus-tts", "diarize-gpu", "stream",
+               "anvil-lyrics", "got-ocr"):
+        resp = await svc.handle_calls_log(_LoopReq(
+            {"endpoint": ep, "kind": "audio", "duration_s": 0.1}))
+        assert resp.status_code == 200, ep

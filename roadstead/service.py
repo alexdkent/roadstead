@@ -2160,6 +2160,16 @@ class ProxyService:
             return JSONResponse(
                 {"error": f"kind {kind!r} is proxy-native; do not push LLM calls"},
                 status_code=409)
+        if normalize_endpoint(endpoint) in self._config.endpoints:
+            # Same double-count guard keyed on the ENDPOINT: a push whose
+            # endpoint normalizes to a proxy-native LLM class (rerank, embed,
+            # chat, ...) duplicates a row the proxy already recorded natively -
+            # regardless of the kind label it arrives under (the 2026-06-11
+            # rerank double-count arrived as kind='external').
+            return JSONResponse(
+                {"error": f"endpoint {endpoint!r} is proxy-native "
+                          f"({normalize_endpoint(endpoint)}); do not push LLM calls"},
+                status_code=409)
         status = str(body.get("status") or ("ok" if body.get("success", True) else "error"))
         request_id = str(body.get("request_id") or f"ext-{uuid.uuid4().hex}")
         in_tok = _to_int(body.get("input_tokens"), 0)
