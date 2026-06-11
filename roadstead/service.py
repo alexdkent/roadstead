@@ -55,6 +55,19 @@ from .config import (
 _MIN_RETRY_BUDGET_S = 5.0
 _RETRY_BACKOFF_S = 0.5
 
+# Empty-completion rescue (2026-06-11). Some prompts make the model emit EOS
+# as its FIRST token — a 1-token "completion" with empty content, fully
+# deterministic for that prompt even at high temperature (observed live: the
+# sidekick craft_6 prompt failed 6/6 across temps and thinking modes; same model-
+# degeneration family as the repetition loops the degeneration guard catches).
+# A plain retry can never recover it. The retry therefore re-dispatches with
+# ``min_tokens``, which masks EOS for the first N positions and forces the
+# model past the degenerate opening — replaying the actual poisoned payload
+# with min_tokens=16 produced 696 tokens of normal output. vLLM honors the
+# param; llama.cpp ignores unknown fields (safe no-op). Injected ONLY on the
+# retry of an empty-completion failure, never on the first attempt.
+_EMPTY_RESCUE_MIN_TOKENS = 16
+
 # Phase 2.1 — bounded in-flight drain on graceful shutdown. The BOUND is the fix
 # for the historic SIGTERM hang (uvicorn waiting forever behind a slow request):
 # drain up to this long, then force-cancel stragglers.
@@ -461,6 +474,11 @@ class ProxyService:
         # fleet-wide concurrency with a plain counter — single event loop, no
         # lock needed; NOT a semaphore (waiting would queue caller responses).
         self._degen_redispatch_inflight = 0
+        # Empty-completion (position-0-EOS) rescue tallies — see
+        # _EMPTY_RESCUE_MIN_TOKENS. attempts = retries dispatched with
+        # min_tokens; recovered = those that produced a real response.
+        self._empty_rescue_attempts = 0
+        self._empty_rescue_recovered = 0
         # Dedupe set so a single request that races across two timeout
         # layers (e.g. admission expiry + client-wait) is logged once.
         self._timed_out_ids: set[str] = set()
@@ -1858,6 +1876,10 @@ class ProxyService:
                     / max(1, sum(t["checked"] for t in self._shadow_drop.values())),
                     4,
                 ),
+                # Empty-completion (position-0-EOS) rescue: retries dispatched
+                # with min_tokens, and how many produced a real response.
+                "empty_rescue_attempts": self._empty_rescue_attempts,
+                "empty_rescue_recovered": self._empty_rescue_recovered,
                 # Egress degeneration guard — repetition-loop responses detected,
                 # and how many an anti-repetition re-dispatch recovered.
                 "degeneration_detected": self._degeneration_detected,
@@ -2494,6 +2516,11 @@ class ProxyService:
         decision: DispatchDecision,
     ) -> None:
         attempts = 0
+        # Local dispatch payload: the empty-completion rescue swaps in a COPY
+        # with min_tokens on the retry — req.payload itself is corpus-persisted
+        # and must stay the caller's bytes.
+        dispatch_payload = req.payload
+        rescue_armed = False
         while True:
             attempts += 1
             # Phase 1.5 slot-leak fix: bound each backend attempt to the
@@ -2527,7 +2554,7 @@ class ProxyService:
             t0 = time.monotonic()
             try:
                 resp = await self._backend.call(
-                    ep_cfg, req.payload, req.payload_type,
+                    ep_cfg, dispatch_payload, req.payload_type,
                     req.request_id, timeout_s=max(1.0, remaining),
                 )
             except BackendTimeout as exc:
@@ -2551,10 +2578,30 @@ class ProxyService:
                     and (req.timeout_deadline - time.monotonic()) > _MIN_RETRY_BUDGET_S
                     and self._endpoint_healthy(req.endpoint)
                 ):
-                    logger.warning(
-                        "transient backend error on %s (attempt %d) — retrying: %s",
-                        ep_cfg.role, attempts, exc,
-                    )
+                    # Empty-completion rescue: a position-0-EOS degeneration is
+                    # DETERMINISTIC for its prompt — re-dispatching the same
+                    # bytes can't recover it. Mask EOS for the first N tokens
+                    # on the retry (vLLM min_tokens; llama.cpp ignores it).
+                    if (
+                        req.payload_type == "chat_completion"
+                        and "empty completion" in (exc.detail or "")
+                    ):
+                        dispatch_payload = {
+                            **req.payload,
+                            "min_tokens": _EMPTY_RESCUE_MIN_TOKENS,
+                        }
+                        rescue_armed = True
+                        self._empty_rescue_attempts += 1
+                        logger.warning(
+                            "empty completion on %s (attempt %d) — retrying "
+                            "with min_tokens=%d (EOS-degeneration rescue)",
+                            ep_cfg.role, attempts, _EMPTY_RESCUE_MIN_TOKENS,
+                        )
+                    else:
+                        logger.warning(
+                            "transient backend error on %s (attempt %d) — retrying: %s",
+                            ep_cfg.role, attempts, exc,
+                        )
                     await asyncio.sleep(_RETRY_BACKOFF_S)
                     continue
                 self._resolve_error(req, str(exc))
@@ -2562,6 +2609,17 @@ class ProxyService:
                 return
 
             duration = time.monotonic() - t0
+
+            if rescue_armed:
+                # The min_tokens re-dispatch produced a real response where the
+                # plain dispatch got 1-token EOS — the rescue worked.
+                self._empty_rescue_recovered += 1
+                logger.info(
+                    "empty-completion rescue RECOVERED on %s (call_site=%s, "
+                    "output_tokens=%d)", ep_cfg.role, req.call_site,
+                    resp.output_tokens,
+                )
+                rescue_armed = False
 
             # Phase 1.1 truncation integrity. finish_reason=length means the
             # backend hit max_tokens mid-output. For a STRUCTURED request
