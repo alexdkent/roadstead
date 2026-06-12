@@ -413,6 +413,19 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         # <think>); guidance structured-outputs available, auto-tool-choice OFF.
         endpoint_class="creative", role="creative",
         max_slots=4, context_per_slot=131072,
+        # Background-band slot policy mirrors the thinker (see above): the
+        # creative role is ~all background (sidekick song authoring at P4_HYGIENE —
+        # craft/theme-pick/hook-polish/self-echo). Left at the dataclass
+        # defaults (floor_pct 0.20 → floor 1, reserve 0 → cap == floor) the
+        # background band was pinned to ONE slot, serializing batch authoring
+        # at 1-wide while the backend is sized for --max-num-seqs 4. DECKARD is
+        # bandwidth-bound (~7 tok/s @1 vs ~42 agg @4) so the extra concurrency
+        # is a large aggregate-throughput win and costs no extra anvil memory
+        # (KV inside the already-allocated gpu-mem 0.28). floor_pct 0.0 → floor
+        # 1; reserve 1 → background cap = max_slots-1 = 3, with one slot held
+        # back for an occasional interactive/fast-path creative call.
+        background_floor_pct=0.0,
+        fast_path_reserve_slots=1,
         host="10.0.0.3", port=9095,
         backend_engine="vllm",
         # On-demand: DECKARD shares the anvil GPU slot with imagegen/diarize/
