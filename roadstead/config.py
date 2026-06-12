@@ -408,11 +408,12 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         # anvil DECKARD-31B (Gemma-4-31B NVFP4-AWQ, AEON DGX-Spark image) :9095 —
         # the `creative` role: a different-family creative/counterpoint voice to the
         # thinker. Dense 31B, bandwidth-bound on Spark (~7 tok/s @1, ~42 agg @4) →
-        # low-QPS by design. --max-num-seqs 4 → max_slots 4; --max-model-len 32768;
-        # gpu-mem-util 0.28 (~34GB: ~20GB weights + fp8 KV). Reasoning model (gemma4
-        # <think>); guidance structured-outputs available, auto-tool-choice OFF.
+        # low-QPS by design. --max-num-seqs 6 → max_slots 6; --max-model-len 131072;
+        # gpu-mem-util 0.21 (~26GB: ~18.4GB weights + ~7.4GB fp8 KV ≈ exactly one
+        # full 131072-ctx request, 2026-06-12). Reasoning model (gemma4 <think>);
+        # guidance structured-outputs available, auto-tool-choice OFF.
         endpoint_class="creative", role="creative",
-        max_slots=4, context_per_slot=131072,
+        max_slots=6, context_per_slot=131072,
         # Background-band slot policy mirrors the thinker (see above): the
         # creative role is ~all background (sidekick song authoring at P4_HYGIENE —
         # craft/theme-pick/hook-polish/self-echo). Left at the dataclass
@@ -428,11 +429,15 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         fast_path_reserve_slots=1,
         host="10.0.0.3", port=9095,
         backend_engine="vllm",
-        # On-demand: DECKARD shares the anvil GPU slot with imagegen/diarize/
-        # lyrics. The proxy loads it via the dispatcher on first request and
-        # idle-unloads it (~8 min) so its ~36GB returns to the burst pool. The
-        # 900s timeout floor (timeout_model.FLOOR_S) covers the cold load.
-        on_demand=True, dispatcher_capability="llm_creative",
+        # 2026-06-12: PINNED ALWAYS-ON — no longer on-demand. Creative became key
+        # to multiple flows so it now mirrors the thinker: a boot-started,
+        # always-resident vLLM unit (vllm-deckard.service WantedBy=multi-user.target;
+        # anvil dispatcher registry manage_process=False → never idle-unloaded).
+        # The proxy therefore dispatches directly with NO dispatcher lease gating,
+        # removing the "dispatcher down → creative 503 even though DECKARD is up"
+        # failure mode. whisper+diarize moving to Nasbox frees the headroom for
+        # permanent residency. (Slot is no longer shared/evicted; the 900s timeout
+        # floor is now moot for warm calls but harmless.)
     ),
 }
 
