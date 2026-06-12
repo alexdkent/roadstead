@@ -44,10 +44,12 @@ FLOOR_S: dict[str, float] = {
     "chat": 30.0,
     "companion": 180.0,
     "thinker": 180.0,
-    # DECKARD-31B (creative) is dense + bandwidth-bound on Spark (~7 tok/s single-stream);
+    # DECKARD-31B (creative) is dense + bandwidth-bound on Spark (~5-7 tok/s single-stream);
     # long-form creative generation needs a high floor so cold-start (no history) doesn't
     # cap requests at the 60s default. recommended = max(p99*margin, floor) once warm.
-    "creative": 600.0,
+    # 900s (15min) so an ON-DEMAND cold model LOAD (several minutes) + generation can WAIT
+    # in-queue rather than time out — the song-compose author stages tolerate the wait.
+    "creative": 900.0,
     "gemma": 60.0,
     # 2026-06-08: the "gemma-hot" endpoint class was removed from DEFAULT_ENDPOINTS
     # (E2B :9090 decommissioned; gemma-greeter consolidated onto the "gemma"/E4B

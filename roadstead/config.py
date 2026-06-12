@@ -220,6 +220,15 @@ class EndpointConfig:
     # (structured_outputs.grammar). Controls proxy-side payload normalization. ---
     backend_engine: str = "llama.cpp"
 
+    # --- on-demand lifecycle (see on_demand.OnDemandManager) ---
+    # When True, this endpoint's model is NOT always-resident: before a request
+    # dispatches, the proxy acquires the anvil GPU-slot dispatcher lease
+    # (``dispatcher_capability``), which loads the model (FIFO behind imagegen /
+    # diarize / etc.) and idle-unloads it when quiet — freeing the GPU pool.
+    # Pairs with a high timeout floor (cold load takes minutes).
+    on_demand: bool = False
+    dispatcher_capability: str = ""
+
     # When True, the proxy injects ``id_slot`` into chat_completion payloads
     # for INTERACTIVE-band requests, keyed by a deterministic hash of
     # session_id. This pins each conversation to one llama.cpp slot across
@@ -406,6 +415,11 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         max_slots=4, context_per_slot=131072,
         host="10.0.0.3", port=9095,
         backend_engine="vllm",
+        # On-demand: DECKARD shares the anvil GPU slot with imagegen/diarize/
+        # lyrics. The proxy loads it via the dispatcher on first request and
+        # idle-unloads it (~8 min) so its ~36GB returns to the burst pool. The
+        # 900s timeout floor (timeout_model.FLOOR_S) covers the cold load.
+        on_demand=True, dispatcher_capability="llm_creative",
     ),
 }
 

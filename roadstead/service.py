@@ -322,6 +322,7 @@ class _ToolCallStreamSanitizer:
 from .cost_model import CostModel, estimate_input_tokens
 from .flags import RuntimeFlags
 from .timeout_model import TimeoutModel
+from .on_demand import OnDemandManager, OnDemandUnavailable
 from .observability import (
     AlertCondition,
     MetricsSample,
@@ -412,6 +413,9 @@ class ProxyService:
         self._scheduler = Scheduler(config, self._cost_model, self._budget_mgr)
         self._backend = BackendClientPool()
         self._queue_db = PersistentQueue(config.queue_db_path or None)
+        # On-demand endpoints (e.g. `creative`/DECKARD): the model is loaded
+        # lazily under the anvil GPU-slot dispatcher lease and idle-unloaded.
+        self._on_demand = OnDemandManager(config.endpoints)
 
         # Runtime-mutable feature flags (flags.py) — shadow→enforce switches +
         # kill-switches that must be flippable without a process restart (no
@@ -674,6 +678,7 @@ class ProxyService:
         self._poller_task.add_done_callback(
             lambda t: self._on_loop_task_exit("capacity poller", t))
         self._inflight_task = asyncio.create_task(self._inflight_stream_loop())
+        await self._on_demand.start()
 
         logger.info(
             "llmproxy started: %d endpoints, %d total slots",
@@ -773,6 +778,12 @@ class ProxyService:
             self._poller_task.cancel()
         if self._inflight_task:
             self._inflight_task.cancel()
+        # Release any held on-demand dispatcher lease so the GPU slot frees for
+        # other services across the restart (don't wait out the lease TTL).
+        try:
+            await self._on_demand.close()
+        except Exception:
+            logger.warning("on_demand close failed during shutdown", exc_info=True)
         # Persist DRR balances so fairness survives the restart (Phase 3.4); the
         # writer flushes this during close().
         try:
@@ -878,6 +889,16 @@ class ProxyService:
                            body.get("timeout_s"), exc, _DEFAULT_TIMEOUT_S)
             timeout_s = _DEFAULT_TIMEOUT_S
 
+        # On-demand endpoints cold-load for minutes — a caller's short timeout
+        # (or the 180s default) would expire mid-load and never see a token.
+        # Floor the deadline at the endpoint's timeout floor so the request can
+        # wait out the load regardless of what the caller sent. (Extend-only:
+        # a caller asking for MORE than the floor keeps their value.)
+        if self._on_demand.manages(endpoint):
+            floor_s = self._timeout_model.floor_ms(endpoint) / 1000.0
+            if timeout_s < floor_s:
+                timeout_s = floor_s
+
         req = QueuedRequest.create(
             agent_id=body.get("agent_id", "unknown"),
             endpoint=endpoint,
@@ -981,6 +1002,30 @@ class ProxyService:
                     "response": cached,
                     "cache_hit": True,
                 })
+
+        # On-demand backends (e.g. creative/DECKARD): acquire the anvil
+        # GPU-slot dispatcher lease so the model is resident before dispatch.
+        # Blocks (FIFO) behind any other on-demand service (imagegen/diarize/…)
+        # holding the slot, and may cold-load for minutes — the 900s timeout
+        # floor covers it. A dispatcher failure surfaces as a DEFERRABLE error
+        # ("backpressure") so the caller retries instead of dispatching into a
+        # dead backend. After the cache check so a cached reply never needlessly
+        # wakes the model; before the circuit breaker (which _endpoint_healthy
+        # short-circuits to True for on-demand endpoints).
+        if self._on_demand.manages(req.endpoint):
+            try:
+                await self._on_demand.ensure_loaded(req.endpoint)
+            except OnDemandUnavailable as exc:
+                err = (f"on-demand backend {req.endpoint} could not be loaded "
+                       f"— backpressure: {exc}")
+                logger.warning("on_demand ensure_loaded failed: %s", err)
+                if openai:
+                    return self._openai_error(
+                        err, "backend_unavailable", 503, code="on_demand_unavailable")
+                return JSONResponse(
+                    {"status": "error", "request_id": req.request_id,
+                     "error": err, "code": "on_demand_unavailable"},
+                    status_code=503)
 
         # Circuit breaker (Phase 1.2): when the backend is marked unhealthy,
         # fast-fail interactive/foreground submits immediately with a DEFERRABLE
@@ -2856,6 +2901,13 @@ class ProxyService:
         # unhealthy so all the defer/fast-fail machinery applies immediately.
         if ep in self._paused_endpoints:
             return False
+        # On-demand endpoints are intentionally unloaded when idle; availability
+        # is gated by OnDemandManager.ensure_loaded (loads on demand or raises),
+        # not the always-on poller probe. Don't let a probe of an unloaded
+        # backend trip the circuit and reject creative requests before they get
+        # a chance to load it.
+        if self._on_demand.manages(ep):
+            return True
         h = self._endpoint_health.get(ep)
         return h["healthy"] if h else True
 
@@ -3049,6 +3101,13 @@ class ProxyService:
         finish_reason: str | None = None,
     ) -> None:
         now = time.monotonic()
+
+        # On-demand: a request to this endpoint reached a terminal outcome
+        # (ok/error/timeout/cancel) — release its in-flight hold so the idle
+        # watchdog can eventually drop the dispatcher lease. No-op for always-on
+        # endpoints. This is also the natural attach point for a future explicit
+        # "unload when done" agent signal (release immediately on that request).
+        self._on_demand.request_done(req.endpoint)
 
         # Report to scheduler
         self._scheduler.complete(
@@ -3370,6 +3429,12 @@ class ProxyService:
     async def _poll_endpoint_once(self, ep_name: str, ep_cfg: EndpointConfig) -> None:
         """One poller pass for one endpoint: capacity discovery (or a plain
         health probe for skip_discovery shims) + the circuit-breaker update."""
+        # On-demand endpoints are intentionally unloaded when idle — probing a
+        # stopped backend would 404/timeout every cycle (log spam) and falsely
+        # mark it unhealthy. Skip until a lease is held (model resident); then
+        # discover served-model/context normally.
+        if getattr(ep_cfg, "on_demand", False) and not self._on_demand.is_loaded(ep_name):
+            return
         probe_ok = False
         try:
             if ep_cfg.skip_discovery:
