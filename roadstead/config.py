@@ -142,6 +142,10 @@ ROLE_TO_CLASS: dict[str, str] = {
     "bge-reranker":  "rerank",
     "bge-m3-embed":  "embed",
     "llama-thinker": "thinker",
+    # 2026-06-11: DECKARD-31B creative/counterpoint model (Gemma-4 NVFP4-AWQ on the
+    # AEON DGX-Spark vLLM image, anvil :9095). Different-family generative voice to
+    # the thinker; gemma4 reasoning parser + guidance structured-outputs (tools off).
+    "creative":      "creative",
 }
 
 CLASS_TO_ROLE: dict[str, str] = {v: k for k, v in ROLE_TO_CLASS.items()}
@@ -389,6 +393,18 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         background_floor_pct=0.0,
         fast_path_reserve_slots=1,
         host="10.0.0.3", port=9083,
+        backend_engine="vllm",
+    ),
+    "creative": EndpointConfig(
+        # anvil DECKARD-31B (Gemma-4-31B NVFP4-AWQ, AEON DGX-Spark image) :9095 —
+        # the `creative` role: a different-family creative/counterpoint voice to the
+        # thinker. Dense 31B, bandwidth-bound on Spark (~7 tok/s @1, ~42 agg @4) →
+        # low-QPS by design. --max-num-seqs 4 → max_slots 4; --max-model-len 32768;
+        # gpu-mem-util 0.28 (~34GB: ~20GB weights + fp8 KV). Reasoning model (gemma4
+        # <think>); guidance structured-outputs available, auto-tool-choice OFF.
+        endpoint_class="creative", role="creative",
+        max_slots=4, context_per_slot=131072,
+        host="10.0.0.3", port=9095,
         backend_engine="vllm",
     ),
 }
