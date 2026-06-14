@@ -25,11 +25,9 @@ from .coalesce import DeterministicCache
 from .grammar import (
     GrammarResult,
     grammar_hash,
-    inject_reason_field,
     normalize_and_validate,
     recover_structured_object,
     root_object_keys,
-    strip_top_field,
     verify_conformance,
 )
 from .config import (
@@ -37,14 +35,10 @@ from .config import (
     LLMPriority,
     PriorityBand,
     ProxyConfig,
-    StructKind,
-    StructMechanism,
-    StructMode,
     degeneration_guard_enabled,
     degeneration_shadow_only,
     normalize_endpoint,
     shadow_egress_detect_enabled,
-    struct_policy_for,
     thinking_enabled,
     thinking_reasoning_budget,
 )
@@ -446,13 +440,6 @@ class ProxyService:
         self._draining = asyncio.Event()  # set during shutdown drain (Phase 2.1)
         self._pending_futures: dict[str, asyncio.Future] = {}
         self._pending_streams: dict[str, asyncio.Queue] = {}
-        # Structured-output policy (reason-then-constrain): per-request injection
-        # state keyed by request_id — set on dispatch, consumed (popped) on the
-        # response path. {request_id: {"policy","field","grammar","location"}}.
-        # Stays EMPTY unless a call_site policy is flipped on (all ship OFF).
-        self._struct_inject: dict[str, dict] = {}
-        self._struct_egress_failures = 0   # ACTIVE egress double-check failures
-        self._struct_shadow_diffs = 0      # SHADOW non-conformances (no caller impact)
         # Thinking option (per-request native reasoning): per-request state keyed
         # by request_id — set on dispatch, consumed on the response path for
         # structured-output recovery. {request_id: {"allowed_keys": [...]}}.
@@ -1125,112 +1112,14 @@ class ProxyService:
                 req.payload["extra_body"]["grammar"] = result.grammar
         return None
 
-    # ----- structured-output policy (reason-then-constrain) -----
-
-    def _apply_struct_policy(self, req: QueuedRequest) -> None:
-        """Inject a leading free-text ``reason`` field into the grammar for an
-        ACTIVE/SHADOW JUDGMENT call_site (non-streaming, grammar-bearing), so the
-        model reasons before the constrained decision (CRANE-style), bumping
-        max_tokens so the added tokens don't truncate the payload. Records the
-        injection (keyed by request_id) for the response-side strip. Fully
-        transparent when OFF (default), non-judgment, streaming, or no-grammar —
-        all early-out. Never dispatches an invalid injected grammar."""
-        if req.stream or req.payload_type != "chat_completion":
-            return
-        policy = struct_policy_for(req.call_site)
-        if policy is None or policy.mode == StructMode.OFF:
-            return
-        if policy.kind != StructKind.JUDGMENT or policy.mechanism != StructMechanism.REASON_FIELD:
-            return
-        grammar, location = self._extract_grammar(req.payload)
-        if grammar is None:
-            return
-        ep = self._config.endpoints.get(normalize_endpoint(req.endpoint))
-        engine = ep.backend_engine if ep is not None else "llama.cpp"
-        # b9357-class llama.cpp rejects large bounded {0,N} → emit unbounded there.
-        max_chars = policy.reason_max_chars if engine == "vllm" else None
-        res = inject_reason_field(grammar, field=policy.reason_field, max_chars=max_chars)
-        if not res.injected:
-            return
-        vr = normalize_and_validate(res.grammar)
-        if not vr.ok:
-            logger.warning(
-                "struct: injected grammar invalid (call_site=%s): %s — skipping injection",
-                req.call_site, vr.error_payload()["detail"])
-            return
-        if location == "top":
-            req.payload["grammar"] = vr.grammar
-        else:
-            req.payload.setdefault("extra_body", {})["grammar"] = vr.grammar
-        if policy.max_tokens_bump > 0:
-            cur = req.payload.get("max_tokens")
-            if isinstance(cur, int) and cur > 0:
-                req.payload["max_tokens"] = cur + policy.max_tokens_bump
-        self._struct_inject[req.request_id] = {
-            "policy": policy, "field": policy.reason_field,
-            "grammar": grammar, "location": location}
-
-    def _finalize_struct_output(self, req: QueuedRequest, result: dict) -> None:
-        """Egress double-check for an injected response (mutates ``result`` in
-        place). Strips the injected reason field, then verifies the stripped
-        output conforms to the caller's ORIGINAL grammar. SHADOW → log any
-        discrepancy but return the BASELINE (untransformed) response (zero caller
-        risk). ACTIVE → on success write the stripped content back; on a
-        conformance failure FAIL SAFE: convert to a structured error so the
-        caller's existing retry/force-synth path engages, never passing leaky or
-        garbled data. No-op when nothing was injected for this request."""
-        inj = self._struct_inject.pop(req.request_id, None)
-        if inj is None or result.get("status") != "ok":
-            return
-        response = result.get("response")
-        if not isinstance(response, dict):
-            return
-        try:
-            content = response["choices"][0]["message"]["content"]
-        except Exception:  # noqa: BLE001 — not a chat.completion shape; leave untouched
-            return
-        if not isinstance(content, str):
-            return
-        field = inj["field"]
-        stripped, removed = strip_top_field(content, field)
-        ok, why = verify_conformance(stripped, inj["grammar"], forbid_field=field)
-        if inj["policy"].mode == StructMode.SHADOW:
-            if not ok or not removed:
-                self._struct_shadow_diffs += 1
-                logger.warning(
-                    "struct SHADOW non-conformance (call_site=%s removed=%s): %s",
-                    req.call_site, removed, why)
-            return  # baseline response unchanged — zero caller risk
-        # ACTIVE
-        if not ok:
-            self._struct_egress_failures += 1
-            logger.error(
-                "struct EGRESS FAIL (call_site=%s): %s — failing safe to caller retry",
-                req.call_site, why)
-            result["status"] = "error"
-            result["error"] = f"structured-output egress check failed: {why}"
-            result.pop("response", None)
-            return
-        # success — write the stripped content back (copy to avoid mutating shared refs)
-        try:
-            choices = list(response.get("choices") or [])
-            ch0 = dict(choices[0]); msg = dict(ch0.get("message") or {})
-            msg["content"] = stripped; ch0["message"] = msg; choices[0] = ch0
-            new_resp = dict(response); new_resp["choices"] = choices
-            result["response"] = new_resp
-        except Exception:  # noqa: BLE001 — never break the response on a strip-write error
-            logger.exception("struct: strip-write failed (call_site=%s)", req.call_site)
-
     def _shadow_egress_detect(self, req: "QueuedRequest", result: dict) -> None:
         """WS-4: SHADOW silent-drop detector over ALL grammar-bearing responses.
 
         Runs ``verify_conformance`` on every grammar-bearing structured response
-        whose call_site is NOT already covered by a registry SHADOW/ACTIVE policy
-        (those are handled by ``_finalize_struct_output`` — skip to avoid double
-        counting). Tallies per-call_site checked/dropped so ``/v1/status`` can
-        surface a silent-drop rate to health→health-verifier. This closes the
-        no-silent-failure gap fleet-wide: a markdown fence / non-JSON / wrong-keys
-        response means llama.cpp dropped the grammar and ran free-form.
+        and tallies per-call_site checked/dropped so ``/v1/status`` can surface a
+        silent-drop rate to health→health-verifier. This closes the no-silent-failure gap
+        fleet-wide: a markdown fence / non-JSON / wrong-keys response means
+        llama.cpp dropped the grammar and ran free-form.
 
         READ-ONLY: it never mutates ``result`` (zero caller risk), and any error
         is swallowed so the detector can never break a real response."""
@@ -1240,11 +1129,6 @@ class ProxyService:
             if result.get("status") != "ok":
                 return
             if req.stream or req.payload_type != "chat_completion":
-                return
-            # Registry SHADOW/ACTIVE call_sites already run a conformance check in
-            # _finalize_struct_output; OFF/None fall through to this blanket pass.
-            pol = struct_policy_for(req.call_site)
-            if pol is not None and pol.mode != StructMode.OFF:
                 return
             grammar, _loc = self._extract_grammar(req.payload)
             if not grammar:
@@ -1528,11 +1412,6 @@ class ProxyService:
         future: asyncio.Future = loop.create_future()
         self._pending_futures[req.request_id] = future
 
-        # Structured-output policy: reason-inject the grammar for managed
-        # judgment call_sites (no-op when OFF). Done here (post cache-key, pre
-        # enqueue) so the cache key stays the caller's ORIGINAL request and the
-        # response path can strip what we inject.
-        self._apply_struct_policy(req)
         # Thinking option: honor a per-request `thinking:true` opt-in (enable
         # native <think> on vLLM + generous budget bump). No-op otherwise.
         self._apply_thinking(req)
@@ -1549,7 +1428,6 @@ class ProxyService:
             self._scheduler.cancel(req.request_id)
             self._queue_db.persist_expire(req.request_id)
             self._pending_futures.pop(req.request_id, None)
-            self._struct_inject.pop(req.request_id, None)  # no _finalize on timeout
             self._thinking_active.pop(req.request_id, None)
             # The caller's deadline fired — work may still be in flight.
             self._record_timeout_event(req, layer="client_wait", elapsed_s=req.timeout_s)
@@ -1569,7 +1447,6 @@ class ProxyService:
         # Admission timeout (scheduler callback) resolves the future with a
         # timeout result — already logged there; surface the same 504.
         if result.get("status") == "timeout":
-            self._struct_inject.pop(req.request_id, None)  # no _finalize on timeout
             self._thinking_active.pop(req.request_id, None)
             if openai:
                 return self._openai_error(
@@ -1582,11 +1459,6 @@ class ProxyService:
                 status_code=504,
             )
 
-        # Structured-output egress: strip the injected reason + run the
-        # conformance double-check (no-op when nothing was injected). On an ACTIVE
-        # egress failure this flips result→error (fail-safe to caller retry); so
-        # it must run BEFORE the cache so we never cache a leaky/failed response.
-        self._finalize_struct_output(req, result)
         # Thinking option: normalize the structured response (deterministic
         # stray-brace recovery; fail-safe if unrecoverable). Before the cache so a
         # repaired (or failed-safe) response is what gets cached, never the noise.
@@ -1897,10 +1769,6 @@ class ProxyService:
                 # context_gate_enforce flip check — compare against actual
                 # backend overflow errors before flipping).
                 "context_overflows_shadow": self._context_overflows,
-                # Structured-output policy (reason-then-constrain) egress health.
-                # Both stay 0 until a call_site policy is flipped on.
-                "struct_egress_failures": self._struct_egress_failures,
-                "struct_shadow_diffs": self._struct_shadow_diffs,
                 # Thinking option (per-request native reasoning) health. All 0
                 # until a caller opts in with thinking:true. Watch
                 # thinking_truncated to tune COLLECTIVE_PROXY_THINKING_BUDGET down.

@@ -442,77 +442,13 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Structured-output policy — the proxy-centralized "reason-then-constrain"
-# layer (CRANE-style). Per-call_site policy, applied IN the proxy and
-# transparent to callers (the proxy injects a leading free-text `reason` field
-# into the grammar on the way IN, and strips it on the way OUT, so the caller's
-# schema is unchanged). EVERYTHING SHIPS OFF (mode=OFF) — the transform is dead
-# until an operator flips a call_site to SHADOW/ACTIVE after the offline A/B in
-# a downtime window. See ~/.claude/plans/sparkling-petting-wilkinson.md.
-# ---------------------------------------------------------------------------
-
-from enum import Enum  # noqa: E402
-
-
-class StructMode(str, Enum):
-    OFF = "off"        # no transformation — fully transparent (the default)
-    SHADOW = "shadow"  # transform + egress-check + LOG discrepancies, but return
-                       # the baseline (untransformed) response — zero caller risk
-    ACTIVE = "active"  # transform + strip + return the transformed response
-
-
-class StructKind(str, Enum):
-    JUDGMENT = "judgment"      # consequential decision — gets reason-injection
-    EXTRACTION = "extraction"  # NER firehose — throughput-critical, NOT injected
-    TOOL_LOOP = "tool_loop"    # orchestrator inner loop — tool-format axis (deferred)
-
-
-class StructMechanism(str, Enum):
-    REASON_FIELD = "reason_field"  # Arm-1: in-schema leading reason field (validated)
-    # THINK_PARSER (Arm-2: native <think>/two-call) is DEFERRED — needs the
-    # offline decision-quality A/B before it can be wired/activated.
-
-
-@dataclass(frozen=True)
-class StructPolicy:
-    """Per-call_site structured-output policy. Frozen — edit the registry, not
-    instances. ``mode`` is the live switch; it ships OFF for every call_site."""
-    call_site: str
-    kind: StructKind
-    mode: StructMode = StructMode.OFF
-    mechanism: StructMechanism = StructMechanism.REASON_FIELD
-    reason_field: str = "reason"
-    # Bounded reason length for vLLM (guidance) backends. The proxy emits an
-    # UNBOUNDED rchar* on llama.cpp endpoints (b9357 rejects large {0,N}); see
-    # grammar.inject_reason_field. None here forces unbounded everywhere.
-    reason_max_chars: int | None = 400
-    # Bump the request's max_tokens by this much when injecting, so the added
-    # reason tokens never truncate the real payload (validated: +150 left a ~2-6%
-    # truncation tail at 800-budget proposal; +200 cleared it).
-    max_tokens_bump: int = 200
-
-
-# The consequential JUDGMENT grammars (call_site strings from the live queue.db).
-# ALL ship OFF. NOTE: verify each call_site string against the proxy queue.db
-# (proxy_completions.call_site) before flipping to SHADOW/ACTIVE — a wrong key
-# silently no-ops (stays OFF), which is safe but means the policy never applies.
-# proposal_emitter is queue-verified (1497 rows); the rest are inferred from the
-# grammar headers and are low-volume/monthly so scarce in the queue.
-STRUCTURED_OUTPUT_POLICY: dict[str, StructPolicy] = {
-    "forum-agent.proposal_emitter":             StructPolicy("forum-agent.proposal_emitter", StructKind.JUDGMENT),
-    "knowledge.dedup_check":                StructPolicy("knowledge.dedup_check", StructKind.JUDGMENT),
-    "knowledge.hygiene_monthly_merge":      StructPolicy("knowledge.hygiene_monthly_merge", StructKind.JUDGMENT),
-    "temporal.trip_resolve":                StructPolicy("temporal.trip_resolve", StructKind.JUDGMENT),
-    "temporal.trip_business_classify":      StructPolicy("temporal.trip_business_classify", StructKind.JUDGMENT),
-    "mail-agent.calendar_flight_extract": StructPolicy("mail-agent.calendar_flight_extract", StructKind.JUDGMENT),
-}
-
-
-def struct_policy_for(call_site: str) -> StructPolicy | None:
-    """The structured-output policy for a call_site, or None if unmanaged.
-    Returns None (→ no transformation) for everything not in the registry."""
-    return STRUCTURED_OUTPUT_POLICY.get(call_site)
+# NOTE: the proxy-centralized "reason-then-constrain" reason-injection layer
+# (StructMode/StructPolicy registry + grammar.inject_reason_field) was REMOVED
+# 2026-06-14. The 2026-06-05 offline A/B measured it neutral-to-modestly-worse
+# on the only real-data call_site and recommended dropping it; it shipped OFF
+# and never activated. The egress silent-drop DETECTOR below
+# (shadow_egress_detect_enabled / grammar.verify_conformance) is independent and
+# stays — it's the piece the A/B said was worth keeping.
 
 
 # --- Thinking option (per-request opt-in native reasoning) ---------------------

@@ -15,7 +15,6 @@ REPO = Path(__file__).resolve().parents[2]  # originfleet/
 sys.path.insert(0, str(REPO))
 
 service = importlib.import_module("originfleet.llmproxy.service")
-config = importlib.import_module("originfleet.llmproxy.config")
 S = service.ProxyService
 
 # Tiny object-root grammar: {"x": "<str>"}. verify_conformance derives root key
@@ -126,34 +125,6 @@ def test_kill_switch_disables(monkeypatch=None):
             os.environ.pop("COLLECTIVE_PROXY_SHADOW_EGRESS", None)
         else:
             os.environ["COLLECTIVE_PROXY_SHADOW_EGRESS"] = old
-
-
-def test_registry_managed_nonoff_call_site_skipped(monkeypatch=None):
-    # A call_site with a non-OFF registry policy is handled by
-    # _finalize_struct_output; the blanket detector must skip it (no double count).
-    cs = "ws4.fake_shadow"
-    pol = config.StructPolicy(call_site=cs, kind=config.StructKind.JUDGMENT,
-                              mode=config.StructMode.SHADOW)
-    config.STRUCTURED_OUTPUT_POLICY[cs] = pol
-    try:
-        m = _mock_self()
-        m._shadow_egress_detect(_req(_payload(), call_site=cs), _result('not json'))
-        assert m._shadow_drop == {}
-    finally:
-        config.STRUCTURED_OUTPUT_POLICY.pop(cs, None)
-
-
-def test_off_registry_call_site_still_checked():
-    # OFF registry call_sites are NOT verified by _finalize_struct_output, so the
-    # blanket detector must cover them.
-    off_sites = [cs for cs, p in config.STRUCTURED_OUTPUT_POLICY.items()
-                 if p.mode == config.StructMode.OFF]
-    if not off_sites:
-        return  # nothing to assert
-    cs = off_sites[0]
-    m = _mock_self()
-    m._shadow_egress_detect(_req(_payload(), call_site=cs), _result('{"x":"ok"}'))
-    assert m._shadow_drop[cs] == {"checked": 1, "dropped": 0}
 
 
 if __name__ == "__main__":
