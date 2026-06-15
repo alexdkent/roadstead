@@ -358,6 +358,11 @@ class TestInflightSnapshot:
         row = reqs[0]
         assert row["request_id"] == req.request_id
         assert row["endpoint"] == "chat"        # qwen-analyst normalizes to the chat class
+        # `backend` = the actual host:port doing the processing (UI "Endpoint");
+        # `served_model` = the model the backend answers to. Both derived from
+        # the endpoint config so the In-Flight view can show model + endpoint.
+        assert "backend" in row
+        assert "served_model" in row
         assert row["agent"] == "agent_a"
         assert row["input_tokens"] > 0          # context size flowing through
         assert 0.9 <= row["elapsed_s"] <= 1.2   # ~1s since dispatch

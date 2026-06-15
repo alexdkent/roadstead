@@ -401,11 +401,19 @@ class Scheduler:
         ActiveRequest.dispatched_at) for the elapsed computation."""
         requests: list[dict] = []
         for ep, active_map in self._active.items():
+            ep_cfg = self._config.endpoints.get(ep)
+            backend = f"{ep_cfg.host}:{ep_cfg.port}" if ep_cfg and ep_cfg.host else None
+            served_model = ep_cfg.effective_model_id if ep_cfg else None
             for ar in active_map.values():
                 req = ar.request
                 requests.append({
                     "request_id": req.request_id,
+                    # `endpoint` = the role/endpoint-class (e.g. "thinker").
+                    # Surfaced in the UI as "Model". `backend` is the actual
+                    # host:port doing the processing (UI "Endpoint").
                     "endpoint": ep,
+                    "served_model": served_model,
+                    "backend": backend,
                     "agent": req.agent_id,
                     "call_site": req.call_site,
                     "priority": req.priority.name,
