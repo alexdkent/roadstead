@@ -317,9 +317,14 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
         # keep it exact.
         endpoint_class="companion", role="qwen-composer",
         max_slots=3, context_per_slot=32768,
-        # The patched-cache 80B aborted under full 4-slot pressure with a
-        # llama.cpp KV-seq-removal assertion, so it's served --parallel 3; this
-        # cap (== max_slots) keeps the proven-safe 3-wide ceiling explicit.
+        # Served --parallel 3 (== max_slots). 2026-06-16: migrated nexus off the
+        # self-patched 0be84685b-cached build to CLEAN upstream llama.cpp b9309
+        # (6d57c26), which fixes the recurrent/hybrid seq_rm path natively
+        # (common_context_can_seq_rm → checkpoint-restore fallback). That ended
+        # the recurring GGML_ABORT "failed to remove sequence" core-dumps (Jun
+        # 1/5/13/14) the old patched build hit on partial KV trims, while keeping
+        # checkpoint reuse (validated: 14 restores, 0 reprefill, 0 abort on
+        # multi-turn 4.6K-ctx). The 3-slot cap stays as a conservative ceiling.
         dispatch_concurrency_cap=3,
         # Reserve 1 slot for interactive/chat rounds; background (composer
         # summaries + knowledge ingestion) uses the other 2. Mirrors the
