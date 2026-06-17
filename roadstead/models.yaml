@@ -84,6 +84,8 @@ models:
     host: nexus
     port: 8080
     backend_engine: llama.cpp
+    systemd_unit: llama-vision
+    probe_kind: llama
     model_family: Qwen3-VL-30B-A3B-Instruct (vision)
     quant: UD-Q4_K_XL
     context_per_slot: 32768
@@ -117,6 +119,8 @@ models:
     host: nexus
     port: 8081
     backend_engine: llama.cpp
+    systemd_unit: llama-companion
+    probe_kind: llama
     model_family: Qwen3-Next-80B-A3B (Huihui abliterated)
     quant: Q4_K_M
     context_per_slot: 32768
@@ -154,6 +158,8 @@ models:
     host: anvil
     port: 9091
     backend_engine: llama.cpp
+    systemd_unit: llama-gemma
+    probe_kind: llama
     model_family: Gemma-4-E4B-it
     quant: Q5_K_M
     context_per_slot: 16384
@@ -219,6 +225,8 @@ models:
     host: anvil
     port: 9083
     backend_engine: vllm
+    systemd_unit: vllm-thinker
+    probe_kind: vllm
     served_model_names: [llama-thinker, thinker, claude-sonnet-4-5, llama]
     model_family: Qwen3.6-27B-Text-NVFP4-MTP
     quant: NVFP4
@@ -257,9 +265,15 @@ models:
     host: anvil
     port: 9095
     backend_engine: vllm
+    systemd_unit: vllm-deckard
+    probe_kind: vllm
     served_model_names: [creative, deckard-31b, deckard]
     dispatcher_capability: llm_creative
+    dispatcher_unit_key: anvil-deckard
     unit: vllm-deckard.service
+    manage_process: false            # pinned always-on; dispatcher brokers the slot only
+    health_path: /health
+    warmup_sec: 420                  # cold vLLM NVFP4 + torch.compile is multi-minute
     model_family: Gemma-4-31B (DECKARD, NVFP4-AWQ)
     quant: NVFP4-AWQ
     params: {active: 31B, total: 31B}
@@ -297,6 +311,8 @@ models:
     host: anvil
     port: 9087
     backend_engine: shim
+    systemd_unit: bge-m3-embed
+    probe_kind: health
     model_family: BGE-M3 (dense + sparse + colbert)
     quant: fp16
     context_per_slot: 8192
@@ -327,6 +343,8 @@ models:
     host: anvil
     port: 9084
     backend_engine: shim
+    systemd_unit: bge-reranker-shim
+    probe_kind: infinity
     model_family: BGE-Reranker v2-m3 (cross-encoder)
     quant: fp16
     context_per_slot: 8192
@@ -358,6 +376,8 @@ models:
     host: nexus
     port: 8087
     backend_engine: shim
+    systemd_unit: nexus-got-ocr
+    probe_kind: health
     model_family: GOT-OCR-2.0
     quant: fp16
     capabilities:
@@ -379,6 +399,8 @@ models:
     host: nexus
     port: 8098
     backend_engine: shim
+    systemd_unit: orpheus-tts
+    probe_kind: health
     model_family: Orpheus 8-voice (Llama-3.2-3B + SNAC)
     purpose: Text-to-speech — DJ + voice replies.
     when_used:
@@ -455,6 +477,7 @@ models:
     backend_engine: shim
     dispatcher_capability: image_diffusers
     dispatcher_capability_aliases: [image_fast, image_hq]
+    dispatcher_unit_key: anvil-imagegen
     unit: anvil-imagegen.service
     manage_process: false            # self-managing; dispatcher brokers the slot only
     health_path: /healthz
@@ -503,6 +526,7 @@ models:
     port: 9220
     backend_engine: shim
     dispatcher_capability: music_generate
+    dispatcher_unit_key: anvil-musicgen
     unit: musicgen.service
     health_path: /healthz
     warmup_sec: 45
@@ -521,6 +545,7 @@ models:
     port: 9221
     backend_engine: shim
     dispatcher_capability: stem_separate
+    dispatcher_unit_key: anvil-htdemucs
     unit: htdemucs.service
     health_path: /healthz
     warmup_sec: 60
@@ -539,6 +564,7 @@ models:
     port: 9222
     backend_engine: shim
     dispatcher_capability: lyrics_transcribe
+    dispatcher_unit_key: anvil-lyrics
     unit: lyrics.service
     health_path: /healthz
     warmup_sec: 60
@@ -557,6 +583,7 @@ models:
     port: 9223
     backend_engine: shim
     dispatcher_capability: audio_variation
+    dispatcher_unit_key: anvil-vampnet
     unit: vampnet.service
     health_path: /health
     warmup_sec: 30

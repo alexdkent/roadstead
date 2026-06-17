@@ -45,6 +45,10 @@ class ModelEntry:
     port: int = 0
     wyoming_port: int = 0
     backend_engine: str = ""
+    # --- off-package derive fields (telemetry UNITS + dispatcher registry) ---
+    systemd_unit: str = ""          # box unit name (no .service) for telemetry UNITS
+    probe_kind: str = ""            # telemetry probe type: vllm | llama | infinity | health
+    dispatcher_unit_key: str = ""   # anvil-dispatcher MODEL_REGISTRY key (media/creative)
     served_model_names: tuple[str, ...] = ()
     model_family: str = ""
     quant: str = ""
@@ -128,6 +132,9 @@ def _coerce_entry(name: str, raw: dict[str, Any]) -> ModelEntry:
         port=int(raw.get("port", 0) or 0),
         wyoming_port=int(raw.get("wyoming_port", 0) or 0),
         backend_engine=raw.get("backend_engine", ""),
+        systemd_unit=raw.get("systemd_unit", ""),
+        probe_kind=raw.get("probe_kind", ""),
+        dispatcher_unit_key=raw.get("dispatcher_unit_key", ""),
         served_model_names=_t("served_model_names"),
         model_family=raw.get("model_family", ""),
         quant=raw.get("quant", ""),
@@ -291,6 +298,51 @@ def build_valid_providers(cat: Catalog | None = None) -> frozenset[str]:
         names.update(e.all_names)
     names.update(cat.extra_context_windows.keys())
     return frozenset(names)
+
+
+def build_telemetry_units(cat: Catalog | None = None, host: str = "") -> list[tuple[str, str, int, str]]:
+    """(role, systemd_unit, port, probe_kind) for every telemetry-probed model on
+    ``host`` (nexus/anvil). Drives the per-host telemetry UNITS tables + health-verifier
+    health. Scope: chat/embed/rerank/ocr/tts roles with their OWN backend on the
+    box (classifier shares router's E4B → excluded); media is dispatcher-managed
+    (not telemetry); ``planned`` roles are excluded. Order is catalog order."""
+    cat = cat or load_catalog()
+    probed = {"chat", "embed", "rerank", "ocr", "tts"}
+    out: list[tuple[str, str, int, str]] = []
+    for e in cat.models.values():
+        if e.host != host or e.status not in ("active", "on_demand"):
+            continue
+        if e.kind not in probed or not e.systemd_unit:
+            continue
+        if e.kind == "chat" and not e.proxy_endpoint:
+            continue  # shares another role's backend (classifier -> router E4B)
+        out.append((e.role, e.systemd_unit, e.port, e.probe_kind or "health"))
+    return out
+
+
+def build_dispatcher_entries(cat: Catalog | None = None) -> list[dict[str, Any]]:
+    """One dict per anvil-dispatcher-managed model (media + the pinned creative
+    LLM) — everything needed to build MODEL_REGISTRY + DEFAULT_POLICY. Excludes
+    ``planned`` roles (e.g. video). The dispatcher constructs its own ModelMeta
+    from these (ModelMeta lives there, so we return plain dicts)."""
+    cat = cat or load_catalog()
+    out: list[dict[str, Any]] = []
+    for e in cat.models.values():
+        if e.host != "anvil" or not e.dispatcher_capability:
+            continue
+        if e.status not in ("active", "on_demand"):
+            continue
+        out.append({
+            "key": e.dispatcher_unit_key or e.role,
+            "unit": e.unit,
+            "port": e.port,
+            "health_path": e.health_path or "/health",
+            "warmup_sec": e.warmup_sec or 60,
+            "manage_process": e.manage_process,
+            "capability": e.dispatcher_capability,
+            "capability_aliases": list(e.dispatcher_capability_aliases),
+        })
+    return out
 
 
 def build_port_to_role(cat: Catalog | None = None) -> dict[str, str]:
