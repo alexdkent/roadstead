@@ -32,7 +32,8 @@
 #
 # Field reference (per entry):
 #   kind            chat | embed | rerank | ocr | tts | stt | diarize | stream | media
-#   status          active | on_demand | deprecated | decommissioned
+#   status          active | on_demand | planned | deprecated | decommissioned
+#                   (planned = name/port reserved but NOT deployed — not live)
 #   aliases         every legacy / shorthand name that must resolve to this entry
 #   host            nexus | anvil | nasbox   (resolved to IP via meta.hosts + env)
 #   port            backend port on `host`
@@ -470,7 +471,7 @@ models:
 
   video:
     kind: media
-    status: on_demand
+    status: planned                  # NOT deployed — reserved name/port only
     proxy_endpoint: false
     role: ltx1-videogen
     aliases: [ltx1-videogen, anvil-ltx]
@@ -480,14 +481,17 @@ models:
     dispatcher_capability: video_fast
     dispatcher_capability_aliases: [video_hq]
     model_family: LTX-Video
-    purpose: On-demand video generation.
+    purpose: On-demand video generation (PLANNED — not live).
     when_used:
       - short-form video gen
     fallback: null
     notes: |
-      Name/port reserved (telemetry + llm_client) and GenerationCapability
-      declared, but NO systemd unit is currently deployed in MODEL_REGISTRY —
-      keep status:on_demand; add a unit + dispatcher row when the model lands.
+      PLANNED, not deployed. The name/port (9101) is reserved and the
+      GenerationCapability (video_fast/video_hq) is declared, but there is NO
+      systemd unit, no DEFAULT_POLICY mapping, and no MODEL_REGISTRY row. To go
+      live: add the unit + a MODEL_REGISTRY row + DEFAULT_POLICY mapping, then
+      flip status -> on_demand. Until then it is excluded from the live catalog
+      view (`inferctl models` shows it only under --all).
 
   musicgen:
     kind: media
