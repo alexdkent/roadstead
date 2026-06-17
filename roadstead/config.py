@@ -23,6 +23,8 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
+from . import model_catalog
+
 logger = logging.getLogger(__name__)
 
 
@@ -126,29 +128,13 @@ def priority_to_band(p: LLMPriority) -> PriorityBand:
 # Role → endpoint-class mapping (mirrors framework/llm_qos.py)
 # ---------------------------------------------------------------------------
 
-ROLE_TO_CLASS: dict[str, str] = {
-    "qwen-analyst":  "chat",
-    "qwen-composer": "companion",
-    # 2026-06-08: gemma-greeter consolidated onto the E4B "gemma" backend (:9091);
-    # the E2B-hot unit (:9090, llama-gemma-hot) was DECOMMISSIONED to reclaim ~2GB of
-    # anvil's unified pool. It served ~1.2K tokens over 2.4d — the Tier-1.5 LLM
-    # router/classifier fallback rarely fires (keyword routers handle the common path).
-    # The role NAME is kept so the ~8 agent callers (health-verifier / mail-agent /
-    # homeassistant / infrastructure / knowledge / sidekick / orchestrator / temporal) are
-    # untouched — their make_nexus_client("gemma-greeter") calls now land on E4B.
-    # Listed before gemma-router so CLASS_TO_ROLE["gemma"] stays "gemma-router".
-    "gemma-greeter": "gemma",
-    "gemma-router":  "gemma",
-    "bge-reranker":  "rerank",
-    "bge-m3-embed":  "embed",
-    "llama-thinker": "thinker",
-    # 2026-06-11: DECKARD-31B creative/counterpoint model (Gemma-4 NVFP4-AWQ on the
-    # AEON DGX-Spark vLLM image, anvil :9095). Different-family generative voice to
-    # the thinker; gemma4 reasoning parser + guidance structured-outputs (tools off).
-    "creative":      "creative",
-}
+# Derived from the model authority (llmproxy/models.yaml). To add/move/rename a
+# role, edit THAT file — these maps follow automatically. (gemma-greeter shares
+# the E4B "gemma" backend with gemma-router; the proxy-endpoint OWNER of "gemma"
+# is gemma-router, so CLASS_TO_ROLE["gemma"] == "gemma-router".)
+ROLE_TO_CLASS: dict[str, str] = model_catalog.build_role_to_class()
 
-CLASS_TO_ROLE: dict[str, str] = {v: k for k, v in ROLE_TO_CLASS.items()}
+CLASS_TO_ROLE: dict[str, str] = model_catalog.build_class_to_role()
 
 
 def normalize_endpoint(endpoint: str) -> str:
@@ -298,152 +284,19 @@ class AgentQuotaConfig:
 # Top-level proxy config
 # ---------------------------------------------------------------------------
 
+# THE canonical role→host:port routing table — DERIVED from the model authority
+# (llmproxy/models.yaml). Each `proxy_endpoint: true` role produces one entry,
+# keyed by its endpoint class. Slots/context are STARTUP SEEDS — the capacity
+# poller overwrites max_slots/context_per_slot from backend /props at runtime.
+# To add/move/retune a routed model, edit models.yaml (+ the box's systemd unit);
+# the per-class policy knobs (slot_affinity, fast_path_reserve_slots,
+# dispatch_concurrency_cap, background_floor_pct, skip_discovery) live in its
+# `policy:` block. The deep operational rationale for each knob is in the model's
+# `notes:` field in models.yaml. NOTE: the "gemma-hot" class (E2B :9090) is
+# decommissioned — do NOT re-add a probe of :9090.
 DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
-    "chat": EndpointConfig(
-        # nexus llama-vision — Qwen3-VL-30B-A3B (served id chat.gguf) on :8080.
-        # Live: --ctx-size 65536 --parallel 2 → 32768/slot, 2 slots. Serves the
-        # qwen-analyst role (classify / situation reports) + vision.
-        endpoint_class="chat", role="qwen-analyst",
-        max_slots=2, context_per_slot=32768,
-        host="10.0.0.6", port=8080,
-    ),
-    "companion": EndpointConfig(
-        # nexus llama-companion — Huihui Qwen3-Next-80B-A3B abliterated
-        # (served id companion.gguf) on :8081. Live (2026-06-05): --ctx-size
-        # 98304 --parallel 3 → 32768/slot, 3 slots — downsized from 4×98304 to
-        # free nexus memory for the Chatterbox Turbo TTS. The fleet's
-        # high-capability summarizer/composer (qwen-composer role). /props
-        # discovery is unreliable on the 80B, so this seed is load-bearing —
-        # keep it exact.
-        endpoint_class="companion", role="qwen-composer",
-        max_slots=3, context_per_slot=32768,
-        # Served --parallel 3 (== max_slots). 2026-06-16: migrated nexus off the
-        # self-patched 0be84685b-cached build to CLEAN upstream llama.cpp b9309
-        # (6d57c26), which fixes the recurrent/hybrid seq_rm path natively
-        # (common_context_can_seq_rm → checkpoint-restore fallback). That ended
-        # the recurring GGML_ABORT "failed to remove sequence" core-dumps (Jun
-        # 1/5/13/14) the old patched build hit on partial KV trims, while keeping
-        # checkpoint reuse (validated: 14 restores, 0 reprefill, 0 abort on
-        # multi-turn 4.6K-ctx). The 3-slot cap stays as a conservative ceiling.
-        dispatch_concurrency_cap=3,
-        # Reserve 1 slot for interactive/chat rounds; background (composer
-        # summaries + knowledge ingestion) uses the other 2. Mirrors the
-        # thinker's fast_path_reserve pattern. background_floor_pct left at the
-        # default (0.20 → floor 1): background_cap = max(floor, max_slots -
-        # reserve) = max(1, 2) = 2.
-        fast_path_reserve_slots=1,
-        slot_affinity=True,
-        host="10.0.0.6", port=8081,
-    ),
-    "gemma": EndpointConfig(
-        # anvil Gemma-4-E4B (cold classifier + vision) :9091 — n_ctx
-        # 16384/slot, 2 slots. Since 2026-06-08 this backend ALSO serves the
-        # gemma-greeter role (Tier-1.5 router/classifier fallback) — the E2B-hot
-        # :9090 backend was decommissioned (see ROLE_TO_CLASS note above). E4B is
-        # lightly loaded (~177K tok/day, n_busy≈1.0 of 2 slots) so it absorbs the
-        # rare greeter fallbacks with headroom; the only cost is slightly slower
-        # first-token (4B vs 2B) on those infrequent calls.
-        endpoint_class="gemma", role="gemma-router",
-        max_slots=2, context_per_slot=16384,
-        host="10.0.0.3", port=9091,
-    ),
-    # NOTE: the "gemma-hot" endpoint class (anvil Gemma-4-E2B :9090) was REMOVED
-    # 2026-06-08. The llama-gemma-hot.service unit is stopped+disabled on anvil.
-    # gemma-greeter now routes to the "gemma" class above. Do NOT re-add a probe of
-    # :9090 — it is dark by design.
-    "rerank": EndpointConfig(
-        # anvil bge-reranker shim :9084 (infinity backend behind it on :9085)
-        # — n_ctx 8192/slot, 1 slot.
-        endpoint_class="rerank", role="bge-reranker",
-        max_slots=1, context_per_slot=8192,
-        background_floor_pct=0.0,
-        host="10.0.0.3", port=9084,
-        # FastAPI shim — no /props or /v1/models; health-probe only.
-        skip_discovery=True,
-    ),
-    "embed": EndpointConfig(
-        # anvil bge-m3 embed :9087 — n_ctx 8192/slot, 4 slots (the CANONICAL
-        # fleet embed; the nexus CPU copy on :8091 was removed 2026-06-05).
-        endpoint_class="embed", role="bge-m3-embed",
-        max_slots=4, context_per_slot=8192,
-        host="10.0.0.3", port=9087,
-        # FastAPI shim — no /props or /v1/models; health-probe only.
-        skip_discovery=True,
-    ),
-    "thinker": EndpointConfig(
-        # vLLM-NVFP4 on GB10 (Qwen3.6-27B-Text-NVFP4-MTP since 2026-05-30).
-        # max_slots=32 MATCHES vLLM's --max-num-seqs 32 — the throughput knee
-        # from the autonomous tuning sweep at backend gpu-memory-utilization 0.50
-        # (0 preemptions to 32; KV ~24-66%; >32 has sharply diminishing aggregate
-        # for much worse per-stream latency). Decode is memory-bandwidth-bound, so
-        # the backend runs MTP speculative decoding (qwen3_5_mtp n=3) which is the
-        # real per-stream lever (+34-85%, composes with the guidance grammar path).
-        # Remeasure (vllm:num_preemptions_total, kv_cache_usage_perc) and pull back
-        # max-num-seqs/max_slots together if thrashing appears.
-        endpoint_class="thinker", role="llama-thinker",
-        # context_per_slot is the STARTUP SEED only — the capacity poller
-        # auto-discovers the live value from vLLM /v1/models max_model_len
-        # (service.py _update_endpoint_health), so this can't get ahead of the
-        # backend. 2026-05-31: raised 32768 → 131072 to match the vLLM
-        # --max-model-len 128K bump (opencode large-context coding). Zero extra
-        # memory — the fp8 KV pool (~647K tokens @ gpu-mem 0.50) is util-driven,
-        # not max-model-len-driven; 128K is well within the model's 256K native
-        # context (no rope-scaling). Fleet chunkers stay at 32K on purpose
-        # (framework _DEFAULT_CONTEXT_WINDOW) to keep extraction chunks small.
-        max_slots=32, context_per_slot=131072,
-        # ~95% of thinker load is background (knowledge ingestion, forum-agent
-        # proposals, hygiene), so let the background band use all but one slot
-        # (max_slots - 1); DRR keeps that fair across agents. The single
-        # reserved slot leaves room for the occasional fast-path call. Scales
-        # automatically if max_slots is raised (8→7 background, 10→9, etc.).
-        #
-        # background_floor_pct PINNED to 0.0 (→ floor 1). The 0.20 default was
-        # calibrated for the old 6-slot thinker (int(6·0.20)=1); at 32 slots it
-        # silently became int(32·0.20)=6, walling 6 slots off from rare
-        # interactive bursts (interactive ceiling 32-6=26) for no benefit on a
-        # background-dominated endpoint. The floor's only role is the
-        # interactive-reservation ceiling — keep it minimal so an interactive
-        # burst can use all 31 non-reserved slots. Cap stays 31 via the reserve.
-        background_floor_pct=0.0,
-        fast_path_reserve_slots=1,
-        host="10.0.0.3", port=9083,
-        backend_engine="vllm",
-    ),
-    "creative": EndpointConfig(
-        # anvil DECKARD-31B (Gemma-4-31B NVFP4-AWQ, AEON DGX-Spark image) :9095 —
-        # the `creative` role: a different-family creative/counterpoint voice to the
-        # thinker. Dense 31B, bandwidth-bound on Spark (~7 tok/s @1, ~42 agg @4) →
-        # low-QPS by design. --max-num-seqs 6 → max_slots 6; --max-model-len 131072;
-        # gpu-mem-util 0.21 (~26GB: ~18.4GB weights + ~7.4GB fp8 KV ≈ exactly one
-        # full 131072-ctx request, 2026-06-12). Reasoning model (gemma4 <think>);
-        # guidance structured-outputs available, auto-tool-choice OFF.
-        endpoint_class="creative", role="creative",
-        max_slots=6, context_per_slot=131072,
-        # Background-band slot policy mirrors the thinker (see above): the
-        # creative role is ~all background (sidekick song authoring at P4_HYGIENE —
-        # craft/theme-pick/hook-polish/self-echo). Left at the dataclass
-        # defaults (floor_pct 0.20 → floor 1, reserve 0 → cap == floor) the
-        # background band was pinned to ONE slot, serializing batch authoring
-        # at 1-wide while the backend is sized for --max-num-seqs 4. DECKARD is
-        # bandwidth-bound (~7 tok/s @1 vs ~42 agg @4) so the extra concurrency
-        # is a large aggregate-throughput win and costs no extra anvil memory
-        # (KV inside the already-allocated gpu-mem 0.28). floor_pct 0.0 → floor
-        # 1; reserve 1 → background cap = max_slots-1 = 3, with one slot held
-        # back for an occasional interactive/fast-path creative call.
-        background_floor_pct=0.0,
-        fast_path_reserve_slots=1,
-        host="10.0.0.3", port=9095,
-        backend_engine="vllm",
-        # 2026-06-12: PINNED ALWAYS-ON — no longer on-demand. Creative became key
-        # to multiple flows so it now mirrors the thinker: a boot-started,
-        # always-resident vLLM unit (vllm-deckard.service WantedBy=multi-user.target;
-        # anvil dispatcher registry manage_process=False → never idle-unloaded).
-        # The proxy therefore dispatches directly with NO dispatcher lease gating,
-        # removing the "dispatcher down → creative 503 even though DECKARD is up"
-        # failure mode. whisper+diarize moving to Nasbox frees the headroom for
-        # permanent residency. (Slot is no longer shared/evicted; the 900s timeout
-        # floor is now moot for warm calls but harmless.)
-    ),
+    cls: EndpointConfig(**kwargs)
+    for cls, kwargs in model_catalog.build_endpoint_kwargs().items()
 }
 
 

@@ -1,0 +1,599 @@
+# ===========================================================================
+# THE model naming + capability AUTHORITY for the whole fleet.
+#
+# This file is owned by the LLM proxy and is the SINGLE SOURCE OF TRUTH for
+# every model the fleet runs — chat / embed / rerank / vision / speech / media.
+# The proxy routing table, the framework client port+alias maps, the gateway
+# facade, the telemetry UNITS, the dispatcher registry, the model cards, the
+# frontend catalog and the `inferctl models` CLI all DERIVE from this file
+# (see originfleet/llmproxy/model_catalog.py). Do not hand-maintain those
+# copies — edit HERE.
+#
+# Naming strategy: FUNCTION-BASED. The top-level key names the JOB
+# (router / analyst / composer / reasoner / creative / embed / rerank / ocr /
+# tts / stt / imagegen / ...). The model family is an ATTRIBUTE that may change
+# without renaming the role. Old names live on under `aliases:` so existing
+# callers keep working through a compat window.
+#
+# ---------------------------------------------------------------------------
+# WHEN YOU ADD / MOVE / RENAME / RETIRE A MODEL — edit THIS file first, then:
+#   add     → set status:active; drop a systemd unit on the box + `sync-to-*`;
+#             add the name to the vLLM `--served-model-name` list if vLLM;
+#             verify the frontend catalog row renders (parity gate);
+#             confirm telemetry UNITS probe + dashboard tile appear.
+#   move    → change host/port here; edit the unit + redeploy that box.
+#   rename  → change the key; move the old name into `aliases:` (auto-resolves).
+#   retire  → set status:decommissioned; disable/remove the unit; drop the
+#             served-model-name alias.
+# The doctrine test (tests/framework/test_model_naming_doctrine.py) FAILS if a
+# role string / served-model-name / port can't resolve to an entry here, so a
+# forgotten location can't merge silently. Full checklist: `model-selection` skill.
+# ---------------------------------------------------------------------------
+#
+# Field reference (per entry):
+#   kind            chat | embed | rerank | ocr | tts | stt | diarize | stream | media
+#   status          active | on_demand | deprecated | decommissioned
+#   aliases         every legacy / shorthand name that must resolve to this entry
+#   host            nexus | anvil | nasbox   (resolved to IP via meta.hosts + env)
+#   port            backend port on `host`
+#   proxy_endpoint  true if this role OWNS the DEFAULT_ENDPOINTS[endpoint_class]
+#                   row (chat/embed/rerank roles routed by the proxy). false for
+#                   facade-only (ocr/tts/stt/...) and media (dispatcher) roles.
+#   endpoint_class  the proxy QoS class (only for proxy_endpoint / shared roles)
+#   role            the proxy EndpointConfig.role / telemetry role string (the
+#                   pre-rename canonical — kept until the call-site sweep lands)
+#   backend_engine  llama.cpp | vllm | shim
+#   served_model_names  vLLM --served-model-name tokens that MUST match here
+#   context_per_slot    proxy EndpointConfig seed (live value comes from /props)
+#   context_window      framework chunker/preflight default (_DEFAULT_CONTEXT_WINDOW)
+#   slots               max_slots seed
+#   timeout_floor_s     per-class floor (llmproxy/timeout_model.FLOOR_S)
+#   policy.*            EndpointConfig knobs (reserve / floor_pct / cap / affinity / skip_discovery)
+#   capabilities.*      vision / streaming / reasoning / tool_calling / structured_output
+#   dispatcher_capability   media: the GenerationCapability key the dispatcher uses
+#   unit                media: systemd unit name
+#   token_speed         approx decode throughput / latency note (advisory)
+# ===========================================================================
+
+meta:
+  hosts:
+    nexus: 10.0.0.6
+    anvil: 10.0.0.3
+    nasbox: 10.0.0.10
+  # Provider context-window values preserved VERBATIM for callers/DB rows that
+  # are not (yet) covered by a role entry. anthropic is the no-op v2 fallback;
+  # the nexus-* legacy values are intentionally the OLD numbers — un-migrated
+  # DB rows fall back here until llm_provider._migrate_provider_names() renames
+  # them on boot. (nexus-companion/nexus-gemma differ from their live roles.)
+  extra_context_windows:
+    anthropic: 200000
+    nexus-companion: 16384
+    nexus-gemma: 16384
+
+models:
+
+  # ---------------------------------------------------------------- chat / reasoning
+  analyst:
+    kind: chat
+    status: active
+    proxy_endpoint: true
+    endpoint_class: chat
+    role: qwen-analyst
+    aliases: [qwen-analyst, chat, nexus-chat]
+    host: nexus
+    port: 8080
+    backend_engine: llama.cpp
+    model_family: Qwen3-VL-30B-A3B-Instruct (vision)
+    quant: UD-Q4_K_XL
+    context_per_slot: 32768
+    context_window: 32768
+    slots: 2
+    timeout_floor_s: 30
+    capabilities:
+      vision: true
+      streaming: false
+      reasoning: false
+      tool_calling: true
+      structured_output: grammar
+    token_speed: {note: "~0.1-1.5s classify; ~1-2s vision"}
+    purpose: Vision (OCR/description) + fast prefill-bound classification tier.
+    when_used:
+      - Image/screenshot/calendar-photo vision (description + OCR)
+      - Tier-1.5 / Tier-2 classification (email triage, relationship, attachments)
+      - Vision fallback behind `ocr` (got-ocr)
+    fallback: composer
+    notes: |
+      Not the streaming-synth path. Lives on nexus so anvil stays free for
+      the user-facing composer slot.
+
+  composer:
+    kind: chat
+    status: active
+    proxy_endpoint: true
+    endpoint_class: companion
+    role: qwen-composer
+    aliases: [qwen-composer, companion, nexus-companion]
+    host: nexus
+    port: 8081
+    backend_engine: llama.cpp
+    model_family: Qwen3-Next-80B-A3B (Huihui abliterated)
+    quant: Q4_K_M
+    context_per_slot: 32768
+    context_window: 98304
+    slots: 3
+    timeout_floor_s: 180
+    policy:
+      dispatch_concurrency_cap: 3   # G1: KV-seq-rm headroom on the 80B
+      fast_path_reserve_slots: 1
+      slot_affinity: true           # pin a conversation to one slot (KV reuse)
+    capabilities:
+      vision: false
+      streaming: true
+      reasoning: false
+      tool_calling: true
+      structured_output: grammar
+    token_speed: {note: "streaming synth; decode-bound"}
+    purpose: Streaming user-facing synth + high-capability composer/summarizer.
+    when_used:
+      - Inner-loop final-answer synthesis + tier2_synth streaming reply
+      - Speech-frame voice replies, recipe-runner recipe execution
+      - Large-context summary fallover (>24k tokens)
+    fallback: reasoner
+    notes: |
+      /props discovery is unreliable on the 80B — the context_per_slot seed is
+      load-bearing, keep it exact. slot_affinity reuses the checkpoint cache.
+
+  router:
+    kind: chat
+    status: active
+    proxy_endpoint: true
+    endpoint_class: gemma
+    role: gemma-router
+    aliases: [gemma-router, gemma, nexus-gemma]
+    host: anvil
+    port: 9091
+    backend_engine: llama.cpp
+    model_family: Gemma-4-E4B-it
+    quant: Q5_K_M
+    context_per_slot: 16384
+    context_window: 16384
+    slots: 2
+    timeout_floor_s: 60
+    capabilities:
+      vision: false
+      streaming: false
+      reasoning: false
+      tool_calling: true
+      structured_output: grammar
+    token_speed: {note: "cheap classify; first-token fast"}
+    purpose: Tier-1.5 LLM router + cheap classification / tool routing.
+    when_used:
+      - Tool routers (temporal / health-verifier / research), email + proposal classify
+      - knowledge audit/dedup classifiers
+    fallback: classifier
+    notes: |
+      Since 2026-06-08 this E4B backend ALSO serves the `classifier`
+      (gemma-greeter) role — the E2B-hot :9090 was decommissioned.
+
+  classifier:
+    kind: chat
+    status: active
+    proxy_endpoint: false            # shares the `gemma` endpoint with `router`
+    endpoint_class: gemma
+    role: gemma-greeter
+    aliases: [gemma-greeter, gemma-hot, nexus-gemma-hot]
+    host: anvil
+    port: 9091
+    backend_engine: llama.cpp
+    model_family: Gemma-4-E4B-it
+    quant: Q5_K_M
+    context_per_slot: 16384
+    context_window: 4096             # legacy greeter default (small prompts)
+    slots: 2
+    timeout_floor_s: 60
+    capabilities:
+      vision: false
+      streaming: false
+      reasoning: false
+      tool_calling: true
+      structured_output: grammar
+    token_speed: {note: "cheap classify; rare fallback path"}
+    purpose: Tier-1.5 router/classifier fallback (greeter); lands on the E4B backend.
+    when_used:
+      - tool_router fallback (health-verifier / temporal), chip narration
+    fallback: router
+    notes: |
+      Two logical roles (router + classifier) legitimately SHARE one physical
+      backend (E4B :9091). proxy_endpoint:false — `router` owns the `gemma`
+      DEFAULT_ENDPOINTS row; this entry only contributes gemma-greeter→gemma to
+      ROLE_TO_CLASS + its own context window.
+
+  reasoner:
+    kind: chat
+    status: active
+    proxy_endpoint: true
+    endpoint_class: thinker
+    role: llama-thinker
+    aliases: [llama-thinker, thinker]
+    host: anvil
+    port: 9083
+    backend_engine: vllm
+    served_model_names: [llama-thinker, thinker, claude-sonnet-4-5, llama]
+    model_family: Qwen3.6-27B-Text-NVFP4-MTP
+    quant: NVFP4
+    params: {active: 27B, total: 27B}
+    context_per_slot: 131072
+    context_window: 32768            # fleet chunkers size against 32K on purpose
+    slots: 32
+    timeout_floor_s: 180
+    policy:
+      background_floor_pct: 0.0
+      fast_path_reserve_slots: 1
+    capabilities:
+      vision: false
+      streaming: true
+      reasoning: true               # MTP speculative + per-request thinking
+      tool_calling: true
+      structured_output: guidance
+    token_speed: {decode_tok_s_at_1: 40, aggregate_tok_s_full: 120}
+    purpose: Dense agentic reasoning tier (the fleet's heavy reasoner).
+    when_used:
+      - knowledge extraction, news synthesis, thread/device enrichment
+      - browser-broker default, forum-agent thread summary
+    fallback: composer
+    notes: |
+      Function-named: actually a Qwen3.6 dense model on vLLM with qwen3_5_mtp
+      n=3 speculative decoding. served window is 128K (opencode); fleet chunkers
+      deliberately use 32K (context_window) to keep extraction chunks small.
+
+  creative:
+    kind: chat
+    status: on_demand               # PINNED always-on since 2026-06-12 (dispatcher broker-only)
+    proxy_endpoint: true
+    endpoint_class: creative
+    role: creative
+    aliases: [deckard, deckard-31b]
+    host: anvil
+    port: 9095
+    backend_engine: vllm
+    served_model_names: [creative, deckard-31b, deckard]
+    dispatcher_capability: llm_creative
+    unit: vllm-deckard.service
+    model_family: Gemma-4-31B (DECKARD, NVFP4-AWQ)
+    quant: NVFP4-AWQ
+    params: {active: 31B, total: 31B}
+    context_per_slot: 131072
+    slots: 6
+    timeout_floor_s: 900            # tolerates cold multi-minute vLLM load
+    policy:
+      background_floor_pct: 0.0
+      fast_path_reserve_slots: 1
+    capabilities:
+      vision: false
+      streaming: true
+      reasoning: true               # gemma4 <think>
+      tool_calling: false           # auto-tool-choice OFF
+      structured_output: guidance
+    token_speed: {decode_tok_s_at_1: 7, aggregate_tok_s_full: 42}
+    purpose: Creative / counterpoint voice — a different-family generative model.
+    when_used:
+      - sidekick song authoring (theme/hook/expand), dj crew speaker voice
+    fallback: composer
+    notes: |
+      Dense 31B, bandwidth-bound on Spark (low-QPS by design). 2026-06-12 pinned
+      always-resident (vllm-deckard.service WantedBy=multi-user.target); the
+      dispatcher is broker-only (manage_process=false) → never idle-unloaded, so
+      the proxy dispatches directly with no lease gating.
+
+  # ---------------------------------------------------------------- retrieval
+  embed:
+    kind: embed
+    status: active
+    proxy_endpoint: true
+    endpoint_class: embed
+    role: bge-m3-embed
+    aliases: [bge-m3-embed]
+    host: anvil
+    port: 9087
+    backend_engine: shim
+    model_family: BGE-M3 (dense + sparse + colbert)
+    quant: fp16
+    context_per_slot: 8192
+    slots: 4
+    timeout_floor_s: 15
+    policy:
+      skip_discovery: true          # FastAPI shim — no /props or /v1/models
+    capabilities:
+      vision: false
+      streaming: false
+      structured_output: none
+    token_speed: {note: "hybrid embed, one forward pass"}
+    purpose: Dense/sparse/colbert hybrid embeddings for retrieval (the canonical fleet embed).
+    when_used:
+      - knowledge ingest + retrieval, forum-agent similarity gate, dedup
+    fallback: null
+    notes: |
+      NOT OpenAI-compatible — POST /embed returning dense+sparse+colbert. The
+      nexus CPU copy (:8091) was removed 2026-06-05.
+
+  rerank:
+    kind: rerank
+    status: active
+    proxy_endpoint: true
+    endpoint_class: rerank
+    role: bge-reranker
+    aliases: [bge-reranker, rerank, nexus-rerank]
+    host: anvil
+    port: 9084
+    backend_engine: shim
+    model_family: BGE-Reranker v2-m3 (cross-encoder)
+    quant: fp16
+    context_per_slot: 8192
+    slots: 1
+    timeout_floor_s: 10
+    policy:
+      background_floor_pct: 0.0
+      skip_discovery: true
+    capabilities:
+      vision: false
+      streaming: false
+      structured_output: none
+    token_speed: {note: "cross-encode candidate batch"}
+    purpose: Late-stage retrieval candidate reranking.
+    when_used:
+      - knowledge retrieval rerank stage
+    fallback: null
+    notes: |
+      Cohere-style POST /rerank (not OpenAI). Upstream `infinity-bge-reranker`
+      (:9085) is the INTERNAL backend behind this shim — not a public role.
+
+  # ---------------------------------------------------------------- vision / OCR
+  ocr:
+    kind: ocr
+    status: active
+    proxy_endpoint: false           # facade-only (gateway), not a proxy LLM role
+    role: got-ocr
+    aliases: [got-ocr, got_ocr]
+    host: nexus
+    port: 8087
+    backend_engine: shim
+    model_family: GOT-OCR-2.0
+    quant: fp16
+    capabilities:
+      vision: true
+      structured_output: none
+    purpose: Primary OCR (document/image text extraction).
+    when_used:
+      - attachments + email document OCR
+    fallback: analyst                # qwen-analyst vision is the OCR fallback
+    notes: Reached via the gateway facade, not make_nexus_client.
+
+  # ---------------------------------------------------------------- speech
+  tts:
+    kind: tts
+    status: active
+    proxy_endpoint: false
+    role: orpheus-tts
+    aliases: [orpheus-tts, orpheus]
+    host: nexus
+    port: 8098
+    backend_engine: shim
+    model_family: Orpheus 8-voice (Llama-3.2-3B + SNAC)
+    purpose: Text-to-speech — DJ + voice replies.
+    when_used:
+      - dj crew voice, speech-frame replies
+    fallback: null
+    notes: |
+      Backbone `orpheus-llama` (Llama-3.2-3B) on :8096 emits SNAC codes;
+      orpheus-tts (:8098) is the front. Replaced chatterbox-tts (2026-06-07).
+
+  stt:
+    kind: stt
+    status: active
+    proxy_endpoint: false
+    role: whisper-1
+    aliases: [whisper-1, whisper]
+    host: nasbox                     # RELOCATED off nexus 2026-06-12 (OpenVINO NPU)
+    port: 8086
+    backend_engine: shim
+    model_family: Whisper Large v3 (int8, OpenVINO)
+    purpose: Speech-to-text transcription.
+    when_used:
+      - Tideway transcription, voice intake, Wyoming ASR for HA
+    fallback: null
+    notes: Runs on the Nasbox Intel Xe/NPU box (10.0.0.10) since 2026-06-12.
+
+  diarize:
+    kind: diarize
+    status: on_demand
+    proxy_endpoint: false
+    role: diarize-gpu
+    aliases: [diarize-gpu, nexus-diarize-gpu]
+    host: nasbox                     # RELOCATED off anvil 2026-06-12 (OpenVINO iGPU)
+    port: 8086
+    backend_engine: shim
+    model_family: DiariZen (WavLM, OpenVINO)
+    dispatcher_capability: diarize
+    unit: diarize-gpu.service        # NOTE: dispatcher registry still lists anvil :8093 (stale; reconcile)
+    purpose: Speaker diarization.
+    when_used:
+      - multi-speaker transcript attribution
+    fallback: null
+    notes: |
+      Gated by DIARIZE_ENABLED (default off). Moved to the Nasbox iGPU 2026-06-12;
+      the anvil dispatcher MODEL_REGISTRY row (anvil-diarize :8093) is stale.
+
+  stream:
+    kind: stream
+    status: active
+    proxy_endpoint: false
+    role: nexus-stream
+    aliases: [nexus-stream, stream]
+    host: nasbox                     # RELOCATED off anvil 2026-06-12
+    port: 8190
+    wyoming_port: 10300
+    backend_engine: shim
+    model_family: nexus-stream audio mux (WS + OpenAI batch + Wyoming TCP)
+    purpose: Speech audio mux / streaming relay (+ Wyoming bridge for Home Assistant).
+    when_used:
+      - real-time voice capture pipeline, HA Wyoming ASR
+    fallback: null
+    notes: Nasbox (10.0.0.10) :8190 + Wyoming :10300 since 2026-06-12.
+
+  # ---------------------------------------------------------------- media / generation
+  # All dispatcher-managed, on-demand (GPU-slot lease). Keyed by
+  # dispatcher_capability; `unit` is the systemd unit the dispatcher brokers.
+  imagegen:
+    kind: media
+    status: on_demand
+    proxy_endpoint: false
+    role: flux1-imagegen
+    aliases: [flux1-imagegen, anvil-imagegen]
+    host: anvil
+    port: 9210
+    backend_engine: shim
+    dispatcher_capability: image_diffusers
+    dispatcher_capability_aliases: [image_fast, image_hq]
+    unit: anvil-imagegen.service
+    manage_process: false            # self-managing; dispatcher brokers the slot only
+    health_path: /healthz
+    warmup_sec: 15
+    model_family: Diffusers (Flux / SDXL, ~150 swappable checkpoints)
+    purpose: On-demand image generation.
+    when_used:
+      - Image Studio, sidekick/dj artwork
+    fallback: null
+    notes: |
+      Hosts ~150 swappable checkpoints behind one FastAPI — the per-checkpoint
+      sub-registry lives in infra/anvil/anvil_imagegen/models.yaml (a finer
+      granularity; NOT folded into this authority).
+
+  video:
+    kind: media
+    status: on_demand
+    proxy_endpoint: false
+    role: ltx1-videogen
+    aliases: [ltx1-videogen, anvil-ltx]
+    host: anvil
+    port: 9101
+    backend_engine: shim
+    dispatcher_capability: video_fast
+    dispatcher_capability_aliases: [video_hq]
+    model_family: LTX-Video
+    purpose: On-demand video generation.
+    when_used:
+      - short-form video gen
+    fallback: null
+    notes: |
+      Name/port reserved (telemetry + llm_client) and GenerationCapability
+      declared, but NO systemd unit is currently deployed in MODEL_REGISTRY —
+      keep status:on_demand; add a unit + dispatcher row when the model lands.
+
+  musicgen:
+    kind: media
+    status: on_demand
+    proxy_endpoint: false
+    role: anvil-musicgen
+    aliases: [anvil-musicgen, musicgen]
+    host: anvil
+    port: 9220
+    backend_engine: shim
+    dispatcher_capability: music_generate
+    unit: musicgen.service
+    health_path: /healthz
+    warmup_sec: 45
+    model_family: MusicGen
+    purpose: AI music generation bridge.
+    when_used: [dj audio production]
+    fallback: null
+
+  stem:
+    kind: media
+    status: on_demand
+    proxy_endpoint: false
+    role: anvil-htdemucs
+    aliases: [anvil-htdemucs, htdemucs]
+    host: anvil
+    port: 9221
+    backend_engine: shim
+    dispatcher_capability: stem_separate
+    unit: htdemucs.service
+    health_path: /healthz
+    warmup_sec: 60
+    model_family: HTDemucs
+    purpose: Stem separation.
+    when_used: [dj audio production]
+    fallback: null
+
+  lyrics:
+    kind: media
+    status: on_demand
+    proxy_endpoint: false
+    role: anvil-lyrics
+    aliases: [anvil-lyrics]
+    host: anvil
+    port: 9222
+    backend_engine: shim
+    dispatcher_capability: lyrics_transcribe
+    unit: lyrics.service
+    health_path: /healthz
+    warmup_sec: 60
+    model_family: Whisper (lyrics transcription)
+    purpose: Lyrics transcription for catalog tracks.
+    when_used: [dj/sidekick lyric alignment]
+    fallback: null
+
+  audio-variation:
+    kind: media
+    status: on_demand
+    proxy_endpoint: false
+    role: anvil-vampnet
+    aliases: [anvil-vampnet, vampnet]
+    host: anvil
+    port: 9223
+    backend_engine: shim
+    dispatcher_capability: audio_variation
+    unit: vampnet.service
+    health_path: /health
+    warmup_sec: 30
+    model_family: VampNet
+    purpose: Audio variations.
+    when_used: [dj audio production]
+    fallback: null
+
+# ---------------------------------------------------------------------------
+# Decommissioned — kept for HISTORY only (not loaded into any routing table).
+# `inferctl models --all` and audits surface these with their retirement note.
+# ---------------------------------------------------------------------------
+decommissioned:
+  gemma-hot:
+    aliases: [llama-gemma-hot]
+    host: anvil
+    port: 9090
+    retired: 2026-06-08
+    notes: Gemma-4-E2B hot router. Consolidated onto the E4B `router`/`classifier` (:9091).
+  chatterbox-tts:
+    host: nexus
+    port: 8088
+    retired: 2026-06-07
+    notes: Replaced by `tts` (orpheus-tts). Itself replaced sesame-tts.
+  sesame-tts:
+    host: anvil
+    port: 9122
+    retired: 2026-05-22
+    notes: Removed in v3; TTS consolidated onto nexus Orpheus.
+  bge-m3-embed-cpu:
+    host: nexus
+    port: 8091
+    retired: 2026-06-05
+    notes: CPU embed copy. `embed` (anvil :9087) is the canonical fleet embed.
+  nexus-diarize:
+    host: nexus
+    port: 8089
+    retired: 2026-05-22
+    notes: Streaming diarize. Superseded by Nasbox `diarize`.
+  nexus-diarize-offline:
+    host: nexus
+    port: 8092
+    retired: 2026-05-22
+    notes: Offline-batch diarize. Superseded by Nasbox `diarize`.
