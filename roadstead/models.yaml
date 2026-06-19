@@ -257,7 +257,7 @@ models:
 
   creative:
     kind: chat
-    status: on_demand               # PINNED always-on since 2026-06-12 (dispatcher broker-only)
+    status: active                  # PINNED always-resident since 2026-06-12 — a real always-on endpoint (dispatcher brokers the slot only, manage_process:false → never idle-unloaded)
     proxy_endpoint: true
     endpoint_class: creative
     role: creative
@@ -437,14 +437,16 @@ models:
     backend_engine: shim
     model_family: DiariZen (WavLM, OpenVINO)
     dispatcher_capability: diarize
-    unit: diarize-gpu.service        # NOTE: dispatcher registry still lists anvil :8093 (stale; reconcile)
+    unit: diarize-gpu.service
     purpose: Speaker diarization.
     when_used:
       - multi-speaker transcript attribution
     fallback: null
     notes: |
-      Gated by DIARIZE_ENABLED (default off). Moved to the Nasbox iGPU 2026-06-12;
-      the anvil dispatcher MODEL_REGISTRY row (anvil-diarize :8093) is stale.
+      Gated by DIARIZE_ENABLED (default off). Runs on the Nasbox iGPU (10.0.0.10:8086,
+      OpenVINO) since 2026-06-12, reached via the gateway facade. The anvil
+      dispatcher row was removed 2026-06-16 (build_dispatcher_entries excludes
+      non-anvil hosts), so this is no longer a anvil-dispatcher capability.
 
   stream:
     kind: stream
