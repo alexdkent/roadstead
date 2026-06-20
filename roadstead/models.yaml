@@ -257,48 +257,43 @@ models:
 
   creative:
     kind: chat
-    status: active                  # PINNED always-resident since 2026-06-12 — a real always-on endpoint (dispatcher brokers the slot only, manage_process:false → never idle-unloaded)
+    status: active                  # PINNED always-resident on the DEDICATED boxa (docker --restart unless-stopped auto-starts vLLM); standalone — no dispatcher/systemd, proxy dispatches directly
     proxy_endpoint: true
     endpoint_class: creative
     role: creative
     aliases: [deckard, deckard-31b]
-    host: anvil
-    port: 9095
+    host: nasbox
+    port: 9196
     backend_engine: vllm
-    systemd_unit: vllm-deckard
-    probe_kind: vllm
     served_model_names: [creative, deckard-31b, deckard]
-    dispatcher_capability: llm_creative
-    dispatcher_unit_key: anvil-deckard
-    unit: vllm-deckard.service
-    manage_process: false            # pinned always-on; dispatcher brokers the slot only
-    health_path: /health
-    warmup_sec: 420                  # cold vLLM NVFP4 + torch.compile is multi-minute
-    model_family: Gemma-4-31B (DECKARD, NVFP4-AWQ)
-    quant: NVFP4-AWQ
+    model_family: Gemma-4-31B (alonsoko abliterated, W4A16)
+    quant: W4A16
     params: {active: 31B, total: 31B}
-    context_per_slot: 131072
-    slots: 6
-    timeout_floor_s: 900            # tolerates cold multi-minute vLLM load
+    context_per_slot: 65536          # boxa vLLM --max-model-len
+    slots: 16                        # boxa vLLM --max-num-seqs hard cap
+    timeout_floor_s: 900            # tolerates cold multi-minute vLLM load + long-context prefill
     policy:
       background_floor_pct: 0.0
       fast_path_reserve_slots: 1
     capabilities:
       vision: false
       streaming: true
-      reasoning: true               # gemma4 <think>
+      reasoning: false              # alonsoko abliterated — inline CoT only, NO <think>/reasoning_content channel
       tool_calling: false           # auto-tool-choice OFF
       structured_output: guidance
-    token_speed: {decode_tok_s_at_1: 7, aggregate_tok_s_full: 42}
+    token_speed: {decode_tok_s_at_1: 25, aggregate_tok_s_full: 250}
     purpose: Creative / counterpoint voice — a different-family generative model.
     when_used:
       - sidekick song authoring (theme/hook/expand), dj crew speaker voice
     fallback: composer
     notes: |
-      Dense 31B, bandwidth-bound on Spark (low-QPS by design). 2026-06-12 pinned
-      always-resident (vllm-deckard.service WantedBy=multi-user.target); the
-      dispatcher is broker-only (manage_process=false) → never idle-unloaded, so
-      the proxy dispatches directly with no lease gating.
+      Dense abliterated Gemma-4-31B (alonsoko, W4A16) on the DEDICATED Intel Arc Pro boxa
+      (10.0.0.10:9196, custom vLLM 0.23 XPU build) since 2026-06-20 — replaced the anvil
+      GB10 NVFP4 DECKARD (kept as hot rollback). Standalone always-on docker container
+      `vllm-creative-boxa` (--restart unless-stopped; entrypoint auto-starts vLLM on boot/crash);
+      NO anvil dispatcher, NO systemd. gpu-mem-util 0.98, max-num-seqs 16, max-model-len 65536
+      (~108K KV tokens). Depends on the /mnt/cache/llm NVMe mount (editable vLLM install + model
+      + serve_prod.sh). Replaces DECKARD's thinking finetune → no structured reasoning channel.
 
   # ---------------------------------------------------------------- retrieval
   embed:
