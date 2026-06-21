@@ -276,7 +276,7 @@ models:
       background_floor_pct: 0.0
       fast_path_reserve_slots: 1
     capabilities:
-      vision: false                 # DEPLOYMENT choice, NOT a model limit. VALIDATED 2026-06-21 (in a maintenance window): the vision tower IS present (356 tensors) and image + video input both work on vLLM-XPU — BUT ONLY under `--dtype bfloat16`. Prod serves `--dtype float16` (text-only is fine under fp16), which silently breaks vision via the SigLIP fp16 overflow (vLLM #40290 — empty/<pad> output). AUDIO is NOT supported: the checkpoint has no audio-tower weights (audio_config is vestigial → vLLM 400s). To enable image/video: flip `--limit-mm-per-prompt` image/video>0 AND switch to `--dtype bfloat16` (re-validate boxa text throughput under bf16 first). Video routes as frames THROUGH the vision tower (no separate video tower).
+      vision: true                  # IMAGE + VIDEO input LIVE in prod since 2026-06-21 (serve_prod.sh: --dtype bfloat16 + --limit-mm-per-prompt image:2,video:1). Validated end-to-end through the proxy (Anthropic image block → OAI translate → vLLM). bf16 is MANDATORY for vision (fp16 silently breaks it via SigLIP overflow, vLLM #40290); text throughput unchanged (24.8 vs 25.9 tok/s). AUDIO is NOT supported — the checkpoint has no audio tower (audio_config vestigial → vLLM 400s); keep audio:0. Video routes as frames THROUGH the vision tower (no separate video tower).
       streaming: true
       reasoning: false              # served as a non-thinking chat model — no <think>/reasoning_content channel
       tool_calling: false           # auto-tool-choice OFF
@@ -299,11 +299,12 @@ models:
       model). Standalone always-on docker container `vllm-creative-boxa` (--restart unless-stopped;
       entrypoint auto-starts vLLM on boot/crash); NO anvil dispatcher, NO systemd. gpu-mem-util
       0.98, max-num-seqs 16, max-model-len 65536 (~108K KV tokens). Depends on the /mnt/cache/llm
-      NVMe mount (editable vLLM install + model + serve_prod.sh). MULTIMODAL (validated 2026-06-21,
-      see capabilities + PRODUCTION.md): vision tower present (356 tensors) → IMAGE + VIDEO work, but
-      ONLY under --dtype bfloat16 (fp16 silently breaks vision: SigLIP overflow, vLLM #40290). NO audio
-      tower in the checkpoint → audio unsupported. Prod serves --dtype float16 TEXT-ONLY via
-      --limit-mm-per-prompt '{"image":0,...}'.
+      NVMe mount (editable vLLM install + model + serve_prod.sh). MULTIMODAL LIVE (2026-06-21, see
+      capabilities + PRODUCTION.md): prod serves --dtype bfloat16 with --limit-mm-per-prompt
+      image:2,video:1 → IMAGE + VIDEO input work (vision tower = 356 tensors; video = frames through
+      the vision tower). bf16 is mandatory (fp16 silently breaks vision: SigLIP overflow, vLLM #40290);
+      text throughput unchanged. NO audio tower → audio unsupported (audio:0). Callers reach it like any
+      vision role: make_nexus_client("creative") with image content; the proxy translates + forwards.
 
   # ---------------------------------------------------------------- retrieval
   embed:
