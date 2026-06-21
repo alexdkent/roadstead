@@ -261,12 +261,12 @@ models:
     proxy_endpoint: true
     endpoint_class: creative
     role: creative
-    aliases: [deckard, deckard-31b]
+    aliases: [deckard, deckard-31b]   # HISTORICAL — from the prior anvil NVFP4 DECKARD model; kept as compat role aliases only (the deployed model is NOT a DECKARD finetune)
     host: nasbox
     port: 9196
     backend_engine: vllm
-    served_model_names: [creative, deckard-31b, deckard]
-    model_family: Gemma-4-31B (alonsoko abliterated, W4A16)
+    served_model_names: [creative, deckard-31b, deckard]   # `creative` = the LIVE boxa server (serve_prod.sh); `deckard`/`deckard-31b` = the DORMANT anvil rollback (serve_deckard.sh) — all declared so the naming-doctrine test covers both serve scripts
+    model_family: Gemma-4-31B-it abliterated (Heretic-ARA), AWQ W4A16
     quant: W4A16
     params: {active: 31B, total: 31B}
     context_per_slot: 65536          # boxa vLLM --max-model-len
@@ -276,9 +276,9 @@ models:
       background_floor_pct: 0.0
       fast_path_reserve_slots: 1
     capabilities:
-      vision: false
+      vision: false                 # DEPLOYMENT choice, NOT a model limit — served text-only via `--limit-mm-per-prompt '{"image":0,...}'`. The checkpoint's vision+audio towers are FULL-PRECISION/intact (gemma4_vision + gemma4 audio); enabling image input is a serve-flag flip + vLLM-XPU multimodal validation away.
       streaming: true
-      reasoning: false              # alonsoko abliterated — inline CoT only, NO <think>/reasoning_content channel
+      reasoning: false              # served as a non-thinking chat model — no <think>/reasoning_content channel
       tool_calling: false           # auto-tool-choice OFF
       structured_output: guidance
     token_speed: {decode_tok_s_at_1: 25, aggregate_tok_s_full: 250}
@@ -287,13 +287,21 @@ models:
       - sidekick song authoring (theme/hook/expand), dj crew speaker voice
     fallback: composer
     notes: |
-      Dense abliterated Gemma-4-31B (alonsoko, W4A16) on the DEDICATED Intel Arc Pro boxa
-      (10.0.0.10:9196, custom vLLM 0.23 XPU build) since 2026-06-20 — replaced the anvil
-      GB10 NVFP4 DECKARD (kept as hot rollback). Standalone always-on docker container
-      `vllm-creative-boxa` (--restart unless-stopped; entrypoint auto-starts vLLM on boot/crash);
-      NO anvil dispatcher, NO systemd. gpu-mem-util 0.98, max-num-seqs 16, max-model-len 65536
-      (~108K KV tokens). Depends on the /mnt/cache/llm NVMe mount (editable vLLM install + model
-      + serve_prod.sh). Replaces DECKARD's thinking finetune → no structured reasoning channel.
+      DEPLOYED MODEL (ground-truth, /models/alonsoko-ct-w4a16 on the box): the pre-quantized HF
+      download `alonsoko/Gemma-4-31B-it-abliterated-heretic-AWQ-W4A16` — an AWQ W4A16 quant
+      (group_size 128 symmetric, compressed-tensors, calibrated on ultrachat_200k) of
+      `trohrbaugh/gemma-4-31b-it-heretic-ara`, itself a HERETIC-ARA abliterated derivative of
+      `google/gemma-4-31b-it`. This is NOT the DavidAU "DECKARD" finetune nor a locally
+      AutoRound-quantized model — the earlier `infra/nasbox-vllm-xpu/` build plan targeted DECKARD
+      but production switched to this downloaded AWQ artifact. Runs on the DEDICATED Intel Arc Pro
+      boxa (10.0.0.10:9196, custom vLLM 0.23 XPU build) since 2026-06-20 — replaced the anvil GB10
+      NVFP4 DECKARD (kept as hot rollback; the `deckard` aliases are historical from that prior
+      model). Standalone always-on docker container `vllm-creative-boxa` (--restart unless-stopped;
+      entrypoint auto-starts vLLM on boot/crash); NO anvil dispatcher, NO systemd. gpu-mem-util
+      0.98, max-num-seqs 16, max-model-len 65536 (~108K KV tokens). Depends on the /mnt/cache/llm
+      NVMe mount (editable vLLM install + model + serve_prod.sh). MULTIMODAL-CAPABLE: only the LM
+      linear layers are 4-bit; the vision + audio towers and mm projector stay full precision, so
+      the model CAN accept images — we serve it TEXT-ONLY via --limit-mm-per-prompt (see capabilities).
 
   # ---------------------------------------------------------------- retrieval
   embed:
