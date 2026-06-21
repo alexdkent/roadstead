@@ -491,27 +491,36 @@ models:
 
   video:
     kind: media
-    status: planned                  # NOT deployed — reserved name/port only
+    status: on_demand                # LIVE 2026-06-21 — Phase 0 validated on the GB10
     proxy_endpoint: false
-    role: ltx1-videogen
-    aliases: [ltx1-videogen, anvil-ltx]
+    role: ltx2-videogen
+    aliases: [ltx2-videogen, anvil-videogen, anvil-ltx]
     host: anvil
-    port: 9101
+    port: 9211                       # anvil-videogen FastAPI service (adjacent to imagegen :9210)
     backend_engine: shim
     dispatcher_capability: video_fast
     dispatcher_capability_aliases: [video_hq]
-    model_family: LTX-Video
-    purpose: On-demand video generation (PLANNED — not live).
+    dispatcher_unit_key: anvil-videogen
+    unit: anvil-videogen.service
+    manage_process: false            # always-on service; self-manages ComfyUI residency + the slot lease
+    health_path: /healthz
+    warmup_sec: 30
+    model_family: LTX-2.3 (LTX 2.3 22B distilled, fp8-scaled)
+    quant: fp8-scaled
+    purpose: On-demand text-to-video and image-to-video.
     when_used:
-      - short-form video gen
+      - short-form video gen, animate Image-Studio stills
     fallback: null
     notes: |
-      PLANNED, not deployed. The name/port (9101) is reserved and the
-      GenerationCapability (video_fast/video_hq) is declared, but there is NO
-      systemd unit, no DEFAULT_POLICY mapping, and no MODEL_REGISTRY row. To go
-      live: add the unit + a MODEL_REGISTRY row + DEFAULT_POLICY mapping, then
-      flip status -> on_demand. Until then it is excluded from the live catalog
-      view (`inferctl models` shows it only under --all).
+      LTX-2.3 22B distilled fp8 on the anvil GB10 via an isolated headless
+      ComfyUI (/opt/comfyui-video, PyTorch SDPA — sm_121 has no FlashAttention;
+      SageAttention deferred). The anvil-videogen FastAPI service (:9211,
+      manage_process:false) is always-on, owns the dispatcher GPU-slot lease, and
+      lazy-starts / idle-stops the ComfyUI child + memory-guards loads — the ~80GB
+      video stack shares the 121GB unified pool with the always-resident vLLM
+      thinker, so generation is strictly serialized + memory-preflighted. Gemma-3-12B
+      is the prompt text encoder. Per-checkpoint sub-registry lives in
+      infra/anvil/anvil_videogen/models.yaml (not folded into this authority).
 
   musicgen:
     kind: media
