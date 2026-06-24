@@ -407,7 +407,7 @@ class ProxyService:
         self._scheduler = Scheduler(config, self._cost_model, self._budget_mgr)
         self._backend = BackendClientPool()
         self._queue_db = PersistentQueue(config.queue_db_path or None)
-        # On-demand endpoints (e.g. `creative`/DECKARD): the model is loaded
+        # On-demand endpoints (e.g. `creative`, Gemma-4-31B abliterated): the model is loaded
         # lazily under the anvil GPU-slot dispatcher lease and idle-unloaded.
         self._on_demand = OnDemandManager(config.endpoints)
 
@@ -990,7 +990,7 @@ class ProxyService:
                     "cache_hit": True,
                 })
 
-        # On-demand backends (e.g. creative/DECKARD): acquire the anvil
+        # On-demand backends (e.g. creative, Gemma-4-31B abliterated): acquire the anvil
         # GPU-slot dispatcher lease so the model is resident before dispatch.
         # Blocks (FIFO) behind any other on-demand service (imagegen/diarize/…)
         # holding the slot, and may cold-load for minutes — the 900s timeout

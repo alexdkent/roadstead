@@ -44,7 +44,7 @@ FLOOR_S: dict[str, float] = {
     "chat": 30.0,
     "companion": 180.0,
     "thinker": 180.0,
-    # DECKARD-31B (creative) is dense + bandwidth-bound on Spark (~5-7 tok/s single-stream);
+    # creative (Gemma-4-31B abliterated) is dense (~25 tok/s single-stream, 16 slots on the Arc Pro boxa);
     # long-form creative generation needs a high floor so cold-start (no history) doesn't
     # cap requests at the 60s default. recommended = max(p99*margin, floor) once warm.
     # 900s (15min) so an ON-DEMAND cold model LOAD (several minutes) + generation can WAIT
