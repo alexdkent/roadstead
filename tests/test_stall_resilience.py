@@ -15,13 +15,15 @@ from originfleet.llmproxy.observability import (
 )
 
 
-def _metrics_with_timeouts(endpoint: str, n: int, now: float) -> RollingMetrics:
+def _metrics_with_timeouts(
+    endpoint: str, n: int, now: float, *, premature: bool = False,
+) -> RollingMetrics:
     m = RollingMetrics(window_s=300.0)
     for _ in range(n):
         m.record(MetricsSample(
             timestamp=now, endpoint=endpoint, agent_id="a", priority="P3_INGESTION",
             queue_wait_ms=0.0, backend_latency_ms=0.0, status="timeout",
-            slot_seconds=0.0))
+            slot_seconds=0.0, premature=premature))
     return m
 
 
@@ -58,6 +60,37 @@ def test_no_stall_below_threshold():
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
     assert "endpoint_stalled" not in _names(alerts)
+
+
+def test_no_stall_on_premature_timeout_burst():
+    # Best-effort gemma paths (greeter advisory ~0.9s, sidekick.extract_obs 3.0s) give
+    # up below the gemma 60s floor by design. A burst of those premature
+    # timeouts with free slots is a CLIENT give-up, not a backend stall — it must
+    # NOT manufacture an endpoint_stalled ERROR (the false-alert churn fixed here).
+    now = time.monotonic()
+    m = _metrics_with_timeouts("gemma", 8, now, premature=True)
+    snaps = {"gemma": {"in_flight": 0, "max_slots": 2, "queued": 0, "paused": False}}
+    alerts = check_alerts(
+        endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
+        cost_model_samples={}, queue_wal_size=0, now=now)
+    assert "endpoint_stalled" not in _names(alerts)
+
+
+def test_genuine_timeouts_still_fire_amid_premature_noise():
+    # A real stall (requests waiting PAST the recommended deadline → premature=
+    # False) must still surface even when premature give-ups share the window.
+    now = time.monotonic()
+    m = _metrics_with_timeouts("gemma", 5, now, premature=True)
+    for _ in range(3):  # genuine, non-premature
+        m.record(MetricsSample(
+            timestamp=now, endpoint="gemma", agent_id="a", priority="P3_INGESTION",
+            queue_wait_ms=0.0, backend_latency_ms=0.0, status="timeout",
+            slot_seconds=0.0, premature=False))
+    snaps = {"gemma": {"in_flight": 0, "max_slots": 2, "queued": 0, "paused": False}}
+    alerts = check_alerts(
+        endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
+        cost_model_samples={}, queue_wal_size=0, now=now)
+    assert "endpoint_stalled" in _names(alerts)
 
 
 def test_intertoken_gap_constant_present():

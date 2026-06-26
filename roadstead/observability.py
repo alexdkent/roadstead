@@ -128,6 +128,12 @@ class MetricsSample:
     backend_latency_ms: float
     status: str
     slot_seconds: float
+    # True when a `status="timeout"` sample fired BELOW the proxy's own
+    # recommended deadline for that model/size (a client-side give-up, not a
+    # backend problem). Best-effort interactive paths (gemma greeter advisory,
+    # sidekick.extract_obs) deliberately apply sub-second deadlines well under the
+    # gemma 60s floor; their give-ups must NOT be read as a backend stall.
+    premature: bool = False
 
 
 class RollingMetrics:
@@ -177,6 +183,7 @@ class RollingMetrics:
         endpoint: str | None = None,
         agent_id: str | None = None,
         status: str | None = None,
+        premature: bool | None = None,
         now: float | None = None,
     ) -> int:
         if now:
@@ -188,6 +195,8 @@ class RollingMetrics:
             if agent_id and s.agent_id != agent_id:
                 continue
             if status and s.status != status:
+                continue
+            if premature is not None and s.premature != premature:
                 continue
             n += 1
         return n
@@ -284,17 +293,29 @@ def check_alerts(
     # backend is usually only PARTIALLY degraded (most requests still succeed),
     # so fast-failing all of its traffic would be worse than letting the healthy
     # majority through. Distinct from admission_timeout_spike (global, load).
+    #
+    # Count only GENUINE timeouts (premature=False). A premature timeout fired
+    # below the proxy's own recommended deadline — a client-side give-up, not a
+    # backend stall. Best-effort interactive gemma paths (greeter advisory ~0.9s,
+    # sidekick.extract_obs 3.0s) deliberately apply sub-second deadlines well under
+    # the gemma 60s floor and routinely give up early; counting those manufactured
+    # false `endpoint_stalled` ERROR bursts (same root cause as the creative-boxa
+    # 120/220s-constant episode, fixed there by deriving from the advice). A real
+    # stall makes requests wait PAST the recommended deadline → premature=False →
+    # still counted, so the genuine signal is preserved, only sharper.
     for ep, snap in endpoint_snapshots.items():
-        ep_timeouts = metrics.count(endpoint=ep, status="timeout", now=now)
+        ep_timeouts = metrics.count(
+            endpoint=ep, status="timeout", premature=False, now=now)
         max_slots = snap.get("max_slots", 0) or 0
         if (ep_timeouts >= 3
                 and snap.get("queued", 0) == 0
                 and (max_slots == 0 or snap.get("in_flight", 0) < max_slots)):
             alerts.append(AlertCondition(
                 "endpoint_stalled", "ERROR", True,
-                f"endpoint {ep}: {ep_timeouts} timeouts in 5min with free slots "
-                f"(in_flight={snap.get('in_flight', 0)}/{max_slots or '?'}, "
-                f"queued=0) — backend likely stalling, not saturated",
+                f"endpoint {ep}: {ep_timeouts} non-premature timeouts in 5min "
+                f"with free slots (in_flight={snap.get('in_flight', 0)}/"
+                f"{max_slots or '?'}, queued=0) — backend likely stalling, "
+                f"not saturated",
             ))
 
     # Agent starvation — REMOVED. The DRR fix (pick_agent on head-of-queue wait)

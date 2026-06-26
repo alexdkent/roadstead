@@ -3198,6 +3198,10 @@ class ProxyService:
                     backend_latency_ms=0.0,
                     status="timeout",
                     slot_seconds=0.0,
+                    # `under` = fired below the proxy's recommended deadline; a
+                    # client-side give-up, excluded from the endpoint_stalled
+                    # backend-stall heuristic (best-effort sub-floor callers).
+                    premature=under,
                 ))
                 self._request_logger.log(RequestLogRecord(
                     ts=datetime.now(timezone.utc).isoformat(),
