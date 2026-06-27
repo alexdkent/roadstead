@@ -58,6 +58,19 @@ def prompt_text(payload_json: str) -> str:
     if isinstance(d.get("prompt"), str):
         return d["prompt"]
     parts: list[str] = []
+    # The top-level `system` field is folded to a FRONT role:system message at dispatch
+    # (backend.normalize_chat_payload), so it IS the front of the prompt vLLM prefix-caches.
+    # Counting it (it was previously ignored) is essential: a byte-stable system + dynamic user —
+    # the dominant judgment shape — otherwise reads as 0% LCP / "misaligned" when it actually caches.
+    sys = d.get("system")
+    if isinstance(sys, str):
+        parts.append(sys)
+    elif isinstance(sys, list):
+        for blk in sys:
+            if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                parts.append(blk["text"])
+            elif isinstance(blk, str):
+                parts.append(blk)
     for m in d.get("messages") or []:
         if not isinstance(m, dict):
             continue
