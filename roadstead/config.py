@@ -405,6 +405,10 @@ class ProxyConfig:
     # Capacity-poller cadence. Production default 10s; tests shrink it so
     # poller-loop behaviour is observable without 10s waits.
     poller_interval_s: float = 10.0
+    # Prefix-cache observability cadence (piggybacks the poller): scrape backend
+    # /metrics + run the cache-ability screen, persist a snapshot per chat
+    # endpoint. 30min keeps it cheap; first run fires on the first poll.
+    cache_stats_interval_s: float = 1800.0
 
     # --- queue.db maintenance (persistence cleanup) ---
     # Payload bodies (payload_json/response_json on proxy_completions) are only

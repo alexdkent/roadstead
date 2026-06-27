@@ -467,6 +467,40 @@ class BackendClientPool:
         except Exception:
             return False
 
+    async def probe_prefix_cache(self, ep_cfg: EndpointConfig) -> dict | None:
+        """Scrape a backend's Prometheus `/metrics` for prefix-cache counters.
+
+        Returns ``{"hits": int, "queries": int}`` (cumulative-since-backend-boot,
+        token-weighted) or ``None`` when the backend doesn't expose them — vLLM
+        publishes ``vllm:prefix_cache_hits_total`` / ``vllm:prefix_cache_queries_total``;
+        llama.cpp has no equivalent, so its endpoints read as actual-rate ``n/a``
+        (the cache-ability screen still covers them). Best-effort: any error → None.
+        """
+        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        try:
+            resp = await asyncio.wait_for(client.get("/metrics"), timeout=5.0)
+            if resp.status_code != 200:
+                return None
+            hits = queries = None
+            for line in resp.text.splitlines():
+                if line.startswith("#") or "prefix_cache" not in line:
+                    continue
+                # "vllm:prefix_cache_hits_total{...} 58112.0"
+                try:
+                    name, val = line.rsplit(" ", 1)
+                    v = int(float(val))
+                except ValueError:
+                    continue
+                if name.startswith("vllm:prefix_cache_hits_total"):
+                    hits = v
+                elif name.startswith("vllm:prefix_cache_queries_total"):
+                    queries = v
+            if hits is not None and queries is not None:
+                return {"hits": hits, "queries": queries}
+        except Exception:
+            pass
+        return None
+
     async def call_shadow(
         self,
         shadow_host: str,

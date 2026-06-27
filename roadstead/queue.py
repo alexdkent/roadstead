@@ -136,11 +136,21 @@ CREATE TABLE IF NOT EXISTS proxy_maintenance (
     source      TEXT
 );
 
+CREATE TABLE IF NOT EXISTS proxy_cache_stats (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_at   REAL NOT NULL,        -- wall-clock of the periodic tick
+    endpoint      TEXT NOT NULL,        -- endpoint_class (creative/thinker/chat/...)
+    cum_hits      INTEGER,              -- vLLM prefix_cache_hits_total (cumulative; NULL=n/a)
+    cum_queries   INTEGER,              -- vLLM prefix_cache_queries_total (cumulative; NULL=n/a)
+    screen_json   TEXT                  -- JSON: per-call_site cache-ability rows for this endpoint
+);
+
 CREATE INDEX IF NOT EXISTS idx_pq_status ON proxy_queue(status);
 CREATE INDEX IF NOT EXISTS idx_pc_completed ON proxy_completions(completed_at);
 CREATE INDEX IF NOT EXISTS idx_pts_completed ON proxy_timeout_shadow(completed_at);
 CREATE INDEX IF NOT EXISTS idx_pto_occurred ON proxy_timeouts(occurred_at);
 CREATE INDEX IF NOT EXISTS idx_pm_endpoint_started ON proxy_maintenance(endpoint, started_at);
+CREATE INDEX IF NOT EXISTS idx_pcs_endpoint_snap ON proxy_cache_stats(endpoint, snapshot_at);
 """
 
 
@@ -987,6 +997,65 @@ class PersistentQueue:
             }
             for r in rows
         ]
+
+    # ----- prefix-cache observability (snapshots + screen payloads) -----
+    def cache_screen_payloads(
+        self, endpoint: str, hours: float = 168.0, limit: int = 2000,
+    ) -> list[tuple[str, str]]:
+        """(call_site, prompt-prefix) rows for one endpoint over the window, most
+        recent first. payload_json is truncated to 16 KB — bounds memory and is
+        ample for the LCP/Jaccard screen (avglen truncates the same, so aligned
+        big prompts still read as high-LCP)."""
+        if not self._conn:
+            return []
+        cutoff = time.time() - hours * 3600.0
+        rows = self._reader().execute(
+            "SELECT call_site, substr(payload_json,1,16000) "
+            "FROM proxy_completions "
+            "WHERE endpoint = ? AND payload_json IS NOT NULL AND completed_at > ? "
+            "ORDER BY completed_at DESC LIMIT ?",
+            (endpoint, cutoff, limit),
+        ).fetchall()
+        return [(r[0], r[1] or "") for r in rows]
+
+    def persist_cache_snapshot(
+        self, *, snapshot_at: float, endpoint: str,
+        cum_hits: int | None, cum_queries: int | None, screen_json: str,
+    ) -> None:
+        """Record one periodic prefix-cache snapshot for an endpoint."""
+        self._w(
+            "INSERT INTO proxy_cache_stats "
+            "(snapshot_at, endpoint, cum_hits, cum_queries, screen_json) "
+            "VALUES (?,?,?,?,?)",
+            (snapshot_at, endpoint, cum_hits, cum_queries, screen_json),
+        )
+
+    def prune_cache_stats(self, older_than_s: float = 30 * 86400.0) -> None:
+        self._w("DELETE FROM proxy_cache_stats WHERE snapshot_at < ?",
+                (time.time() - older_than_s,))
+
+    def cache_stats_snapshots(self, window_s: float = 7 * 86400.0) -> list[dict]:
+        """All snapshots within the window, oldest→newest (drives latest +
+        windowed-rate-delta + trend + drift in the handler)."""
+        if not self._conn:
+            return []
+        cutoff = time.time() - window_s
+        rows = self._reader().execute(
+            "SELECT snapshot_at, endpoint, cum_hits, cum_queries, screen_json "
+            "FROM proxy_cache_stats WHERE snapshot_at > ? ORDER BY snapshot_at ASC",
+            (cutoff,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                screen = json.loads(r[4]) if r[4] else []
+            except Exception:
+                screen = []
+            out.append({
+                "snapshot_at": r[0], "endpoint": r[1],
+                "cum_hits": r[2], "cum_queries": r[3], "screen": screen,
+            })
+        return out
 
     # ----- non-LLM ingest (Phase 1: proxy = fleet call-metrics authority) -----
 

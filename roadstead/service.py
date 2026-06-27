@@ -30,6 +30,7 @@ from .grammar import (
     root_object_keys,
     verify_conformance,
 )
+from . import cache_stats
 from .config import (
     CLASS_TO_ROLE,
     LLMPriority,
@@ -653,6 +654,7 @@ class ProxyService:
         self._queue_db.cleanup_old_completions(self._config.completions_retention_s)
         self._queue_db.cleanup_old_payloads(self._config.payload_retention_s)
         self._last_cleanup_at = time.monotonic()
+        self._last_cache_stats_at = 0.0  # 0 → compute prefix-cache stats on first poll
 
         # Start background loops. The done-callbacks make an UNEXPECTED loop
         # exit loud (CRITICAL) — the iteration guards inside the loops should
@@ -2048,6 +2050,16 @@ class ProxyService:
         data = await asyncio.to_thread(self._queue_db.top_callers, window_s, per_endpoint)
         return JSONResponse(data)
 
+    async def handle_fleet_cache_stats(self, request: Request) -> Response:
+        """Prefix-cache observability: per-model actual hit-rate + per-call_site
+        misalignment offenders + rollup + trend + drift. Computed from the
+        periodic snapshots in proxy_cache_stats (see _compute_cache_stats)."""
+        window_s = _clamp_window(request.query_params.get("window", "7d"), 30 * 86400)
+        snaps = await asyncio.to_thread(self._queue_db.cache_stats_snapshots, window_s)
+        labels = cache_stats.chat_endpoint_labels()
+        engines = {ep: cfg.backend_engine for ep, cfg in self._config.endpoints.items()}
+        return JSONResponse(cache_stats.build_fleet_payload(snaps, labels, engines))
+
     async def handle_usage(self, request: Request) -> Response:
         dimension = request.query_params.get("by", "agent")
         if dimension not in ("agent", "call_site", "endpoint", "provider"):
@@ -3422,6 +3434,15 @@ class ProxyService:
         if mono - self._last_budget_save_at > 60.0:
             self._last_budget_save_at = mono
             self._queue_db.save_budgets(self._budget_mgr.snapshot())
+        # Prefix-cache observability (continuous): scrape each chat backend's
+        # /metrics + run the cache-ability screen, persist one snapshot/endpoint.
+        # Piggybacks the poller cadence but gated to its own interval.
+        if mono - self._last_cache_stats_at > self._config.cache_stats_interval_s:
+            self._last_cache_stats_at = mono
+            try:
+                await self._compute_cache_stats()
+            except Exception as exc:  # noqa: BLE001 — best-effort observability
+                logger.debug("cache-stats iteration failed: %s", exc)
         # Alerting (Phase 2.5): evaluate conditions → logs + /v1/status so
         # health-verifier/log_scan see proxy-internal health. Never restarts a backend.
         try:
@@ -3431,6 +3452,37 @@ class ProxyService:
         # Age out stale timeout-model samples (cheap; piggybacks the
         # poller cadence instead of a dedicated task).
         self._timeout_model.prune(mono)
+
+    async def _compute_cache_stats(self) -> None:
+        """One prefix-cache snapshot pass over the chat endpoints. For each:
+        scrape vLLM /metrics prefix-cache counters (None for llama.cpp), run the
+        cache-ability screen over recent stored prompts (off-loop), persist a row.
+        Cheap + bounded; runs at ``cache_stats_interval_s``."""
+        chat_classes = set(cache_stats.chat_endpoint_labels())
+        snap_at = time.time()
+        for ep_name, ep_cfg in self._config.endpoints.items():
+            if ep_name not in chat_classes or ep_name in self._paused_endpoints:
+                continue
+            cum_hits = cum_queries = None
+            if ep_cfg.backend_engine == "vllm":
+                try:
+                    pc = await self._backend.probe_prefix_cache(ep_cfg)
+                    if pc:
+                        cum_hits, cum_queries = pc["hits"], pc["queries"]
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                rows = await asyncio.to_thread(
+                    self._queue_db.cache_screen_payloads, ep_name, 168.0, 2000)
+                screen = await asyncio.to_thread(cache_stats.screen, rows)
+            except Exception:  # noqa: BLE001
+                screen = []
+            self._queue_db.persist_cache_snapshot(
+                snapshot_at=snap_at, endpoint=ep_name,
+                cum_hits=cum_hits, cum_queries=cum_queries,
+                screen_json=json.dumps(screen),
+            )
+        self._queue_db.prune_cache_stats()
 
     def _apply_discovered_props(
         self, ep_name: str, ep_cfg: EndpointConfig, props: dict,
