@@ -1682,6 +1682,87 @@ class ProxyService:
 
     # ----- handler: status -----
 
+    async def handle_prometheus_metrics(self, request: Request) -> Response:
+        """GET /metrics — Prometheus text exposition of CURRENT QoS aggregates
+        (timeseries_migration_plan Phase 3.1). In-memory reads only (scheduler +
+        the 300s rolling window + since-boot counters), so ~zero scrape cost; the
+        proxy_timeouts/_completions event tables stay the forensic system-of-
+        record. Layer-split timeout counts + would-timeout% remain on
+        /v1/timeouts (SQL-windowed), not here. Never raises — degrades to empty."""
+        from originfleet.framework.metrics import Metric, render_prometheus
+
+        now = time.monotonic()
+        out: list[Metric] = []
+        _Q = {50: "0.5", 95: "0.95"}
+        try:
+            for ep_name in self._config.endpoints:
+                lbl = {"endpoint": ep_name}
+                snap = self._scheduler.endpoint_snapshot(ep_name)
+                if snap.get("max_slots") is not None:
+                    out.append(Metric("llmproxy_endpoint_slots_total",
+                                      snap["max_slots"], lbl, "gauge",
+                                      help="configured max concurrent slots"))
+                if snap.get("in_flight") is not None:
+                    out.append(Metric("llmproxy_endpoint_inflight",
+                                      snap["in_flight"], lbl, "gauge",
+                                      help="requests dispatched and in flight"))
+                if snap.get("queued") is not None:
+                    out.append(Metric("llmproxy_endpoint_queued", snap["queued"],
+                                      lbl, "gauge", help="requests waiting in queue"))
+                for band, n in (snap.get("queue_by_band") or {}).items():
+                    out.append(Metric("llmproxy_endpoint_queued_by_band", n,
+                                      {"endpoint": ep_name, "band": str(band)},
+                                      "gauge", help="queued requests by priority band"))
+                for q, qlabel in _Q.items():
+                    w = self._metrics.percentile("queue_wait_ms", q,
+                                                 endpoint=ep_name, now=now)
+                    if w is not None:
+                        out.append(Metric("llmproxy_queue_wait_ms", w,
+                                          {"endpoint": ep_name, "quantile": qlabel},
+                                          "gauge", help="queue-wait latency (ms)"))
+                    b = self._metrics.percentile("backend_latency_ms", q,
+                                                 endpoint=ep_name, now=now)
+                    if b is not None:
+                        out.append(Metric("llmproxy_backend_latency_ms", b,
+                                          {"endpoint": ep_name, "quantile": qlabel},
+                                          "gauge", help="backend latency (ms)"))
+                out.append(Metric("llmproxy_recent_timeouts_5m",
+                                  self._metrics.count(endpoint=ep_name,
+                                                      status="timeout", now=now),
+                                  lbl, "gauge",
+                                  help="timeouts in the last 5 min"))
+                out.append(Metric("llmproxy_recent_requests_5m",
+                                  self._metrics.count(endpoint=ep_name, now=now),
+                                  lbl, "gauge",
+                                  help="requests in the last 5 min"))
+                ep_cfg = self._config.endpoints[ep_name]
+                ss_consumed = self._metrics.slot_seconds_consumed(ep_name, now)
+                out.append(Metric("llmproxy_slot_seconds_5m", ss_consumed, lbl,
+                                  "gauge", help="slot-seconds consumed in 5 min"))
+                if ep_cfg.max_slots > 0:
+                    ss_available = ep_cfg.max_slots * 300.0
+                    util = (ss_consumed / ss_available * 100) if ss_available > 0 else 0
+                    out.append(Metric("llmproxy_endpoint_utilization_pct",
+                                      round(util, 1), lbl, "gauge",
+                                      help="5-min slot utilization %"))
+                h = self._endpoint_health.get(ep_name, {})
+                out.append(Metric("llmproxy_endpoint_healthy",
+                                  1 if h.get("healthy", True) else 0, lbl, "gauge",
+                                  help="1 if the endpoint is healthy (not paused)"))
+
+            stats = self._scheduler.stats()
+            for key, name in (("total_dispatched", "llmproxy_dispatched_total"),
+                              ("total_completed", "llmproxy_completed_total"),
+                              ("total_timeouts", "llmproxy_timeouts_total")):
+                if stats.get(key) is not None:
+                    out.append(Metric(name, stats[key], {}, "counter",
+                                      help="since-boot scheduler counter"))
+        except Exception:
+            logger.exception("llmproxy /metrics render failed")
+            out = []
+        return Response(render_prometheus(out),
+                        media_type="text/plain; version=0.0.4")
+
     async def handle_status(self, request: Request) -> Response:
         now = time.monotonic()
         endpoints = {}

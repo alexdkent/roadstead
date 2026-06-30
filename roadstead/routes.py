@@ -57,6 +57,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_metrics(request: Request) -> Response:
         return await svc.handle_metrics(request)
 
+    async def handle_prometheus_metrics(request: Request) -> Response:
+        return await svc.handle_prometheus_metrics(request)
+
     async def handle_cost_model(request: Request) -> Response:
         return await svc.handle_cost_model(request)
 
@@ -156,4 +159,6 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         # Runtime feature flags: the shadow→enforce flip surface (internal/ACL).
         Route("/v1/admin/flags", handle_admin_flags, methods=["GET", "POST"]),
         Route("/health", handle_health, methods=["GET"]),
+        # Prometheus text exposition of current QoS aggregates (scraped by VM).
+        Route("/metrics", handle_prometheus_metrics, methods=["GET"]),
     ]
