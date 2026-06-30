@@ -269,8 +269,12 @@ models:
     model_family: Gemma-4-31B-it abliterated (Heretic-ARA), AWQ W4A16
     quant: W4A16
     params: {active: 31B, total: 31B}
-    context_per_slot: 65536          # boxa vLLM --max-model-len
+    context_per_slot: 40960          # boxa vLLM --max-model-len (config-C cutover 2026-06-27)
     slots: 16                        # boxa vLLM --max-num-seqs hard cap
+    # Vision resolution: Gemma-4 default visual budget is 280 tokens/image. Callers can raise it
+    # PER-REQUEST for fine OCR via extra_body={"mm_processor_kwargs":{"max_soft_tokens": 560}} — the
+    # proxy forwards it verbatim (no boxa change). VERIFIED 2026-06-30: 560 is safe + lifts fine-text
+    # (fixed an SSN date the default missed); 1120 OOM-crashes the boxa engine — do NOT exceed ~560.
     timeout_floor_s: 900            # tolerates cold multi-minute vLLM load + long-context prefill
     policy:
       background_floor_pct: 0.0
