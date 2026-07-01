@@ -379,6 +379,19 @@ class ProxyHttpHandlers:
                     cs: t for cs, t in self.state.degeneration_by_call_site.items()
                     if t["detected"]
                 },
+                # Phase 3 schema-repair backstop — structured/tool responses that
+                # failed their JSON contract, and how they were resolved (in-memory
+                # json-repair / one error-fed-back retry / failed-loud deferrable).
+                # stream = detected on a streaming reassembly (detect-only).
+                "schema_detected": self.state.schema_detected,
+                "schema_repaired": self.state.schema_repaired,
+                "schema_retry_recovered": self.state.schema_retry_recovered,
+                "schema_unrecoverable": self.state.schema_unrecoverable,
+                "schema_invalid_stream": self.state.schema_invalid_stream,
+                "schema_by_call_site": {
+                    cs: t for cs, t in self.state.schema_by_call_site.items()
+                    if t.get("detected")
+                },
             },
             # Phase 5F — endpoints an operator has drained for maintenance.
             "paused_endpoints": sorted(self.state.paused_endpoints),

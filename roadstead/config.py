@@ -413,6 +413,34 @@ def endpoint_cooldown_enabled() -> bool:
     )
 
 
+def schema_backstop_enabled() -> bool:
+    """Phase 3 (2026-07-01): the structured-output/tool-call reliability backstop.
+    On a structured/tool SYNC response, run
+    ``json-repair → jsonschema-validate against the caller's declared schema →
+    one bounded (deadline+concurrency) retry with the error fed back → fail-loud
+    deferrable``, closing the parseable-but-schema-invalid / trailing-prose /
+    fenced / malformed-``tool_calls.arguments`` gap (today only empty / degenerate
+    / truncated / thinking-noise are rescued). Default OFF == byte-identical (the
+    guard early-returns before any observable effect). Env
+    ``COLLECTIVE_PROXY_SCHEMA_BACKSTOP``. See
+    ``docs/llmproxy_phase3_schema_backstop_contract.md``."""
+    return os.environ.get("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def schema_backstop_shadow() -> bool:
+    """When set (and the backstop enabled), the backstop only DETECTS + attempts
+    repair in memory + logs what it WOULD return + counts — but returns the
+    ORIGINAL response untouched (no swap, no retry re-dispatch, no fail-loud). The
+    review window: measure how often the backstop fires and whether repair succeeds
+    before it mutates live responses. Default OFF (the guard actively corrects when
+    enabled). Env ``COLLECTIVE_PROXY_SCHEMA_BACKSTOP_SHADOW``."""
+    return os.environ.get("COLLECTIVE_PROXY_SCHEMA_BACKSTOP_SHADOW", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def endpoint_cooldown_shadow() -> bool:
     """Step 4b SHADOW (review this first): count backend-fault failures + log a
     'would cool' + surface the trip on /v1/status, but DON'T actually pull the

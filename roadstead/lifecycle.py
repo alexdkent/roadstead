@@ -451,9 +451,14 @@ class Lifecycle:
         await self.correction.apply(req, result)
 
         # Cache if deterministic — but NEVER cache an unrecovered degenerate
-        # response (don't serve the same garbage for the cache TTL).
+        # response (don't serve the same garbage for the cache TTL). Both internal
+        # markers are POPPED here so they never leak into the returned JSON; the
+        # schema-unrecoverable path also flips status to "error" (→ excluded from
+        # cache anyway), but we pop it for symmetry + response hygiene.
         degen_unrecovered = result.pop("_degenerate_unrecovered", False)
-        if cache_key and result.get("status") == "ok" and not degen_unrecovered:
+        schema_unrecovered = result.pop("_schema_unrecoverable", False)
+        if (cache_key and result.get("status") == "ok"
+                and not degen_unrecovered and not schema_unrecovered):
             self.state.cache.put(cache_key, result.get("response", {}))
 
         # OpenAI consumers get the bare chat.completion (or an OpenAI-shaped

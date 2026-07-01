@@ -20,6 +20,8 @@ from .config import (
     degeneration_guard_enabled,
     degeneration_shadow_only,
     normalize_endpoint,
+    schema_backstop_enabled,
+    schema_backstop_shadow,
     shadow_egress_detect_enabled,
     thinking_enabled,
     thinking_reasoning_budget,
@@ -34,6 +36,21 @@ from .grammar import (
     verify_conformance,
 )
 from .observability import MetricsSample
+
+# Phase 3 schema-repair backstop deps. json-repair recovers parseable-but-not-
+# valid JSON (fences / trailing prose / trailing commas / a missing brace) before
+# schema validation. GUARDED: a missing lib degrades the backstop to strict-parse
+# + jsonschema only (repair becomes a no-op) and NEVER crashes the proxy — the
+# import failure is logged once at first use, not at module load. jsonschema is a
+# container base dep (transitive), but guard it too for symmetry / test envs.
+try:
+    import json_repair as _json_repair
+except ImportError:  # pragma: no cover — exercised via the degraded-path test
+    _json_repair = None
+try:
+    import jsonschema as _jsonschema
+except ImportError:  # pragma: no cover
+    _jsonschema = None
 
 if TYPE_CHECKING:
     from .config import EndpointConfig  # noqa: F401
@@ -99,6 +116,219 @@ def _chat_completion_text(body: dict) -> str:
         return (msg.get("content") or "")
     except Exception:  # noqa: BLE001
         return ""
+
+
+# --- Phase 3 schema-repair backstop — pure helpers --------------------------
+# All are total (never raise) so the guard can stay fail-open; the orchestration
+# (flags / state / persist / retry) lives on Correction.maybe_repair_schema. See
+# docs/llmproxy_phase3_schema_backstop_contract.md.
+
+def _response_tool_calls(body: dict) -> list:
+    """The assistant message's tool_calls list (or [])."""
+    try:
+        msg = ((body.get("choices") or [{}])[0] or {}).get("message") or {}
+        tc = msg.get("tool_calls")
+        return tc if isinstance(tc, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _extract_declared_schema(payload: dict) -> dict | None:
+    """The caller's declared JSON Schema, if any — the standard OpenAI
+    ``response_format:{type:json_schema,json_schema:{schema:{…}}}`` shape or vLLM
+    ``guided_json`` (top-level or under ``extra_body``). ``None`` when only a GBNF
+    grammar or nothing is declared → validity degrades to 'parses as JSON'.
+    Conservative: an unrecognized shape returns None (repair+parse only), never a
+    wrong schema."""
+    if not isinstance(payload, dict):
+        return None
+    containers = [payload]
+    eb = payload.get("extra_body")
+    if isinstance(eb, dict):
+        containers.append(eb)
+    for c in containers:
+        rf = c.get("response_format")
+        if isinstance(rf, dict) and rf.get("type") == "json_schema":
+            sch = (rf.get("json_schema") or {}).get("schema")
+            if isinstance(sch, dict):
+                return sch
+        gj = c.get("guided_json")
+        if isinstance(gj, dict):
+            return gj
+    return None
+
+
+def _schema_valid(obj, schema: dict | None) -> bool:
+    """True iff obj satisfies schema. No schema / no jsonschema lib / a MALFORMED
+    declared schema (north-face caller bug) all → True (we cannot judge, so treat
+    as 'parses-only')."""
+    if schema is None or _jsonschema is None:
+        return True
+    validator_cls = _jsonschema.Draft7Validator
+    # A broken DECLARED schema (any shape jsonschema can't compile, incl. an
+    # unknown "type") is the CALLER's bug — we can't validate against it, so
+    # degrade to parses-only rather than failing the response over it (north-face).
+    try:
+        validator_cls.check_schema(schema)
+    except Exception:  # noqa: BLE001
+        logger.warning("schema-backstop: caller declared an invalid JSON Schema "
+                       "— validating parse-only")
+        return True
+    try:
+        validator_cls(schema).validate(obj)
+        return True
+    except Exception:  # noqa: BLE001 — ValidationError / UnknownType → real miss
+        return False
+
+
+def _content_valid(text: str, schema: dict | None) -> bool:
+    """True iff text strict-parses as JSON AND satisfies schema."""
+    try:
+        obj = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return False
+    return _schema_valid(obj, schema)
+
+
+def _repair_json_text(text: str):
+    """json-repair text → a Python object, or None if the lib is absent or the
+    text is unrepairable (json_repair returns '' / raises)."""
+    if _json_repair is None or not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        obj = _json_repair.loads(text)
+    except Exception:  # noqa: BLE001
+        return None
+    # json_repair returns "" for hopeless input — treat that as unrepairable.
+    if obj == "" or obj is None:
+        return None
+    return obj
+
+
+def _arg_str_valid(tc: dict) -> bool:
+    """True iff a tool_call's function.arguments is absent/empty or valid JSON."""
+    try:
+        args = (tc.get("function") or {}).get("arguments")
+    except Exception:  # noqa: BLE001
+        return True
+    if not isinstance(args, str) or not args.strip():
+        return True  # absent/empty arguments is legal
+    try:
+        json.loads(args)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _clone_with_content(body: dict, new_content: str) -> dict:
+    """A deep copy of body with choices[0].message.content replaced."""
+    import copy
+    nb = copy.deepcopy(body)
+    nb["choices"][0]["message"]["content"] = new_content
+    return nb
+
+
+def _clone_with_repaired_args(body: dict) -> dict | None:
+    """A deep copy of body with every invalid tool_call arguments string
+    json-repaired to canonical JSON. None if any is unrepairable."""
+    import copy
+    nb = copy.deepcopy(body)
+    try:
+        tcs = nb["choices"][0]["message"]["tool_calls"]
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(tcs, list):
+        return None
+    for tc in tcs:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if not isinstance(fn, dict):
+            continue
+        args = fn.get("arguments")
+        if not isinstance(args, str) or not args.strip():
+            continue
+        try:
+            json.loads(args)
+            continue  # already valid
+        except Exception:  # noqa: BLE001
+            pass
+        obj = _repair_json_text(args)
+        if obj is None:
+            return None
+        fn["arguments"] = json.dumps(obj, ensure_ascii=False)
+    return nb
+
+
+def _conform_body(
+    body: dict, schema: dict | None, expect_json_content: bool = True,
+) -> tuple[str, dict | None]:
+    """Classify + best-effort in-memory repair of a chat.completion body against
+    the caller's JSON contract. Returns:
+      ("ok", body)        — content + all tool-call args already valid (no-op)
+      ("repaired", body)  — a NEW body with content/args json-repaired to valid
+      ("failed", None)    — could not be made valid without a backend re-dispatch
+
+    ``expect_json_content`` gates whether ``content`` is validated AS JSON. It is
+    True only when the request actually constrained its content output (grammar /
+    response_format / structured_outputs). For a PURE tool-calling request (tools
+    present, no structured-output contract) the assistant ``content`` is often a
+    natural-language preamble alongside ``tool_calls`` — validating that as JSON
+    would false-positive; only the tool_calls arguments are checked."""
+    content = _chat_completion_text(body)
+    tool_calls = _response_tool_calls(body)
+    content_ok = (
+        _content_valid(content, schema)
+        if (expect_json_content and content.strip()) else True
+    )
+    args_ok = all(_arg_str_valid(tc) for tc in tool_calls if isinstance(tc, dict))
+    if content_ok and args_ok:
+        return ("ok", body)
+
+    new_body = None
+    if not content_ok:
+        obj = _repair_json_text(content)
+        if obj is None or not _schema_valid(obj, schema):
+            return ("failed", None)
+        new_body = _clone_with_content(body, json.dumps(obj, ensure_ascii=False))
+    if not args_ok:
+        fixed = _clone_with_repaired_args(new_body if new_body is not None else body)
+        if fixed is None:
+            return ("failed", None)
+        new_body = fixed
+    return ("repaired", new_body if new_body is not None else body)
+
+
+def _validation_error(body: dict, schema: dict | None) -> str:
+    """A short human description of WHY a body failed, for the retry feedback."""
+    content = _chat_completion_text(body)
+    try:
+        obj = json.loads(content)
+    except Exception:  # noqa: BLE001
+        return "the output was not valid JSON"
+    if schema is not None and _jsonschema is not None:
+        try:
+            _jsonschema.Draft7Validator(schema).validate(obj)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(getattr(exc, "message", exc)).splitlines()[0]
+            return f"the JSON did not match the schema ({msg[:200]})"
+    if any(not _arg_str_valid(tc) for tc in _response_tool_calls(body) if isinstance(tc, dict)):
+        return "a tool call's arguments were not valid JSON"
+    return "the output did not satisfy the required format"
+
+
+def _with_error_feedback(payload: dict, error_msg: str) -> dict:
+    """A deep copy of payload with a corrective user turn appended, keeping the
+    original response_format/grammar so the backend re-constrains on retry."""
+    import copy
+    p = copy.deepcopy(payload)
+    msgs = p.get("messages")
+    note = (
+        "Your previous response was rejected: " + error_msg + ". "
+        "Return ONLY the JSON that satisfies the required format — no prose, no "
+        "markdown fences, no commentary."
+    )
+    if isinstance(msgs, list):
+        msgs.append({"role": "user", "content": note})
+    return p
 
 
 class _ToolCallStreamSanitizer:
@@ -302,11 +532,16 @@ class Correction:
         guard + the shadow detector + the cache all observe corrected content, and
         the degeneration guard runs before the shadow detector + cache so an
         unrecovered-degenerate flag (``_degenerate_unrecovered``) is set before
-        the caller decides whether to cache. No flag gate — this path is
-        byte-identical to the prior inline calls; the flag only governs the NEW
-        streaming coverage (``finalize_stream`` + the both-doors sanitizer)."""
+        the caller decides whether to cache. The pre-existing steps carry no flag
+        gate (byte-identical to the prior inline calls); the Step-4a flag governs
+        the NEW streaming coverage, and the Phase-3 ``maybe_repair_schema`` step is
+        itself flag-gated (``COLLECTIVE_PROXY_SCHEMA_BACKSTOP``, default OFF ==
+        byte-identical). Schema repair runs AFTER the finalizers (so it sees
+        de-thought, degeneration-corrected content) and BEFORE the shadow detector
+        (detect-only, last)."""
         self.finalize_thinking(req, result)
         await self.maybe_correct_degenerate(req, result)
+        await self.maybe_repair_schema(req, result)
         self.shadow_egress_detect(req, result)
 
     def finalize_stream(
@@ -343,6 +578,23 @@ class Correction:
             # its own kill-switch, matching the sync detector).
             if shadow_egress_detect_enabled():
                 self._shadow_egress_check(req, content)
+            # Phase 3: schema-invalid DETECTION over the reassembled structured
+            # content (detect-only — a stream can't un-send, so no repair/retry;
+            # records the same signal the sync backstop would raise). Gated on the
+            # backstop flag AND the uniform-correction gate above.
+            if (schema_backstop_enabled() and content
+                    and self.request_is_structured(req)):
+                payload = req.payload if isinstance(req.payload, dict) else {}
+                if not _content_valid(content, _extract_declared_schema(payload)):
+                    self.state.schema_invalid_stream += 1
+                    cs = req.call_site or "?"
+                    tally = self.state.schema_by_call_site.setdefault(
+                        cs, {"detected": 0, "repaired": 0, "retried": 0,
+                             "unrecoverable": 0})
+                    tally["detected"] += 1
+                    logger.warning(
+                        "schema-invalid structured output DETECTED (stream) "
+                        "call_site=%s endpoint=%s", cs, req.endpoint)
         except Exception:  # noqa: BLE001 — detection must never break a stream
             logger.debug("finalize_stream failed", exc_info=True)
 
@@ -572,6 +824,179 @@ class Correction:
                 self.state.degen_redispatch_inflight -= 1
         except Exception:  # noqa: BLE001 — guard must never break a response
             logger.debug("degeneration guard failed", exc_info=True)
+    async def maybe_repair_schema(
+        self, req: "QueuedRequest", result: dict,
+    ) -> None:
+        """Phase 3 structured-output/tool-call reliability backstop. On a
+        structured/tool SYNC response that is a 200 but whose JSON is wrong
+        (trailing prose / fenced / mildly malformed / schema-invalid / bad
+        ``tool_calls.arguments``), run: json-repair → schema-validate → ONE bounded
+        retry (error fed back) → fail-loud deferrable. Closes the gap where output
+        is parseable-but-schema-invalid (today only empty / degenerate / truncated /
+        thinking-noise are rescued).
+
+        FAIL-OPEN: any error leaves ``result`` byte-identical. Flag-gated
+        (``COLLECTIVE_PROXY_SCHEMA_BACKSTOP``, default OFF); shadow
+        (``…_SHADOW``) = detect + repair-in-memory + count + log, return original
+        untouched. See docs/llmproxy_phase3_schema_backstop_contract.md."""
+        try:
+            if not schema_backstop_enabled():
+                return
+            if result.get("status") != "ok" or req.payload_type != "chat_completion":
+                return
+            response = result.get("response")
+            if not isinstance(response, dict):
+                return
+            payload = req.payload if isinstance(req.payload, dict) else {}
+            is_struct = self.request_is_structured(req)
+            has_tools = bool(payload.get("tools") or payload.get("tool_choice"))
+            if not (is_struct or has_tools):
+                return
+
+            schema = _extract_declared_schema(payload)
+            status, conformed = _conform_body(response, schema, expect_json_content=is_struct)
+            if status == "ok":
+                return  # fast path — already valid, no-op
+
+            # The backstop WOULD fire. Record + per-call-site tally.
+            self.state.schema_detected += 1
+            cs = req.call_site or "?"
+            tally = self.state.schema_by_call_site.setdefault(
+                cs, {"detected": 0, "repaired": 0, "retried": 0, "unrecoverable": 0})
+            tally["detected"] += 1
+            shadow = schema_backstop_shadow()
+
+            # (1) In-memory repair succeeded (no backend call).
+            if status == "repaired":
+                if shadow:
+                    logger.info(
+                        "schema-backstop WOULD repair in-memory (shadow) call_site=%s "
+                        "endpoint=%s", cs, req.endpoint)
+                    return
+                result["response"] = conformed
+                self.state.schema_repaired += 1
+                tally["repaired"] += 1
+                self._persist_corrected(req, conformed)
+                logger.info(
+                    "schema-backstop REPAIRED in-memory call_site=%s endpoint=%s",
+                    cs, req.endpoint)
+                return
+
+            # status == "failed": in-memory repair insufficient.
+            error_msg = _validation_error(response, schema)
+            if shadow:
+                logger.info(
+                    "schema-backstop WOULD retry+fail (shadow) call_site=%s "
+                    "endpoint=%s: %s", cs, req.endpoint, error_msg)
+                return
+
+            # (2) One bounded retry with the error fed back.
+            retried = await self._schema_retry(req, payload, schema, error_msg, is_struct)
+            if retried is not None:
+                result["response"] = retried
+                self.state.schema_retry_recovered += 1
+                tally["retried"] += 1
+                self._persist_corrected(req, retried)
+                logger.info(
+                    "schema-backstop RECOVERED via retry call_site=%s endpoint=%s",
+                    cs, req.endpoint)
+                return
+
+            # (3) Fail loud — never hand malformed structured output to the caller.
+            # Same in-band shape as thinking-fallback: status=error + drop the body
+            # → handle_sync_submit returns 502 (deferrable via the client's
+            # "llm proxy error 50" marker); never cached (_schema_unrecoverable,
+            # honored at lifecycle alongside _degenerate_unrecovered).
+            self.state.schema_unrecoverable += 1
+            tally["unrecoverable"] += 1
+            result["status"] = "error"
+            result["error"] = (
+                f"backend {req.endpoint} produced schema-invalid structured output "
+                f"({error_msg}); repair + one retry failed")
+            result["code"] = "schema_invalid"
+            result["_schema_unrecoverable"] = True
+            result.pop("response", None)
+            logger.warning(
+                "schema-backstop UNRECOVERABLE call_site=%s endpoint=%s: %s",
+                cs, req.endpoint, error_msg)
+        except Exception:  # noqa: BLE001 — backstop must never break a response
+            logger.debug("schema backstop failed", exc_info=True)
+    async def _schema_retry(
+        self, req: "QueuedRequest", payload: dict, schema: dict | None,
+        error_msg: str, expect_json_content: bool = True,
+    ) -> dict | None:
+        """One error-fed-back re-dispatch, bounded by fleet-wide concurrency + the
+        caller's remaining deadline. Returns a conformant body (repaired if needed)
+        or None (skipped / failed / still-invalid). The re-dispatch runs OUTSIDE
+        slot accounting (the original slot freed when the 200 completed) — bounded
+        like the degeneration re-dispatch. Never retries more than once."""
+        if self.state.schema_retry_inflight >= 2:
+            logger.warning(
+                "schema-backstop retry skipped (2 already in flight) call_site=%s",
+                req.call_site or "?")
+            return None
+        remaining = req.timeout_deadline - time.monotonic()
+        if remaining < _MIN_RETRY_BUDGET_S:
+            return None
+        ep_cfg = self.state.config.endpoints.get(req.endpoint)
+        if ep_cfg is None:
+            return None
+        self.state.schema_retry_inflight += 1
+        rt0 = time.monotonic()
+        try:
+            retry_payload = _with_error_feedback(payload, error_msg)
+            resp = await self.state.backend.call(
+                ep_cfg, retry_payload, req.payload_type,
+                f"{req.request_id}-schema", timeout_s=max(2.0, remaining),
+            )
+            self.state.metrics.record(MetricsSample(
+                timestamp=time.monotonic(), endpoint=req.endpoint,
+                agent_id=req.agent_id, priority=req.priority.name,
+                queue_wait_ms=0.0,
+                backend_latency_ms=resp.duration_s * 1000.0,
+                status="schema_retry", slot_seconds=resp.duration_s))
+            status, conformed = _conform_body(
+                resp.body, schema, expect_json_content=expect_json_content)
+            if status in ("ok", "repaired"):
+                return conformed
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "schema-backstop retry dispatch failed (call_site=%s): %s",
+                req.call_site or "?", exc)
+            self.state.metrics.record(MetricsSample(
+                timestamp=time.monotonic(), endpoint=req.endpoint,
+                agent_id=req.agent_id, priority=req.priority.name,
+                queue_wait_ms=0.0,
+                backend_latency_ms=(time.monotonic() - rt0) * 1000.0,
+                status="schema_retry", slot_seconds=time.monotonic() - rt0))
+            return None
+        finally:
+            self.state.schema_retry_inflight -= 1
+    def _persist_corrected(self, req: "QueuedRequest", body: dict) -> None:
+        """Replace the already-written completion row with the corrected body
+        (INSERT OR REPLACE on request_id), mirroring the degeneration guard — the
+        row was persisted with the pre-repair body in _execute_sync before apply
+        ran, so the audit corpus / health sweeps must see what the caller actually
+        received, not the garbage. Token counts are read from the body's ``usage``
+        so accounting is preserved (an in-memory repair leaves usage untouched; a
+        retry's body carries the retry's usage). The corrective-dispatch latency
+        lives in the ``schema_retry`` metrics sample, so duration is left 0.0 here."""
+        try:
+            u = body.get("usage") if isinstance(body, dict) else None
+            u = u if isinstance(u, dict) else {}
+            in_tok = int(u.get("prompt_tokens") or 0)
+            out_tok = int(u.get("completion_tokens") or 0)
+            self.state.queue_db.persist_complete(
+                req.request_id, req.agent_id, req.endpoint,
+                req.call_site, int(req.priority),
+                in_tok, out_tok, 0.0, 0.0, "ok",
+                payload=req.payload, response=body,
+                session_id=req.session_id, turn_id=req.turn_id,
+                caller_id=req.caller_id,
+            )
+        except Exception:  # noqa: BLE001 — accounting must not break the response
+            logger.debug("schema corrected-row persist failed", exc_info=True)
     def thinking_allowed_keys(self, payload: dict) -> list[str]:
         """Top-level object keys the structured constraint permits — used to
         anchor response recovery. Covers GBNF (top / extra_body /

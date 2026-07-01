@@ -183,6 +183,18 @@ class FakeBackend:
     # inside the fake, whereas ``json.loads`` (what the proxy's ``resp.json()``
     # uses) DOES accept ``NaN``/``Infinity`` — so a raw body reaches the parser.
     raw_completion_text: Optional[str] = None
+    # Phase 3 schema-backstop (independent adversarial track). When set, the SYNC
+    # happy-path (fault-none) completion returns this EXACT string as the
+    # assistant ``content`` (instead of ``echo: …``) — the only way to steer the
+    # backend's *structured* content (fenced / trailing-prose / non-JSON /
+    # schema-conforming) without adding a named fault (keeps ALL_FAULTS meta
+    # coverage untouched). Also serves, via ``fault_max_hits``, as the RECOVERED
+    # body a retry sees.
+    structured_content: Optional[str] = None
+    # Phase 3 — when set, the SYNC happy-path completion carries a single
+    # tool_call whose ``function.arguments`` is this EXACT string (empty content),
+    # so a test can emit tool-call args that are repairable or hopeless.
+    structured_tool_args: Optional[str] = None
 
     requests: List[RecordedRequest] = field(default_factory=list)
     # live concurrency counter (capacity_desync)
@@ -205,6 +217,8 @@ class FakeBackend:
         self.cached_tokens = None
         self.usage_override = _UNSET
         self.raw_completion_text = None
+        self.structured_content = None
+        self.structured_tool_args = None
         self.requests.clear()
         with self._lock:
             self._inflight = 0
@@ -409,6 +423,18 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
             return PlainTextResponse(
                 controller.raw_completion_text, status_code=200,
                 media_type="application/json")
+        if controller.structured_tool_args is not None:
+            # Phase 3: a single tool_call with caller-chosen (possibly hopeless)
+            # arguments + empty content — the tool-call backstop target.
+            tc = [{
+                "id": "call_0", "type": "function",
+                "function": {"name": "do_thing",
+                             "arguments": controller.structured_tool_args},
+            }]
+            return JSONResponse(_completion_body("", tool_calls=tc))
+        if controller.structured_content is not None:
+            # Phase 3: caller-chosen structured content (fenced / prose / JSON).
+            return JSONResponse(_completion_body(controller.structured_content))
         return JSONResponse(_completion_body(
             "echo: " + _last_user_text(body),
             cached_tokens=controller.cached_tokens,

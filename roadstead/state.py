@@ -119,6 +119,21 @@ class ProxyState:
         # fleet-wide concurrency with a plain counter — single event loop, no
         # lock needed; NOT a semaphore (waiting would queue caller responses).
         self.degen_redispatch_inflight = 0
+        # Phase 3 schema-repair backstop tallies (structured/tool responses that
+        # parse-but-fail-schema / need json-repair). detected = would-fire;
+        # repaired = fixed in-memory by json-repair (no backend); retry_recovered
+        # = fixed by the one bounded error-fed-back re-dispatch; unrecoverable =
+        # failed loud (deferrable, never cached); stream_invalid = detected on a
+        # streaming reassembly (detect-only). by_call_site mirrors the degeneration
+        # tally shape. retry_inflight bounds the OUT-of-slot re-dispatch concurrency
+        # (same rationale as degen_redispatch_inflight above).
+        self.schema_detected = 0
+        self.schema_repaired = 0
+        self.schema_retry_recovered = 0
+        self.schema_unrecoverable = 0
+        self.schema_invalid_stream = 0
+        self.schema_by_call_site: dict[str, dict] = {}
+        self.schema_retry_inflight = 0
         # Empty-completion (position-0-EOS) rescue tallies — see
         # _EMPTY_RESCUE_MIN_TOKENS. attempts = retries dispatched with
         # min_tokens; recovered = those that produced a real response.
