@@ -36,6 +36,7 @@ from .timeout_model import TimeoutModel
 
 if TYPE_CHECKING:
     from .grammar import GrammarResult
+    from .scheduler import QueuedRequest
 
 
 class ProxyState:
@@ -190,3 +191,50 @@ class ProxyState:
         self.poller_task: asyncio.Task | None = None
         self.inflight_task: asyncio.Task | None = None
         self.started_at = time.monotonic()
+
+    # ----- shared response/report helpers -----
+    # Small read/write helpers that span clusters (Lifecycle + Health both call
+    # resolve_error; Health poller + HTTP both call metrics_payload). Lifting
+    # them here removes the only cross-collaborator method calls (contract §5.1
+    # prefers the shared-state form). ProxyService keeps `_resolve_error` /
+    # `_metrics_payload` as thin delegators to these.
+
+    def resolve_error(self, req: "QueuedRequest", error: str) -> None:
+        """Release a queued/pending request with a deferrable error, resolving
+        whichever wait primitive the caller is blocked on (sync future or
+        streaming queue)."""
+        future = self.pending_futures.get(req.request_id)
+        if future and not future.done():
+            future.set_result({
+                "request_id": req.request_id,
+                "status": "error",
+                "error": error,
+            })
+        stream_q = self.pending_streams.get(req.request_id)
+        if stream_q:
+            try:
+                stream_q.put_nowait({"type": "error", "error": error})
+            except asyncio.QueueFull:
+                pass
+
+    def metrics_payload(self, now: float) -> dict:
+        """Rolling 5-min metrics — shared by GET /v1/metrics and the periodic
+        SSE `metrics` frame."""
+        return {
+            "per_endpoint": {
+                ep: {
+                    "requests": self.metrics.count(endpoint=ep, now=now),
+                    "timeouts": self.metrics.count(endpoint=ep, status="timeout", now=now),
+                    "p50_wait_ms": self.metrics.percentile("queue_wait_ms", 50, endpoint=ep, now=now),
+                    "p95_wait_ms": self.metrics.percentile("queue_wait_ms", 95, endpoint=ep, now=now),
+                    "p50_backend_ms": self.metrics.percentile("backend_latency_ms", 50, endpoint=ep, now=now),
+                    "p95_backend_ms": self.metrics.percentile("backend_latency_ms", 95, endpoint=ep, now=now),
+                    "slot_seconds_consumed": round(self.metrics.slot_seconds_consumed(ep, now), 1),
+                }
+                for ep in self.config.endpoints
+            },
+            "per_agent": {
+                aid: round(ss, 1)
+                for aid, ss in self.metrics.per_agent_consumed(now).items()
+            },
+        }
