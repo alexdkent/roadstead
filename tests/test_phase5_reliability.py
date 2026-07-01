@@ -17,6 +17,7 @@ import time
 
 import pytest
 
+from originfleet.llmproxy import lifecycle as lifecycle_mod
 from originfleet.llmproxy import service as service_mod
 from originfleet.llmproxy.backend import (
     BackendResponse, BackendStreamEvent, BackendUnavailable,
@@ -194,7 +195,9 @@ async def test_circuit_recovers_on_health_even_if_discovery_fails():
 
 @pytest.mark.asyncio
 async def test_ttft_fastfail_aborts_zero_token_hang(monkeypatch):
-    monkeypatch.setattr(service_mod, "_STREAM_TTFT_DEADLINE_S", 0.3)
+    # The streaming TTFT watchdog moved to the Lifecycle collaborator (Step 3);
+    # its constant now resolves in lifecycle's namespace.
+    monkeypatch.setattr(lifecycle_mod, "_STREAM_TTFT_DEADLINE_S", 0.3)
     svc = ProxyService(ProxyConfig())
 
     async def hang_stream(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):

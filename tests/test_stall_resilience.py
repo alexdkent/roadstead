@@ -95,9 +95,10 @@ def test_genuine_timeouts_still_fire_amid_premature_noise():
 
 def test_intertoken_gap_constant_present():
     # The mid-stream no-progress watchdog must be wired (extends the
-    # first-token-only TTFT watchdog).
-    from originfleet.llmproxy import service
-    assert service._STREAM_INTERTOKEN_GAP_S > 0
+    # first-token-only TTFT watchdog). The streaming path (and its constant)
+    # moved to the Lifecycle collaborator in de-monolith Step 3.
+    from originfleet.llmproxy import lifecycle
+    assert lifecycle._STREAM_INTERTOKEN_GAP_S > 0
 
 
 # --- Phase 2 hardening: no-consumer streaming dispatch frees its slot --------
