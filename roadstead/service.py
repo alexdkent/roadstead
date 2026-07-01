@@ -2996,16 +2996,13 @@ class ProxyService:
         """On the unhealthy transition, release queued INTERACTIVE/FOREGROUND
         requests for this endpoint with a deferrable error so they don't wait out
         their full deadline; BACKGROUND stays queued to defer until recovery."""
-        eq = self._scheduler._queues.get(ep_name)
-        if not eq:
-            return
-        for band in (PriorityBand.INTERACTIVE, PriorityBand.FOREGROUND):
-            for agent_id in list(eq._queues.get(band, {}).keys()):
-                for req in list(eq._queues[band][agent_id]):
-                    self._scheduler.cancel(req.request_id)
-                    self._queue_db.persist_expire(req.request_id)
-                    self._resolve_error(
-                        req, f"backend {ep_name} unavailable (circuit open)")
+        queued = self._scheduler.queued_requests(
+            ep_name, (PriorityBand.INTERACTIVE, PriorityBand.FOREGROUND))
+        for req in queued:
+            self._scheduler.cancel(req.request_id)
+            self._queue_db.persist_expire(req.request_id)
+            self._resolve_error(
+                req, f"backend {ep_name} unavailable (circuit open)")
 
     def _evaluate_alerts(self, now: float) -> None:
         """Evaluate proxy-internal alert conditions (Phase 2.5) and surface them

@@ -8,7 +8,7 @@ from typing import Dict, Optional, Tuple
 import pytest
 
 from originfleet.llmproxy.agent_budget import BudgetManager
-from originfleet.llmproxy.config import LLMPriority, ProxyConfig
+from originfleet.llmproxy.config import LLMPriority, PriorityBand, ProxyConfig
 from originfleet.llmproxy.cost_model import CostModel
 from originfleet.llmproxy.scheduler import (
     CompletionRecord,
@@ -385,3 +385,64 @@ class TestInflightSnapshot:
         )
         assert sched.inflight_snapshot(now + 0.6)["requests"] == []
         assert sched.inflight_snapshot(now + 0.6)["per_endpoint"]["chat"]["in_flight"] == 0
+
+
+class TestQueuedRequestsAccessor:
+    """The public `queued_requests(ep, bands)` accessor (Step-3 §5.1) — the
+    read-only enumeration that replaces the health layer's reach-into
+    `_scheduler._queues`. Must enumerate in band → agent → FIFO order and
+    filter to the requested bands only."""
+
+    def test_empty_for_unknown_endpoint(self):
+        sched, *_ = _make_scheduler()
+        assert sched.queued_requests(
+            "does-not-exist", (PriorityBand.INTERACTIVE,)) == []
+
+    def test_empty_when_no_queued(self):
+        sched, *_ = _make_scheduler()
+        assert sched.queued_requests(
+            "qwen-analyst",
+            (PriorityBand.INTERACTIVE, PriorityBand.FOREGROUND)) == []
+
+    def test_band_agent_fifo_order_and_band_filter(self):
+        sched, *_ = _make_scheduler()
+        now = time.monotonic()
+        # Two INTERACTIVE agents (a: 2 reqs FIFO, b: 1), one FOREGROUND (c),
+        # one BACKGROUND (d) that must be excluded when only INT+FG requested.
+        ia1 = _req(agent_id="a", endpoint="qwen-analyst",
+                   priority="P1_TURN_SUPPORT", now=now)
+        ia2 = _req(agent_id="a", endpoint="qwen-analyst",
+                   priority="P1_TURN_SUPPORT", now=now)
+        ib1 = _req(agent_id="b", endpoint="qwen-analyst",
+                   priority="P1_TURN_SUPPORT", now=now)
+        fc1 = _req(agent_id="c", endpoint="qwen-analyst",
+                   priority="P2_POST_TURN", now=now)
+        bd1 = _req(agent_id="d", endpoint="qwen-analyst",
+                   priority="P3_INGESTION", now=now)
+        for r in (ia1, ia2, ib1, fc1, bd1):
+            sched.enqueue(r)
+
+        ep = ia1.endpoint  # normalized canonical name
+        got = sched.queued_requests(
+            ep, (PriorityBand.INTERACTIVE, PriorityBand.FOREGROUND))
+        ids = [r.request_id for r in got]
+        # INTERACTIVE band first (agent a's two in FIFO, then agent b),
+        # then FOREGROUND (agent c); BACKGROUND (d) excluded.
+        assert ids == [ia1.request_id, ia2.request_id,
+                       ib1.request_id, fc1.request_id]
+
+    def test_snapshot_is_stable_under_cancel_during_iteration(self):
+        sched, *_ = _make_scheduler()
+        now = time.monotonic()
+        reqs = [_req(agent_id="a", endpoint="qwen-analyst",
+                     priority="P1_TURN_SUPPORT", now=now) for _ in range(3)]
+        for r in reqs:
+            sched.enqueue(r)
+        ep = reqs[0].endpoint  # normalized canonical name
+        # Cancelling each during the walk must not skip any (list is snapshotted).
+        seen = []
+        for r in sched.queued_requests(ep, (PriorityBand.INTERACTIVE,)):
+            seen.append(r.request_id)
+            sched.cancel(r.request_id)
+        assert seen == [r.request_id for r in reqs]
+        assert sched.queue_depth(ep) == 0

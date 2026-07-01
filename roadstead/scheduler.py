@@ -365,6 +365,27 @@ class Scheduler:
                             return True
         return False
 
+    def queued_requests(
+        self, endpoint: str, bands: tuple[PriorityBand, ...],
+    ) -> list[QueuedRequest]:
+        """Enumerate (read-only) queued requests for an endpoint across the
+        given priority bands, in band → agent → FIFO order.
+
+        Public accessor for the health layer's fast-fail on the unhealthy
+        transition (release queued INTERACTIVE/FOREGROUND requests without a
+        reach-in to per-band/per-agent queue internals). The full list is
+        snapshotted before return so the caller may cancel/expire during
+        iteration without mutating the structure mid-walk.
+        """
+        eq = self._queues.get(endpoint)
+        if not eq:
+            return []
+        out: list[QueuedRequest] = []
+        for band in bands:
+            for agent_id in list(eq._queues.get(band, {}).keys()):
+                out.extend(list(eq._queues[band][agent_id]))
+        return out
+
     def active_count(self, endpoint: str) -> int:
         return len(self._active.get(endpoint, {}))
 
