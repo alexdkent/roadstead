@@ -1,7 +1,9 @@
 """Unit tests for the proxy thinking option (request-side enable + generous budget,
 response-side deterministic structured-output recovery, fail-safe). Self-contained:
-binds the real LLMProxyService methods to a lightweight mock `self` (the Mac 3.9
-conftest blocks pytest, so this runs as a plain script too)."""
+binds the real Correction methods (de-monolith Step 3 moved the thinking logic
+from ProxyService to the Correction collaborator) to a lightweight mock `self`
+with a `.state` (the Mac 3.9 conftest blocks pytest, so this runs as a plain
+script too)."""
 import importlib.util
 import json
 import os
@@ -15,7 +17,8 @@ sys.path.insert(0, str(REPO))
 # Import the modules under test (package import so relative imports resolve).
 service = importlib.import_module("originfleet.llmproxy.service")
 config = importlib.import_module("originfleet.llmproxy.config")
-S = service.ProxyService
+correction = importlib.import_module("originfleet.llmproxy.correction")
+C = correction.Correction
 
 
 def _req(payload, *, stream=False, ptype="chat_completion", endpoint="thinker",
@@ -27,16 +30,25 @@ def _req(payload, *, stream=False, ptype="chat_completion", endpoint="thinker",
 
 
 def _mock_self(engine="vllm"):
-    m = types.SimpleNamespace()
+    # Correction operates on a shared `self.state`; mimic just the fields the
+    # thinking methods touch. The mock IS the Correction `self`.
+    state = types.SimpleNamespace()
     ep = types.SimpleNamespace(backend_engine=engine)
-    m._config = types.SimpleNamespace(endpoints={"thinker": ep})
-    m._thinking_active = {}
-    m._thinking_requests = m._thinking_clean = m._thinking_recovered = 0
-    m._thinking_truncated = m._thinking_fallback = 0
-    # bind the real methods
-    for name in ("_apply_thinking", "_finalize_thinking", "_thinking_allowed_keys",
-                 "_extract_grammar"):
-        setattr(m, name, getattr(S, name).__get__(m, S.__class__))
+    state.config = types.SimpleNamespace(endpoints={"thinker": ep})
+    state.thinking_active = {}
+    state.thinking_requests = state.thinking_clean = state.thinking_recovered = 0
+    state.thinking_truncated = state.thinking_fallback = 0
+    m = types.SimpleNamespace(state=state)
+    # bind the real Correction methods to the mock under their public names (so
+    # internal cross-calls like self.thinking_allowed_keys resolve) AND under the
+    # old underscore-prefixed names the test bodies call.
+    for pub, priv in (("apply_thinking", "_apply_thinking"),
+                      ("finalize_thinking", "_finalize_thinking"),
+                      ("thinking_allowed_keys", "_thinking_allowed_keys"),
+                      ("extract_grammar", "_extract_grammar")):
+        bound = getattr(C, pub).__get__(m, C)
+        setattr(m, pub, bound)
+        setattr(m, priv, bound)
     return m
 
 
@@ -52,7 +64,7 @@ def test_apply_thinking_opt_in_vllm():
     assert p.get("chat_template_kwargs", {}).get("enable_thinking") is True
     assert p["max_tokens"] == 800 + config.thinking_reasoning_budget()  # generous bump
     assert "thinking" not in p  # control field stripped
-    assert set(m._thinking_active["r1"]["allowed_keys"]) == {"action", "params", "why"}
+    assert set(m.state.thinking_active["r1"]["allowed_keys"]) == {"action", "params", "why"}
 
 
 def test_apply_thinking_transparent_without_optin():
@@ -61,7 +73,7 @@ def test_apply_thinking_transparent_without_optin():
     m._apply_thinking(_req(p))
     assert "chat_template_kwargs" not in p
     assert p["max_tokens"] == 800
-    assert m._thinking_active == {}
+    assert m.state.thinking_active == {}
 
 
 def test_apply_thinking_noop_on_llamacpp():
@@ -69,39 +81,39 @@ def test_apply_thinking_noop_on_llamacpp():
     p = {"messages": [], "max_tokens": 800, "thinking": True}
     m._apply_thinking(_req(p))
     assert "chat_template_kwargs" not in p and p["max_tokens"] == 800
-    assert "thinking" not in p and m._thinking_active == {}  # still stripped, no-op
+    assert "thinking" not in p and m.state.thinking_active == {}  # still stripped, no-op
 
 
 def test_finalize_recovers_brace_dup():
     m = _mock_self("vllm")
-    m._thinking_active["r1"] = {"allowed_keys": ["action", "params", "why"]}
+    m.state.thinking_active["r1"] = {"allowed_keys": ["action", "params", "why"]}
     bad = '\n\n{{"action": "comment", "params": {"x": 1}, "why": "ok"}'
     result = {"status": "ok", "response": {"choices": [
         {"message": {"content": bad, "reasoning": "...thought..."}, "finish_reason": "stop"}]}}
     m._finalize_thinking(_req({}, rid="r1"), result)
     out = result["response"]["choices"][0]["message"]["content"]
     assert json.loads(out) == {"action": "comment", "params": {"x": 1}, "why": "ok"}
-    assert m._thinking_recovered == 1 and result["status"] == "ok"
+    assert m.state.thinking_recovered == 1 and result["status"] == "ok"
 
 
 def test_finalize_clean_passthrough():
     m = _mock_self("vllm")
-    m._thinking_active["r1"] = {"allowed_keys": ["action", "params", "why"]}
+    m.state.thinking_active["r1"] = {"allowed_keys": ["action", "params", "why"]}
     good = '{"action": "upvote", "params": {}, "why": "y"}'
     result = {"status": "ok", "response": {"choices": [
         {"message": {"content": good}, "finish_reason": "stop"}]}}
     m._finalize_thinking(_req({}, rid="r1"), result)
-    assert m._thinking_clean == 1 and result["response"]["choices"][0]["message"]["content"] == good
+    assert m.state.thinking_clean == 1 and result["response"]["choices"][0]["message"]["content"] == good
 
 
 def test_finalize_truncation_fails_safe():
     m = _mock_self("vllm")
-    m._thinking_active["r1"] = {"allowed_keys": ["action", "params", "why"]}
+    m.state.thinking_active["r1"] = {"allowed_keys": ["action", "params", "why"]}
     result = {"status": "ok", "response": {"choices": [
         {"message": {"content": ""}, "finish_reason": "length"}]}}
     m._finalize_thinking(_req({}, rid="r1"), result)
     assert result["status"] == "error" and "response" not in result
-    assert m._thinking_truncated == 1
+    assert m.state.thinking_truncated == 1
 
 
 def test_finalize_noop_without_optin():

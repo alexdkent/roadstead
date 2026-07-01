@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import pytest
 
-from originfleet.llmproxy import service as service_mod
+from originfleet.llmproxy import correction as correction_mod
+from originfleet.llmproxy import service as service_mod  # noqa: F401
 from originfleet.llmproxy.service import _is_degenerate_text
 
 from tests.llmproxy.fake_backend import FAULT_DEGENERATE_LOOP
@@ -37,7 +38,9 @@ async def test_degeneration_guard_present_corrects(proxy):
 
 async def test_degeneration_guard_reverted_leaks_bad_output(proxy, monkeypatch):
     # Revert the guard: stub the enable-check to False so no correction runs.
-    monkeypatch.setattr(service_mod, "degeneration_guard_enabled", lambda: False)
+    # The degeneration guard moved to the Correction collaborator (de-monolith
+    # Step 3); its enable-check resolves in correction's namespace now.
+    monkeypatch.setattr(correction_mod, "degeneration_guard_enabled", lambda: False)
     proxy.controller.set_fault(FAULT_DEGENERATE_LOOP, max_hits=1)
     resp = await proxy.chat("sing me something")
     assert resp.status_code == 200

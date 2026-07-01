@@ -27,7 +27,8 @@ REPO = Path(__file__).resolve().parents[2]  # originfleet/
 sys.path.insert(0, str(REPO))
 
 service = importlib.import_module("originfleet.llmproxy.service")
-S = service.ProxyService
+correction = importlib.import_module("originfleet.llmproxy.correction")
+C = correction.Correction  # degeneration guard moved here in de-monolith Step 3
 
 # A repetition loop: the same 6-word shingle dominates the whole output.
 DEGEN = "the song of the night and " * 30
@@ -88,21 +89,23 @@ def _req():
 
 
 def _mock_self(backend_call):
-    m = types.SimpleNamespace()
-    m._degeneration_detected = 0
-    m._degeneration_recovered = 0
-    m._degeneration_unrecovered = 0
-    m._degeneration_by_call_site = {}
-    # Phase 5 accounting surfaces.
-    m._degen_redispatch_inflight = 0
-    m._metrics = types.SimpleNamespace(record=lambda sample: None)
+    # Correction.maybe_correct_degenerate operates on self.state.* — mirror the
+    # fields it touches.
+    state = types.SimpleNamespace()
+    state.degeneration_detected = 0
+    state.degeneration_recovered = 0
+    state.degeneration_unrecovered = 0
+    state.degeneration_by_call_site = {}
+    state.degen_redispatch_inflight = 0
+    state.metrics = types.SimpleNamespace(record=lambda sample: None)
+    m = types.SimpleNamespace(state=state)
     m._persisted = []
-    m._queue_db = types.SimpleNamespace(
+    state.queue_db = types.SimpleNamespace(
         persist_complete=lambda *a, **k: m._persisted.append((a, k)))
     ep = types.SimpleNamespace(role="thinker")
-    m._config = types.SimpleNamespace(endpoints={"thinker": ep})
-    m._backend = types.SimpleNamespace(call=backend_call)
-    m._maybe_correct_degenerate = S._maybe_correct_degenerate.__get__(m, S)
+    state.config = types.SimpleNamespace(endpoints={"thinker": ep})
+    state.backend = types.SimpleNamespace(call=backend_call)
+    m._maybe_correct_degenerate = C.maybe_correct_degenerate.__get__(m, C)
     return m
 
 
@@ -128,8 +131,8 @@ def test_degenerate_is_recovered_by_redispatch():
     m = _mock_self(backend)
     res = _result(DEGEN)
     asyncio.run(m._maybe_correct_degenerate(_req(), res))
-    assert m._degeneration_detected == 1
-    assert m._degeneration_recovered == 1
+    assert m.state.degeneration_detected == 1
+    assert m.state.degeneration_recovered == 1
     assert res["response"] is clean_body                      # swapped in
     assert backend.calls and "frequency_penalty" in backend.calls[0]
 
@@ -139,7 +142,7 @@ def test_clean_response_is_noop():
     m = _mock_self(backend)
     res = _result(CLEAN)
     asyncio.run(m._maybe_correct_degenerate(_req(), res))
-    assert m._degeneration_detected == 0
+    assert m.state.degeneration_detected == 0
     assert backend.calls == []                                # backend never re-called
 
 
@@ -152,8 +155,8 @@ def test_shadow_mode_detects_only():
         asyncio.run(m._maybe_correct_degenerate(_req(), res))
     finally:
         os.environ.pop("COLLECTIVE_PROXY_DEGENERATION_SHADOW", None)
-    assert m._degeneration_detected == 1
-    assert m._degeneration_recovered == 0
+    assert m.state.degeneration_detected == 1
+    assert m.state.degeneration_recovered == 0
     assert backend.calls == []                                # no re-dispatch in shadow
     assert res["response"]["choices"][0]["message"]["content"] == DEGEN
 
@@ -167,7 +170,7 @@ def test_kill_switch_disables():
         asyncio.run(m._maybe_correct_degenerate(_req(), res))
     finally:
         os.environ.pop("COLLECTIVE_PROXY_DEGENERATION_GUARD", None)
-    assert m._degeneration_detected == 0
+    assert m.state.degeneration_detected == 0
     assert backend.calls == []
 
 
@@ -179,9 +182,9 @@ def test_unrecoverable_is_flagged_not_mutated():
     m = _mock_self(backend)
     res = _result(DEGEN)
     asyncio.run(m._maybe_correct_degenerate(_req(), res))
-    assert m._degeneration_detected == 1
-    assert m._degeneration_recovered == 0
-    assert m._degeneration_unrecovered == 1
+    assert m.state.degeneration_detected == 1
+    assert m.state.degeneration_recovered == 0
+    assert m.state.degeneration_unrecovered == 1
     assert res.get("_degenerate_unrecovered") is True
     assert res["response"]["choices"][0]["message"]["content"] == DEGEN  # untouched
 
@@ -201,13 +204,13 @@ if __name__ == "__main__":
 def test_redispatch_concurrency_guard_fails_open():
     backend = _backend_returning()
     m = _mock_self(backend)
-    m._degen_redispatch_inflight = 2  # two already running fleet-wide
+    m.state.degen_redispatch_inflight = 2  # two already running fleet-wide
     res = _result(DEGEN)
     asyncio.run(m._maybe_correct_degenerate(_req(), res))
     assert backend.calls == []                       # no third re-dispatch
     assert res["_degenerate_unrecovered"] is True    # fail-open, never cached
-    assert m._degeneration_unrecovered == 1
-    assert m._degen_redispatch_inflight == 2         # untouched
+    assert m.state.degeneration_unrecovered == 1
+    assert m.state.degen_redispatch_inflight == 2         # untouched
 
 
 def test_recovery_persists_corrected_row_same_request_id():
@@ -216,13 +219,13 @@ def test_recovery_persists_corrected_row_same_request_id():
     m = _mock_self(backend)
     res = _result(DEGEN)
     asyncio.run(m._maybe_correct_degenerate(_req(), res))
-    assert m._degeneration_recovered == 1
+    assert m.state.degeneration_recovered == 1
     assert len(m._persisted) == 1
     args, kwargs = m._persisted[0]
     assert args[0] == "rid-1"                        # SAME request_id → row replaced
     assert kwargs["response"] is clean_body          # the corrected body, not the garbage
     assert args[5] == 10 and args[6] == 20           # re-dispatch token counts
-    assert m._degen_redispatch_inflight == 0         # released
+    assert m.state.degen_redispatch_inflight == 0         # released
 
 
 def test_redispatch_metrics_sample_emitted():
@@ -230,7 +233,7 @@ def test_redispatch_metrics_sample_emitted():
     clean_body = {"choices": [{"message": {"content": CLEAN}}]}
     backend = _backend_returning(clean_body)
     m = _mock_self(backend)
-    m._metrics = types.SimpleNamespace(record=samples.append)
+    m.state.metrics = types.SimpleNamespace(record=samples.append)
     asyncio.run(m._maybe_correct_degenerate(_req(), _result(DEGEN)))
     assert len(samples) == 1
     assert samples[0].status == "degen_retry"

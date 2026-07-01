@@ -15,7 +15,8 @@ REPO = Path(__file__).resolve().parents[2]  # originfleet/
 sys.path.insert(0, str(REPO))
 
 service = importlib.import_module("originfleet.llmproxy.service")
-S = service.ProxyService
+correction = importlib.import_module("originfleet.llmproxy.correction")
+C = correction.Correction  # shadow-egress logic moved here in de-monolith Step 3
 
 # Tiny object-root grammar: {"x": "<str>"}. verify_conformance derives root key
 # {"x"} from the literal and flags fences / non-JSON / wrong-keys as drops.
@@ -40,10 +41,17 @@ def _result(content, status="ok"):
 
 
 def _mock_self():
-    m = types.SimpleNamespace()
-    m._shadow_drop = {}
-    for name in ("_shadow_egress_detect", "_extract_grammar"):
-        setattr(m, name, getattr(S, name).__get__(m, S))
+    # Correction operates on self.state; the shadow_drop tally is mutated in
+    # place, so aliasing m._shadow_drop to the same dict keeps the test bodies'
+    # reads valid.
+    state = types.SimpleNamespace(shadow_drop={})
+    m = types.SimpleNamespace(state=state)
+    m._shadow_drop = state.shadow_drop
+    for pub, priv in (("shadow_egress_detect", "_shadow_egress_detect"),
+                      ("extract_grammar", "_extract_grammar")):
+        bound = getattr(C, pub).__get__(m, C)
+        setattr(m, pub, bound)
+        setattr(m, priv, bound)
     return m
 
 
