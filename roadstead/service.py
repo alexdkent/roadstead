@@ -903,6 +903,32 @@ class ProxyService:
             now=now,
         )
 
+        # Payload-shape gate (north-face hardening). A chat payload whose
+        # ``messages`` is not a list of objects is unambiguously malformed: the
+        # backend would 400 on it, and worse, ``estimate_input_tokens`` (context
+        # gate below) and ``backend._normalize_chat_payload`` both do
+        # ``msg.get(...)`` on each element → ``AttributeError`` → a confusing
+        # generic 500 instead of a clean rejection. Reject here as a typed 400.
+        # No shadow phase: unlike the unknown-endpoint / context heuristics a
+        # non-dict message is never legitimate, so there is no false-positive
+        # risk to soak. (Guards the Phase-T fuzz repro: messages=["hi","there"].)
+        if req.payload_type == "chat_completion":
+            messages = req.payload.get("messages")
+            if messages is not None and (
+                not isinstance(messages, list)
+                or any(not isinstance(m, dict) for m in messages)
+            ):
+                err = ("invalid request: 'messages' must be a list of "
+                       "{role, content} objects")
+                if openai:
+                    return self._openai_error(
+                        err, "invalid_request_error", 400,
+                        code="invalid_messages")
+                return JSONResponse(
+                    {"status": "error", "request_id": req.request_id,
+                     "error": err, "code": "invalid_messages"},
+                    status_code=400)
+
         # Grammar authority: validate + safe-normalize any GBNF grammar
         # BEFORE enqueue. Fail loud on an invalid grammar rather than
         # dispatching it (llama-server would silently run unconstrained).

@@ -114,6 +114,12 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
         # coercions (priority/timeout_s/query-params) are handled at the source;
         # this catches anything they miss.
         exception_handlers={
+            # A non-UTF8 request body raises UnicodeDecodeError inside
+            # request.json() BEFORE json parsing — it is a ValueError but NOT a
+            # JSONDecodeError, so without this entry it fell through to the
+            # generic 500 backstop. Both malformed-encoding and malformed-JSON
+            # bodies are the same "unparseable body" class → clean 400.
+            UnicodeDecodeError: _on_invalid_json,
             json.JSONDecodeError: _on_invalid_json,
             Exception: _on_unhandled,
         },

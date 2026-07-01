@@ -8,13 +8,12 @@ the one invariant that must hold for every input:
     NEVER leaks a slot on any input.
 
 The stronger invariant — *never* the unhandled-500 backstop, i.e. every hostile
-input yields a clean *typed* 4xx — is the Phase-1 (resilience / uniform
-correction) target and is NOT yet met by the proxy: this fuzz layer discovered
-two concrete north-face gaps where a malformed request currently surfaces as a
-generic 500 instead of a clean 4xx. They are pinned as executable, strict-xfail
-repros in ``test_north_face_500_gaps_phase1`` below — when Phase 1 hardens them
-the xfail flips to XPASS and forces this file to be tightened. That is the
-harness doing its job (finding real defects), not a Phase-T failure.
+input yields a clean *typed* 4xx — was the Phase-1 (resilience / uniform
+correction) target. This fuzz layer discovered two concrete north-face gaps
+where a malformed request surfaced as a generic 500 instead of a clean 4xx (a
+non-dict message shape, and a non-UTF8 body). Both were **hardened in Phase 1
+(2026-07-01)**; ``test_north_face_500_gaps_phase1`` below is now a live
+regression guard (was strict-xfail through Phase T) proving they stay 4xx.
 
 No ``hypothesis`` dependency (not installed in-container): a small seeded
 generator gives reproducibility (same seed → same corpus) and fits the
@@ -172,14 +171,14 @@ async def test_fuzz_garbage_grammars(proxy):
         await _assert_no_hang_no_leak(proxy, resp, f"grammar#{i}")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Phase-1 north-face hardening target: a malformed request SHAPE (message is "
-    "not a dict → AttributeError in cost_model.estimate_input_tokens, "
-    "service.py:940) and a non-UTF8 request body (UnicodeDecodeError in "
-    "request.json(), not caught by the JSONDecodeError handler) currently surface "
-    "as the generic 500 backstop instead of a clean typed 4xx. When Phase 1 fixes "
-    "these, this test XPASSes → strict-xfail fails the suite → remove the xfail."))
 async def test_north_face_500_gaps_phase1(proxy):
+    # Phase-1 HARDENED (2026-07-01): both gaps now return a clean typed 4xx
+    # instead of the generic 500 backstop, so this is a live regression guard
+    # (was strict-xfail through Phase T). Gap 1 = a malformed message SHAPE
+    # (element not a dict) — caught by the payload-shape gate in handle_submit
+    # before it reaches estimate_input_tokens / _normalize_chat_payload. Gap 2 =
+    # a non-UTF8 body (UnicodeDecodeError) — now mapped to the clean-400 handler
+    # alongside JSONDecodeError. Revert either fix and this test fails.
     # Gap 1: hostile message shape (a bare string where a {role,content} dict is
     # expected).
     r1 = await proxy.client.post("/v1/chat/completions", json={
