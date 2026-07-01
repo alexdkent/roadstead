@@ -62,13 +62,14 @@ def _attr(proxy):
 
 
 async def test_sync_capture_rollup_deblend_and_surfaces(proxy):
-    """One proxy spin exercising the whole SYNC chain (kept lean for the
-    tollgate budget): capture → per-caller rollup math → the NULL/0 distinction
-    → the fleet de-blend → the /v1/fleet/cache-attribution endpoint → the
-    per-endpoint cache_hit_rate on /v1/status.
+    """One proxy spin exercising the SYNC per-caller chain (kept lean for the
+    tollgate budget): cached_tokens capture → per-caller rollup math → the
+    NULL/0 distinction → the fleet de-blend → the /v1/fleet/cache-attribution
+    endpoint shape. (The real per-ENDPOINT rate on /v1/status is covered by
+    test_endpoint_rate_uses_real_backend_metric_not_null.)
 
-    Traffic: 2 attributed vLLM chats on 'chat' (cached 6/12) + 4 NULL
-    (llama.cpp shape) chats on 'companion'."""
+    Traffic: 2 attributed chats emitting cached_tokens=6/12 + 4 NULL
+    (llama.cpp shape) chats — driven on the 'chat'/'companion' endpoints."""
     proxy.controller.cached_tokens = 6
     for _ in range(2):
         assert (await proxy.chat("hi", model="chat")).status_code == 200
@@ -106,12 +107,37 @@ async def test_sync_capture_rollup_deblend_and_surfaces(proxy):
                     "unattributed_calls", "cached_tokens",
                     "attributable_input_tokens", "hit_rate")) <= set(row)
 
-    # /v1/status per-endpoint cache_hit_rate after one cache-stats cycle.
+
+async def test_endpoint_rate_uses_real_backend_metric_not_null(proxy):
+    """Phase-2a operator decision: the per-ENDPOINT hit rate on /v1/status +
+    the attribution by_endpoint overlay come from the vLLM /metrics prefix-cache
+    counters (which WORK), NOT the per-request cached_tokens (NULL on our vLLM
+    builds). So a vLLM endpoint shows a REAL rate; a llama.cpp endpoint (no
+    counter) shows n/a — never a fabricated 0.
+
+    The fake exposes vllm:prefix_cache_{hits,queries}_total from these knobs;
+    'thinker' is a vLLM endpoint, 'chat' is llama.cpp."""
+    proxy.controller.prefix_cache_hits = 40
+    proxy.controller.prefix_cache_queries = 100     # → 0.40 real endpoint rate
+    await proxy.chat("hi", model="thinker")
+    await proxy.chat("hi", model="chat")
+    proxy.svc._queue_db.flush(timeout=5.0)
     await proxy.svc._health.compute_cache_stats()
+
+    # /v1/status: real rate for the vLLM endpoint, absent for llama.cpp.
     snap = (await proxy.client.get("/v1/status")).json()["endpoints"]
-    assert snap["chat"].get("cache_hit_rate") == 0.5
-    # an endpoint with no ATTRIBUTABLE calls must not carry the field.
-    assert "cache_hit_rate" not in snap.get("companion", {})
+    assert snap["thinker"].get("cache_hit_rate") == 0.4
+    assert "cache_hit_rate" not in snap["chat"], "llama.cpp has no counter → n/a"
+
+    # attribution by_endpoint: the vLLM row's headline hit_rate is overlaid with
+    # the real metric + flagged; llama.cpp stays n/a (no overlay).
+    j = (await proxy.client.get("/v1/fleet/cache-attribution?window=1h")).json()
+    thinker = next(r for r in j["by_endpoint"] if r["endpoint"] == "thinker")
+    assert thinker["hit_rate"] == 0.4
+    assert thinker["hit_rate_source"] == "backend_prefix_cache_metrics"
+    chat = next((r for r in j["by_endpoint"] if r["endpoint"] == "chat"), None)
+    if chat is not None:  # llama.cpp: no metric overlay, no source flag
+        assert "hit_rate_source" not in chat
 
 
 async def test_stream_cached_tokens_captured(proxy):

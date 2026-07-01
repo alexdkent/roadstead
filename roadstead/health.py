@@ -422,6 +422,7 @@ class Health:
         Cheap + bounded; runs at ``cache_stats_interval_s``."""
         chat_classes = set(cache_stats.chat_endpoint_labels())
         snap_at = time.time()
+        rates: dict[str, dict] = {}
         for ep_name, ep_cfg in self.state.config.endpoints.items():
             if ep_name not in chat_classes or ep_name in self.state.paused_endpoints:
                 continue
@@ -433,6 +434,21 @@ class Health:
                         cum_hits, cum_queries = pc["hits"], pc["queries"]
                 except Exception:  # noqa: BLE001
                     pass
+            # Phase 2a — ACTUAL per-endpoint prefix-cache hit rate. vLLM per-request
+            # usage.prompt_tokens_details.cached_tokens is NULL on our builds (a
+            # vLLM build gap, not a flag — verified 2026-07-01), so the per-caller
+            # cached_tokens rollup reads n/a. The GLOBAL vLLM /metrics prefix-cache
+            # counters DO work, so surface the real per-ENDPOINT lifetime rate from
+            # those here (llama.cpp exposes no counter → stays absent = n/a). This is
+            # what /v1/status.cache_hit_rate + the attribution by_endpoint overlay
+            # read. Per-CALLER actual stays backend-gated (Tier-1 LCP screen predicts
+            # it); this is the real ENDPOINT number the operator asked to surface.
+            if cum_queries and cum_queries > 0 and cum_hits is not None:
+                rates[ep_name] = {
+                    "hit_rate": round(cum_hits / cum_queries, 4),
+                    "queries": int(cum_queries),
+                    "source": "backend_prefix_cache_metrics",
+                }
             try:
                 rows = await asyncio.to_thread(
                     self.state.queue_db.cache_screen_payloads, ep_name, 168.0, 2000)
@@ -445,24 +461,7 @@ class Health:
                 screen_json=json.dumps(screen),
             )
         self.state.queue_db.prune_cache_stats()
-        # Phase 2a — refresh the ACTUAL per-endpoint prefix-cache hit rate (from
-        # captured cached_tokens) once per cycle so /v1/status can read it hot
-        # without a GROUP-BY. Off-loop; fail-open (measurement must never break
-        # the poller). This is the Tier-2 number that de-blends the llama.cpp
-        # NULLs the global vLLM scrape can't attribute.
-        try:
-            attribution = await asyncio.to_thread(
-                self.state.queue_db.cache_attribution, 3600)
-            self.state.endpoint_cache_hit_rate = {
-                r["endpoint"]: {
-                    "hit_rate": r["hit_rate"],
-                    "attributed_calls": r["attributed_calls"],
-                    "unattributed_calls": r["unattributed_calls"],
-                }
-                for r in attribution.get("by_endpoint", [])
-            }
-        except Exception:  # noqa: BLE001
-            pass
+        self.state.endpoint_cache_hit_rate = rates
     def apply_discovered_props(
         self, ep_name: str, ep_cfg: EndpointConfig, props: dict,
     ) -> None:

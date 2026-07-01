@@ -282,11 +282,11 @@ class ProxyHttpHandlers:
             # (feeds the endpoint_stalled alert + health-verifier/dashboards).
             snap["recent_timeouts"] = self.state.metrics.count(
                 endpoint=ep_name, status="timeout", now=now)
-            # Phase 2a — ACTUAL prefix-cache hit rate (last cache-stats cycle).
-            # None/n/a for llama.cpp roles (no cached_tokens counter) — only
-            # surfaced when the endpoint had attributable calls in the window.
+            # Phase 2a — ACTUAL prefix-cache hit rate (last cache-stats cycle,
+            # from the vLLM /metrics global counters). Absent for llama.cpp roles
+            # (no counter) → field omitted = n/a.
             _cache = self.state.endpoint_cache_hit_rate.get(ep_name)
-            if _cache and _cache.get("attributed_calls"):
+            if _cache and _cache.get("hit_rate") is not None:
                 snap["cache_hit_rate"] = _cache["hit_rate"]
             endpoints[ep_name] = snap
 
@@ -600,6 +600,28 @@ class ProxyHttpHandlers:
         limit = max(1, min(_to_int(request.query_params.get("limit"), 40), 200))
         data = await asyncio.to_thread(
             self.state.queue_db.cache_attribution, window_s, limit)
+        # Per-endpoint headline hit_rate: the cached_tokens rollup reads n/a
+        # (vLLM emits null per-request), so overlay the REAL per-endpoint rate
+        # from the vLLM /metrics scrape (Phase-2a operator decision). The
+        # cached_tokens-derived fields (attributed/unattributed/attributable_in)
+        # are kept for transparency; hit_rate_source flags the real ones. The
+        # per-CALLER (by_call_site) rows stay cached_tokens-based (n/a until the
+        # backend emits it — Tier-1's LCP screen predicts per-caller reuse).
+        real = self.state.endpoint_cache_hit_rate
+        for row in data.get("by_endpoint", []):
+            r = real.get(row.get("endpoint"))
+            if r and r.get("hit_rate") is not None:
+                row["hit_rate"] = r["hit_rate"]
+                row["hit_rate_source"] = r.get("source", "backend_prefix_cache_metrics")
+        fleet = data.get("fleet")
+        if fleet is not None and real:
+            # fleet headline = query-weighted mean of the real per-endpoint rates.
+            tot_q = sum(v["queries"] for v in real.values() if v.get("queries"))
+            if tot_q > 0:
+                fleet["hit_rate"] = round(
+                    sum(v["hit_rate"] * v["queries"] for v in real.values()
+                        if v.get("queries")) / tot_q, 4)
+                fleet["hit_rate_source"] = "backend_prefix_cache_metrics"
         return JSONResponse(data)
     async def handle_usage(self, request: Request) -> Response:
         dimension = request.query_params.get("by", "agent")
