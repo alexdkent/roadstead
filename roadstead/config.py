@@ -169,6 +169,13 @@ class EndpointConfig:
 
     # --- policy knobs ---
     min_expected_slots: int = 1
+    # The backend's REAL launch-time concurrency ceiling for a vLLM endpoint
+    # (``--max-num-seqs``), mirrored from the tracked serve script. vLLM does NOT
+    # expose this over its API (unlike llama.cpp /props), so ``max_slots`` stays
+    # config-seeded and can silently drift from the backend's actual cap (the
+    # reasoner 32-vs-20 class, reconciled in Step 2b). 0 = not tracked (llama.cpp /
+    # shims). The Step-4c shadow reconciler warns when ``max_slots`` != this value.
+    documented_max_num_seqs: int = 0
     background_floor_pct: float = 0.20
     # Slots held back from the BACKGROUND band so an occasional interactive /
     # fast-path call always has an open slot (no preemption exists). When set,
@@ -374,6 +381,21 @@ def uniform_correction_enabled() -> bool:
     ``COLLECTIVE_PROXY_UNIFORM_CORRECTION``."""
     return os.environ.get("COLLECTIVE_PROXY_UNIFORM_CORRECTION", "0").strip().lower() in (
         "1", "true", "yes", "on",
+    )
+
+
+def max_slots_reconcile_enabled() -> bool:
+    """Step 4c (2026-07-01): SHADOW reconciler for the vLLM ``max_slots`` desync.
+    vLLM's ``--max-num-seqs`` is not API-discoverable, so ``max_slots`` is
+    config-seeded and can silently drift from the backend's real launch cap (the
+    reasoner 32-vs-20 bug, Step 2b). This standing guard compares each vLLM
+    endpoint's ``max_slots`` against its ``documented_max_num_seqs`` (mirrored from
+    the serve script) and raises a ``max_slots_drift`` WARNING alert on mismatch.
+    OBSERVABILITY ONLY — it never changes admission (zero caller-visible effect,
+    like the shadow-egress detector), so default ON. Env kill-switch
+    ``COLLECTIVE_PROXY_MAX_SLOTS_RECONCILE``."""
+    return os.environ.get("COLLECTIVE_PROXY_MAX_SLOTS_RECONCILE", "1").strip().lower() not in (
+        "0", "false", "no", "off", "",
     )
 
 

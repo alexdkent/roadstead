@@ -225,6 +225,10 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
             ("dispatch_concurrency_cap", "dispatch_concurrency_cap"),
             ("slot_affinity", "slot_affinity"),
             ("skip_discovery", "skip_discovery"),
+            # Step 4c: the vLLM backend's real --max-num-seqs launch cap, mirrored
+            # from the serve script (vLLM doesn't expose it) — drives the shadow
+            # max_slots-drift reconciler.
+            ("documented_max_num_seqs", "documented_max_num_seqs"),
         ):
             if src in pol:
                 kw[dst] = pol[src]

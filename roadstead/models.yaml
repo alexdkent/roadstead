@@ -247,6 +247,10 @@ models:
     policy:
       background_floor_pct: 0.0
       fast_path_reserve_slots: 1
+      # Step 4c: the backend's real --max-num-seqs (serve_thinker_prod.sh). Keep
+      # EQUAL to `slots` above; the shadow reconciler warns if they drift (the
+      # 32-vs-20 class). Update BOTH whenever serve_thinker_prod.sh changes.
+      documented_max_num_seqs: 20
     capabilities:
       vision: false
       streaming: true
@@ -288,6 +292,9 @@ models:
     policy:
       background_floor_pct: 0.0
       fast_path_reserve_slots: 1
+      # Step 4c: the boxa's real --max-num-seqs (serve_prod.sh). Keep EQUAL to
+      # `slots: 16` above; the shadow reconciler warns on drift.
+      documented_max_num_seqs: 16
     capabilities:
       vision: true                  # IMAGE + VIDEO input LIVE in prod since 2026-06-21 (serve_prod.sh: --dtype bfloat16 + --limit-mm-per-prompt image:2,video:1). Validated end-to-end through the proxy (Anthropic image block → OAI translate → vLLM). bf16 is MANDATORY for vision (fp16 silently breaks it via SigLIP overflow, vLLM #40290); text throughput unchanged (24.8 vs 25.9 tok/s). AUDIO is NOT supported — the checkpoint has no audio tower (audio_config vestigial → vLLM 400s); keep audio:0. Video routes as frames THROUGH the vision tower (no separate video tower).
       streaming: true

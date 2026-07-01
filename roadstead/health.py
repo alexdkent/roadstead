@@ -15,7 +15,7 @@ import time
 from typing import TYPE_CHECKING
 
 from . import cache_stats
-from .config import PriorityBand, normalize_endpoint
+from .config import PriorityBand, max_slots_reconcile_enabled, normalize_endpoint
 from .observability import AlertCondition, check_alerts
 
 if TYPE_CHECKING:
@@ -170,6 +170,21 @@ class Health:
                 name="write_queue_overflow", severity="WARNING", triggered=True,
                 detail=f"{dropped} best-effort DB write(s) dropped (queue full)",
             ))
+        # Step 4c: SHADOW max_slots-drift reconciler. vLLM's --max-num-seqs isn't
+        # API-discoverable, so max_slots stays config-seeded and can silently
+        # diverge from the backend's real launch cap (the reasoner 32-vs-20 class,
+        # Step 2b). Warn — never auto-change admission — when a vLLM endpoint's
+        # admitted max_slots differs from its documented launch value.
+        if max_slots_reconcile_enabled():
+            for ep_name, ep_cfg in self.state.config.endpoints.items():
+                doc = getattr(ep_cfg, "documented_max_num_seqs", 0)
+                if doc and ep_cfg.max_slots != doc:
+                    alerts.append(AlertCondition(
+                        name="max_slots_drift", severity="WARNING", triggered=True,
+                        detail=(f"endpoint {ep_name} admits max_slots={ep_cfg.max_slots} "
+                                f"but documented --max-num-seqs={doc} — reconcile "
+                                f"models.yaml `slots` with the serve script"),
+                    ))
         self.state.alerts = [
             {"name": a.name, "severity": a.severity, "detail": a.detail}
             for a in alerts
