@@ -233,7 +233,16 @@ models:
     params: {active: 27B, total: 27B}
     context_per_slot: 131072
     context_window: 32768            # fleet chunkers size against 32K on purpose
-    slots: 32
+    # 20 = the backend's HARD cap (vllm-thinker `--max-num-seqs 20`, lowered
+    # 32->20 on 2026-06-11 for DECKARD co-residency — see serve_thinker_prod.sh).
+    # vLLM does NOT expose --max-num-seqs over its API, so this seed is the ONLY
+    # source of the proxy's admission ceiling; a stale 32 here over-admitted the
+    # thinker by 12 (the extra 12 just queued at the backend, bypassing the
+    # proxy's DRR fairness). Reconciled to the documented launch value 2026-07-01
+    # (Phase-0 discovery). NOTE: llama.cpp roles self-correct via /props; vLLM
+    # ones like this do NOT — a Phase-1 shadow reconciler will warn on future
+    # drift. Keep this equal to serve_thinker_prod.sh's --max-num-seqs.
+    slots: 20
     timeout_floor_s: 180
     policy:
       background_floor_pct: 0.0
