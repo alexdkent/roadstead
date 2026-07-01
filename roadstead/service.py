@@ -334,6 +334,7 @@ from .scheduler import (
     Scheduler,
 )
 from .sse_hub import DROP_SENTINEL, SSEHub
+from .state import ProxyState
 
 logger = logging.getLogger(__name__)
 
@@ -391,150 +392,104 @@ def _to_float(value: object, default: float) -> float:
         return default
 
 
+class _StateField:
+    """Data-descriptor forwarding ``ProxyService._<name>`` to
+    ``self._state.<name>`` (de-monolith contract §2).
+
+    The data now lives on ``ProxyState``; ``ProxyService`` keeps the identical
+    ``self._<field>`` surface the ~530 white-box tests reach into. Read+write —
+    a few counters are ``+=``'d and ``_shed_depth`` is reassigned by tests —
+    and because ``__get__`` returns the *live* object, in-place mutation
+    (``.append``, ``[k]=v``, ``.add``, ``|=``) works unchanged with identity
+    preserved.
+    """
+
+    __slots__ = ("_attr",)
+
+    def __init__(self, attr: str) -> None:
+        self._attr = attr
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return getattr(obj._state, self._attr)
+
+    def __set__(self, obj, value) -> None:
+        setattr(obj._state, self._attr, value)
+
+
 class ProxyService:
     """Main proxy service that coordinates all components."""
 
+    # --- Frozen private surface (contract §2) --------------------------------
+    # Every ``self._<field>`` name ProxyService has always exposed, forwarded to
+    # the identically-named attribute on ``ProxyState`` (leading underscore
+    # dropped). Source of truth for the field set is ``ProxyState.__init__``.
+    _config = _StateField("config")
+    _cost_model = _StateField("cost_model")
+    _timeout_model = _StateField("timeout_model")
+    _budget_mgr = _StateField("budget_mgr")
+    _scheduler = _StateField("scheduler")
+    _backend = _StateField("backend")
+    _queue_db = _StateField("queue_db")
+    _on_demand = _StateField("on_demand")
+    _flags = _StateField("flags")
+    _cache = _StateField("cache")
+    _grammar_cache = _StateField("grammar_cache")
+    _grammar_alerted = _StateField("grammar_alerted")
+    _metrics = _StateField("metrics")
+    _request_logger = _StateField("request_logger")
+    _acl = _StateField("acl")
+    _sse = _StateField("sse")
+    _dispatch_event = _StateField("dispatch_event")
+    _draining = _StateField("draining")
+    _pending_futures = _StateField("pending_futures")
+    _pending_streams = _StateField("pending_streams")
+    _thinking_active = _StateField("thinking_active")
+    _thinking_requests = _StateField("thinking_requests")
+    _thinking_clean = _StateField("thinking_clean")
+    _thinking_recovered = _StateField("thinking_recovered")
+    _thinking_truncated = _StateField("thinking_truncated")
+    _thinking_fallback = _StateField("thinking_fallback")
+    _shadow_drop = _StateField("shadow_drop")
+    _degeneration_detected = _StateField("degeneration_detected")
+    _degeneration_recovered = _StateField("degeneration_recovered")
+    _degeneration_unrecovered = _StateField("degeneration_unrecovered")
+    _degeneration_by_call_site = _StateField("degeneration_by_call_site")
+    _degen_redispatch_inflight = _StateField("degen_redispatch_inflight")
+    _empty_rescue_attempts = _StateField("empty_rescue_attempts")
+    _empty_rescue_recovered = _StateField("empty_rescue_recovered")
+    _timed_out_ids = _StateField("timed_out_ids")
+    _inflight_tasks = _StateField("inflight_tasks")
+    _endpoint_health = _StateField("endpoint_health")
+    _health_fail_threshold = _StateField("health_fail_threshold")
+    _paused_endpoints = _StateField("paused_endpoints")
+    _transient_retry_max = _StateField("transient_retry_max")
+    _last_cleanup_at = _StateField("last_cleanup_at")
+    _last_budget_save_at = _StateField("last_budget_save_at")
+    _last_wal_checkpoint_at = _StateField("last_wal_checkpoint_at")
+    _last_incr_vacuum_at = _StateField("last_incr_vacuum_at")
+    _last_cache_stats_at = _StateField("last_cache_stats_at")
+    _shed_depth = _StateField("shed_depth")
+    _alerts = _StateField("alerts")
+    _alert_logged = _StateField("alert_logged")
+    _admin_ips_seen = _StateField("admin_ips_seen")
+    _unknown_endpoint_submits = _StateField("unknown_endpoint_submits")
+    _context_overflows = _StateField("context_overflows")
+    _slot_leak_reclaimed = _StateField("slot_leak_reclaimed")
+    _drain_straggler_cancelled = _StateField("drain_straggler_cancelled")
+    _scheduler_task = _StateField("scheduler_task")
+    _poller_task = _StateField("poller_task")
+    _inflight_task = _StateField("inflight_task")
+    _started_at = _StateField("started_at")
+
     def __init__(self, config: ProxyConfig) -> None:
-        self._config = config
-
-        # Core components
-        self._cost_model = CostModel()
-        self._timeout_model = TimeoutModel(
-            margin=config.timeout_advice_margin,
-            window_s=config.timeout_advice_window_s,
-            min_samples=config.timeout_advice_min_samples,
-        )
-        self._budget_mgr = BudgetManager(starvation_timeout_s=config.starvation_timeout_s)
-        self._scheduler = Scheduler(config, self._cost_model, self._budget_mgr)
-        self._backend = BackendClientPool()
-        self._queue_db = PersistentQueue(config.queue_db_path or None)
-        # On-demand endpoints (e.g. `creative`, Gemma-4-31B abliterated): the model is loaded
-        # lazily under the anvil GPU-slot dispatcher lease and idle-unloaded.
-        self._on_demand = OnDemandManager(config.endpoints)
-
-        # Runtime-mutable feature flags (flags.py) — shadow→enforce switches +
-        # kill-switches that must be flippable without a process restart (no
-        # env gates). Reads are dict lookups; mutation only via /v1/admin/flags.
-        self._flags = RuntimeFlags(config.runtime_flags_path or None)
-
-        # Deterministic response cache (temperature=0).
-        self._cache = DeterministicCache()
-
-        # Grammar authority: cache of normalize+validate results keyed by
-        # grammar hash, + a set of hashes we've already alerted on so each
-        # bad grammar logs loudly once (not per request).
-        self._grammar_cache: dict[str, "GrammarResult"] = {}
-        self._grammar_alerted: set[str] = set()
-
-        # Observability
-        self._metrics = RollingMetrics(window_s=300.0)
-        self._request_logger = RequestLogger(config.request_log_path or None)
-        self._acl = IPIdentityMap.from_env()
-        # Real-time fan-out (Phase 1: proxy = fleet call-metrics authority).
-        # Every completion emits a `call.completed` event; the poller pushes a
-        # periodic `metrics` frame. Drives the unified Inference page's usage
-        # panels without 5-10s polling. No-op when nobody is subscribed.
-        self._sse = SSEHub()
-
-        # Async plumbing
-        self._dispatch_event = asyncio.Event()
-        self._draining = asyncio.Event()  # set during shutdown drain (Phase 2.1)
-        self._pending_futures: dict[str, asyncio.Future] = {}
-        self._pending_streams: dict[str, asyncio.Queue] = {}
-        # Thinking option (per-request native reasoning): per-request state keyed
-        # by request_id — set on dispatch, consumed on the response path for
-        # structured-output recovery. {request_id: {"allowed_keys": [...]}}.
-        # Stays EMPTY unless a caller opts in with thinking:true.
-        self._thinking_active: dict[str, dict] = {}
-        self._thinking_requests = 0    # opted-in thinking requests seen
-        self._thinking_clean = 0       # structured output already conformant (no fix)
-        self._thinking_recovered = 0   # stray-brace artifact deterministically cleaned
-        self._thinking_truncated = 0   # finish=length (raise budget) — failed safe
-        self._thinking_fallback = 0    # unrecoverable structured output — failed safe
-        # WS-4 shadow egress detector: per-call_site silent grammar-drop tally
-        # over ALL grammar-bearing responses (read-only; NEVER mutates a
-        # response). {call_site: {"checked": int, "dropped": int}}. Populated by
-        # _shadow_egress_detect when COLLECTIVE_PROXY_SHADOW_EGRESS is on (default).
-        self._shadow_drop: dict[str, dict] = {}
-        # Egress degeneration guard tallies (repetition-loop detect + re-dispatch).
-        self._degeneration_detected = 0      # responses flagged as a repetition loop
-        self._degeneration_recovered = 0     # …fixed by an anti-repetition re-dispatch
-        self._degeneration_unrecovered = 0   # …still degenerate after re-dispatch(es)
-        self._degeneration_by_call_site: dict[str, dict] = {}
-        # Re-dispatches run OUTSIDE scheduler slot accounting (the original
-        # slot was freed when the degenerate 200 completed), so bound their
-        # fleet-wide concurrency with a plain counter — single event loop, no
-        # lock needed; NOT a semaphore (waiting would queue caller responses).
-        self._degen_redispatch_inflight = 0
-        # Empty-completion (position-0-EOS) rescue tallies — see
-        # _EMPTY_RESCUE_MIN_TOKENS. attempts = retries dispatched with
-        # min_tokens; recovered = those that produced a real response.
-        self._empty_rescue_attempts = 0
-        self._empty_rescue_recovered = 0
-        # Dedupe set so a single request that races across two timeout
-        # layers (e.g. admission expiry + client-wait) is logged once.
-        self._timed_out_ids: set[str] = set()
-        # In-flight dispatch tasks keyed by request_id (Phase 1.5 / 2.1). Lets
-        # the drain path await them on shutdown; the slot-leak fix is the
-        # deadline-bound backend call in _execute_sync/_execute_streaming.
-        self._inflight_tasks: dict[str, asyncio.Task] = {}
-        # Per-endpoint circuit-breaker health (Phase 1.2). An endpoint flips
-        # unhealthy only after consecutive capacity-probe failures CONFIRMED by a
-        # failed /health probe — latency/saturation never flips it
-        # (alert-don't-kill). While unhealthy the scheduler defers its queue.
-        self._endpoint_health: dict[str, dict] = {
-            ep: {"healthy": True, "consecutive_failures": 0, "unhealthy_since": None}
-            for ep in config.endpoints
-        }
-        self._health_fail_threshold = 3
-        # Phase 5F — operator drain: endpoints an operator has explicitly PAUSED
-        # for maintenance (e.g. a vLLM restart to change --max-model-len). A
-        # paused endpoint reads as unhealthy (→ background defers, interactive
-        # fast-fails deferrably) so NO request hits the backend while it's down,
-        # WITHOUT the ~30s auto-circuit-trip lag. Distinct from the auto-circuit
-        # so a planned drain never fires the endpoint_paused ERROR alert. The
-        # poller skips paused endpoints; /resume hands them back to the poller.
-        self._paused_endpoints: set[str] = set()
-        self._transient_retry_max = 1
-        # Retention sweep cadence (Phase 2.3) — monotonic ts of the last DB trim.
-        self._last_cleanup_at = 0.0
-        # DRR-balance persistence cadence (Phase 3.4).
-        self._last_budget_save_at = 0.0
-        # queue.db maintenance cadences (persistence cleanup): WAL truncate +
-        # incremental freelist return.
-        self._last_wal_checkpoint_at = 0.0
-        self._last_incr_vacuum_at = 0.0
-        # Load-shed threshold (Phase 2.4): per-(endpoint, band) queue depth at
-        # which NON-interactive submits are shed with 429 + Retry-After.
-        self._shed_depth = 50
-        # Alerting (Phase 2.5) — current triggered alerts (exposed on /v1/status)
-        # + the set already logged, so a sustained condition logs once not every
-        # poll tick.
-        self._alerts: list[dict] = []
-        self._alert_logged: set = set()
-        # Admin-surface audit: source IPs seen per admin-ish route, exposed on
-        # /v1/status so the ACL-tightening go/no-go can read the live set
-        # instead of grepping logs. First hit per (route, ip) also logs INFO.
-        self._admin_ips_seen: dict[str, set[str]] = {}
-        # Unknown-endpoint submits (shadow counter): endpoint → {count,
-        # callers}. Feeds the scheduled flip-check for unknown_endpoint_enforce
-        # via /v1/status; non-empty means some caller submits a role the proxy
-        # can't route (today that request rots to its deadline — the bug
-        # enforce mode fixes with a fast 404).
-        self._unknown_endpoint_submits: dict[str, dict] = {}
-        # Context-overflow gate counter (shadow): endpoint → {count, callers,
-        # max_est_in}. Feeds the context_gate_enforce flip check — compared
-        # against ACTUAL backend overflow errors before enforcement flips.
-        self._context_overflows: dict[str, dict] = {}
-        # Phase 5B observability counters (exposed on /v1/status).
-        self._slot_leak_reclaimed = 0       # streaming dispatches cancelled on
-                                            # consumer-disconnect → slot freed
-        self._drain_straggler_cancelled = 0  # in-flight tasks cancelled at the
-                                            # shutdown drain deadline
-        self._scheduler_task: asyncio.Task | None = None
-        self._poller_task: asyncio.Task | None = None
-        self._inflight_task: asyncio.Task | None = None
-        self._started_at = time.monotonic()
+        # All mutable data + references to the injected singletons live on
+        # ProxyState (de-monolith contract §3). ProxyService exposes the frozen
+        # ``self._<field>`` surface via the _StateField descriptors above; the
+        # Health / Correction / Lifecycle / http_handlers collaborators receive
+        # and mutate this one shared state object.
+        self._state = ProxyState(config)
 
     # ----- lifecycle -----
 
