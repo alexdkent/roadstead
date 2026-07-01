@@ -29,7 +29,12 @@ from .backend import (
     BackendTimeout,
     BackendUnavailable,
 )
-from .config import LLMPriority, PriorityBand, normalize_endpoint
+from .config import (
+    LLMPriority,
+    PriorityBand,
+    normalize_endpoint,
+    uniform_correction_enabled,
+)
 from .constants import (
     _DEFAULT_TIMEOUT_S,
     _MIN_RETRY_BUDGET_S,
@@ -436,19 +441,13 @@ class Lifecycle:
                 status_code=504,
             )
 
-        # Thinking option: normalize the structured response (deterministic
-        # stray-brace recovery; fail-safe if unrecoverable). Before the cache so a
-        # repaired (or failed-safe) response is what gets cached, never the noise.
-        self.correction.finalize_thinking(req, result)
-        # Egress degeneration guard: detect a repetition-loop response and
-        # re-dispatch with an anti-repetition penalty (fail-open). Runs before the
-        # shadow detector + cache so they see the CORRECTED content.
-        await self.correction.maybe_correct_degenerate(req, result)
-        # WS-4: SHADOW silent-drop detector over ALL grammar-bearing responses
-        # (read-only; never mutates). Runs after the finalizers so it observes the
-        # baseline content callers receive, and before the cache so every response
-        # is seen exactly once.
-        self.correction.shadow_egress_detect(req, result)
+        # Uniform non-streaming correction (Step 4a): thinking-finalize →
+        # degeneration-correct → shadow-egress-detect, in that load-bearing order
+        # (finalizers first so the guard/detector/cache see corrected content;
+        # degeneration before the detector + cache so a never-cache-degenerate flag
+        # is set first). Byte-identical to the prior inline sequence — see
+        # Correction.apply.
+        await self.correction.apply(req, result)
 
         # Cache if deterministic — but NEVER cache an unrecovered degenerate
         # response (don't serve the same garbage for the cache TTL).
@@ -523,7 +522,15 @@ class Lifecycle:
                             break
                         # queued / admitted / anything else → not an OpenAI frame.
                         continue
-                    # Internal envelope path (unchanged): re-emit every event.
+                    # Internal envelope path: re-emit every event. Under uniform
+                    # correction (Step 4a), route tool-call CHUNK frames through the
+                    # SAME sanitizer the OpenAI door uses so internal /v1/submit
+                    # consumers (agents via ProxyLLMClient) get the qwen3_xml
+                    # phantom/truncated-arg fix too — not just the OpenAI door.
+                    # Default OFF == byte-identical (internal streams emit raw).
+                    if (uniform_correction_enabled()
+                            and event.get("type") == "chunk" and "data" in event):
+                        event = {**event, "data": toolcall_sanitizer.feed(event["data"])}
                     yield f"data: {json.dumps(event)}\n\n"
                     if event.get("type") in ("done", "error"):
                         break
@@ -910,6 +917,11 @@ class Lifecycle:
         output_tokens = 0
         last_finish_reason: str | None = None
         ttft_ms: float | None = None  # Phase 4.1 — time to first token
+        # Step 4a: accumulate assistant content across chunks for end-of-stream
+        # DETECTION (degeneration loop / silent grammar-drop) — gated on the flag
+        # so the flag-OFF path adds zero per-chunk work and stays byte-identical.
+        uniform_on = uniform_correction_enabled()
+        accumulated_content = ""
 
         # Phase 1.5: bound the stream to the caller's remaining deadline so an
         # abandoned stream can't hold its slot past the SLA.
@@ -957,6 +969,11 @@ class Lifecycle:
                                 fr = choices[0].get("finish_reason")
                                 if fr:
                                     last_finish_reason = fr
+                                if uniform_on:
+                                    delta = choices[0].get("delta")
+                                    piece = delta.get("content") if isinstance(delta, dict) else None
+                                    if isinstance(piece, str):
+                                        accumulated_content += piece
                         if not usage_only:
                             await stream_q.put({
                                 "type": "chunk",
@@ -1011,6 +1028,11 @@ class Lifecycle:
             req, decision, duration, input_tokens, output_tokens, status,
             finish_reason=last_finish_reason,
         )
+        # Step 4a: uniform streaming detection over the reassembled content
+        # (degeneration loop / silent grammar-drop). Detect-only + fail-open +
+        # self-gated on the flag; no-op when uniform correction is off.
+        if uniform_on:
+            self.correction.finalize_stream(req, accumulated_content, last_finish_reason)
     def on_admission_timeout(self, req: QueuedRequest) -> None:
         """Scheduler callback: a request expired while still queued. Log
         it and release the caller promptly with a timeout result (instead

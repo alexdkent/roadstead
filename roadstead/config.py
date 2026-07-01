@@ -361,6 +361,22 @@ def degeneration_shadow_only() -> bool:
     )
 
 
+def uniform_correction_enabled() -> bool:
+    """Step 4a (2026-07-01): route the STREAMING + internal ``/v1/submit`` response
+    paths through the uniform correction layer, closing the two path-dependence
+    gaps the sync path never had — (1) sanitize vLLM ``qwen3_xml`` tool-call streams
+    on BOTH doors (today the ``_ToolCallStreamSanitizer`` runs only for the OpenAI
+    door; internal ``/v1/submit`` streams emit raw), and (2) run truncation +
+    degeneration DETECTION over a stream's reassembled content (a stream can't
+    un-send, but it records the same tallies the sync guards do, so streaming is no
+    longer a correction blind spot). Default OFF == byte-identical (only OpenAI
+    streams sanitized, no stream-side detection). Env
+    ``COLLECTIVE_PROXY_UNIFORM_CORRECTION``."""
+    return os.environ.get("COLLECTIVE_PROXY_UNIFORM_CORRECTION", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def thinking_reasoning_budget() -> int:
     """Tokens of reasoning headroom ADDED to a thinking request's max_tokens.
     Reasoning is generated <think> output and counts against max_tokens, so too

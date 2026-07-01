@@ -23,6 +23,7 @@ from .config import (
     shadow_egress_detect_enabled,
     thinking_enabled,
     thinking_reasoning_budget,
+    uniform_correction_enabled,
 )
 from .constants import _MIN_RETRY_BUDGET_S
 from .grammar import (
@@ -288,6 +289,63 @@ class Correction:
     def __init__(self, state: "ProxyState") -> None:
         self.state = state
 
+    async def apply(self, req: "QueuedRequest", result: dict) -> None:
+        """Uniform non-streaming correction entrypoint (Step 4a). Runs, in the
+        LOAD-BEARING order, every guard applicable to a completed sync result:
+
+            finalize_thinking → maybe_correct_degenerate → shadow_egress_detect
+
+        This is a behavior-preserving consolidation of the inline sequence that
+        lived in ``Lifecycle.handle_sync_submit`` — SAME methods, SAME order, so
+        the golden oracle stays byte-identical. The order matters (contract §2 of
+        the Step-3 decomposition): the finalizers run first so the degeneration
+        guard + the shadow detector + the cache all observe corrected content, and
+        the degeneration guard runs before the shadow detector + cache so an
+        unrecovered-degenerate flag (``_degenerate_unrecovered``) is set before
+        the caller decides whether to cache. No flag gate — this path is
+        byte-identical to the prior inline calls; the flag only governs the NEW
+        streaming coverage (``finalize_stream`` + the both-doors sanitizer)."""
+        self.finalize_thinking(req, result)
+        await self.maybe_correct_degenerate(req, result)
+        self.shadow_egress_detect(req, result)
+
+    def finalize_stream(
+        self, req: "QueuedRequest", content: str, last_finish_reason: str | None,
+    ) -> None:
+        """Uniform STREAMING detection (Step 4a). The chunks already streamed
+        (can't un-send), but over the reassembled assistant ``content`` we DETECT
+        a degeneration loop + a silent grammar-drop and record the SAME per-call
+        tallies the sync guards use — so a streaming response is no longer a
+        correction blind spot. Never re-dispatches (the bytes are gone) and never
+        mutates anything the client received. Gated on
+        ``uniform_correction_enabled()``; FAIL-OPEN (any error is swallowed so
+        detection can never break a stream). ``last_finish_reason`` is accepted for
+        symmetry with the sync truncation classifier (already recorded by the
+        streaming producer) and future use."""
+        try:
+            if not uniform_correction_enabled():
+                return
+            if req.payload_type != "chat_completion":
+                return
+            # Degeneration DETECTION (detect-only on a stream — no re-dispatch).
+            if content and _is_degenerate_text(content):
+                self.state.degeneration_detected += 1
+                cs = req.call_site or "?"
+                tally = self.state.degeneration_by_call_site.setdefault(
+                    cs, {"detected": 0, "recovered": 0})
+                tally["detected"] += 1
+                reps, total = _top_shingle_reps(content)
+                logger.warning(
+                    "DEGENERATION detected (stream) call_site=%s endpoint=%s "
+                    "words=%d top_shingle=%d/%d", cs, req.endpoint,
+                    len(content.split()), reps, total)
+            # Silent grammar-drop DETECTION over the reassembled content (respects
+            # its own kill-switch, matching the sync detector).
+            if shadow_egress_detect_enabled():
+                self._shadow_egress_check(req, content)
+        except Exception:  # noqa: BLE001 — detection must never break a stream
+            logger.debug("finalize_stream failed", exc_info=True)
+
     def extract_grammar(self, payload: dict) -> tuple[str | None, str | None]:
         """Return (grammar_string, location) where location is 'top' or
         'extra_body', or (None, None) if no grammar present."""
@@ -352,26 +410,34 @@ class Correction:
                 return
             if req.stream or req.payload_type != "chat_completion":
                 return
-            grammar, _loc = self.extract_grammar(req.payload)
-            if not grammar:
-                return
             resp = result.get("response", {}) or {}
             ch = (resp.get("choices") or [{}])[0]
             content = (ch.get("message", {}) or {}).get("content")
-            if not isinstance(content, str) or not content:
-                return
-            ok, reason = verify_conformance(content, grammar)
-            cs = req.call_site or "unknown"
-            tally = self.state.shadow_drop.setdefault(cs, {"checked": 0, "dropped": 0})
-            tally["checked"] += 1
-            if not ok:
-                tally["dropped"] += 1
-                logger.warning(
-                    "shadow_egress: silent grammar-drop call_site=%s endpoint=%s "
-                    "reason=%s", cs, req.endpoint, reason,
-                )
+            self._shadow_egress_check(req, content)
         except Exception:  # noqa: BLE001 — detector must never break a response
             logger.debug("shadow_egress_detect failed", exc_info=True)
+    def _shadow_egress_check(self, req: "QueuedRequest", content) -> None:
+        """Core silent-grammar-drop check over one response's CONTENT string:
+        verify conformance against the request's grammar and tally per call_site.
+        Shared by the sync path (``shadow_egress_detect``, over the response body)
+        and the streaming path (``finalize_stream``, over the reassembled deltas)
+        so BOTH doors measure grammar-drops identically. No-op when the request
+        carried no grammar or the content is empty."""
+        grammar, _loc = self.extract_grammar(req.payload)
+        if not grammar:
+            return
+        if not isinstance(content, str) or not content:
+            return
+        ok, reason = verify_conformance(content, grammar)
+        cs = req.call_site or "unknown"
+        tally = self.state.shadow_drop.setdefault(cs, {"checked": 0, "dropped": 0})
+        tally["checked"] += 1
+        if not ok:
+            tally["dropped"] += 1
+            logger.warning(
+                "shadow_egress: silent grammar-drop call_site=%s endpoint=%s "
+                "reason=%s", cs, req.endpoint, reason,
+            )
     async def maybe_correct_degenerate(
         self, req: "QueuedRequest", result: dict,
     ) -> None:

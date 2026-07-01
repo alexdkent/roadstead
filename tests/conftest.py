@@ -15,6 +15,16 @@ keeps working unchanged.
 
 from __future__ import annotations
 
+# Pin the STDLIB ``queue`` into sys.modules before any test module (or a lazily
+# imported pytest plugin) does ``from queue import Queue`` while the inner
+# ``originfleet/llmproxy`` dir is on sys.path[0] — there it would shadow stdlib
+# with ``llmproxy/queue.py`` (whose relative ``from .config import`` then fails
+# with "attempted relative import with no known parent package"). This bites only
+# where a hypothesis-style plugin is installed (the dev Mac); the container has no
+# such plugin, so this is a harmless no-op there. conftest imports run before
+# collection, when sys.path[0] is still the stdlib-clean rootdir.
+import queue  # noqa: F401
+
 import pytest
 
 from originfleet.llmproxy.backend import BackendClientPool

@@ -52,6 +52,10 @@ def _mock_self():
         bound = getattr(C, pub).__get__(m, C)
         setattr(m, pub, bound)
         setattr(m, priv, bound)
+    # Step 4a: shadow_egress_detect delegates its conformance-check core to
+    # _shadow_egress_check (shared with the streaming finalize_stream path). Bind
+    # it on the mock self so the moved-method-on-mock-self pattern still resolves.
+    m._shadow_egress_check = C._shadow_egress_check.__get__(m, C)
     return m
 
 
