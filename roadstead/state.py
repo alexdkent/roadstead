@@ -170,6 +170,12 @@ class ProxyState:
         # Prefix-cache stats cadence (seeded to 0 → compute on first poll). Set
         # by Lifecycle at startup, advanced by Health at runtime.
         self.last_cache_stats_at = 0.0
+        # Phase 2a — per-endpoint ACTUAL prefix-cache hit rate (from captured
+        # cached_tokens), refreshed once per cache-stats cycle by Health so the
+        # hot /v1/status handler can surface it without a per-poll GROUP-BY.
+        # {endpoint: {"hit_rate": float|None, "attributed_calls": int,
+        #             "unattributed_calls": int}}. Empty until the first cycle.
+        self.endpoint_cache_hit_rate: dict[str, dict] = {}
         # Load-shed threshold (Phase 2.4): per-(endpoint, band) queue depth at
         # which NON-interactive submits are shed with 429 + Retry-After.
         self.shed_depth = 50

@@ -445,6 +445,24 @@ class Health:
                 screen_json=json.dumps(screen),
             )
         self.state.queue_db.prune_cache_stats()
+        # Phase 2a — refresh the ACTUAL per-endpoint prefix-cache hit rate (from
+        # captured cached_tokens) once per cycle so /v1/status can read it hot
+        # without a GROUP-BY. Off-loop; fail-open (measurement must never break
+        # the poller). This is the Tier-2 number that de-blends the llama.cpp
+        # NULLs the global vLLM scrape can't attribute.
+        try:
+            attribution = await asyncio.to_thread(
+                self.state.queue_db.cache_attribution, 3600)
+            self.state.endpoint_cache_hit_rate = {
+                r["endpoint"]: {
+                    "hit_rate": r["hit_rate"],
+                    "attributed_calls": r["attributed_calls"],
+                    "unattributed_calls": r["unattributed_calls"],
+                }
+                for r in attribution.get("by_endpoint", [])
+            }
+        except Exception:  # noqa: BLE001
+            pass
     def apply_discovered_props(
         self, ep_name: str, ep_cfg: EndpointConfig, props: dict,
     ) -> None:

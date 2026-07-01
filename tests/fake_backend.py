@@ -110,6 +110,14 @@ STREAM_ONLY_FAULTS: Tuple[str, ...] = (
 )
 
 
+# Sentinels for the Phase-2a adversarial usage-shape knobs (below). ``_UNSET``
+# = "use the normal happy-path usage block"; ``_OMIT_USAGE`` = "emit no usage
+# block at all". Distinct objects so ``None`` remains a legal override value
+# (an explicit ``usage: null``).
+_UNSET: Any = object()
+_OMIT_USAGE: Any = object()
+
+
 class MidStreamReset(RuntimeError):
     """Raised inside the SSE generator to abort the connection mid-body so the
     real httpx client sees a RemoteProtocolError (proxy -> BackendUnavailable)."""
@@ -152,6 +160,29 @@ class FakeBackend:
     fault_max_hits: int = 0
     # For FAULT_CAPACITY_DESYNC: accept at most this many concurrent chat calls.
     accept_limit: int = 1
+    # Phase 2a — per-request prefix-cache attribution. When set, the happy-path
+    # completion (sync + the streaming usage frame) emits
+    # ``usage.prompt_tokens_details.cached_tokens`` (the vLLM shape); prompt_tokens
+    # is fixed at 12 so a test can assert an exact hit rate (cached/12). None
+    # (default) emits NO such field — the llama.cpp shape the proxy must treat as
+    # n/a, distinct from a reported 0.
+    cached_tokens: Optional[int] = None
+    # Phase 2a ADVERSARIAL (independent track): drive arbitrary hostile usage
+    # shapes the plain ``cached_tokens`` int knob can't express. When
+    # ``usage_override`` is not ``_UNSET`` it REPLACES the entire happy-path
+    # ``usage`` block verbatim (sync body + the streaming usage frame); set it to
+    # ``_OMIT_USAGE`` to emit no usage at all. Lets a test send
+    # ``prompt_tokens_details`` as a non-dict/null/list, a missing/zero
+    # ``prompt_tokens`` (division-by-zero probe), an explicit null cached_tokens,
+    # etc. NB: ``cached_tokens`` itself is only type-hinted ``int`` — a test may
+    # assign ANY value (float/str/bool/list/NaN) to exercise the parser.
+    usage_override: Any = _UNSET
+    # When set (str), the SYNC happy-path chat returns this EXACT string as a 200
+    # ``application/json`` body. The only way to put NaN/Infinity on the sync
+    # wire: Starlette's JSONResponse hard-codes ``allow_nan=False`` and would 500
+    # inside the fake, whereas ``json.loads`` (what the proxy's ``resp.json()``
+    # uses) DOES accept ``NaN``/``Infinity`` — so a raw body reaches the parser.
+    raw_completion_text: Optional[str] = None
 
     requests: List[RecordedRequest] = field(default_factory=list)
     # live concurrency counter (capacity_desync)
@@ -171,6 +202,9 @@ class FakeBackend:
         self.default_fault = FAULT_NONE
         self.fault_arg = 0.0
         self.fault_max_hits = 0
+        self.cached_tokens = None
+        self.usage_override = _UNSET
+        self.raw_completion_text = None
         self.requests.clear()
         with self._lock:
             self._inflight = 0
@@ -216,7 +250,9 @@ def _last_user_text(body: Optional[dict]) -> str:
 
 def _completion_body(content: str, *, finish: str = "stop",
                      with_usage: bool = True,
-                     tool_calls: Optional[list] = None) -> dict:
+                     tool_calls: Optional[list] = None,
+                     cached_tokens: Any = None,
+                     usage_override: Any = _UNSET) -> dict:
     msg: Dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls is not None:
         msg["tool_calls"] = tool_calls
@@ -227,11 +263,19 @@ def _completion_body(content: str, *, finish: str = "stop",
         "model": "fake-model",
         "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
     }
+    if usage_override is not _UNSET:
+        # Adversarial: verbatim usage block (or none at all).
+        if usage_override is not _OMIT_USAGE:
+            body["usage"] = usage_override
+        return body
     if with_usage:
         pt = 12
         ct = max(1, len(content.split()))
-        body["usage"] = {"prompt_tokens": pt, "completion_tokens": ct,
-                         "total_tokens": pt + ct}
+        usage: Dict[str, Any] = {"prompt_tokens": pt, "completion_tokens": ct,
+                                 "total_tokens": pt + ct}
+        if cached_tokens is not None:  # Phase 2a — vLLM prefix-cache shape
+            usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+        body["usage"] = usage
     return body
 
 
@@ -360,7 +404,15 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
             return JSONResponse(_completion_body("", tool_calls=tc))
 
         # happy path
-        return JSONResponse(_completion_body("echo: " + _last_user_text(body)))
+        if controller.raw_completion_text is not None:
+            # Verbatim body (NaN/Infinity etc. that JSONResponse would reject).
+            return PlainTextResponse(
+                controller.raw_completion_text, status_code=200,
+                media_type="application/json")
+        return JSONResponse(_completion_body(
+            "echo: " + _last_user_text(body),
+            cached_tokens=controller.cached_tokens,
+            usage_override=controller.usage_override))
 
     def _stream_response(body: Optional[dict], fault: str, arg: float) -> StreamingResponse:
         text = "echo: " + _last_user_text(body)
@@ -416,12 +468,26 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
 
             yield _sse(_chunk({}, finish="stop"))
             # usage-only frame (include_usage) then DONE — unless suppressed.
-            yield _sse({
-                "id": "chatcmpl-fake", "object": "chat.completion.chunk",
-                "choices": [],
-                "usage": {"prompt_tokens": 12, "completion_tokens": len(tokens),
-                          "total_tokens": 12 + len(tokens)},
-            })
+            # Adversarial usage_override wins; else the normal (optionally
+            # cached_tokens-bearing) block. _sse uses json.dumps (allow_nan=True),
+            # so a NaN/Infinity cached_tokens rides the stream frame verbatim.
+            if controller.usage_override is not _UNSET:
+                if controller.usage_override is not _OMIT_USAGE:
+                    yield _sse({
+                        "id": "chatcmpl-fake", "object": "chat.completion.chunk",
+                        "choices": [], "usage": controller.usage_override,
+                    })
+            else:
+                _usage: Dict[str, Any] = {
+                    "prompt_tokens": 12, "completion_tokens": len(tokens),
+                    "total_tokens": 12 + len(tokens)}
+                if controller.cached_tokens is not None:  # Phase 2a — vLLM shape
+                    _usage["prompt_tokens_details"] = {
+                        "cached_tokens": controller.cached_tokens}
+                yield _sse({
+                    "id": "chatcmpl-fake", "object": "chat.completion.chunk",
+                    "choices": [], "usage": _usage,
+                })
             if fault != FAULT_NO_DONE:
                 yield b"data: [DONE]\n\n"
 

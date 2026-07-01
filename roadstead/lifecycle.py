@@ -28,6 +28,7 @@ from .backend import (
     BackendResponse,
     BackendTimeout,
     BackendUnavailable,
+    extract_cached_tokens,
 )
 from .config import (
     LLMPriority,
@@ -815,6 +816,7 @@ class Lifecycle:
                     resp.input_tokens, resp.output_tokens, "truncated",
                     response_body=resp.body if req.payload_type == "chat_completion" else None,
                     finish_reason=resp.finish_reason,
+                    cached_tokens=resp.cached_tokens,
                 )
                 return
 
@@ -836,6 +838,7 @@ class Lifecycle:
                 req, decision, duration,
                 resp.input_tokens, resp.output_tokens, "ok",
                 response_body=capture_response, finish_reason=resp.finish_reason,
+                cached_tokens=resp.cached_tokens,
             )
 
             # Shadow backend A/B: fire-and-forget to the shadow if configured
@@ -868,6 +871,7 @@ class Lifecycle:
             shadow_resp.input_tokens, shadow_resp.output_tokens,
             shadow_resp.duration_s, decision.queue_wait_ms, "ok",
             payload=req.payload, response=shadow_resp.body,
+            cached_tokens=shadow_resp.cached_tokens,
         )
     async def execute_streaming(
         self,
@@ -919,6 +923,7 @@ class Lifecycle:
         t0 = time.monotonic()
         input_tokens = 0
         output_tokens = 0
+        cached_tokens: int | None = None  # Phase 2a — prefix-cache attribution
         last_finish_reason: str | None = None
         ttft_ms: float | None = None  # Phase 4.1 — time to first token
         # Step 4a: accumulate assistant content across chunks for end-of-stream
@@ -963,6 +968,9 @@ class Lifecycle:
                             if usage:
                                 input_tokens = usage.get("prompt_tokens", input_tokens)
                                 output_tokens = usage.get("completion_tokens", output_tokens)
+                                ct = extract_cached_tokens(usage)
+                                if ct is not None:
+                                    cached_tokens = ct
                                 # The synthetic usage frame (usage, no choices)
                                 # exists because WE injected include_usage —
                                 # capture it but never relay it to a client
@@ -1032,7 +1040,7 @@ class Lifecycle:
         )
         self.record_completion(
             req, decision, duration, input_tokens, output_tokens, status,
-            finish_reason=last_finish_reason,
+            finish_reason=last_finish_reason, cached_tokens=cached_tokens,
         )
         # Step 4a: uniform streaming detection over the reassembled content
         # (degeneration loop / silent grammar-drop). Detect-only + fail-open +
@@ -1069,6 +1077,7 @@ class Lifecycle:
         status: str,
         response_body: dict | None = None,
         finish_reason: str | None = None,
+        cached_tokens: int | None = None,
     ) -> None:
         now = time.monotonic()
 
@@ -1109,6 +1118,7 @@ class Lifecycle:
             caller_id=req.caller_id,
             finish_reason=finish_reason,
             kind=kind,
+            cached_tokens=cached_tokens,
         )
 
         # Log

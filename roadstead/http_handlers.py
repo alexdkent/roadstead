@@ -282,6 +282,12 @@ class ProxyHttpHandlers:
             # (feeds the endpoint_stalled alert + health-verifier/dashboards).
             snap["recent_timeouts"] = self.state.metrics.count(
                 endpoint=ep_name, status="timeout", now=now)
+            # Phase 2a — ACTUAL prefix-cache hit rate (last cache-stats cycle).
+            # None/n/a for llama.cpp roles (no cached_tokens counter) — only
+            # surfaced when the endpoint had attributable calls in the window.
+            _cache = self.state.endpoint_cache_hit_rate.get(ep_name)
+            if _cache and _cache.get("attributed_calls"):
+                snap["cache_hit_rate"] = _cache["hit_rate"]
             endpoints[ep_name] = snap
 
         agents = {
@@ -580,6 +586,21 @@ class ProxyHttpHandlers:
         labels = cache_stats.chat_endpoint_labels()
         engines = {ep: cfg.backend_engine for ep, cfg in self.state.config.endpoints.items()}
         return JSONResponse(cache_stats.build_fleet_payload(snaps, labels, engines))
+    async def handle_cache_attribution(self, request: Request) -> Response:
+        """Phase 2a — per-caller ACTUAL prefix-cache hit rate (Tier-2).
+
+        The complement to /health/llmproxy.cache (Tier-1 predicted cacheability
+        from the misalignment screen): this reports the *measured* hit rate from
+        captured cached_tokens, per (call_site,endpoint), plus per-endpoint and
+        fleet rollups. Rows the backend couldn't attribute (llama.cpp — no
+        cached_tokens counter) are surfaced as unattributed, not folded into a
+        false 0% (the ~4.8% global-scrape artifact this fixes). Heavy GROUP-BY →
+        off the event loop so a dashboard poll can't stall fleet scheduling."""
+        window_s = _clamp_window(request.query_params.get("window", "1h"), 7 * 86400)
+        limit = max(1, min(_to_int(request.query_params.get("limit"), 40), 200))
+        data = await asyncio.to_thread(
+            self.state.queue_db.cache_attribution, window_s, limit)
+        return JSONResponse(data)
     async def handle_usage(self, request: Request) -> Response:
         dimension = request.query_params.get("by", "agent")
         if dimension not in ("agent", "call_site", "endpoint", "provider"):

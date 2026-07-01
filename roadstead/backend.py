@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
@@ -162,6 +163,43 @@ def _has_enable_thinking(payload: dict) -> bool:
     return False
 
 
+def extract_cached_tokens(usage: Any) -> int | None:
+    """Pull the per-request prefix-cache hit count out of an OpenAI ``usage``
+    block, defensively. Phase 2a attribution.
+
+    vLLM (V1, prefix caching on) emits ``usage.prompt_tokens_details.cached_tokens``
+    — the number of prompt tokens served from the KV prefix cache. llama.cpp does
+    NOT emit any such field. The distinction matters: a backend that reports ``0``
+    is a real *cold* miss (attributable), whereas an *absent* field means the
+    backend can't tell us (llama.cpp) — which must persist as NULL so the rollup
+    marks it ``n/a`` instead of dragging the hit rate toward zero.
+
+    Returns the int (including 0) when present and numeric, else ``None``.
+    Never raises on a malformed/hostile usage shape (south-face safety)."""
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("prompt_tokens_details")
+    candidate: Any = None
+    if isinstance(details, dict) and "cached_tokens" in details:
+        candidate = details.get("cached_tokens")
+    elif "cached_tokens" in usage:  # some shims flatten it to the top level
+        candidate = usage.get("cached_tokens")
+    else:
+        return None
+    if isinstance(candidate, bool):  # bool is an int subclass — reject it
+        return None
+    if isinstance(candidate, (int, float)):
+        # NaN/±Infinity reach here over the wire — JSON accepts them by default
+        # (both httpx .json() and our SSE-frame json.loads), and int(nan)/int(inf)
+        # RAISE (ValueError/OverflowError). An observability field must never
+        # convert a good completion into a caller-facing error → reject non-finite.
+        if isinstance(candidate, float) and not math.isfinite(candidate):
+            return None
+        val = int(candidate)
+        return val if val >= 0 else None
+    return None
+
+
 @dataclass
 class BackendResponse:
     """Result of a backend call (non-streaming)."""
@@ -171,6 +209,10 @@ class BackendResponse:
     input_tokens: int
     output_tokens: int
     finish_reason: str | None = None
+    # Phase 2a: prompt tokens served from the backend prefix cache, when the
+    # backend reports it (vLLM). None == backend didn't say (llama.cpp) → NULL
+    # in telemetry so the per-caller rollup marks it n/a, not a 0% hit.
+    cached_tokens: int | None = None
 
 
 @dataclass
@@ -308,6 +350,7 @@ class BackendClientPool:
         input_tokens = 0
         output_tokens = 0
         usage = body.get("usage") or {}
+        cached_tokens = extract_cached_tokens(usage)
         if usage:
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
@@ -339,6 +382,7 @@ class BackendClientPool:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             finish_reason=finish_reason,
+            cached_tokens=cached_tokens,
         )
 
     async def stream(
@@ -535,6 +579,7 @@ class BackendClientPool:
                 duration_s=duration,
                 input_tokens=usage.get("prompt_tokens", 0),
                 output_tokens=usage.get("completion_tokens", 0),
+                cached_tokens=extract_cached_tokens(usage),
             )
         except Exception:
             return None

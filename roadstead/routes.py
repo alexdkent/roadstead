@@ -116,6 +116,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_fleet_cache_stats(request: Request) -> Response:
         return await svc.handle_fleet_cache_stats(request)
 
+    async def handle_cache_attribution(request: Request) -> Response:
+        return await svc.handle_cache_attribution(request)
+
     async def handle_usage(request: Request) -> Response:
         return await svc.handle_usage(request)
 
@@ -147,6 +150,7 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         Route("/v1/fleet/savings", handle_fleet_savings, methods=["GET"]),
         Route("/v1/fleet/top-callers", handle_top_callers, methods=["GET"]),
         Route("/v1/fleet/cache-stats", handle_fleet_cache_stats, methods=["GET"]),
+        Route("/v1/fleet/cache-attribution", handle_cache_attribution, methods=["GET"]),
         Route("/v1/usage", handle_usage, methods=["GET"]),
         Route("/v1/series", handle_series, methods=["GET"]),
         # Phase 5F — operator drain for backend maintenance (internal-only/ACL).

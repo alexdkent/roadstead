@@ -27,6 +27,7 @@ stall.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 from typing import Any, List
@@ -122,8 +123,17 @@ async def _assert_no_hang_no_leak(proxy, resp: httpx.Response, label: str) -> No
     # is the Phase-1 target (see the module docstring + the xfail test).
     assert resp is not None, f"[{label}] proxy returned no response (hang?)"
     _ = resp.text
-    # slot-accounting invariant (this the proxy DOES hold today, even on crash):
-    # a sync POST resolves synchronously, so in-flight must be back to baseline.
+    # slot-accounting invariant. A sync POST resolves synchronously, but a fuzz
+    # body can set stream:true → the buffered response can return a beat before
+    # the detached dispatch task runs record_completion and frees the slot. That
+    # release lags the client by an event-loop turn or two, widening under
+    # container load — so poll briefly for settle rather than checking the raw
+    # instant (mirrors test_e2e_adversarial._assert_no_leak). The invariant is
+    # "no LEAK", i.e. it returns to baseline promptly, not "zero on the same tick".
+    for _ in range(100):
+        if proxy.total_in_flight() == 0:
+            break
+        await asyncio.sleep(0.02)
     assert proxy.total_in_flight() == 0, f"[{label}] slot leak: in-flight != 0"
 
 

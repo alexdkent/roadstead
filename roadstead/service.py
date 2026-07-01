@@ -576,6 +576,9 @@ class ProxyService:
     async def handle_fleet_cache_stats(self, request: Request) -> Response:
         return await self._http.handle_fleet_cache_stats(request)
 
+    async def handle_cache_attribution(self, request: Request) -> Response:
+        return await self._http.handle_cache_attribution(request)
+
     async def handle_usage(self, request: Request) -> Response:
         return await self._http.handle_usage(request)
 

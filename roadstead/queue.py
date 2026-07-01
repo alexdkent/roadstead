@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS proxy_completions (
     priority         INTEGER NOT NULL,
     input_tokens     INTEGER,
     output_tokens    INTEGER,
+    -- Phase 2a prefix-cache attribution: prompt tokens the backend served from
+    -- its KV prefix cache (vLLM usage.prompt_tokens_details.cached_tokens).
+    -- NULL when the backend doesn't report it (llama.cpp) — distinct from 0
+    -- (a real cold miss) so the per-caller rollup marks it n/a, not 0% hit.
+    cached_tokens    INTEGER,
     duration_s       REAL,
     queue_wait_ms    REAL,
     status           TEXT NOT NULL,
@@ -231,6 +236,7 @@ class PersistentQueue:
             "caller_id": "TEXT",
             "finish_reason": "TEXT",
             "kind": "TEXT",
+            "cached_tokens": "INTEGER",  # Phase 2a prefix-cache attribution
         })
         # Index supporting the fleet-usage rollups (group by endpoint over a
         # recent window) now that the table holds whole-fleet call metrics.
@@ -570,6 +576,7 @@ class PersistentQueue:
         caller_id: str | None = None,
         finish_reason: str | None = None,
         kind: str | None = "llm",
+        cached_tokens: int | None = None,
     ) -> None:
         if not self._conn:
             return
@@ -583,13 +590,13 @@ class PersistentQueue:
         self._w(
             "INSERT OR REPLACE INTO proxy_completions "
             "(request_id, agent_id, endpoint, call_site, priority, "
-            " input_tokens, output_tokens, duration_s, queue_wait_ms, "
+            " input_tokens, output_tokens, cached_tokens, duration_s, queue_wait_ms, "
             " status, completed_at, payload_json, response_json, "
             " session_id, turn_id, caller_id, finish_reason, kind) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 request_id, agent_id, endpoint, call_site, priority,
-                input_tokens, output_tokens, duration_s, queue_wait_ms,
+                input_tokens, output_tokens, cached_tokens, duration_s, queue_wait_ms,
                 status, now, payload_s, response_s,
                 session_id, turn_id, caller_id, finish_reason, kind,
             ),
@@ -1184,6 +1191,77 @@ class PersistentQueue:
             })
         return {"endpoint": ep, "window_s": window_s, "bin_s": bin_s,
                 "now": now, "calls_series": series}
+
+    def cache_attribution(self, window_s: int = 3600, limit: int = 40) -> dict:
+        """Phase 2a — per-caller prefix-cache attribution (the Tier-2 the
+        observability doc specced but never built).
+
+        Hit rate = ``sum(cached_tokens) / sum(input_tokens)`` computed ONLY over
+        rows where the backend actually reported ``cached_tokens`` (vLLM). Rows
+        where it is NULL (llama.cpp exposes no such counter) are EXCLUDED from
+        the ratio and surfaced separately as ``unattributed_calls`` — so a
+        non-reporting backend can never masquerade as a 0% hit rate and drag the
+        number down (the exact ~4.8% attribution artifact this fixes).
+
+        Returns per-(call_site,endpoint) rows ranked by volume, a per-endpoint
+        rollup, and a fleet total. ``hit_rate`` is ``None`` (n/a) whenever no
+        call in the group carried an attributable count."""
+        empty = {"window_s": window_s, "now": None, "by_call_site": [],
+                 "by_endpoint": [], "fleet": None}
+        if not self._conn:
+            return empty
+        now = time.time()
+        since = now - window_s
+        # attributable_in only counts input_tokens on rows that reported cache
+        # data, so the ratio's denominator matches its numerator's population.
+        _attr_in = ("SUM(CASE WHEN cached_tokens IS NOT NULL "
+                    "THEN COALESCE(input_tokens,0) ELSE 0 END)")
+        select_tail = (
+            "COUNT(*) AS calls, "
+            "COUNT(cached_tokens) AS attributed_calls, "
+            "COALESCE(SUM(cached_tokens),0) AS cached_in, "
+            f"{_attr_in} AS attributable_in ")
+
+        def _row(cols: tuple, label_keys: list[str]) -> dict:
+            *labels, calls, attributed, cached_in, attributable_in = cols
+            attributable_in = int(attributable_in or 0)
+            cached_in = int(cached_in or 0)
+            out = {k: v for k, v in zip(label_keys, labels)}
+            out.update({
+                "calls": int(calls or 0),
+                "attributed_calls": int(attributed or 0),
+                "unattributed_calls": int(calls or 0) - int(attributed or 0),
+                "cached_tokens": cached_in,
+                "attributable_input_tokens": attributable_in,
+                "hit_rate": (round(cached_in / attributable_in, 4)
+                             if attributable_in > 0 else None),
+            })
+            return out
+
+        # kind='chat' is the prefix-cacheable LLM class — cached_tokens only ever
+        # rides chat usage (vLLM); embed/rerank + non-LLM external calls have no
+        # prefix cache and are correctly excluded.
+        where = "FROM proxy_completions WHERE completed_at >= ? AND kind = 'chat' "
+        cs_rows = self._reader().execute(
+            "SELECT call_site, endpoint, " + select_tail + where +
+            "GROUP BY call_site, endpoint ORDER BY calls DESC LIMIT ?",
+            (since, limit),
+        ).fetchall()
+        ep_rows = self._reader().execute(
+            "SELECT endpoint, " + select_tail + where +
+            "GROUP BY endpoint ORDER BY calls DESC",
+            (since,),
+        ).fetchall()
+        fleet_row = self._reader().execute(
+            "SELECT 'fleet', " + select_tail + where,
+            (since,),
+        ).fetchone()
+        return {
+            "window_s": window_s, "now": now,
+            "by_call_site": [_row(r, ["call_site", "endpoint"]) for r in cs_rows],
+            "by_endpoint": [_row(r, ["endpoint"]) for r in ep_rows],
+            "fleet": _row(fleet_row, ["scope"]) if fleet_row else None,
+        }
 
     def top_callers(self, window_s: int = 3600, per_endpoint: int = 5) -> dict:
         """Top calling agents per endpoint over a recent window:

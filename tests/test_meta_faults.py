@@ -149,8 +149,8 @@ def test_meta_phantom_tool_calls(server):
 
 def test_meta_timeout_delays(server):
     t0 = time.monotonic()
-    _chat(server, fb.FAULT_TIMEOUT, arg=0.4)
-    assert time.monotonic() - t0 >= 0.35
+    _chat(server, fb.FAULT_TIMEOUT, arg=0.2)
+    assert time.monotonic() - t0 >= 0.15
 
 
 def test_meta_capacity_desync(server):
@@ -175,16 +175,16 @@ def test_meta_capacity_desync(server):
 
 def test_meta_ttft_stall(server):
     t0 = time.monotonic()
-    lines = _stream_lines(server, fb.FAULT_TTFT_STALL, arg=0.4)
+    lines = _stream_lines(server, fb.FAULT_TTFT_STALL, arg=0.2)
     # first data frame arrives only after the stall
-    assert time.monotonic() - t0 >= 0.35
+    assert time.monotonic() - t0 >= 0.15
     assert any(ln.startswith("data: ") for ln in lines)
 
 
 def test_meta_intertoken_stall(server):
     t0 = time.monotonic()
-    _stream_lines(server, fb.FAULT_INTERTOKEN_STALL, arg=0.4)
-    assert time.monotonic() - t0 >= 0.35
+    _stream_lines(server, fb.FAULT_INTERTOKEN_STALL, arg=0.2)
+    assert time.monotonic() - t0 >= 0.15
 
 
 def test_meta_mid_stream_reset(server):
