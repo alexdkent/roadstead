@@ -43,3 +43,19 @@ def _no_network_probes(monkeypatch):
     monkeypatch.setattr(BackendClientPool, "probe_vllm_capacity", _none)
     monkeypatch.setattr(BackendClientPool, "probe_health", _down)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _fast_retry_backoff(monkeypatch):
+    """Collapse the transient-retry backoff for the whole suite. Production
+    sleeps ``_RETRY_BACKOFF_S`` (0.5s) between dispatch retries; every
+    retry-path test (empty-rescue, transient-unavailable, backend-timeout
+    retry) pays that real wall-clock, and there are many — ~3-4s of pure sleep
+    across the suite that a loaded-container tollgate can ill afford. No test
+    asserts the backoff DURATION (only retry OUTCOMES + slot accounting), so
+    shrinking it is behaviour-equivalent for what's under test. lifecycle reads
+    the module global at call time, so patching the module attribute takes
+    effect. Doctrine: shrink the corpus/waits, never raise the budget."""
+    monkeypatch.setattr(
+        "originfleet.llmproxy.lifecycle._RETRY_BACKOFF_S", 0.02, raising=False)
+    yield

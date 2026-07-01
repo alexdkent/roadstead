@@ -260,6 +260,28 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
             body=body, headers={k: v for k, v in request.headers.items()},
         ))
 
+    async def _sleep_or_disconnect(
+        request: Request, seconds: float, step: float = 0.05,
+    ) -> None:
+        """Sleep up to ``seconds`` but return the instant the client
+        disconnects. A plain (non-streaming) Response handler is NOT cancelled
+        by uvicorn on client disconnect, so a naive ``asyncio.sleep(arg)`` keeps
+        the fake's worker busy for the full ``arg`` even after the proxy aborts
+        at its own deadline — which then blocks fixture teardown (thread-join)
+        for ~arg seconds. Polling for disconnect preserves the injected-timeout
+        semantics (outlast the caller deadline) while freeing the worker
+        promptly. StreamingResponse handlers already self-cancel on disconnect,
+        so only the sync timeout fault needs this."""
+        elapsed = 0.0
+        while elapsed < seconds:
+            try:
+                if await request.is_disconnected():
+                    return
+            except Exception:
+                return
+            await asyncio.sleep(min(step, seconds - elapsed))
+            elapsed += step
+
     # ---- chat completions (sync + stream) -------------------------------- #
     async def chat(request: Request) -> Response:
         try:
@@ -295,7 +317,7 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
         if fault == FAULT_HTTP_503:
             return JSONResponse({"error": "unavailable (injected)"}, status_code=503)
         if fault == FAULT_TIMEOUT:
-            await asyncio.sleep(arg if arg > 0 else 2.0)
+            await _sleep_or_disconnect(request, arg if arg > 0 else 2.0)
             # If the caller hasn't already abandoned us, still answer.
             return JSONResponse(_completion_body("late: " + _last_user_text(body)))
 
