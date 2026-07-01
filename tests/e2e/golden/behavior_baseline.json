@@ -1,0 +1,328 @@
+{
+  "chat_stream_happy": {
+    "frames": [
+      "{\"choices\": [{\"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null, \"index\": 0}], \"id\": \"<id>\", \"object\": \"chat.completion.chunk\"}",
+      "{\"choices\": [{\"delta\": {\"content\": \"echo: \"}, \"finish_reason\": null, \"index\": 0}], \"id\": \"<id>\", \"object\": \"chat.completion.chunk\"}",
+      "{\"choices\": [{\"delta\": {\"content\": \"one \"}, \"finish_reason\": null, \"index\": 0}], \"id\": \"<id>\", \"object\": \"chat.completion.chunk\"}",
+      "{\"choices\": [{\"delta\": {\"content\": \"two \"}, \"finish_reason\": null, \"index\": 0}], \"id\": \"<id>\", \"object\": \"chat.completion.chunk\"}",
+      "{\"choices\": [{\"delta\": {\"content\": \"three \"}, \"finish_reason\": null, \"index\": 0}], \"id\": \"<id>\", \"object\": \"chat.completion.chunk\"}",
+      "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"stop\", \"index\": 0}], \"id\": \"<id>\", \"object\": \"chat.completion.chunk\"}",
+      "[DONE]"
+    ],
+    "mode": "stream",
+    "status_code": 200
+  },
+  "chat_stream_truncated_tool_calls": {
+    "frames": [
+      "{\"choices\": [{\"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null, \"index\": 0}], \"id\": \"<id>\", \"object\": \"chat.completion.chunk\"}",
+      "{\"choices\": [{\"delta\": {}, \"finish_reason\": null, \"index\": 0}], \"id\": \"<id>\", \"object\": \"chat.completion.chunk\"}",
+      "{\"choices\": [{\"delta\": {}, \"finish_reason\": \"length\", \"index\": 0}], \"id\": \"<id>\", \"object\": \"chat.completion.chunk\"}",
+      "[DONE]"
+    ],
+    "mode": "stream",
+    "status_code": 200
+  },
+  "chat_sync_degenerate_loop": {
+    "body": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea the song of the sea",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "<id>",
+      "model": "fake-model",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 200,
+        "prompt_tokens": 12,
+        "total_tokens": 212
+      }
+    },
+    "mode": "sync",
+    "status_code": 200
+  },
+  "chat_sync_empty_completion": {
+    "body": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "echo: hello world",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "<id>",
+      "model": "fake-model",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 12,
+        "total_tokens": 15
+      }
+    },
+    "mode": "sync",
+    "status_code": 200
+  },
+  "chat_sync_finish_length": {
+    "body": {
+      "choices": [
+        {
+          "finish_reason": "length",
+          "index": 0,
+          "message": {
+            "content": "truncated mid-thought",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "<id>",
+      "model": "fake-model",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 2,
+        "prompt_tokens": 12,
+        "total_tokens": 14
+      }
+    },
+    "mode": "sync",
+    "status_code": 200
+  },
+  "chat_sync_grammar": {
+    "body": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "echo: play something mellow for the evening",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "<id>",
+      "model": "fake-model",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 7,
+        "prompt_tokens": 12,
+        "total_tokens": 19
+      }
+    },
+    "mode": "sync",
+    "status_code": 200
+  },
+  "chat_sync_happy": {
+    "body": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "echo: hello world",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "<id>",
+      "model": "fake-model",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 12,
+        "total_tokens": 15
+      }
+    },
+    "mode": "sync",
+    "status_code": 200
+  },
+  "chat_sync_http_500": {
+    "body": {
+      "error": {
+        "code": "backend_error",
+        "message": "backend error 500: {\"error\":\"internal error (injected)\"}",
+        "type": "backend_error"
+      }
+    },
+    "mode": "sync",
+    "status_code": 502
+  },
+  "chat_sync_phantom_tool_calls": {
+    "body": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"x\": 1",
+                  "name": "do_thing"
+                },
+                "id": "call_0",
+                "type": "function"
+              }
+            ]
+          }
+        }
+      ],
+      "created": 0,
+      "id": "<id>",
+      "model": "fake-model",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 1,
+        "prompt_tokens": 12,
+        "total_tokens": 13
+      }
+    },
+    "mode": "sync",
+    "status_code": 200
+  },
+  "chat_sync_timeout": {
+    "body": {
+      "error": {
+        "code": "proxy_timeout",
+        "message": "proxy timeout after 0s",
+        "type": "proxy_timeout"
+      }
+    },
+    "mode": "sync",
+    "status_code": 504
+  },
+  "chat_sync_vllm_happy": {
+    "body": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "content": "echo: vllm path",
+            "role": "assistant"
+          }
+        }
+      ],
+      "created": 0,
+      "id": "<id>",
+      "model": "fake-model",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 3,
+        "prompt_tokens": 12,
+        "total_tokens": 15
+      }
+    },
+    "mode": "sync",
+    "status_code": 200
+  },
+  "embeddings_error": {
+    "body": {
+      "error": {
+        "code": "backend_error",
+        "message": "backend error 500: {\"error\":\"embed failed (injected)\"}",
+        "type": "backend_error"
+      }
+    },
+    "mode": "sync",
+    "status_code": 502
+  },
+  "embeddings_happy": {
+    "body": {
+      "data": [
+        {
+          "embedding": [
+            0.01,
+            0.01,
+            0.01,
+            0.01,
+            0.01,
+            0.01,
+            0.01,
+            0.01
+          ],
+          "index": 0,
+          "object": "embedding"
+        },
+        {
+          "embedding": [
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02
+          ],
+          "index": 1,
+          "object": "embedding"
+        }
+      ],
+      "model": "fake-model",
+      "object": "list",
+      "usage": {
+        "completion_tokens": 0,
+        "prompt_tokens": 8,
+        "total_tokens": 8
+      }
+    },
+    "mode": "sync",
+    "status_code": 200
+  },
+  "submit_sync_happy": {
+    "body": {
+      "backend_latency_ms": 0,
+      "estimated_cost_ss": 0,
+      "queue_wait_ms": 0,
+      "request_id": "<rid>",
+      "response": {
+        "choices": [
+          {
+            "finish_reason": "stop",
+            "index": 0,
+            "message": {
+              "content": "echo: internal hi",
+              "role": "assistant"
+            }
+          }
+        ],
+        "created": 0,
+        "id": "<id>",
+        "model": "fake-model",
+        "object": "chat.completion",
+        "usage": {
+          "completion_tokens": 3,
+          "prompt_tokens": 12,
+          "total_tokens": 15
+        }
+      },
+      "status": "ok"
+    },
+    "mode": "sync",
+    "status_code": 200
+  },
+  "submit_sync_http_500": {
+    "body": {
+      "code": "backend_error",
+      "error": "backend error 500: {\"error\":\"internal error (injected)\"}",
+      "request_id": "<rid>",
+      "status": "error"
+    },
+    "mode": "sync",
+    "status_code": 502
+  }
+}
