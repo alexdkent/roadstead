@@ -1,0 +1,620 @@
+"""Programmable fake inference backend for the LLM-proxy Phase-T harness.
+
+This is the single most-reused asset in the LLMProxy v2 test plan. It is an
+ASGI (Starlette) app that faithfully mimics **every south-face surface the proxy
+calls** — for both wire shapes the proxy speaks:
+
+  POST /v1/chat/completions   (sync JSON + streaming SSE)   — llama.cpp & vLLM
+  POST /embed                 (embeddings shim)
+  POST /rerank                (rerank shim)
+  GET  /props                 (llama.cpp capacity discovery)
+  GET  /v1/models             (served-model id + vLLM max_model_len)
+  GET  /metrics               (vLLM Prometheus prefix-cache counters)
+  GET  /health                (liveness)
+
+It serves correct happy-path responses AND, on command, any **south-face
+pathology** the proxy must survive: truncated/invalid JSON, empty completion,
+degenerate repetition, wrong/invalid schema, phantom & truncated tool_calls,
+partial/interleaved SSE frames, TTFT stall, inter-token stall, mid-stream reset,
+4xx/5xx, timeout, capacity desync, slow-drain.
+
+Fault selection, per request, in priority order:
+  1. the ``X-Fault`` request header (+ optional ``X-Fault-Arg`` numeric arg) — so a
+     single running server can serve a *different* fault per call (needed for the
+     duplicate-storm / mixed-traffic tests);
+  2. the controller's ``default_fault`` (set by a test via ``FakeBackend.set_fault``).
+
+The app is normally driven through :class:`FakeBackendServer`, which runs uvicorn
+on a real ephemeral 127.0.0.1 socket in a background thread, so the proxy's real
+``httpx`` client + real SSE framing are exercised end-to-end (higher fidelity than
+an in-process ``MockTransport`` for the mid-stream/reset/interleaved-frame faults).
+A ``MockTransport`` handler (:func:`mock_transport_handler`) is also exported for
+pure-unit cases that don't need a socket.
+
+Kept dependency-free beyond Starlette/uvicorn/httpx (all already fleet deps) and
+Python-3.9-safe (``from __future__ import annotations``) so it runs both on the dev
+Mac and in-container.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import socket
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
+
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from starlette.routing import Route
+
+
+# --------------------------------------------------------------------------- #
+# Fault catalogue
+# --------------------------------------------------------------------------- #
+# Names are the single source of truth for both the fake and the meta-tests that
+# assert each fault actually fires. Keep this list and the handlers in sync; the
+# meta-test iterates ALL_FAULTS.
+
+# Happy path.
+FAULT_NONE = "none"
+
+# --- non-streaming HTTP-status / body pathologies ---
+FAULT_HTTP_400 = "http_400"            # 4xx  -> BackendError(400)
+FAULT_HTTP_500 = "http_500"            # 5xx  -> BackendError(500)
+FAULT_HTTP_503 = "http_503"            # 503  -> BackendError(503)
+FAULT_TRUNCATED_JSON = "truncated_json"  # 200 with unparseable body
+FAULT_EMPTY_COMPLETION = "empty_completion"  # 200, blank content, no tool_calls -> proxy 502
+FAULT_NO_USAGE = "no_usage"            # 200 valid, but usage block omitted
+FAULT_FINISH_LENGTH = "finish_length"  # finish_reason=length (truncation signal)
+FAULT_DEGENERATE_LOOP = "degenerate_loop"  # same long n-gram repeated many times
+FAULT_SCHEMA_VALID_WRONG = "schema_valid_wrong"    # valid JSON, semantically wrong
+FAULT_SCHEMA_INVALID = "schema_invalid"            # parseable JSON, violates declared schema
+FAULT_PHANTOM_TOOL_CALLS = "phantom_tool_calls"    # tool_calls w/ malformed args, empty content
+
+# --- streaming (SSE) pathologies ---
+FAULT_TTFT_STALL = "ttft_stall"        # delay before first chunk (arg=seconds)
+FAULT_INTERTOKEN_STALL = "intertoken_stall"  # delay between chunks (arg=seconds)
+FAULT_MID_STREAM_RESET = "mid_stream_reset"  # abort the connection mid-stream
+FAULT_PARTIAL_SSE = "partial_sse"      # a data: frame split across writes / incomplete
+FAULT_INTERLEAVED_SSE = "interleaved_sse"    # comment/keepalive lines interleaved with frames
+FAULT_NO_DONE = "no_done"              # stream ends without the [DONE] sentinel
+FAULT_SLOW_DRAIN = "slow_drain"        # valid stream, tokens emitted slowly (arg=seconds/token)
+FAULT_TRUNCATED_TOOL_CALLS = "truncated_tool_calls"  # streamed tool_call args cut off mid-JSON
+
+# --- transport / capacity ---
+FAULT_TIMEOUT = "timeout"              # sleep past the caller deadline (arg=seconds)
+FAULT_CAPACITY_DESYNC = "capacity_desync"  # accept only N concurrent, 503 beyond (props lies)
+
+ALL_FAULTS: Tuple[str, ...] = (
+    FAULT_NONE,
+    FAULT_HTTP_400, FAULT_HTTP_500, FAULT_HTTP_503,
+    FAULT_TRUNCATED_JSON, FAULT_EMPTY_COMPLETION, FAULT_NO_USAGE,
+    FAULT_FINISH_LENGTH, FAULT_DEGENERATE_LOOP,
+    FAULT_SCHEMA_VALID_WRONG, FAULT_SCHEMA_INVALID, FAULT_PHANTOM_TOOL_CALLS,
+    FAULT_TTFT_STALL, FAULT_INTERTOKEN_STALL, FAULT_MID_STREAM_RESET,
+    FAULT_PARTIAL_SSE, FAULT_INTERLEAVED_SSE, FAULT_NO_DONE, FAULT_SLOW_DRAIN,
+    FAULT_TRUNCATED_TOOL_CALLS,
+    FAULT_TIMEOUT, FAULT_CAPACITY_DESYNC,
+)
+
+# Faults meaningful only on the streaming path.
+STREAM_ONLY_FAULTS: Tuple[str, ...] = (
+    FAULT_TTFT_STALL, FAULT_INTERTOKEN_STALL, FAULT_MID_STREAM_RESET,
+    FAULT_PARTIAL_SSE, FAULT_INTERLEAVED_SSE, FAULT_NO_DONE, FAULT_SLOW_DRAIN,
+    FAULT_TRUNCATED_TOOL_CALLS,
+)
+
+
+class MidStreamReset(RuntimeError):
+    """Raised inside the SSE generator to abort the connection mid-body so the
+    real httpx client sees a RemoteProtocolError (proxy -> BackendUnavailable)."""
+
+
+@dataclass
+class RecordedRequest:
+    """One backend call the fake received — inspected by tests/meta-tests."""
+    method: str
+    path: str
+    fault: str
+    body: Optional[dict]
+    headers: Dict[str, str]
+
+
+@dataclass
+class FakeBackend:
+    """Mutable controller shared by the ASGI app and the test.
+
+    A test flips ``default_fault`` (and optional ``fault_arg``) to steer every
+    subsequent call, or sends a per-call ``X-Fault`` header. All received calls
+    are recorded in ``requests`` for assertions.
+    """
+    # engine shape this endpoint imitates: "llama.cpp" or "vllm"
+    engine: str = "llama.cpp"
+    served_model_id: str = "fake-model"
+    props_n_parallel: int = 4
+    props_n_ctx: int = 32768
+    max_model_len: int = 40960
+    # prefix-cache counters exposed on /metrics (vLLM shape)
+    prefix_cache_hits: int = 0
+    prefix_cache_queries: int = 0
+
+    default_fault: str = FAULT_NONE
+    fault_arg: float = 0.0
+    # Apply the default fault at most this many times, then serve happy — models
+    # a TRANSIENT backend fault that recovers on retry (degeneration re-dispatch,
+    # empty-rescue). 0 = unlimited (persistent fault). Header-driven faults are
+    # never rate-limited (they are per-call by construction).
+    fault_max_hits: int = 0
+    # For FAULT_CAPACITY_DESYNC: accept at most this many concurrent chat calls.
+    accept_limit: int = 1
+
+    requests: List[RecordedRequest] = field(default_factory=list)
+    # live concurrency counter (capacity_desync)
+    _inflight: int = 0
+    _hits: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def set_fault(self, name: str, arg: float = 0.0, max_hits: int = 0) -> None:
+        if name not in ALL_FAULTS:
+            raise ValueError(f"unknown fault {name!r}")
+        self.default_fault = name
+        self.fault_arg = arg
+        self.fault_max_hits = max_hits
+        self._hits = 0
+
+    def reset(self) -> None:
+        self.default_fault = FAULT_NONE
+        self.fault_arg = 0.0
+        self.fault_max_hits = 0
+        self.requests.clear()
+        with self._lock:
+            self._inflight = 0
+            self._hits = 0
+
+    # -- fault resolution --------------------------------------------------- #
+    def _resolve_fault(self, request: Request) -> Tuple[str, float]:
+        hdr = request.headers.get("x-fault")
+        if hdr:
+            arg_raw = request.headers.get("x-fault-arg", "")
+            try:
+                arg = float(arg_raw) if arg_raw else 0.0
+            except ValueError:
+                arg = 0.0
+            return hdr, arg
+        if self.default_fault != FAULT_NONE and self.fault_max_hits:
+            with self._lock:
+                if self._hits >= self.fault_max_hits:
+                    return FAULT_NONE, 0.0
+                self._hits += 1
+        return self.default_fault, self.fault_arg
+
+
+# --------------------------------------------------------------------------- #
+# Response builders
+# --------------------------------------------------------------------------- #
+
+def _last_user_text(body: Optional[dict]) -> str:
+    if not body:
+        return ""
+    msgs = body.get("messages") or []
+    for m in reversed(msgs):
+        if isinstance(m, dict) and m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):  # OpenAI multimodal content parts
+                for part in c:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        return str(part.get("text", ""))
+    return ""
+
+
+def _completion_body(content: str, *, finish: str = "stop",
+                     with_usage: bool = True,
+                     tool_calls: Optional[list] = None) -> dict:
+    msg: Dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        msg["tool_calls"] = tool_calls
+    body: Dict[str, Any] = {
+        "id": "chatcmpl-fake",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "fake-model",
+        "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+    }
+    if with_usage:
+        pt = 12
+        ct = max(1, len(content.split()))
+        body["usage"] = {"prompt_tokens": pt, "completion_tokens": ct,
+                         "total_tokens": pt + ct}
+    return body
+
+
+def _sse(obj: dict) -> bytes:
+    return ("data: " + json.dumps(obj) + "\n\n").encode()
+
+
+def _chunk(delta: dict, finish: Optional[str] = None) -> dict:
+    return {
+        "id": "chatcmpl-fake",
+        "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# App factory
+# --------------------------------------------------------------------------- #
+
+def make_fake_app(controller: FakeBackend) -> Starlette:
+    """Build the Starlette ASGI app bound to ``controller``."""
+
+    async def _record(request: Request, fault: str, body: Optional[dict]) -> None:
+        controller.requests.append(RecordedRequest(
+            method=request.method, path=request.url.path, fault=fault,
+            body=body, headers={k: v for k, v in request.headers.items()},
+        ))
+
+    # ---- chat completions (sync + stream) -------------------------------- #
+    async def chat(request: Request) -> Response:
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        fault, arg = controller._resolve_fault(request)
+        await _record(request, fault, body)
+        streaming = bool(body and body.get("stream"))
+
+        # capacity desync applies to both sync/stream: 503 once over the limit.
+        if fault == FAULT_CAPACITY_DESYNC:
+            with controller._lock:
+                controller._inflight += 1
+                over = controller._inflight > controller.accept_limit
+            if over:
+                with controller._lock:
+                    controller._inflight -= 1
+                return JSONResponse({"error": "no slot available"}, status_code=503)
+            try:
+                await asyncio.sleep(max(arg, 0.05))
+                return JSONResponse(_completion_body(
+                    "echo: " + _last_user_text(body)))
+            finally:
+                with controller._lock:
+                    controller._inflight -= 1
+
+        # transport faults
+        if fault == FAULT_HTTP_400:
+            return JSONResponse({"error": "bad request (injected)"}, status_code=400)
+        if fault == FAULT_HTTP_500:
+            return JSONResponse({"error": "internal error (injected)"}, status_code=500)
+        if fault == FAULT_HTTP_503:
+            return JSONResponse({"error": "unavailable (injected)"}, status_code=503)
+        if fault == FAULT_TIMEOUT:
+            await asyncio.sleep(arg if arg > 0 else 2.0)
+            # If the caller hasn't already abandoned us, still answer.
+            return JSONResponse(_completion_body("late: " + _last_user_text(body)))
+
+        if streaming:
+            return _stream_response(body, fault, arg)
+
+        # non-streaming body pathologies
+        if fault == FAULT_TRUNCATED_JSON:
+            # 200 with an unparseable body: proxy resp.json() fails -> {"raw":..}
+            # -> chat path sees no choices -> empty-completion 502.
+            return PlainTextResponse(
+                '{"choices":[{"message":{"content":"hel',
+                status_code=200, media_type="application/json")
+        if fault == FAULT_EMPTY_COMPLETION:
+            return JSONResponse(_completion_body(""))
+        if fault == FAULT_NO_USAGE:
+            return JSONResponse(_completion_body(
+                "echo: " + _last_user_text(body), with_usage=False))
+        if fault == FAULT_FINISH_LENGTH:
+            return JSONResponse(_completion_body(
+                "truncated mid-thought", finish="length"))
+        if fault == FAULT_DEGENERATE_LOOP:
+            loop = ("the song of the sea " * 40).strip()
+            return JSONResponse(_completion_body(loop))
+        if fault == FAULT_SCHEMA_VALID_WRONG:
+            # valid JSON object, but not what the (declared) schema wanted.
+            return JSONResponse(_completion_body('{"unexpected": "shape", "n": 1}'))
+        if fault == FAULT_SCHEMA_INVALID:
+            # parseable JSON with a trailing-prose tail — the classic
+            # "parseable but schema-invalid" case Phase 3 must repair.
+            return JSONResponse(_completion_body(
+                '{"answer": "yes"} — and here is some extra prose the schema forbids'))
+        if fault == FAULT_PHANTOM_TOOL_CALLS:
+            # tool_calls present (so the empty-content gate is bypassed) but the
+            # arguments are malformed JSON — the Phase-3 tool backstop target.
+            tc = [{
+                "id": "call_0", "type": "function",
+                "function": {"name": "do_thing", "arguments": '{"x": 1'},
+            }]
+            return JSONResponse(_completion_body("", tool_calls=tc))
+
+        # happy path
+        return JSONResponse(_completion_body("echo: " + _last_user_text(body)))
+
+    def _stream_response(body: Optional[dict], fault: str, arg: float) -> StreamingResponse:
+        text = "echo: " + _last_user_text(body)
+        tokens = text.split(" ")
+
+        async def gen() -> AsyncIterator[bytes]:
+            # role preamble
+            if fault == FAULT_TTFT_STALL:
+                await asyncio.sleep(arg if arg > 0 else 1.0)
+            yield _sse(_chunk({"role": "assistant"}))
+
+            if fault == FAULT_MID_STREAM_RESET:
+                yield _sse(_chunk({"content": tokens[0] if tokens else "x"}))
+                # Abort the connection mid-body: real httpx sees RemoteProtocolError.
+                raise MidStreamReset("injected mid-stream reset")
+
+            if fault == FAULT_DEGENERATE_LOOP:
+                for _ in range(40):
+                    yield _sse(_chunk({"content": "the song of the sea "}))
+                yield _sse(_chunk({}, finish="stop"))
+                yield b"data: [DONE]\n\n"
+                return
+
+            if fault == FAULT_TRUNCATED_TOOL_CALLS:
+                # stream a tool_call whose argument JSON is cut off mid-object
+                yield _sse(_chunk({"tool_calls": [{
+                    "index": 0, "id": "call_0", "type": "function",
+                    "function": {"name": "do_thing", "arguments": '{"x":'},
+                }]}))
+                yield _sse(_chunk({}, finish="tool_calls"))
+                yield b"data: [DONE]\n\n"
+                return
+
+            if fault == FAULT_PARTIAL_SSE:
+                # emit a valid frame, then a *partial* data line with no
+                # terminating blank line, then finish properly.
+                yield _sse(_chunk({"content": "partial "}))
+                yield b'data: {"choices":[{"index":0,"delta":{"content":"cut'
+                yield _sse(_chunk({}, finish="stop"))
+                yield b"data: [DONE]\n\n"
+                return
+
+            for i, tok in enumerate(tokens):
+                if fault == FAULT_INTERTOKEN_STALL and i == 1:
+                    await asyncio.sleep(arg if arg > 0 else 1.0)
+                if fault == FAULT_SLOW_DRAIN:
+                    await asyncio.sleep(arg if arg > 0 else 0.02)
+                if fault == FAULT_INTERLEAVED_SSE:
+                    # SSE comment / keepalive lines the proxy parser must skip.
+                    yield b": keepalive\n\n"
+                    yield b"\n"
+                yield _sse(_chunk({"content": (tok + " ")}))
+
+            yield _sse(_chunk({}, finish="stop"))
+            # usage-only frame (include_usage) then DONE — unless suppressed.
+            yield _sse({
+                "id": "chatcmpl-fake", "object": "chat.completion.chunk",
+                "choices": [],
+                "usage": {"prompt_tokens": 12, "completion_tokens": len(tokens),
+                          "total_tokens": 12 + len(tokens)},
+            })
+            if fault != FAULT_NO_DONE:
+                yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    # ---- embeddings shim -------------------------------------------------- #
+    async def embed(request: Request) -> Response:
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        fault, arg = controller._resolve_fault(request)
+        await _record(request, fault, body)
+        if fault == FAULT_HTTP_500:
+            return JSONResponse({"error": "embed failed (injected)"}, status_code=500)
+        if fault == FAULT_TRUNCATED_JSON:
+            return PlainTextResponse('{"data":[{"embedding":[0.0,0.1', status_code=200,
+                                     media_type="application/json")
+        inputs = []
+        if body:
+            raw = body.get("input")
+            if isinstance(raw, list):
+                inputs = raw
+            elif raw is not None:
+                inputs = [raw]
+        if not inputs:
+            inputs = [""]
+        data = [{"object": "embedding", "index": i, "embedding": [0.01 * (i + 1)] * 8}
+                for i in range(len(inputs))]
+        return JSONResponse({
+            "object": "list", "data": data, "model": controller.served_model_id,
+            "usage": {"prompt_tokens": 8, "completion_tokens": 0, "total_tokens": 8},
+        })
+
+    # ---- rerank shim ------------------------------------------------------ #
+    async def rerank(request: Request) -> Response:
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        fault, arg = controller._resolve_fault(request)
+        await _record(request, fault, body)
+        if fault == FAULT_HTTP_500:
+            return JSONResponse({"error": "rerank failed (injected)"}, status_code=500)
+        docs = (body or {}).get("documents") or (body or {}).get("texts") or []
+        results = [{"index": i, "relevance_score": 1.0 / (i + 1)}
+                   for i in range(len(docs))]
+        return JSONResponse({"results": results,
+                             "usage": {"prompt_tokens": 8, "completion_tokens": 0}})
+
+    # ---- capacity / discovery probes ------------------------------------- #
+    async def props(request: Request) -> Response:
+        return JSONResponse({
+            "default_generation_settings": {
+                "n_parallel": controller.props_n_parallel,
+                "n_ctx": controller.props_n_ctx,
+            },
+            "total_slots": controller.props_n_parallel,
+            "slots": [{} for _ in range(controller.props_n_parallel)],
+            "n_ctx": controller.props_n_ctx,
+        })
+
+    async def models(request: Request) -> Response:
+        return JSONResponse({
+            "object": "list",
+            "data": [{
+                "id": controller.served_model_id, "object": "model",
+                "max_model_len": controller.max_model_len,
+            }],
+        })
+
+    async def metrics(request: Request) -> Response:
+        lines = [
+            "# HELP vllm:prefix_cache_hits_total Prefix cache hits.",
+            "# TYPE vllm:prefix_cache_hits_total counter",
+            'vllm:prefix_cache_hits_total{model_name="%s"} %d.0' % (
+                controller.served_model_id, controller.prefix_cache_hits),
+            'vllm:prefix_cache_queries_total{model_name="%s"} %d.0' % (
+                controller.served_model_id, controller.prefix_cache_queries),
+        ]
+        return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain")
+
+    async def health(request: Request) -> Response:
+        return JSONResponse({"status": "ok"})
+
+    routes = [
+        Route("/v1/chat/completions", chat, methods=["POST"]),
+        Route("/embed", embed, methods=["POST"]),
+        Route("/rerank", rerank, methods=["POST"]),
+        Route("/props", props, methods=["GET"]),
+        Route("/v1/models", models, methods=["GET"]),
+        Route("/metrics", metrics, methods=["GET"]),
+        Route("/health", health, methods=["GET"]),
+    ]
+    app = Starlette(routes=routes)
+    app.state.controller = controller
+    return app
+
+
+# --------------------------------------------------------------------------- #
+# Real-socket server (uvicorn in a background thread)
+# --------------------------------------------------------------------------- #
+
+def _free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
+
+
+class FakeBackendServer:
+    """Runs :func:`make_fake_app` on a real 127.0.0.1 socket in a daemon thread.
+
+    Usage::
+
+        srv = FakeBackendServer(FakeBackend(engine="vllm"))
+        srv.start()
+        try:
+            ...  # point an EndpointConfig at srv.host / srv.port
+        finally:
+            srv.stop()
+    """
+
+    def __init__(self, controller: Optional[FakeBackend] = None,
+                 host: str = "127.0.0.1", port: Optional[int] = None) -> None:
+        self.controller = controller or FakeBackend()
+        self.host = host
+        self.port = port or _free_port()
+        self.app = make_fake_app(self.controller)
+        self._server: Optional[uvicorn.Server] = None
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def start(self, timeout: float = 5.0) -> "FakeBackendServer":
+        config = uvicorn.Config(
+            self.app, host=self.host, port=self.port,
+            log_level="warning", access_log=False, lifespan="off",
+        )
+        self._server = uvicorn.Server(config)
+        # Silence uvicorn's install_signal_handlers (only valid on main thread).
+        self._server.install_signal_handlers = lambda: None
+        self._thread = threading.Thread(target=self._server.run, daemon=True,
+                                        name=f"fake-backend-{self.port}")
+        self._thread.start()
+        # wait until the socket accepts connections
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._server.started:
+                return self
+            try:
+                with socket.create_connection((self.host, self.port), timeout=0.1):
+                    return self
+            except OSError:
+                time.sleep(0.02)
+        raise RuntimeError(f"fake backend did not start on {self.url}")
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.should_exit = True
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        self._server = None
+        self._thread = None
+
+    def __enter__(self) -> "FakeBackendServer":
+        return self.start()
+
+    def __exit__(self, *exc: Any) -> None:
+        self.stop()
+
+
+# --------------------------------------------------------------------------- #
+# MockTransport handler (no socket — pure-unit fallback)
+# --------------------------------------------------------------------------- #
+
+def mock_transport_handler(controller: FakeBackend) -> Callable[[Any], Any]:
+    """Return an httpx.MockTransport handler serving the same happy-path shapes.
+
+    Only covers the non-streaming happy path + discovery probes — for the
+    streaming/reset/interleave faults use :class:`FakeBackendServer` (a real
+    socket). Handy where a test just needs a deterministic 200 without a thread.
+    """
+    import httpx
+
+    def handler(request: "httpx.Request") -> "httpx.Response":
+        path = request.url.path
+        if path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if path == "/props":
+            return httpx.Response(200, json={
+                "default_generation_settings": {
+                    "n_parallel": controller.props_n_parallel,
+                    "n_ctx": controller.props_n_ctx},
+                "total_slots": controller.props_n_parallel})
+        if path == "/v1/models":
+            return httpx.Response(200, json={"object": "list", "data": [{
+                "id": controller.served_model_id,
+                "max_model_len": controller.max_model_len}]})
+        if path == "/embed":
+            return httpx.Response(200, json={
+                "object": "list",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1] * 8}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 0}})
+        if path == "/rerank":
+            return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.9}]})
+        # chat
+        try:
+            body = json.loads(request.content.decode() or "{}")
+        except Exception:
+            body = {}
+        return httpx.Response(200, json=_completion_body("echo: " + _last_user_text(body)))
+
+    return handler
