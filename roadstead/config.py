@@ -399,6 +399,58 @@ def max_slots_reconcile_enabled() -> bool:
     )
 
 
+def endpoint_cooldown_enabled() -> bool:
+    """Step 4b ENFORCE: after ``cooldown_allowed_fails`` BACKEND-FAULT failures
+    (5xx / timeout / unavailable) within ``cooldown_window_s``, briefly mark an
+    endpoint unhealthy so the scheduler defers its traffic; auto-recovers after
+    ``cooldown_duration_s``. Catches a FLAKY backend (intermittent 5xx that never
+    strings ``health_fail_threshold`` in a row — which the consecutive-fail circuit
+    misses). Only DEFERS/DEGRADES — never reroutes across backends (that's Phase 4),
+    so a cache-sensitive interactive conversation is not cache-busted. Default OFF
+    == byte-identical. Env ``COLLECTIVE_PROXY_ENDPOINT_COOLDOWN``."""
+    return os.environ.get("COLLECTIVE_PROXY_ENDPOINT_COOLDOWN", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def endpoint_cooldown_shadow() -> bool:
+    """Step 4b SHADOW (review this first): count backend-fault failures + log a
+    'would cool' + surface the trip on /v1/status, but DON'T actually pull the
+    endpoint. Confirm the thresholds don't false-trip on this fleet's traffic, then
+    flip enforce. Default OFF. Env ``COLLECTIVE_PROXY_ENDPOINT_COOLDOWN_SHADOW``."""
+    return os.environ.get("COLLECTIVE_PROXY_ENDPOINT_COOLDOWN_SHADOW", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def cooldown_allowed_fails() -> int:
+    """Backend-fault failures within the window that trip a cooldown (default 4 —
+    above the 3-consecutive circuit so this catches the INTERMITTENT case).
+    Env ``COLLECTIVE_PROXY_COOLDOWN_ALLOWED_FAILS``."""
+    try:
+        return max(1, int(os.environ.get("COLLECTIVE_PROXY_COOLDOWN_ALLOWED_FAILS", "4")))
+    except ValueError:
+        return 4
+
+
+def cooldown_window_s() -> float:
+    """Sliding window over which ``cooldown_allowed_fails`` is counted (default 60s).
+    Env ``COLLECTIVE_PROXY_COOLDOWN_WINDOW_S``."""
+    try:
+        return max(1.0, float(os.environ.get("COLLECTIVE_PROXY_COOLDOWN_WINDOW_S", "60")))
+    except ValueError:
+        return 60.0
+
+
+def cooldown_duration_s() -> float:
+    """How long a tripped endpoint stays cooled before auto-recovery (default 30s).
+    Env ``COLLECTIVE_PROXY_COOLDOWN_DURATION_S``."""
+    try:
+        return max(1.0, float(os.environ.get("COLLECTIVE_PROXY_COOLDOWN_DURATION_S", "30")))
+    except ValueError:
+        return 30.0
+
+
 def thinking_reasoning_budget() -> int:
     """Tokens of reasoning headroom ADDED to a thinking request's max_tokens.
     Reasoning is generated <think> output and counts against max_tokens, so too

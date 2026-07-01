@@ -15,7 +15,17 @@ import time
 from typing import TYPE_CHECKING
 
 from . import cache_stats
-from .config import PriorityBand, max_slots_reconcile_enabled, normalize_endpoint
+from .backend import BackendError
+from .config import (
+    PriorityBand,
+    cooldown_allowed_fails,
+    cooldown_duration_s,
+    cooldown_window_s,
+    endpoint_cooldown_enabled,
+    endpoint_cooldown_shadow,
+    max_slots_reconcile_enabled,
+    normalize_endpoint,
+)
 from .observability import AlertCondition, check_alerts
 
 if TYPE_CHECKING:
@@ -52,6 +62,14 @@ class Health:
         # unhealthy so all the defer/fast-fail machinery applies immediately.
         if ep in self.state.paused_endpoints:
             return False
+        # Step 4b: rate-windowed cooldown (ENFORCE only). A flaky backend that
+        # tripped the cooldown reads unhealthy until it expires, so the scheduler
+        # defers its traffic (interactive was fast-failed at trip time); the next
+        # dispatch tick after expiry re-admits it (auto-recovery).
+        if endpoint_cooldown_enabled():
+            until = self.state.endpoint_cooldown_until.get(ep, 0.0)
+            if until and time.monotonic() < until:
+                return False
         # On-demand endpoints are intentionally unloaded when idle; availability
         # is gated by OnDemandManager.ensure_loaded (loads on demand or raises),
         # not the always-on poller probe. Don't let a probe of an unloaded
@@ -129,6 +147,48 @@ class Health:
             self.state.queue_db.persist_expire(req.request_id)
             self.state.resolve_error(
                 req, f"backend {ep_name} unavailable (circuit open)")
+    def record_dispatch_failure(self, endpoint: str, exc: Exception) -> None:
+        """Step 4b: feed the rate-windowed cooldown from the dispatch error paths.
+
+        Counts ONLY a BACKEND-FAULT failure (5xx / timeout=504 / unavailable=503 —
+        ``status_code >= 500``); a 4xx is the CALLER's fault and never cools the
+        backend. After ``cooldown_allowed_fails`` within ``cooldown_window_s``,
+        cool the endpoint (enforce → briefly unhealthy + fast-fail its queued
+        interactive, exactly like the circuit) or log a would-cool (shadow). No-op
+        — and zero cost — when both cooldown flags are off (byte-identical)."""
+        shadow = endpoint_cooldown_shadow()
+        enforce = endpoint_cooldown_enabled()
+        if not (shadow or enforce):
+            return
+        if not (isinstance(exc, BackendError) and exc.status_code >= 500):
+            return
+        ep = normalize_endpoint(endpoint)
+        now = time.monotonic()
+        window = cooldown_window_s()
+        times = self.state.endpoint_failure_times.setdefault(ep, [])
+        times.append(now)
+        cutoff = now - window
+        while times and times[0] < cutoff:
+            times.pop(0)
+        if len(times) < cooldown_allowed_fails():
+            return
+        # Tripped — reset the window and record the trip (surfaced on /v1/status
+        # even in shadow mode, so the operator can review before enforcing).
+        times.clear()
+        self.state.endpoint_cooldown_trips[ep] = (
+            self.state.endpoint_cooldown_trips.get(ep, 0) + 1)
+        dur = cooldown_duration_s()
+        if enforce:
+            self.state.endpoint_cooldown_until[ep] = now + dur
+            logger.warning(
+                "endpoint %s COOLED %.0fs — %d backend-fault failures within %.0fs "
+                "(flaky backend); deferring its queue, fast-failing interactive",
+                ep, dur, cooldown_allowed_fails(), window)
+            self.fast_fail_interactive(ep)
+        else:
+            logger.warning(
+                "endpoint %s WOULD cool %.0fs (SHADOW) — %d backend-fault failures "
+                "within %.0fs", ep, dur, cooldown_allowed_fails(), window)
     def evaluate_alerts(self, now: float) -> None:
         """Evaluate proxy-internal alert conditions (Phase 2.5) and surface them
         to logs (log_scan/health-verifier) + /v1/status. Never restarts a backend — a dead

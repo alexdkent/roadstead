@@ -264,6 +264,17 @@ class ProxyHttpHandlers:
             h = self.state.endpoint_health.get(ep_name, {})
             snap["healthy"] = h.get("healthy", True)
             snap["paused"] = not h.get("healthy", True)  # check_alerts (Phase 2.5) keys on this
+            # Step 4b — rate-windowed cooldown surface (shadow report + enforce
+            # state). `cooldown_trips` accrues even in shadow mode so the operator
+            # can review the trip rate before flipping enforce; `cooling` +
+            # `cooldown_remaining_s` reflect an ACTIVE (enforce) cooldown.
+            trips = self.state.endpoint_cooldown_trips.get(ep_name, 0)
+            if trips:
+                snap["cooldown_trips"] = trips
+            _cd_until = self.state.endpoint_cooldown_until.get(ep_name, 0.0)
+            if _cd_until and now < _cd_until:
+                snap["cooling"] = True
+                snap["cooldown_remaining_s"] = round(_cd_until - now, 1)
             # Survivorship fix (2026-06-06): the timeout-advice model + shadow
             # only ingest status==ok, so they reported a misleading "0 would
             # timeout" while requests were actually timing out. Surface the real

@@ -738,6 +738,7 @@ class Lifecycle:
                     req, layer="backend", elapsed_s=duration,
                     queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
                 )
+                self.health.record_dispatch_failure(req.endpoint, exc)  # Step 4b
                 return
             except (BackendUnavailable, BackendError) as exc:
                 duration = time.monotonic() - t0
@@ -779,6 +780,9 @@ class Lifecycle:
                     continue
                 self.state.resolve_error(req, str(exc))
                 self.record_completion(req, decision, duration, 0, 0, "error")
+                # Step 4b: count a backend-fault (5xx/503) toward the cooldown; a
+                # 4xx caller error is classified out inside record_dispatch_failure.
+                self.health.record_dispatch_failure(req.endpoint, exc)
                 return
 
             duration = time.monotonic() - t0
@@ -1002,11 +1006,13 @@ class Lifecycle:
                 req, layer="stream", elapsed_s=duration,
                 queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
             )
+            self.health.record_dispatch_failure(req.endpoint, exc)  # Step 4b (BackendTimeout only)
             return
         except Exception as exc:
             await stream_q.put({"type": "error", "error": str(exc)})
             duration = time.monotonic() - t0
             self.record_completion(req, decision, duration, input_tokens, output_tokens, "error")
+            self.health.record_dispatch_failure(req.endpoint, exc)  # Step 4b
             return
 
         duration = time.monotonic() - t0

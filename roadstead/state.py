@@ -148,6 +148,16 @@ class ProxyState:
         # so a planned drain never fires the endpoint_paused ERROR alert. The
         # poller skips paused endpoints; /resume hands them back to the poller.
         self.paused_endpoints: set[str] = set()
+        # Step 4b — rate-windowed per-endpoint cooldown. Complements the
+        # consecutive-fail circuit above: a FLAKY backend (intermittent 5xx that
+        # never strings ``health_fail_threshold`` in a row) trips THIS instead.
+        # Per endpoint: recent backend-fault dispatch-failure timestamps (sliding
+        # window), the monotonic time until which it's cooled (enforce only), and a
+        # trip counter for the shadow report. All empty/off by default → the
+        # feature is byte-identical until a cooldown flag is set.
+        self.endpoint_failure_times: dict[str, list[float]] = {}
+        self.endpoint_cooldown_until: dict[str, float] = {}
+        self.endpoint_cooldown_trips: dict[str, int] = {}
         self.transient_retry_max = 1
         # Retention sweep cadence (Phase 2.3) — monotonic ts of the last DB trim.
         self.last_cleanup_at = 0.0
