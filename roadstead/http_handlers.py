@@ -21,7 +21,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from . import cache_stats
 from .config import LLMPriority, normalize_endpoint
-from .constants import _DEFAULT_TIMEOUT_S, _PAYLOAD_KIND
+from .constants import _PAYLOAD_KIND
 from .lifecycle import _openai_error
 from .sse_hub import DROP_SENTINEL
 
@@ -106,14 +106,15 @@ class ProxyHttpHandlers:
                 code="unknown_endpoint")
 
         # Honor a client-supplied deadline (goose recipes can run long): a
-        # ``timeout_s`` body field or an ``X-Timeout-S`` header overrides the
-        # 180s default. Popped from the body so it isn't forwarded to the
-        # backend (which would reject the unknown field).
+        # ``timeout_s`` body field or an ``X-Timeout-S`` header. Popped from the
+        # body so it isn't forwarded to the backend (which would reject the
+        # unknown field). When the client supplies NOTHING, omit timeout_s so
+        # handle_submit chooses the (flag-gated) smart/flat default — instead of
+        # baking the flat 180s here, which denied the OpenAI door the data-driven
+        # default framework callers get (Phase 5a). Coercion of a supplied value
+        # is handled uniformly in handle_submit (a malformed value falls back to
+        # the default there, same as before).
         client_timeout = body.pop("timeout_s", None) or request.headers.get("X-Timeout-S")
-        try:
-            timeout_s = float(client_timeout) if client_timeout else _DEFAULT_TIMEOUT_S
-        except (TypeError, ValueError):
-            timeout_s = _DEFAULT_TIMEOUT_S
 
         submit_body = {
             "agent_id": agent_id,
@@ -123,8 +124,9 @@ class ProxyHttpHandlers:
             "caller_id": agent_id,
             "payload_type": "chat_completion",
             "payload": body,
-            "timeout_s": timeout_s,
         }
+        if client_timeout is not None:
+            submit_body["timeout_s"] = client_timeout
         return await self.lifecycle.handle_submit(submit_body, request, openai=True)
     async def handle_openai_embeddings(self, body: dict, request: Request) -> Response:
         remote_ip = request.client.host if request.client else "unknown"
@@ -346,6 +348,11 @@ class ProxyHttpHandlers:
                 # context_gate_enforce flip check — compare against actual
                 # backend overflow errors before flipping).
                 "context_overflows_shadow": self.state.context_overflows,
+                # Smart-default-timeout shadow (Phase 5a): for callers that OMIT
+                # timeout_s, what the data-driven default WOULD be (smart_s_*)
+                # vs the flat 180s. Recorded whether smart_default_timeout is on
+                # or off; the flip go/no-go reads mean = smart_s_sum / count.
+                "smart_default_shadow": self.state.smart_default_shadow,
                 # Thinking option (per-request native reasoning) health. All 0
                 # until a caller opts in with thinking:true. Watch
                 # thinking_truncated to tune COLLECTIVE_PROXY_THINKING_BUDGET down.

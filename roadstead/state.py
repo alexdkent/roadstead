@@ -219,6 +219,13 @@ class ProxyState:
         # max_est_in}. Feeds the context_gate_enforce flip check — compared
         # against ACTUAL backend overflow errors before enforcement flips.
         self.context_overflows: dict[str, dict] = {}
+        # Phase 5a — smart-default-timeout shadow tally: endpoint → {count,
+        # flat_s, smart_s_min, smart_s_max, smart_s_sum}. Records, for callers
+        # that OMIT timeout_s, what the data-driven default WOULD be (smart_s)
+        # vs the flat _DEFAULT_TIMEOUT_S — populated whether the
+        # smart_default_timeout flag is on or off, so the flip decision has a
+        # direct artifact on /v1/status. mean = smart_s_sum / count.
+        self.smart_default_shadow: dict[str, dict] = {}
         # Phase 5B observability counters (exposed on /v1/status).
         self.slot_leak_reclaimed = 0       # streaming dispatches cancelled on
                                            # consumer-disconnect → slot freed

@@ -15,6 +15,13 @@ _RETRY_BACKOFF_S = 0.5
 # tier; this is only the floor when a caller supplies no timeout.
 _DEFAULT_TIMEOUT_S = 180.0
 
+# Phase 5a — upper bound on the server-side SMART default deadline (used only
+# when the smart_default_timeout flag is on, for callers that omit timeout_s).
+# Mirrors the client's COLLECTIVE_TIMEOUT_ADVICE_CAP_S (1800s) so server + client
+# agree, and guards against a heavy-tailed background cell (recommended =
+# p99*margin) yielding a pathological multi-hour deadline.
+_SMART_DEFAULT_CAP_S = 1800.0
+
 # Phase 5C — time-to-first-token watchdog for streaming. Data (2026-05-31): the
 # companion 80B sometimes produces ZERO tokens on a large-context synth and burns
 # the FULL deadline (180s), uselessly holding a scarce slot. If no first token

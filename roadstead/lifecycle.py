@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -41,6 +42,7 @@ from .constants import (
     _MIN_RETRY_BUDGET_S,
     _PAYLOAD_KIND,
     _RETRY_BACKOFF_S,
+    _SMART_DEFAULT_CAP_S,
     _STREAM_INTERTOKEN_GAP_S,
     _STREAM_TTFT_DEADLINE_S,
 )
@@ -163,17 +165,29 @@ class Lifecycle:
                 "unknown_endpoint_enforce for a fast 404",
                 endpoint, caller, body.get("call_site"))
 
-        # Robust timeout_s: a malformed value must default, not 500 the request.
+        # Robust timeout_s. A caller either OMITS a deadline (→ the smart/flat
+        # default via resolve_default_timeout; an explicit None counts as
+        # omitted) or SUPPLIES one (coerced — a malformed value must default,
+        # not 500 the request). A supplied value ALWAYS wins over the default.
         # (priority is soft-defaulted inside QueuedRequest.create; payload/
         # endpoint/call_site already use safe .get defaults.)
-        try:
-            timeout_s = float(body.get("timeout_s", _DEFAULT_TIMEOUT_S))
-            if not (timeout_s > 0) or timeout_s != timeout_s:  # non-positive / NaN
-                raise ValueError("timeout_s must be a positive number")
-        except (TypeError, ValueError) as exc:
-            logger.warning("submit: bad timeout_s %r (%s); using default %.0fs",
-                           body.get("timeout_s"), exc, _DEFAULT_TIMEOUT_S)
-            timeout_s = _DEFAULT_TIMEOUT_S
+        raw_timeout = body.get("timeout_s")
+        if raw_timeout is None:
+            timeout_s = self.resolve_default_timeout(endpoint, body)
+        else:
+            try:
+                timeout_s = float(raw_timeout)
+                # Reject non-positive, NaN, AND non-finite (+inf slips past
+                # ``>0`` and ``!=`` — a supplied +inf would otherwise stamp an
+                # UNBOUNDED sync deadline: asyncio.wait_for(timeout=inf) +
+                # backend.call(timeout_s=inf) never reclaims the slot on a hung
+                # backend. Fall through to the default, which is finite+capped).
+                if not (timeout_s > 0) or not math.isfinite(timeout_s):
+                    raise ValueError("timeout_s must be a positive, finite number")
+            except (TypeError, ValueError) as exc:
+                logger.warning("submit: bad timeout_s %r (%s); using default",
+                               raw_timeout, exc)
+                timeout_s = self.resolve_default_timeout(endpoint, body)
 
         # On-demand endpoints cold-load for minutes — a caller's short timeout
         # (or the 180s default) would expire mid-load and never see a token.
@@ -1194,6 +1208,59 @@ class Lifecycle:
 
         # Trigger scheduler (a slot freed up)
         self.state.dispatch_event.set()
+    def resolve_default_timeout(self, endpoint: str, body: dict) -> float:
+        """Deadline for a caller that supplied no ``timeout_s`` (the OpenAI door
+        + a bare ``/v1/submit``). Caller-supplied deadlines never reach here.
+
+        Flag OFF (``smart_default_timeout`` false — the default): the flat
+        ``_DEFAULT_TIMEOUT_S`` (180s), byte-identical to the historical default.
+        Flag ON: the timeout model's class-floored, capped recommendation for
+        this ``(endpoint, tier, size)`` — so a caller that gives no deadline gets
+        the same data-driven bound framework callers already get via
+        ``apply_extend_only``, instead of a blanket 180s that is too tight for a
+        cold on-demand load and absurdly loose for embed/rerank.
+
+        A shadow tally (flat vs smart) is recorded EITHER WAY, so the flip
+        decision has a direct artifact on ``/v1/status.smart_default_shadow``.
+        Fully guarded — advice/estimation faults never 500 a request; on any
+        error the flat default is used and applied."""
+        smart_s = _DEFAULT_TIMEOUT_S
+        try:
+            priority = int(LLMPriority.coerce(
+                body.get("priority"), default=LLMPriority.P1_TURN_SUPPORT))
+            payload = body.get("payload") or {}
+            if isinstance(payload, dict):
+                est_in = estimate_input_tokens(payload)
+                mt = payload.get("max_tokens")
+                est_out = mt if isinstance(mt, int) and mt > 0 else 0
+            else:
+                est_in = est_out = 0
+            rec = self.state.timeout_model.advise(
+                endpoint, priority, est_in, est_out)["recommended_timeout_s"]
+            if rec and rec > 0:
+                smart_s = min(float(rec), _SMART_DEFAULT_CAP_S)
+        except Exception:  # noqa: BLE001 — default resolution must never 500 a request
+            smart_s = _DEFAULT_TIMEOUT_S
+
+        # Shadow tally (both modes) — the reviewable artifact for the flip.
+        try:
+            tally = self.state.smart_default_shadow.setdefault(
+                normalize_endpoint(endpoint),
+                {"count": 0, "flat_s": _DEFAULT_TIMEOUT_S,
+                 "smart_s_min": None, "smart_s_max": None, "smart_s_sum": 0.0})
+            tally["count"] += 1
+            tally["smart_s_sum"] += smart_s
+            tally["smart_s_min"] = (
+                smart_s if tally["smart_s_min"] is None
+                else min(tally["smart_s_min"], smart_s))
+            tally["smart_s_max"] = (
+                smart_s if tally["smart_s_max"] is None
+                else max(tally["smart_s_max"], smart_s))
+        except Exception:  # noqa: BLE001 — a tally fault must never disturb the caller
+            pass
+
+        return smart_s if self.state.flags.get("smart_default_timeout") else _DEFAULT_TIMEOUT_S
+
     def record_timeout_shadow(
         self,
         req: QueuedRequest,

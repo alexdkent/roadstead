@@ -38,6 +38,17 @@ DEFAULT_FLAGS: dict[str, bool] = {
     # dispatch so streaming completions record real token counts. True by
     # default; this is the kill-switch if a backend build rejects the field.
     "inject_stream_usage": True,
+    # Phase 5a — server-side smart DEFAULT deadline for callers that OMIT
+    # timeout_s (the OpenAI /v1/chat/completions door + a bare /v1/submit).
+    # False = the flat _DEFAULT_TIMEOUT_S (180s), byte-identical to the historical
+    # default, while still recording a shadow tally (smart_default_shadow on
+    # /v1/status) of what a data-driven default WOULD be. True = the timeout
+    # model's class-floored, capped recommendation for this (endpoint, tier,
+    # size) — so a caller that gives no deadline gets the same data-driven bound
+    # framework callers already get via apply_extend_only (embed→~15s not 180s;
+    # a cold on-demand load can wait out its multi-minute load). Caller-supplied
+    # timeout_s ALWAYS wins regardless of this flag.
+    "smart_default_timeout": False,
 }
 
 

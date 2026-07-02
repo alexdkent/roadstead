@@ -183,6 +183,7 @@ class ProxyService:
     _admin_ips_seen = _StateField("admin_ips_seen")
     _unknown_endpoint_submits = _StateField("unknown_endpoint_submits")
     _context_overflows = _StateField("context_overflows")
+    _smart_default_shadow = _StateField("smart_default_shadow")
     _slot_leak_reclaimed = _StateField("slot_leak_reclaimed")
     _drain_straggler_cancelled = _StateField("drain_straggler_cancelled")
     _scheduler_task = _StateField("scheduler_task")
