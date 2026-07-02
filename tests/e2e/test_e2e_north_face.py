@@ -18,6 +18,10 @@ import asyncio
 
 import pytest
 
+# Exhaustive ProxyService-spinning adversarial matrix — deselected from the
+# per-ship in_container_tollgate via `-m 'not heavy'` (see pyproject `heavy`).
+pytestmark = pytest.mark.heavy
+
 from tests.llmproxy.corpus.north_face import NORTH_FACE_CASES, NorthFaceCase
 
 

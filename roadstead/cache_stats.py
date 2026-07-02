@@ -158,6 +158,67 @@ def screen(rows: list[tuple[str, str]], *, min_reqs: int = 5, sample: int = 25,
 DRIFT_LCP_DROP_PTS = 25.0
 PREFILL_TOK_PER_S = 250.0  # rough boxa prefill rate, for the time-saved estimate
 
+# Tier-2 step 3 — periodic drift ALARM (health.compute_cache_stats):
+CACHE_DRIFT_WINDOW_S = 48 * 3600.0   # snapshot history the alarm reads (30-min cadence → ~96 pts)
+CACHE_DRIFT_REALERT_S = 6 * 3600.0   # re-fire a still-drifting call_site at most this often
+
+
+def detect_drift(snapshots: list[dict]) -> list[dict]:
+    """Pure drift detector shared by the ``/v1/fleet/cache-stats`` payload and the
+    periodic drift ALARM (Tier-2 step 3). A call_site drifts when its latest
+    front-loaded-prefix share (LCP%) collapsed ≥``DRIFT_LCP_DROP_PTS`` below its
+    own trailing-snapshot baseline (median LCP% over the prior snapshots) — i.e.
+    a prompt edit broke the cacheable leading block.
+
+    ``snapshots`` = ``PersistentQueue.cache_stats_snapshots()`` rows
+    (oldest→newest, each carrying a parsed ``screen`` list). Returns
+    ``[{call_site, endpoint, from, to}]`` — one row per drifted call_site,
+    grouped by endpoint (sorted) to match the fleet payload's ordering."""
+    by_ep: dict[str, list[dict]] = {}
+    for s in snapshots:
+        by_ep.setdefault(s["endpoint"], []).append(s)
+    out: list[dict] = []
+    for ep, snaps in sorted(by_ep.items()):
+        if len(snaps) < 3:
+            continue
+        latest_screen = (snaps[-1] or {}).get("screen") or []
+        hist: dict[str, list[float]] = {}
+        for s in snaps[:-1]:
+            for r in s.get("screen") or []:
+                hist.setdefault(r["call_site"], []).append(r.get("lcp_pct", 0.0))
+        for r in latest_screen:
+            base = hist.get(r["call_site"])
+            if not base:
+                continue
+            b = st.median(base)
+            if b >= MISALIGN_LCP_PCT and r.get("lcp_pct", 0.0) <= b - DRIFT_LCP_DROP_PTS:
+                out.append({"call_site": r["call_site"], "endpoint": ep,
+                            "from": round(b, 1), "to": r.get("lcp_pct", 0.0)})
+    return out
+
+
+def drift_alarms_to_fire(drift: list[dict], alerted: dict, now: float,
+                         cooldown_s: float = CACHE_DRIFT_REALERT_S) -> tuple[list[dict], dict]:
+    """Decide which drifted call_sites the periodic alarm should FIRE now, with
+    dedup so a standing drift doesn't re-alert every 30-min cycle. Pure →
+    unit-testable in isolation from the proxy.
+
+    ``alerted`` maps ``(call_site, endpoint) → last_fired_wall``. A call_site
+    fires on first detection and again only after ``cooldown_s`` of continuous
+    drift; a call_site that CLEARS is dropped from the returned map, so a
+    recurrence alerts immediately. Returns ``(to_fire, next_alerted)``."""
+    to_fire: list[dict] = []
+    next_alerted: dict = {}
+    for d in drift:
+        key = (d["call_site"], d["endpoint"])
+        last = alerted.get(key)
+        if last is None or (now - last) >= cooldown_s:
+            to_fire.append(d)
+            next_alerted[key] = now
+        else:
+            next_alerted[key] = last
+    return to_fire, next_alerted
+
 
 def build_fleet_payload(snapshots: list[dict], labels: dict[str, str],
                         engines: dict[str, str], *, top_offenders: int = 25) -> dict:
@@ -175,7 +236,7 @@ def build_fleet_payload(snapshots: list[dict], labels: dict[str, str],
     for s in snapshots:
         by_ep.setdefault(s["endpoint"], []).append(s)
 
-    models, trend, offenders, drift = [], {}, [], []
+    models, trend, offenders = [], {}, []
     tot_wasted = 0
     fleet_dh = fleet_dq = 0
     for ep, label in sorted(labels.items()):
@@ -217,21 +278,10 @@ def build_fleet_payload(snapshots: list[dict], labels: dict[str, str],
         for r in mis:
             offenders.append({**r, "endpoint": ep})
             tot_wasted += int(r.get("wasted_tokens", 0)) * int(r.get("reqs", 0))
-        # drift: latest lcp_pct vs baseline (median of prior snapshots) per call_site
-        if len(snaps) >= 3:
-            hist: dict[str, list[float]] = {}
-            for s in snaps[:-1]:
-                for r in s.get("screen") or []:
-                    hist.setdefault(r["call_site"], []).append(r.get("lcp_pct", 0.0))
-            for r in screen:
-                base = hist.get(r["call_site"])
-                if not base:
-                    continue
-                b = st.median(base)
-                if b >= MISALIGN_LCP_PCT and r.get("lcp_pct", 0.0) <= b - DRIFT_LCP_DROP_PTS:
-                    drift.append({"call_site": r["call_site"], "endpoint": ep,
-                                  "from": round(b, 1), "to": r.get("lcp_pct", 0.0)})
 
+    # drift: latest LCP% vs trailing baseline per call_site (shared with the
+    # periodic alarm — one implementation, `detect_drift`).
+    drift = detect_drift(snapshots)
     offenders.sort(key=lambda r: r.get("roi", 0), reverse=True)
     captured = round(fleet_dh / fleet_dq, 4) if fleet_dq > 0 else None
     return {

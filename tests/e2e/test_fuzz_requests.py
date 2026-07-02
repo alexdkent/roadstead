@@ -35,6 +35,10 @@ from typing import Any, List
 import httpx
 import pytest
 
+# Exhaustive ProxyService-spinning fuzz/adversarial layer — deselected from the
+# per-ship in_container_tollgate via `-m 'not heavy'` (see pyproject `heavy`).
+pytestmark = pytest.mark.heavy
+
 
 _UNHANDLED_500_MARKER = "internal proxy error"
 _SEED = 0xC0FFEE

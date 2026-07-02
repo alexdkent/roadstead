@@ -31,6 +31,10 @@ import tempfile
 
 import pytest
 
+# Exhaustive ProxyService-spinning adversarial matrix — deselected from the
+# per-ship in_container_tollgate via `-m 'not heavy'` (see pyproject `heavy`).
+pytestmark = pytest.mark.heavy
+
 from originfleet.llmproxy.backend import extract_cached_tokens
 from originfleet.llmproxy.queue import PersistentQueue
 

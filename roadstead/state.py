@@ -201,6 +201,10 @@ class ProxyState:
         # poll tick.
         self.alerts: list[dict] = []
         self.alert_logged: set = set()
+        # Tier-2 step 3 — prefix-cache DRIFT alarm dedup: {(call_site, endpoint):
+        # last_fired_wall} so a standing drift re-alerts at most every
+        # CACHE_DRIFT_REALERT_S instead of every cache-stats cycle.
+        self.cache_drift_alerted: dict = {}
         # Admin-surface audit: source IPs seen per admin-ish route, exposed on
         # /v1/status so the ACL-tightening go/no-go can read the live set
         # instead of grepping logs. First hit per (route, ip) also logs INFO.

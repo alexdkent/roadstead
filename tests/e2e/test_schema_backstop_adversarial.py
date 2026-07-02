@@ -23,6 +23,10 @@ import random
 
 import pytest
 
+# Exhaustive ProxyService-spinning adversarial matrix — deselected from the
+# per-ship in_container_tollgate via `-m 'not heavy'` (see pyproject `heavy`).
+pytestmark = pytest.mark.heavy
+
 from originfleet.llmproxy import correction as correction_mod
 from originfleet.llmproxy.backend import BackendUnavailable
 from tests.llmproxy.fake_backend import (

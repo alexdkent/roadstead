@@ -18,6 +18,7 @@ from . import cache_stats
 from .backend import BackendError
 from .config import (
     PriorityBand,
+    cache_drift_alarm_enabled,
     cooldown_allowed_fails,
     cooldown_duration_s,
     cooldown_window_s,
@@ -27,6 +28,7 @@ from .config import (
     normalize_endpoint,
 )
 from .observability import AlertCondition, check_alerts
+from originfleet.framework.prompt_security import record_security_event
 
 if TYPE_CHECKING:
     from .config import EndpointConfig
@@ -462,6 +464,40 @@ class Health:
             )
         self.state.queue_db.prune_cache_stats()
         self.state.endpoint_cache_hit_rate = rates
+        # Tier-2 step 3 — prefix-cache DRIFT alarm (observability only; never
+        # touches routing/output). Best-effort: a failure here must not break the
+        # cache-stats pass.
+        if cache_drift_alarm_enabled():
+            try:
+                await self._evaluate_cache_drift(snap_at)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("cache-drift alarm failed: %s", exc)
+
+    async def _evaluate_cache_drift(self, now: float) -> None:
+        """Read the recent cache snapshots, detect call_sites whose front-loaded
+        prefix collapsed vs baseline, and raise a ``CACHE_DRIFT_ALERT`` log marker
+        + a store-less ``llmproxy_cache_drift`` security event for each NEW drift
+        (dedup'd via ``state.cache_drift_alerted``). The heavy snapshot read +
+        median math run off the event loop."""
+        snaps = await asyncio.to_thread(
+            self.state.queue_db.cache_stats_snapshots, cache_stats.CACHE_DRIFT_WINDOW_S)
+        drift = cache_stats.detect_drift(snaps)
+        to_fire, self.state.cache_drift_alerted = cache_stats.drift_alarms_to_fire(
+            drift, self.state.cache_drift_alerted, now)
+        for d in to_fire:
+            logger.warning(
+                "CACHE_DRIFT_ALERT call_site=%s endpoint=%s lcp_pct=%.1f->%.1f — "
+                "prefix cacheability collapsed vs baseline; a prompt edit likely "
+                "broke the front-loaded block (see cache_audit / the Inference "
+                "cacheability card)",
+                d["call_site"], d["endpoint"], d["from"], d["to"])
+            record_security_event(
+                None, logger,
+                event_type="llmproxy_cache_drift", severity="warning",
+                source=d["endpoint"], action=d["call_site"],
+                reason=f"prefix LCP% {d['from']}->{d['to']}",
+                metadata={"call_site": d["call_site"], "endpoint": d["endpoint"],
+                          "lcp_from": d["from"], "lcp_to": d["to"]})
     def apply_discovered_props(
         self, ep_name: str, ep_cfg: EndpointConfig, props: dict,
     ) -> None:

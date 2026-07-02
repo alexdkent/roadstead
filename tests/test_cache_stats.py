@@ -94,3 +94,58 @@ def test_build_fleet_payload_drift():
     out = cs.build_fleet_payload(snaps, labels, engines)
     assert out["drift"] and out["drift"][0]["call_site"] == "c"
     assert out["drift"][0]["from"] >= cs.MISALIGN_LCP_PCT and out["drift"][0]["to"] == 5.0
+
+
+# --- Tier-2 step 3: periodic drift alarm (detect_drift + drift_alarms_to_fire) ---
+
+def _drift_snaps():
+    good = {"call_site": "c", "verdict": "aligned", "reqs": 5, "lcp_pct": 80.0,
+            "jacc": 0.7, "wasted_tokens": 0, "roi": 0}
+    broke = {**good, "verdict": "misaligned", "lcp_pct": 5.0}
+    return [_snap(1.0, "creative", 1, 10, [good]),
+            _snap(2.0, "creative", 2, 20, [good]),
+            _snap(3.0, "creative", 3, 30, [broke])]
+
+
+def test_detect_drift_flags_collapsed_prefix():
+    drift = cs.detect_drift(_drift_snaps())
+    assert [(d["call_site"], d["endpoint"]) for d in drift] == [("c", "creative")]
+    assert drift[0]["from"] >= cs.MISALIGN_LCP_PCT and drift[0]["to"] == 5.0
+
+
+def test_detect_drift_needs_three_snapshots():
+    # Two snapshots is not enough baseline history → never flags (guard against a
+    # single edit's first appearance reading as drift).
+    assert cs.detect_drift(_drift_snaps()[:2]) == []
+
+
+def test_detect_drift_ignores_never_front_loaded():
+    # A call_site whose baseline LCP% was already BELOW the alignment floor never
+    # "drifts" — it was never cacheable, so a further drop is not a regression.
+    lo = {"call_site": "x", "verdict": "misaligned", "reqs": 5, "lcp_pct": 10.0,
+          "jacc": 0.6, "wasted_tokens": 5, "roi": 5}
+    worse = {**lo, "lcp_pct": 1.0}
+    snaps = [_snap(1.0, "creative", 1, 10, [lo]),
+             _snap(2.0, "creative", 2, 20, [lo]),
+             _snap(3.0, "creative", 3, 30, [worse])]
+    assert cs.detect_drift(snaps) == []
+
+
+def test_drift_alarms_first_fire_dedup_recover():
+    drift = cs.detect_drift(_drift_snaps())
+    key = ("c", "creative")
+    # First detection fires and records the timestamp.
+    fire1, alerted = cs.drift_alarms_to_fire(drift, {}, now=1000.0)
+    assert [d["call_site"] for d in fire1] == ["c"] and alerted[key] == 1000.0
+    # Still drifting within the cooldown → dedup'd, no re-fire, ts unchanged.
+    fire2, alerted = cs.drift_alarms_to_fire(drift, alerted, now=1000.0 + 60.0)
+    assert fire2 == [] and alerted[key] == 1000.0
+    # Still drifting past the cooldown → re-fires and re-stamps.
+    later = 1000.0 + cs.CACHE_DRIFT_REALERT_S + 1.0
+    fire3, alerted = cs.drift_alarms_to_fire(drift, alerted, now=later)
+    assert [d["call_site"] for d in fire3] == ["c"] and alerted[key] == later
+    # Drift CLEARS → the key is dropped, so a recurrence alerts immediately.
+    fire4, alerted = cs.drift_alarms_to_fire([], alerted, now=later + 1.0)
+    assert fire4 == [] and key not in alerted
+    fire5, alerted = cs.drift_alarms_to_fire(drift, alerted, now=later + 2.0)
+    assert [d["call_site"] for d in fire5] == ["c"]

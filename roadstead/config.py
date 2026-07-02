@@ -399,6 +399,22 @@ def max_slots_reconcile_enabled() -> bool:
     )
 
 
+def cache_drift_alarm_enabled() -> bool:
+    """Tier-2 step 3 (2026-07-01): the periodic prefix-cache DRIFT alarm. Each
+    ``compute_cache_stats`` cycle, detect call_sites whose front-loaded-prefix
+    share (LCP%) collapsed vs their own trailing baseline (a prompt edit broke
+    the cacheable leading block) and raise a ``CACHE_DRIFT_ALERT`` log marker +
+    a store-less ``llmproxy_cache_drift`` security event (dedup'd, re-fires at
+    most every ``CACHE_DRIFT_REALERT_S``). OBSERVABILITY ONLY — it never changes
+    routing/admission/output (zero caller-visible effect, like the max_slots
+    reconciler + shadow-egress detector), so default ON. Env kill-switch
+    ``COLLECTIVE_PROXY_CACHE_DRIFT_ALARM``. See
+    ``docs/llmproxy_prefix_cache_observability.md`` (Tier-2 step 3)."""
+    return os.environ.get("COLLECTIVE_PROXY_CACHE_DRIFT_ALARM", "1").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
 def endpoint_cooldown_enabled() -> bool:
     """Step 4b ENFORCE: after ``cooldown_allowed_fails`` BACKEND-FAULT failures
     (5xx / timeout / unavailable) within ``cooldown_window_s``, briefly mark an
