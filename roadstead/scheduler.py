@@ -55,6 +55,11 @@ class QueuedRequest:
     caller_id: str | None = None
     timeout_s: float = 180.0
     stream: bool = False
+    # context_per_slot observed at ADMISSION (0 = not captured, e.g. a
+    # WAL-recovered request). The poller mutates the endpoint's live value, so
+    # give-up-time reporting must use the denominator the gate actually saw
+    # (audit 2026-07-02).
+    ctx_per_slot_at_admission: int = 0
 
     @classmethod
     def create(

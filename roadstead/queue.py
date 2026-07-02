@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from .config import LLMPriority, normalize_endpoint, priority_to_band
 from .scheduler import QueuedRequest
@@ -148,6 +149,25 @@ CREATE TABLE IF NOT EXISTS proxy_cache_stats (
     cum_hits      INTEGER,              -- vLLM prefix_cache_hits_total (cumulative; NULL=n/a)
     cum_queries   INTEGER,              -- vLLM prefix_cache_queries_total (cumulative; NULL=n/a)
     screen_json   TEXT                  -- JSON: per-call_site cache-ability rows for this endpoint
+);
+
+-- Durable shadow/flip-gate evidence (audit 2026-07-02): the in-memory
+-- context-overflow tally + cache-drift dedup map reset on every ship-driven
+-- proxy restart (2 boots/day is normal), so a "review the shadow window,
+-- then flip" decision could never accumulate its evidence. Aggregates only —
+-- one row per (endpoint, caller) / one KV row — not an event log.
+CREATE TABLE IF NOT EXISTS proxy_context_overflows (
+    endpoint   TEXT NOT NULL,
+    caller     TEXT NOT NULL,
+    count      INTEGER NOT NULL DEFAULT 0,
+    max_est_in INTEGER NOT NULL DEFAULT 0,
+    last_at    REAL NOT NULL,
+    PRIMARY KEY (endpoint, caller)
+);
+
+CREATE TABLE IF NOT EXISTS proxy_kv (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL       -- JSON blob
 );
 
 CREATE INDEX IF NOT EXISTS idx_pq_status ON proxy_queue(status);
@@ -493,6 +513,18 @@ class PersistentQueue:
         ps = self._conn.execute("PRAGMA page_size").fetchone()[0]
         free_before = self._conn.execute(
             "PRAGMA freelist_count").fetchone()[0] * ps
+        # freelist_count only sees whole free pages. cleanup_old_payloads NULLs
+        # payload bodies IN PLACE, leaving intra-page fragmentation that never
+        # reaches the freelist — the file camped at a ~930MB high-water mark
+        # (~59% dead) while the freelist read 32MB, so this gate could never
+        # fire (audit 2026-07-02). Add dbstat's per-page unused bytes when the
+        # module is available (startup-only full scan, pre-writer — acceptable).
+        try:
+            unused = self._conn.execute(
+                "SELECT COALESCE(SUM(unused), 0) FROM dbstat").fetchone()[0]
+            free_before += int(unused or 0)
+        except sqlite3.Error:
+            pass  # dbstat not compiled in — fall back to freelist-only
         if free_before < threshold_bytes:
             return 0
         pages_before = self._conn.execute("PRAGMA page_count").fetchone()[0]
@@ -778,6 +810,66 @@ class PersistentQueue:
                     time.time(),
                 ),
             )
+
+    # ----- durable shadow/flip-gate evidence (audit 2026-07-02) -----
+
+    def record_context_overflow(self, endpoint: str, caller: str,
+                                est_in: int) -> None:
+        """Upsert one (endpoint, caller) overflow aggregate. Rare events
+        (a few/day) — one writer-queue op each, no hot-path cost."""
+        self._w(
+            "INSERT INTO proxy_context_overflows "
+            "(endpoint, caller, count, max_est_in, last_at) VALUES (?,?,1,?,?) "
+            "ON CONFLICT(endpoint, caller) DO UPDATE SET "
+            "count = count + 1, "
+            "max_est_in = MAX(max_est_in, excluded.max_est_in), "
+            "last_at = excluded.last_at",
+            (endpoint, caller, int(est_in), time.time()),
+        )
+
+    def load_context_overflows(self) -> dict[str, dict]:
+        """Rebuild the /v1/status ``context_overflows_shadow`` shape from the
+        durable aggregates (startup seed)."""
+        if not self._conn:
+            return {}
+        rows = self._reader().execute(
+            "SELECT endpoint, caller, count, max_est_in "
+            "FROM proxy_context_overflows").fetchall()
+        out: dict[str, dict] = {}
+        for ep, caller, count, max_in in rows:
+            tally = out.setdefault(ep, {"count": 0, "callers": {}, "max_est_in": 0})
+            tally["count"] += int(count or 0)
+            tally["callers"][caller] = int(count or 0)
+            tally["max_est_in"] = max(tally["max_est_in"], int(max_in or 0))
+        return out
+
+    def kv_set(self, key: str, value: Any) -> None:
+        """Persist a small JSON blob (e.g. the cache-drift dedup map)."""
+        self._w(
+            "INSERT INTO proxy_kv (key, value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, json.dumps(value)),
+        )
+
+    def kv_get(self, key: str, default: Any = None) -> Any:
+        if not self._conn:
+            return default
+        row = self._reader().execute(
+            "SELECT value FROM proxy_kv WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return default
+
+    def delete_budgets(self, agent_ids: list[str]) -> None:
+        """Remove pruned one-off agent_ids from the persisted budget table.
+        Without this, ``INSERT OR REPLACE`` never deletes and ``load_budgets``
+        resurrects every historical id on each boot — 78 immortal ghosts were
+        diluting real agents' replenish rates (audit 2026-07-02)."""
+        for aid in agent_ids:
+            self._w("DELETE FROM proxy_agent_budgets WHERE agent_id = ?", (aid,))
 
     def load_budgets(self) -> list[dict]:
         """Restore persisted DRR balances on startup (Phase 3.4) so fairness

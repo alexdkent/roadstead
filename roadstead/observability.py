@@ -353,9 +353,13 @@ def check_alerts(
         if len(shares) >= 2:
             ji = jains_fairness_index(shares)
             if ji < 0.7:
+                # Detail is the alert-dedup key — bucket the index to 0.1 so a
+                # jittering value doesn't re-fire every 10s poller tick (2,017
+                # log lines in 7d, audit 2026-07-02). The live value stays
+                # visible on /v1/status via state.alerts refresh.
                 alerts.append(AlertCondition(
                     "drr_imbalance", "WARNING", True,
-                    f"Jain's index = {ji:.2f} (with queued work)",
+                    f"Jain's index ≈ {round(ji, 1):.1f} (with queued work)",
                 ))
 
     # Cost model stale

@@ -29,6 +29,7 @@ from .backend import (
     BackendResponse,
     BackendTimeout,
     BackendUnavailable,
+    coerce_token_count,
     extract_cached_tokens,
 )
 from .config import (
@@ -273,6 +274,7 @@ class Lifecycle:
         if req.payload_type == "chat_completion":
             gate_cfg = self.state.config.endpoints.get(req.endpoint)
             ctx_limit = gate_cfg.context_per_slot if gate_cfg else 0
+            req.ctx_per_slot_at_admission = ctx_limit
             if ctx_limit > 0:
                 est_in = estimate_input_tokens(req.payload)
                 mt = req.payload.get("max_tokens")
@@ -284,6 +286,14 @@ class Lifecycle:
                     tally["count"] += 1
                     tally["callers"][caller] = tally["callers"].get(caller, 0) + 1
                     tally["max_est_in"] = max(tally["max_est_in"], est_in)
+                    # Durable (audit 2026-07-02): the in-memory tally resets on
+                    # every ship restart, so the flip-review window never
+                    # accumulated. Rare event → one async writer op.
+                    try:
+                        self.state.queue_db.record_context_overflow(
+                            req.endpoint, caller, est_in)
+                    except Exception:  # noqa: BLE001 — evidence must not break admission
+                        logger.debug("context-overflow persist failed", exc_info=True)
                     err = (
                         f"request (est {est_in} input tokens + max_tokens "
                         f"{est_out}) exceeds the available context size "
@@ -500,8 +510,10 @@ class Lifecycle:
         self.state.dispatch_event.set()
 
         async def stream_generator():
-            # Per-request tool-call stream sanitizer (OpenAI front door only;
-            # stateful across this one stream). See _ToolCallStreamSanitizer.
+            # Per-request tool-call stream sanitizer (stateful across this one
+            # stream). Default: OpenAI front door only; Step-4a
+            # (uniform_correction_enabled) extends it to internal /v1/submit
+            # streams — see the gate ~45 lines below. See _ToolCallStreamSanitizer.
             toolcall_sanitizer = _ToolCallStreamSanitizer()
             # Internal envelope consumers get the queued marker; OpenAI
             # consumers (goose-cli) get ONLY chat.completion.chunk frames, so
@@ -957,9 +969,18 @@ class Lifecycle:
         # Phase 5C: time-to-first-token watchdog. Start with a SHORT deadline; on
         # the first token, reschedule to the full SLA. A 0-token hang then aborts
         # in ~TTFT seconds (freeing the slot) instead of burning the whole 180s.
-        ttft_deadline_s = min(_STREAM_TTFT_DEADLINE_S, stream_timeout)
+        # TTFT scales with prefill size: a 20k+-token prompt legitimately takes
+        # >30s to first token under contention (observed: the 06-30 stream-kill
+        # storm at est_in=7360 and 21.7k openai_compat prefills, audit
+        # 2026-07-02). +1s per 1k estimated input tokens, still capped by the
+        # caller's own deadline. The INTER-token gap stays flat — once tokens
+        # flow, 30s of silence is a genuine stall regardless of prompt size.
+        ttft_deadline_s = min(
+            _STREAM_TTFT_DEADLINE_S + (req.est_input_tokens or 0) / 1000.0,
+            stream_timeout,
+        )
         gap_deadline_s = min(_STREAM_INTERTOKEN_GAP_S, stream_timeout)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         last_chunk_at = t0
         try:
             async with asyncio.timeout(ttft_deadline_s) as _cm:
@@ -985,8 +1006,8 @@ class Lifecycle:
                             usage = event.parsed.get("usage")
                             choices = event.parsed.get("choices") or []
                             if usage:
-                                input_tokens = usage.get("prompt_tokens", input_tokens)
-                                output_tokens = usage.get("completion_tokens", output_tokens)
+                                input_tokens = coerce_token_count(usage.get("prompt_tokens"), input_tokens)
+                                output_tokens = coerce_token_count(usage.get("completion_tokens"), output_tokens)
                                 ct = extract_cached_tokens(usage)
                                 if ct is not None:
                                     cached_tokens = ct
@@ -1017,13 +1038,16 @@ class Lifecycle:
             # "backpressure" marker makes it deferrable (is_deferrable_llm_error)
             # so the caller defers instead of dead-lettering. A 0-token hang is
             # the common case — name it so log_scan can see the pattern.
+            watchdog = False  # proxy-initiated abort (TTFT/stall), not a client SLA
             if ttft_ms is None and isinstance(exc, asyncio.TimeoutError):
                 err = ("backend produced no output within "
                        f"{ttft_deadline_s:.0f}s (ttft timeout) — backpressure")
+                watchdog = True
             elif (isinstance(exc, asyncio.TimeoutError)
                   and (time.monotonic() - last_chunk_at) >= gap_deadline_s - 0.5):
                 err = ("backend stalled mid-stream (no token for "
                        f"{gap_deadline_s:.0f}s) — backpressure")
+                watchdog = True
             else:
                 err = f"stream deadline exceeded — backpressure ({exc})"
             await stream_q.put({"type": "error", "error": err})
@@ -1032,6 +1056,7 @@ class Lifecycle:
             self.record_timeout_event(
                 req, layer="stream", elapsed_s=duration,
                 queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
+                proxy_initiated=watchdog,
             )
             self.health.record_dispatch_failure(req.endpoint, exc)  # Step 4b (BackendTimeout only)
             return
@@ -1318,6 +1343,7 @@ class Lifecycle:
         elapsed_s: float,
         queue_wait_ms: float | None = None,
         emit_metrics_and_log: bool = True,
+        proxy_initiated: bool = False,
     ) -> None:
         """Record a call that hit its timeout instead of finishing.
 
@@ -1344,7 +1370,11 @@ class Lifecycle:
             est_out = int(req.payload.get("max_tokens", 0) or 0)
             priority = int(req.priority)
             ep_cfg = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
-            context_window = ep_cfg.context_per_slot if ep_cfg else 0
+            # Prefer the admission-time snapshot: the poller mutates
+            # context_per_slot, so the live value can differ from the
+            # denominator the gate evaluated (audit 2026-07-02).
+            context_window = req.ctx_per_slot_at_admission or (
+                ep_cfg.context_per_slot if ep_cfg else 0)
             context_used_pct = (
                 round(est_in / context_window * 100.0, 1) if context_window else None
             )
@@ -1354,16 +1384,25 @@ class Lifecycle:
                 )["recommended_ms"]
             except Exception:  # noqa: BLE001
                 recommended_ms = 0.0
-            under = bool(recommended_ms and elapsed_s * 1000.0 <= recommended_ms)
+            # `premature` means the CLIENT gave up below the recommended
+            # deadline. A proxy-initiated watchdog abort (stream TTFT/stall)
+            # is the proxy giving up — never tag it premature, or the rollup
+            # blames callers for the proxy's own kills (audit 2026-07-02).
+            under = (
+                bool(recommended_ms and elapsed_s * 1000.0 <= recommended_ms)
+                and not proxy_initiated
+            )
 
             logger.warning(
                 "LLM TIMEOUT layer=%s endpoint=%s tier=%s caller=%s "
                 "elapsed=%.1fs applied=%.1fs in_flight=%d queued=%d est_in=%d "
-                "est_out=%d ctx_used=%s%% recommended=%.0fms premature=%s",
+                "est_out=%d ctx_used=%s%% recommended=%.0fms premature=%s "
+                "proxy_watchdog=%s",
                 layer, req.endpoint, req.priority.name,
                 req.caller_id or f"{req.agent_id}/{req.call_site}",
                 elapsed_s, req.timeout_s, snap["in_flight"], snap["queued"],
                 est_in, est_out, context_used_pct, recommended_ms, under,
+                proxy_initiated,
             )
 
             if emit_metrics_and_log:

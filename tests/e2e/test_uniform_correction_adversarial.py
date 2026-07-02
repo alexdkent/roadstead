@@ -218,7 +218,7 @@ async def test_grammar_stream_is_shadow_checked(proxy, monkeypatch):
     reassembled content (requires the shadow-egress kill-switch on) — proving the
     streaming path is no longer a shadow-egress blind spot."""
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv("COLLECTIVE_PROXY_SHADOW_EGRESS_DETECT", "1")
+    monkeypatch.setenv("COLLECTIVE_PROXY_SHADOW_EGRESS", "1")
     st = proxy.svc._correction.state
     st.shadow_drop.clear()
     grammar = (
@@ -243,7 +243,7 @@ async def test_sync_door_shadow_egress_wired_through_apply(proxy, monkeypatch):
     grammar + a non-conformant backend reply tallies a silent drop — i.e. apply
     actually wires the real detector into the sync door. Fails if the step is
     dropped from apply."""
-    monkeypatch.setenv("COLLECTIVE_PROXY_SHADOW_EGRESS_DETECT", "1")
+    monkeypatch.setenv("COLLECTIVE_PROXY_SHADOW_EGRESS", "1")
     grammar = (
         'root ::= "{" ws "\\"x\\":" ws str ws "}"\n'
         'str ::= "\\"" [^"]* "\\""\n'

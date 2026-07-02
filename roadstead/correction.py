@@ -731,6 +731,23 @@ class Correction:
             if degeneration_shadow_only():
                 return  # measure-only phase — never re-dispatch
 
+            # A degenerate response that hit its OUTPUT CAP (finish_reason=length)
+            # virtually always re-caps on re-dispatch — the loop refills the
+            # budget and the caller rejects it again (observed: the hourly
+            # autonomous_chat-agent.reflect double-dispatch waste, audit 2026-07-02).
+            # Count the detection but skip the pointless retries.
+            try:
+                fr = (response.get("choices") or [{}])[0].get("finish_reason")
+            except (AttributeError, IndexError, TypeError):
+                fr = None
+            if fr == "length":
+                logger.warning(
+                    "degeneration re-dispatch skipped (finish_reason=length — a "
+                    "capped loop re-caps) call_site=%s", cs)
+                self.state.degeneration_unrecovered += 1
+                result["_degenerate_unrecovered"] = True
+                return
+
             ep_cfg = self.state.config.endpoints.get(req.endpoint)
             if ep_cfg is None:
                 return

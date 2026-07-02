@@ -200,6 +200,22 @@ def extract_cached_tokens(usage: Any) -> int | None:
     return None
 
 
+def coerce_token_count(candidate: Any, default: int = 0) -> int:
+    """Coerce a usage token count (``prompt_tokens``/``completion_tokens``) to a
+    safe non-negative int. Same defensive contract as ``extract_cached_tokens``:
+    ``.get(k, 0)`` returns present-but-``null`` as ``None`` (not the default),
+    and NaN/±Infinity/bool/str over the wire must never reach cost arithmetic,
+    MetricsSample, or the INTEGER telemetry columns (NaN poisons SUM rollups)."""
+    if isinstance(candidate, bool):
+        return default
+    if isinstance(candidate, (int, float)):
+        if isinstance(candidate, float) and not math.isfinite(candidate):
+            return default
+        val = int(candidate)
+        return val if val >= 0 else default
+    return default
+
+
 @dataclass
 class BackendResponse:
     """Result of a backend call (non-streaming)."""
@@ -352,8 +368,8 @@ class BackendClientPool:
         usage = body.get("usage") or {}
         cached_tokens = extract_cached_tokens(usage)
         if usage:
-            input_tokens = usage.get("prompt_tokens", 0)
-            output_tokens = usage.get("completion_tokens", 0)
+            input_tokens = coerce_token_count(usage.get("prompt_tokens", 0))
+            output_tokens = coerce_token_count(usage.get("completion_tokens", 0))
 
         # Empty-completion gate (fail-loud). A 2xx with no generated content is a
         # silent failure — backend hiccup, grammar over-constraint that masks all

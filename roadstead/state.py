@@ -205,6 +205,12 @@ class ProxyState:
         # last_fired_wall} so a standing drift re-alerts at most every
         # CACHE_DRIFT_REALERT_S instead of every cache-stats cycle.
         self.cache_drift_alerted: dict = {}
+        # Currently-drifting call_sites from the last drift evaluation (audit
+        # 2026-07-02): evaluate_alerts turns these into standing AlertConditions
+        # so drift reaches /v1/status.alerts + the llmproxy_alerts_active gauge
+        # (the one-shot CACHE_DRIFT_ALERT log line + store-less security event
+        # were unreachable by any automated consumer).
+        self.cache_drift_current: list[dict] = []
         # Admin-surface audit: source IPs seen per admin-ish route, exposed on
         # /v1/status so the ACL-tightening go/no-go can read the live set
         # instead of grepping logs. First hit per (route, ip) also logs INFO.

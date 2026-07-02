@@ -85,12 +85,13 @@ def test_build_fleet_payload_actual_and_window():
 def test_build_fleet_payload_drift():
     labels = {"creative": "creative"}
     engines = {"creative": "vllm"}
-    good = {"call_site": "c", "verdict": "aligned", "reqs": 5, "lcp_pct": 80.0,
+    good = {"call_site": "c", "verdict": "aligned", "reqs": 30, "lcp_pct": 80.0,
             "jacc": 0.7, "wasted_tokens": 0, "roi": 0}
     broke = {**good, "verdict": "misaligned", "lcp_pct": 5.0, "wasted_tokens": 40, "roi": 200}
     snaps = [_snap(1.0, "creative", 1, 10, [good]),
              _snap(2.0, "creative", 2, 20, [good]),
-             _snap(3.0, "creative", 3, 30, [broke])]
+             _snap(3.0, "creative", 3, 30, [broke]),
+             _snap(4.0, "creative", 4, 40, [broke])]
     out = cs.build_fleet_payload(snaps, labels, engines)
     assert out["drift"] and out["drift"][0]["call_site"] == "c"
     assert out["drift"][0]["from"] >= cs.MISALIGN_LCP_PCT and out["drift"][0]["to"] == 5.0
@@ -98,13 +99,16 @@ def test_build_fleet_payload_drift():
 
 # --- Tier-2 step 3: periodic drift alarm (detect_drift + drift_alarms_to_fire) ---
 
-def _drift_snaps():
-    good = {"call_site": "c", "verdict": "aligned", "reqs": 5, "lcp_pct": 80.0,
+def _drift_snaps(reqs: int = 30):
+    # Drift must HOLD for CACHE_DRIFT_CONSECUTIVE trailing snapshots with a
+    # real sample (audit 2026-07-02 flap guard) — 2 good baseline + 2 broke.
+    good = {"call_site": "c", "verdict": "aligned", "reqs": reqs, "lcp_pct": 80.0,
             "jacc": 0.7, "wasted_tokens": 0, "roi": 0}
     broke = {**good, "verdict": "misaligned", "lcp_pct": 5.0}
     return [_snap(1.0, "creative", 1, 10, [good]),
             _snap(2.0, "creative", 2, 20, [good]),
-            _snap(3.0, "creative", 3, 30, [broke])]
+            _snap(3.0, "creative", 3, 30, [broke]),
+            _snap(4.0, "creative", 4, 40, [broke])]
 
 
 def test_detect_drift_flags_collapsed_prefix():
@@ -113,21 +117,38 @@ def test_detect_drift_flags_collapsed_prefix():
     assert drift[0]["from"] >= cs.MISALIGN_LCP_PCT and drift[0]["to"] == 5.0
 
 
-def test_detect_drift_needs_three_snapshots():
-    # Two snapshots is not enough baseline history → never flags (guard against a
+def test_detect_drift_needs_enough_snapshots():
+    # Not enough baseline+consecutive history → never flags (guard against a
     # single edit's first appearance reading as drift).
-    assert cs.detect_drift(_drift_snaps()[:2]) == []
+    assert cs.detect_drift(_drift_snaps()[:3]) == []
+
+
+def test_detect_drift_single_snapshot_flap_is_not_drift():
+    # The drop appears only in the LATEST snapshot (previous one was fine) —
+    # a bimodal-prompt flap, not a regression (audit 2026-07-02: 4 of 5 live
+    # alerts were this class).
+    snaps = _drift_snaps()
+    good_screen = snaps[1]["screen"]
+    snaps[2] = {**snaps[2], "screen": good_screen}
+    assert cs.detect_drift(snaps) == []
+
+
+def test_detect_drift_small_sample_is_not_drift():
+    # Below the CACHE_DRIFT_MIN_REQS floor the sample can't support a drift
+    # verdict (5-6 reqs/window oscillation class).
+    assert cs.detect_drift(_drift_snaps(reqs=cs.CACHE_DRIFT_MIN_REQS - 1)) == []
 
 
 def test_detect_drift_ignores_never_front_loaded():
     # A call_site whose baseline LCP% was already BELOW the alignment floor never
     # "drifts" — it was never cacheable, so a further drop is not a regression.
-    lo = {"call_site": "x", "verdict": "misaligned", "reqs": 5, "lcp_pct": 10.0,
+    lo = {"call_site": "x", "verdict": "misaligned", "reqs": 30, "lcp_pct": 10.0,
           "jacc": 0.6, "wasted_tokens": 5, "roi": 5}
     worse = {**lo, "lcp_pct": 1.0}
     snaps = [_snap(1.0, "creative", 1, 10, [lo]),
              _snap(2.0, "creative", 2, 20, [lo]),
-             _snap(3.0, "creative", 3, 30, [worse])]
+             _snap(3.0, "creative", 3, 30, [worse]),
+             _snap(4.0, "creative", 4, 40, [worse])]
     assert cs.detect_drift(snaps) == []
 
 

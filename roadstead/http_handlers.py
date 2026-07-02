@@ -237,6 +237,27 @@ class ProxyHttpHandlers:
                 if stats.get(key) is not None:
                     out.append(Metric(name, stats[key], {}, "counter",
                                       help="since-boot scheduler counter"))
+
+            # Liveness + active-alert gauges (audit 2026-07-02): before these,
+            # a dead poller/scheduler/DB-writer or a standing ALERT was visible
+            # only on /health and the log — nothing a TSDB rule could fire on.
+            out.append(Metric("llmproxy_scheduler_alive",
+                              1 if self.health.scheduler_loop_alive() else 0, {},
+                              "gauge", help="1 if the scheduler loop ticked recently"))
+            out.append(Metric("llmproxy_poller_alive",
+                              1 if self.health.poller_alive() else 0, {}, "gauge",
+                              help="1 if the capacity poller iterated recently"))
+            out.append(Metric("llmproxy_writer_thread_alive",
+                              1 if self.state.queue_db.writer_alive() else 0, {},
+                              "gauge", help="1 if the SQLite writer thread is alive"))
+            by_sev: dict[str, int] = {}
+            for a in (self.state.alerts or []):
+                sev = str(a.get("severity", "WARNING"))
+                by_sev[sev] = by_sev.get(sev, 0) + 1
+            for sev in ("CRITICAL", "ERROR", "WARNING", "INFO"):
+                out.append(Metric("llmproxy_alerts_active",
+                                  by_sev.get(sev, 0), {"severity": sev}, "gauge",
+                                  help="standing alert conditions by severity"))
         except Exception:
             logger.exception("llmproxy /metrics render failed")
             out = []

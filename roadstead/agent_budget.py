@@ -73,6 +73,12 @@ class BudgetManager:
         self._agents: dict[str, AgentBudget] = {}
         self._starvation_timeout_s = starvation_timeout_s
         self._total_capacity: float = 0.0
+        # Last observed head-of-queue wait per agent (wait_s, observed_at) —
+        # fed by pick_agent, read by snapshot() so the reported `starving`
+        # reflects DENIED SERVICE (the real guard's criterion), not the sign
+        # of the balance (audit 2026-07-02: a heavy consumer being served
+        # continuously reported starving=true forever).
+        self._last_waits: dict[str, tuple[float, float]] = {}
 
     @property
     def agents(self) -> dict[str, AgentBudget]:
@@ -183,6 +189,8 @@ class BudgetManager:
         # Denied-service escape hatch: serve the agent whose oldest queued
         # request has waited longest past the timeout, regardless of balance.
         if wait_by_agent:
+            for a, w in wait_by_agent.items():
+                self._last_waits[a] = (w, now)
             starving = [
                 (wait_by_agent.get(a, 0.0), a)
                 for a in candidates
@@ -216,7 +224,14 @@ class BudgetManager:
             budget.replenish_rate = self._total_capacity * (budget.weight / total_weight)
 
     def snapshot(self) -> list[dict]:
-        """Return serialisable budget state for observability."""
+        """Return serialisable budget state for observability.
+
+        ``starving`` = a recently observed head-of-queue wait at/past the
+        starvation timeout (the same denied-service criterion the dispatch
+        escape hatch uses) — NOT ``balance < 0``, which merely means "heavy
+        consumer". Observations older than 15s are treated as cleared (the
+        queue drained, so pick_agent stopped reporting waits)."""
+        now = time.monotonic()
         return [
             {
                 "agent_id": b.agent_id,
@@ -225,7 +240,11 @@ class BudgetManager:
                 "replenish_rate_ss": round(b.replenish_rate, 3),
                 "total_consumed_ss": round(b.total_consumed, 1),
                 "total_requests": b.total_requests,
-                "starving": b.negative_since > 0,
+                "starving": (
+                    (lw := self._last_waits.get(b.agent_id)) is not None
+                    and now - lw[1] <= 15.0
+                    and lw[0] >= self._starvation_timeout_s
+                ),
             }
             for b in self._agents.values()
         ]

@@ -245,6 +245,7 @@ class ProxyService:
         # Restore persisted DRR balances (Phase 3.4) so fairness survives a
         # restart instead of resetting to zero. Balances are clamped to the
         # agent's cap and the replenish clock rebased onto this process's monotonic.
+        ghost_rows: list[str] = []
         for row in self._queue_db.load_budgets():
             # Phase 5B.4: prefer the agent's CONFIGURED weight + cap over the
             # persisted row. get_or_create only applies weight/max_balance when
@@ -253,6 +254,14 @@ class ProxyService:
             # clamping the restored balance to the wrong bound + letting a stale
             # persisted weight override config intent. Reconcile explicitly.
             acfg = self._config.agents.get(row["agent_id"])
+            # Ghost gate (audit 2026-07-02): the only restart-surviving state
+            # that matters for fairness is DEBT. A non-configured id with a
+            # non-negative balance is an idle one-off (smoke script, probe,
+            # ad-hoc tool) — skip it; if it ever returns it's lazily recreated
+            # at the identical idle state. Configured agents always restore.
+            if acfg is None and (row["balance"] or 0.0) >= 0.0:
+                ghost_rows.append(row["agent_id"])
+                continue
             weight = acfg.weight if acfg else row["weight"]
             b = self._budget_mgr.get_or_create(row["agent_id"], weight=weight)
             if acfg:
@@ -261,10 +270,56 @@ class ProxyService:
             b.balance = max(-b.max_balance, min(b.max_balance, row["balance"]))
             b.total_consumed = row["total_consumed"]
             b.last_replenish_at = time.monotonic()
+        if ghost_rows:
+            # One-shot DB cleanup of the skipped ghosts (steady-state eviction
+            # is prune_idle + delete_budgets on the daily retention sweep).
+            self._queue_db.delete_budgets(ghost_rows)
+            logger.info("budget: dropped %d idle ghost row(s) at load: %s%s",
+                        len(ghost_rows), ", ".join(sorted(ghost_rows)[:10]),
+                        "…" if len(ghost_rows) > 10 else "")
+
+        # Seed the durable shadow/flip-gate evidence (audit 2026-07-02): the
+        # context-overflow tally and the cache-drift dedup map used to be
+        # in-memory only, resetting on every ship restart — an empty
+        # /v1/status shadow read as "safe to flip" while real overflows sat in
+        # the (differently-windowed) timeout rows.
+        try:
+            self._state.context_overflows = self._queue_db.load_context_overflows()
+            persisted_drift = self._queue_db.kv_get("cache_drift_alerted", [])
+            self._state.cache_drift_alerted = {
+                (str(e[0]), str(e[1])): float(e[2])
+                for e in persisted_drift
+                if isinstance(e, (list, tuple)) and len(e) == 3
+            }
+        except Exception:  # noqa: BLE001 — seeding is best-effort
+            logger.warning("shadow-evidence seed failed", exc_info=True)
 
         # Recover queued requests from WAL
         recovered = self._queue_db.recover_queued(time.monotonic())
         for req in recovered:
+            # Shadow-tally context overflows on the recovery path too — it
+            # bypasses handle_submit, so recovered oversized requests were
+            # invisible to the flip-gate evidence (audit 2026-07-02). Count
+            # only; recovery never rejects (there is no caller to 422).
+            try:
+                if req.payload_type == "chat_completion":
+                    cfg = self._config.endpoints.get(req.endpoint)
+                    limit = cfg.context_per_slot if cfg else 0
+                    mt = req.payload.get("max_tokens")
+                    est_out = mt if isinstance(mt, int) and mt > 0 else 0
+                    est_in = req.est_input_tokens or 0
+                    if limit > 0 and est_in + est_out > limit:
+                        caller = str(req.caller_id or req.agent_id)
+                        tally = self._state.context_overflows.setdefault(
+                            req.endpoint,
+                            {"count": 0, "callers": {}, "max_est_in": 0})
+                        tally["count"] += 1
+                        tally["callers"][caller] = tally["callers"].get(caller, 0) + 1
+                        tally["max_est_in"] = max(tally["max_est_in"], est_in)
+                        self._queue_db.record_context_overflow(
+                            req.endpoint, caller, est_in)
+            except Exception:  # noqa: BLE001 — evidence must not break recovery
+                logger.debug("recovery overflow tally failed", exc_info=True)
             self._scheduler.enqueue(req)
 
         # Re-derive operator drains that were open when the process died.

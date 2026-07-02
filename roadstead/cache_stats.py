@@ -161,6 +161,11 @@ PREFILL_TOK_PER_S = 250.0  # rough boxa prefill rate, for the time-saved estimat
 # Tier-2 step 3 — periodic drift ALARM (health.compute_cache_stats):
 CACHE_DRIFT_WINDOW_S = 48 * 3600.0   # snapshot history the alarm reads (30-min cadence → ~96 pts)
 CACHE_DRIFT_REALERT_S = 6 * 3600.0   # re-fire a still-drifting call_site at most this often
+# Audit 2026-07-02: 4 of 5 live drift alerts were bimodal-prompt/tiny-sample
+# flapping (5-6 reqs/window oscillating 58↔83↔100). Require a real sample AND
+# the drop to hold across consecutive snapshots before calling it drift.
+CACHE_DRIFT_MIN_REQS = 20            # latest-screen sample floor per call_site
+CACHE_DRIFT_CONSECUTIVE = 2          # drop must hold for this many latest snapshots
 
 
 def detect_drift(snapshots: list[dict]) -> list[dict]:
@@ -178,21 +183,35 @@ def detect_drift(snapshots: list[dict]) -> list[dict]:
     for s in snapshots:
         by_ep.setdefault(s["endpoint"], []).append(s)
     out: list[dict] = []
+    n_consec = max(1, CACHE_DRIFT_CONSECUTIVE)
     for ep, snaps in sorted(by_ep.items()):
-        if len(snaps) < 3:
+        if len(snaps) < 2 + n_consec:
             continue
-        latest_screen = (snaps[-1] or {}).get("screen") or []
+        # The trailing n_consec snapshots must ALL show the drop; the baseline
+        # is the median over everything before them (flap/tiny-sample guard,
+        # audit 2026-07-02).
+        recent, prior = snaps[-n_consec:], snaps[:-n_consec]
         hist: dict[str, list[float]] = {}
-        for s in snaps[:-1]:
+        for s in prior:
             for r in s.get("screen") or []:
                 hist.setdefault(r["call_site"], []).append(r.get("lcp_pct", 0.0))
-        for r in latest_screen:
-            base = hist.get(r["call_site"])
+        recent_rows: list[dict[str, dict]] = [
+            {r["call_site"]: r for r in (s.get("screen") or [])} for s in recent
+        ]
+        for site, r in recent_rows[-1].items():
+            base = hist.get(site)
             if not base:
                 continue
+            if r.get("reqs", CACHE_DRIFT_MIN_REQS) < CACHE_DRIFT_MIN_REQS:
+                continue  # too small a sample to call drift
             b = st.median(base)
-            if b >= MISALIGN_LCP_PCT and r.get("lcp_pct", 0.0) <= b - DRIFT_LCP_DROP_PTS:
-                out.append({"call_site": r["call_site"], "endpoint": ep,
+            if b < MISALIGN_LCP_PCT:
+                continue
+            if all(
+                site in rows and rows[site].get("lcp_pct", 0.0) <= b - DRIFT_LCP_DROP_PTS
+                for rows in recent_rows
+            ):
+                out.append({"call_site": site, "endpoint": ep,
                             "from": round(b, 1), "to": r.get("lcp_pct", 0.0)})
     return out
 

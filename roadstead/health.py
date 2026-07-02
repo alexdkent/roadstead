@@ -247,6 +247,19 @@ class Health:
                                 f"but documented --max-num-seqs={doc} — reconcile "
                                 f"models.yaml `slots` with the serve script"),
                     ))
+        # Standing cache-drift conditions (audit 2026-07-02): mirror the current
+        # drift set into the alerts channel so it reaches /v1/status.alerts +
+        # the llmproxy_alerts_active gauge + the health-verifier chip — the CACHE_DRIFT
+        # log line alone had no automated consumer. Bucketed detail (10-pt) so
+        # a jittering LCP% doesn't re-log every tick via the dedup key.
+        for d in (self.state.cache_drift_current or []):
+            alerts.append(AlertCondition(
+                name="cache_drift", severity="WARNING", triggered=True,
+                detail=(f"{d.get('call_site')} on {d.get('endpoint')}: prefix "
+                        f"LCP ~{round(float(d.get('from', 0)) / 10) * 10}%→"
+                        f"~{round(float(d.get('to', 0)) / 10) * 10}% vs baseline"),
+            ))
+
         self.state.alerts = [
             {"name": a.name, "severity": a.severity, "detail": a.detail}
             for a in alerts
@@ -372,6 +385,9 @@ class Health:
             # a returning agent is recreated at the identical idle state.
             pruned = self.state.budget_mgr.prune_idle(mono, idle_ttl_s=3600.0)
             if pruned:
+                # Also delete the persisted rows, or load_budgets resurrects
+                # every ghost on the next boot (audit 2026-07-02).
+                self.state.queue_db.delete_budgets(pruned)
                 logger.info("budget: pruned %d idle agent(s): %s",
                             len(pruned), ", ".join(sorted(pruned)[:20]))
         # Periodic SSE `metrics` frame so /v1/stream subscribers get an
@@ -482,8 +498,21 @@ class Health:
         snaps = await asyncio.to_thread(
             self.state.queue_db.cache_stats_snapshots, cache_stats.CACHE_DRIFT_WINDOW_S)
         drift = cache_stats.detect_drift(snaps)
+        # Standing-alert feed: evaluate_alerts converts the CURRENT drift set
+        # into AlertConditions each tick (reachability, audit 2026-07-02).
+        self.state.cache_drift_current = drift
         to_fire, self.state.cache_drift_alerted = cache_stats.drift_alarms_to_fire(
             drift, self.state.cache_drift_alerted, now)
+        # Persist the dedup map (audit 2026-07-02): without this every proxy
+        # boot re-alerted the full standing-drift set 1s after startup.
+        # Wall-clock timestamps, so they survive across processes correctly.
+        try:
+            self.state.queue_db.kv_set(
+                "cache_drift_alerted",
+                [[cs_, ep_, ts_] for (cs_, ep_), ts_ in
+                 self.state.cache_drift_alerted.items()])
+        except Exception:  # noqa: BLE001 — dedup persistence is best-effort
+            logger.debug("cache-drift dedup persist failed", exc_info=True)
         for d in to_fire:
             logger.warning(
                 "CACHE_DRIFT_ALERT call_site=%s endpoint=%s lcp_pct=%.1f->%.1f — "
