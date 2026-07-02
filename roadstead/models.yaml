@@ -270,7 +270,7 @@ models:
 
   creative:
     kind: chat
-    status: active                  # PINNED always-resident on the DEDICATED boxa (docker --restart unless-stopped auto-starts vLLM); standalone — no dispatcher/systemd, proxy dispatches directly
+    status: active                  # PINNED always-resident on the DEDICATED boxa (docker --restart always auto-starts vLLM); standalone — no dispatcher/systemd, proxy dispatches directly
     proxy_endpoint: true
     endpoint_class: creative
     role: creative
@@ -316,8 +316,10 @@ models:
       but production switched to this downloaded AWQ artifact. Runs on the DEDICATED Intel Arc Pro
       boxa (10.0.0.10:9196, custom vLLM 0.23 XPU build) since 2026-06-20 — replaced the anvil GB10
       NVFP4 DECKARD (kept as hot rollback; the `deckard` aliases are historical from that prior
-      model). Standalone always-on docker container `vllm-creative-boxa` (--restart unless-stopped;
-      entrypoint auto-starts vLLM on boot/crash); NO anvil dispatcher, NO systemd. gpu-mem-util
+      model). Standalone always-on docker container `vllm-creative-boxa` (--restart always;
+      entrypoint auto-starts vLLM on boot/crash — flipped 2026-07-01 from unless-stopped, which
+      skips the auto-restart if the container was stopped when the daemon last came down, e.g. an
+      Nasbox array stop/start); NO anvil dispatcher, NO systemd. gpu-mem-util
       0.98, max-num-seqs 16, max-model-len 65536 (~108K KV tokens). Depends on the /mnt/cache/llm
       NVMe mount (editable vLLM install + model + serve_prod.sh). MULTIMODAL LIVE (2026-06-21, see
       capabilities + PRODUCTION.md): prod serves --dtype bfloat16 with --limit-mm-per-prompt
