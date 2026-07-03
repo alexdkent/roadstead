@@ -114,7 +114,17 @@ models:
       ground-truth (real calendar-photo bench found this 30B's Q4 VL quant
       garbles time fields). analyst still serves ALL text-only classify callers
       unchanged, and is analyst-vision's escalation fallback for the hardest
-      cases plus browser_broker's still-unmigrated screenshot-perception calls.
+      cases. recipe-runner's browser_broker screenshot-perception calls (Suno
+      page-state + the AXTree perceive() fallback) were ALSO benched 2026-07-03
+      against this domain specifically (button/form/status-banner/CAPTCHA
+      legibility, not document OCR) — see
+      originfleet/infra/nexus/bench_results/goose_vision_ab_20260703.md — and DELIBERATELY
+      STAY on analyst: no accuracy win over analyst-vision on this corpus, and
+      analyst-vision ran ~33% slower, which matters here because goose's vision
+      calls block an active browser session (unlike attachments/knowledge_v3's
+      background-intake domain, where the 06-30 bench correctly traded speed
+      for quality). Revisit only if a future vision candidate beats analyst on
+      speed or accuracy for THIS domain — the document-OCR bench doesn't transfer.
 
   analyst-vision:
     kind: chat
@@ -152,16 +162,19 @@ models:
       bolted-on mmproj) per a targeted real-photo A/B; swapped same-day to
       **Qwen3-VL-8B-Instruct** (dedicated VLM, native mmproj) after operator
       review of the full 6-model A/B
-      (infra/nexus/bench_results/vision_ab_6model_20260630.md, 84.3 avg —
+      (originfleet/infra/nexus/bench_results/vision_ab_6model_20260630.md, 84.3 avg —
       beats every bolted-on-mmproj candidate on fine vision) — dedicated-VL >
       bolted-on-mmproj is the fleet's standing lesson here. `qwen-vision-9b`
       kept as a legacy alias (nothing in-repo should reference it going
       forward; use `qwen-vision-8b`/`analyst-vision`). analyst keeps serving
       its TEXT-only callers (classify tier) unchanged — this is a vision-only
       split, not a decommission. browser_broker's page-perception prefixes
-      (screenshots, a different visual domain with no supporting bench) stay
-      on analyst pending their own smoke test. Hard-handwriting cases
-      escalate to `creative`
+      (screenshots — a different visual domain) were benched 2026-07-03 (see
+      analyst's own notes above + originfleet/infra/nexus/bench_results/
+      goose_vision_ab_20260703.md) and DELIBERATELY STAY on analyst: no
+      accuracy win here, and this model ran ~33% slower on that corpus, which
+      matters for goose's blocking/interactive vision calls. Hard-handwriting
+      cases escalate to `creative`
       (extra_body: {"mm_processor_kwargs": {"max_soft_tokens": 560}}) or
       on-demand analyst, per vision_model_comparison_2026-06.md /
       nexus_qwen35_loadout_plan.md.
