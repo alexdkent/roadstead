@@ -82,7 +82,7 @@ models:
     proxy_endpoint: true
     endpoint_class: chat
     role: qwen-analyst
-    aliases: [qwen-analyst, chat, nexus-chat]
+    aliases: [qwen-analyst]
     host: nexus
     port: 8080
     backend_engine: llama.cpp
@@ -130,61 +130,69 @@ models:
       `fallback:` target — no live caller routes to it as PRIMARY vision
       anymore.
 
-  analyst-vision:
+  classify:
     kind: chat
     status: active
     proxy_endpoint: true
-    endpoint_class: vision9b
-    role: qwen-vision-8b
-    aliases: [qwen-vision-8b, qwen-vision-9b, analyst-vision, vision-8b]
+    endpoint_class: classify
+    role: qwen-classify
+    aliases: [qwen-classify, classify, chat, nexus-chat, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b]
     host: nexus
-    port: 8082
+    port: 8091
     backend_engine: llama.cpp
-    systemd_unit: llama-vision-8b
+    systemd_unit: llama-chat
     probe_kind: llama
-    model_family: Qwen3-VL-8B-Instruct + mmproj (vision)
-    quant: Q8_0
-    context_per_slot: 16384
-    context_window: 65536
+    model_family: Qwen3.6-35B-A3B + mmproj (chat + vision)
+    quant: UD-Q4_K_XL
+    context_per_slot: 32768
+    context_window: 32768
     slots: 4
     timeout_floor_s: 45
     capabilities:
       vision: true
       streaming: false
       reasoning: false
-      tool_calling: false
+      tool_calling: true
       structured_output: grammar
-    token_speed: {note: "dedicated VLM, ~24 t/s decode, ~295 t/s prefill; faster+cheaper than the v1 9B dense candidate"}
-    purpose: Dedicated vision model — replaces analyst's vision half for all its callers (analyst's 30B vision is being deprecated).
+    token_speed: {note: "~55 t/s decode text; vision extract ~15-30s/image incl. encode"}
+    purpose: Consolidated text-classify + vision tier — replaces both analyst's TEXT-classify half and the separate analyst-vision (8B) service.
     when_used:
+      - Tier-1.5 / Tier-2 text classification (sidekick.extract_pad fallback, temporal.daily_summary, mail-agent.email_recent_overview, orchestrator.autonomous_chat-agent.reflect, forum-agent.peer_playbook)
       - attachments stage-2 full-resolution image extraction
       - knowledge_v3 ground-truth PII/document intake
-      - browser_broker vision-routed capabilities (perceive./vision./insurance./portal. — recipe-runner Suno/portal/CAPTCHA screenshots, migrated 2026-07-03)
+      - browser_broker vision-routed capabilities (perceive./vision./insurance./portal.)
     fallback: analyst
     notes: |
-      Split out of `analyst` (Qwen3-VL-30B) 2026-07-03 — analyst's Q4 VL quant
-      garbles calendar time-fields. First shipped as Qwen3.5-9B-Q8 (dense,
-      bolted-on mmproj) per a targeted real-photo A/B; swapped same-day to
-      **Qwen3-VL-8B-Instruct** (dedicated VLM, native mmproj) after operator
-      review of the full 6-model A/B
-      (originfleet/infra/nexus/bench_results/vision_ab_6model_20260630.md, 84.3 avg —
-      beats every bolted-on-mmproj candidate on fine vision) — dedicated-VL >
-      bolted-on-mmproj is the fleet's standing lesson here. `qwen-vision-9b`
-      kept as a legacy alias (nothing in-repo should reference it going
-      forward; use `qwen-vision-8b`/`analyst-vision`). analyst keeps serving
-      its TEXT-only callers (classify tier) unchanged. browser_broker's
-      page-perception prefixes (screenshots — a different visual domain) were
-      ALSO benched 2026-07-03 (see analyst's own notes above +
-      originfleet/infra/nexus/bench_results/goose_vision_ab_20260703.md,
-      addendum at top) — tied on accuracy (this model ran ~33% slower, but
-      goose's vision calls are NOT human-interactive, so that didn't matter)
-      — and MIGRATED here same day. That migration is what validated it's
-      safe to deprecate 30B analyst's vision half entirely: every live vision
-      caller now routes to analyst-vision, analyst's vision role is
-      fallback-only. Hard-handwriting cases escalate to `creative`
-      (extra_body: {"mm_processor_kwargs": {"max_soft_tokens": 560}}) or
-      on-demand analyst, per vision_model_comparison_2026-06.md /
-      nexus_qwen35_loadout_plan.md.
+      Stood up 2026-07-03 as the classify leg of the nexus model swap-out
+      (docs/nexus_qwen35_loadout_plan.md); resurrects the pre-2026-05-30
+      `llama-chat.service` model (this IS the model that ran as "chat" before
+      being replaced by the dedicated Qwen3-VL-30B) — same weights
+      (`/srv/models/qwen3.6-35b-a3b-ud-q4_k_m.gguf` + its native mmproj),
+      now on a fresh port (8091) with `--reasoning off` baked in (this model
+      defaults to thinking-mode via its chat template — left on, that's a
+      40-100x slowdown, confirmed in the 2026-07-02 3-way classify bake-off:
+      originfleet/infra/nexus/bench_results/classify_bakeoff_3way_2026-07-02.md).
+
+      **Vision consolidation decision (2026-07-03):** benched this model's
+      native mmproj against the dedicated 8B `analyst-vision`
+      (originfleet/infra/nexus/bench_results/vision_consolidation_qwen36_35b_20260703.md)
+      — tied or slightly ahead across all 7 categories, no substantial 8B
+      edge found. Per the operator's consolidation-biased decision rule,
+      `analyst-vision`/`llama-vision-8b.service` was decommissioned and its
+      3 vision callers (attachments, knowledge_v3 ground-truth,
+      browser_broker) migrated here via the `analyst-vision`/`qwen-vision-8b`
+      aliases (no caller code changes needed — see the decommissioned block
+      below). This also frees ~11 GiB of GTT, which matters: nexus's real
+      usable ceiling is ~109 GiB (not the naive 124 GiB GTT-quota sum — see
+      infra/nexus/runbooks/amdgpu_vm_memory_leak_2026-07-03.md for the full
+      memory-accounting story from this same swap).
+
+      The `chat`/`nexus-chat` aliases moved here from `analyst` (zero live
+      internal callers used the bare "chat" string; the external gateway
+      facade routes via an explicit service id, unaffected). `analyst`
+      remains the escalation fallback (hardest vision cases, on-demand —
+      see its own notes) and is analyst-vision's `fallback:` target,
+      preserved via the alias chain.
 
   composer:
     kind: chat
@@ -491,7 +499,7 @@ models:
     purpose: Primary OCR (document/image text extraction).
     when_used:
       - attachments + email document OCR
-    fallback: analyst                # qwen-analyst vision is the OCR fallback
+    fallback: classify               # updated 2026-07-03 (was analyst — stale since the vision split)
     notes: |
       Reached via the gateway facade, not make_nexus_client. Ran on nexus (ROCm)
       through 2026-07-01; relocated to Kestrel's OCR VM (10.0.0.18, CUDA)
@@ -730,6 +738,17 @@ models:
 # `inferctl models --all` and audits surface these with their retirement note.
 # ---------------------------------------------------------------------------
 decommissioned:
+  analyst-vision:
+    aliases: [qwen-vision-8b, qwen-vision-9b, vision-8b]
+    host: nexus
+    port: 8082
+    retired: 2026-07-03
+    notes: |
+      Dedicated Qwen3-VL-8B-Instruct vision tier (llama-vision-8b.service).
+      Consolidated into `classify` (Qwen3.6-35B-A3B's native mmproj) after a
+      vision A/B found no substantial quality edge — see
+      infra/nexus/bench_results/vision_consolidation_qwen36_35b_20260703.md.
+      Its aliases now resolve to `classify`; no caller code changes needed.
   gemma-hot:
     aliases: [llama-gemma-hot]
     host: anvil

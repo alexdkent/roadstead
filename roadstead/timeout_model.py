@@ -42,6 +42,11 @@ from .config import normalize_endpoint
 
 FLOOR_S: dict[str, float] = {
     "chat": 30.0,
+    # classify (2026-07-03): consolidated text-classify + vision tier — the
+    # vision half (image encode + extraction) runs 15-30s/call, well above the
+    # 30s "chat" floor, so this needs its own higher floor. Matches
+    # models.yaml's classify.timeout_floor_s.
+    "classify": 45.0,
     "companion": 180.0,
     "thinker": 180.0,
     # creative (Gemma-4-31B abliterated) is dense (~25 tok/s single-stream, 16 slots on the Arc Pro boxa);
