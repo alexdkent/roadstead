@@ -109,7 +109,7 @@ models:
     fallback: composer
     notes: |
       Not the streaming-synth path. Lives on nexus so anvil stays free for
-      the user-facing composer slot. 2026-07-03: analyst-vision (Qwen3.5-9B-Q8)
+      the user-facing composer slot. 2026-07-03: analyst-vision (Qwen3-VL-8B-Instruct)
       split out as the PRIMARY vision backend for attachments + knowledge_v3
       ground-truth (real calendar-photo bench found this 30B's Q4 VL quant
       garbles time fields). analyst still serves ALL text-only classify callers
@@ -121,18 +121,18 @@ models:
     status: active
     proxy_endpoint: true
     endpoint_class: vision9b
-    role: qwen-vision-9b
-    aliases: [qwen-vision-9b, analyst-vision, vision-9b]
+    role: qwen-vision-8b
+    aliases: [qwen-vision-8b, qwen-vision-9b, analyst-vision, vision-8b]
     host: nexus
     port: 8082
     backend_engine: llama.cpp
-    systemd_unit: llama-vision-9b
+    systemd_unit: llama-vision-8b
     probe_kind: llama
-    model_family: Qwen3.5-9B-Instruct + mmproj (vision)
+    model_family: Qwen3-VL-8B-Instruct + mmproj (vision)
     quant: Q8_0
-    context_per_slot: 32768
+    context_per_slot: 16384
     context_window: 65536
-    slots: 2
+    slots: 4
     timeout_floor_s: 45
     capabilities:
       vision: true
@@ -140,7 +140,7 @@ models:
       reasoning: false
       tool_calling: false
       structured_output: grammar
-    token_speed: {note: "~equal-to-slower than analyst; dense Q8 decode ~22 t/s, vision prefill ~4000 tok"}
+    token_speed: {note: "dedicated VLM, ~24 t/s decode, ~295 t/s prefill; faster+cheaper than the v1 9B dense candidate"}
     purpose: Dedicated document/calendar-photo vision — replaces analyst's vision half for its validated callers.
     when_used:
       - attachments stage-2 full-resolution image extraction
@@ -148,13 +148,20 @@ models:
     fallback: analyst
     notes: |
       Split out of `analyst` (Qwen3-VL-30B) 2026-07-03 — analyst's Q4 VL quant
-      garbles calendar time-fields; this Q8 dense+mmproj model fixed it on
-      real-photo validation (infra/nexus/bench_results/9b_q8_vision_vs_analyst_20260630.md).
-      analyst keeps serving its TEXT-only callers (classify tier) unchanged —
-      this is a vision-only split, not a decommission. browser_broker's
-      page-perception prefixes (screenshots, a different visual domain with no
-      supporting bench) stay on analyst pending their own smoke test. Hard-
-      handwriting cases escalate to `creative`
+      garbles calendar time-fields. First shipped as Qwen3.5-9B-Q8 (dense,
+      bolted-on mmproj) per a targeted real-photo A/B; swapped same-day to
+      **Qwen3-VL-8B-Instruct** (dedicated VLM, native mmproj) after operator
+      review of the full 6-model A/B
+      (infra/nexus/bench_results/vision_ab_6model_20260630.md, 84.3 avg —
+      beats every bolted-on-mmproj candidate on fine vision) — dedicated-VL >
+      bolted-on-mmproj is the fleet's standing lesson here. `qwen-vision-9b`
+      kept as a legacy alias (nothing in-repo should reference it going
+      forward; use `qwen-vision-8b`/`analyst-vision`). analyst keeps serving
+      its TEXT-only callers (classify tier) unchanged — this is a vision-only
+      split, not a decommission. browser_broker's page-perception prefixes
+      (screenshots, a different visual domain with no supporting bench) stay
+      on analyst pending their own smoke test. Hard-handwriting cases
+      escalate to `creative`
       (extra_body: {"mm_processor_kwargs": {"max_soft_tokens": 560}}) or
       on-demand analyst, per vision_model_comparison_2026-06.md /
       nexus_qwen35_loadout_plan.md.
