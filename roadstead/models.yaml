@@ -78,7 +78,15 @@ models:
   # ---------------------------------------------------------------- chat / reasoning
   analyst:
     kind: chat
-    status: active
+    # 2026-07-03: on_demand here means MANUAL OPERATOR START (systemctl start
+    # llama-vision on nexus) — NOT the anvil-dispatcher-managed lazy-load
+    # that every OTHER on_demand entry in this file means (diarize/imagegen/
+    # musicgen/etc). Nexus llama.cpp chat roles have no dispatcher lease;
+    # nothing auto-starts this. It stays a normal, health-polled proxy
+    # endpoint so routing "just works" whenever it IS running, and the
+    # proxy's ordinary health/circuit handling treats it like any other
+    # backend outage when it's down (no special-casing).
+    status: on_demand
     proxy_endpoint: true
     endpoint_class: chat
     role: qwen-analyst
@@ -101,34 +109,26 @@ models:
       tool_calling: true
       structured_output: grammar
     token_speed: {note: "~0.1-1.5s classify; ~1-2s vision"}
-    purpose: Fast prefill-bound classification tier; vision FALLBACK only (primary vision moved to analyst-vision).
+    purpose: Deepest escalation fallback only — normally STOPPED, not routinely resident. Both its text-classify and vision duty are now served by `classify`.
     when_used:
-      - Tier-1.5 / Tier-2 classification (email triage, relationship, attachments)
-      - Vision escalation fallback (analyst-vision's `fallback:` target — no live caller routes here as PRIMARY vision, including browser_broker as of 2026-07-03)
-      - Vision fallback behind `ocr` (got-ocr)
+      - Manual last-resort escalation for `classify`'s hardest vision misses (faded/cursive handwriting) — operator runs `systemctl start llama-vision` then passes `model="analyst"` explicitly; not automatic (no fallback-chain infra exists — see classify's notes)
     fallback: composer
     notes: |
-      Not the streaming-synth path. Lives on nexus so anvil stays free for
-      the user-facing composer slot. 2026-07-03: analyst-vision (Qwen3-VL-8B-Instruct)
-      split out as the PRIMARY vision backend for attachments + knowledge_v3
-      ground-truth (real calendar-photo bench found this 30B's Q4 VL quant
-      garbles time fields). analyst still serves ALL text-only classify callers
-      unchanged, and is analyst-vision's escalation fallback for the hardest
-      cases. recipe-runner's browser_broker screenshot-perception calls (Suno
-      page-state + the AXTree perceive() fallback) were ALSO benched 2026-07-03
-      against this domain specifically (button/form/status-banner/CAPTCHA
-      legibility, not document OCR) — see
-      originfleet/infra/nexus/bench_results/goose_vision_ab_20260703.md
-      (addendum at the top). Initial verdict was "stay on analyst" (tied
-      accuracy, analyst-vision ~33% slower) under a mistaken assumption that
-      goose's vision calls are human-interactive — they are NOT (recipes run
-      autonomously), so speed isn't a deciding factor here. Corrected same day:
-      goose's vision-routed prefixes MIGRATED to analyst-vision (tied accuracy
-      = no regression), which is what validated it's safe to deprecate 30B
-      analyst's vision half. analyst is now purely the escalation fallback for
-      both attachments/knowledge_v3's hardest cases and analyst-vision's own
-      `fallback:` target — no live caller routes to it as PRIMARY vision
-      anymore.
+      2026-07-03: fully superseded by `classify` (Qwen3.6-35B-A3B + mmproj,
+      :8091) — both the text-classify half (moved 2026-07-03 earlier this
+      same swap) and the vision half (analyst-vision split off 2026-07-03,
+      then itself consolidated into classify same day — see classify's
+      notes and infra/nexus/bench_results/vision_consolidation_qwen36_35b_20260703.md)
+      are gone. `llama-vision.service` is stopped+disabled on nexus
+      (unit file + GGUF kept on disk for rollback — the repo's stated
+      rollback doctrine). Freed ~17.7 GiB of GTT, which — combined with the
+      analyst-vision consolidation — is what makes the Phase 2 composer
+      (122B) swap's memory budget viable; see
+      infra/nexus/runbooks/amdgpu_vm_memory_leak_2026-07-03.md for the full
+      memory-accounting story. No live caller routes here automatically;
+      it exists purely as a manual break-glass escalation, per the
+      "Qwen3-VL-30B on-demand, don't keep it resident" recommendation in
+      docs/nexus_qwen35_loadout_plan.md.
 
   classify:
     kind: chat
