@@ -62,6 +62,7 @@ meta:
     anvil: 10.0.0.3
     nasbox: 10.0.0.10
     kestrel-speech: 10.0.0.13
+    kestrel-perception: 10.0.0.18
   # Provider context-window values preserved VERBATIM for callers/DB rows that
   # are not (yet) covered by a role entry. anthropic is the no-op v2 fallback;
   # the nexus-* legacy values are intentionally the OLD numbers — un-migrated
@@ -402,10 +403,10 @@ models:
     proxy_endpoint: false           # facade-only (gateway), not a proxy LLM role
     role: got-ocr
     aliases: [got-ocr, got_ocr]
-    host: nexus
+    host: kestrel-perception             # RELOCATED off nexus 2026-07-02 (Kestrel OCR VM, CUDA)
     port: 8087
     backend_engine: shim
-    systemd_unit: nexus-got-ocr
+    systemd_unit: ocr-unit
     probe_kind: health
     model_family: GOT-OCR-2.0
     quant: fp16
@@ -416,7 +417,10 @@ models:
     when_used:
       - attachments + email document OCR
     fallback: analyst                # qwen-analyst vision is the OCR fallback
-    notes: Reached via the gateway facade, not make_nexus_client.
+    notes: |
+      Reached via the gateway facade, not make_nexus_client. Ran on nexus (ROCm)
+      through 2026-07-01; relocated to Kestrel's OCR VM (10.0.0.18, CUDA)
+      2026-07-02. nexus's copy left running as rollback during soak.
 
   # ---------------------------------------------------------------- speech
   tts:
@@ -425,8 +429,9 @@ models:
     proxy_endpoint: false
     role: orpheus-tts
     aliases: [orpheus-tts, orpheus]
-    host: nexus
+    host: kestrel-perception             # RELOCATED off nexus 2026-07-02 (Kestrel OCR VM, CUDA)
     port: 8098
+    slots: 4                           # llama.cpp backbone --parallel 4 (bumped from nexus's 2->3->4)
     backend_engine: shim
     systemd_unit: orpheus-tts
     probe_kind: health
@@ -438,6 +443,9 @@ models:
     notes: |
       Backbone `orpheus-llama` (Llama-3.2-3B) on :8096 emits SNAC codes;
       orpheus-tts (:8098) is the front. Replaced chatterbox-tts (2026-06-07).
+      Ran on nexus (Vulkan, --parallel 2) through 2026-07-01; relocated to
+      Kestrel's OCR VM (10.0.0.18, CUDA, --parallel 4) 2026-07-02/03.
+      nexus's copy left running as rollback during soak.
 
   stt:
     kind: stt
@@ -447,6 +455,7 @@ models:
     aliases: [whisper-1, whisper]
     host: kestrel-speech                # RELOCATED off Nasbox 2026-07-03 (Kestrel CTnnn iGPU)
     port: 8086
+    slots: 1                          # single-worker ThreadPoolExecutor(max_workers=1) — sequential
     backend_engine: shim
     model_family: Whisper Large v3 (int8, OpenVINO)
     purpose: Speech-to-text transcription.
@@ -466,6 +475,7 @@ models:
     aliases: [diarize-gpu, nexus-diarize-gpu]
     host: kestrel-speech                # RELOCATED off Nasbox 2026-07-03 (Kestrel CTnnn iGPU)
     port: 8086
+    slots: 1                          # single-worker ThreadPoolExecutor(max_workers=1) — sequential
     backend_engine: shim
     model_family: DiariZen (WavLM, OpenVINO)
     dispatcher_capability: diarize
