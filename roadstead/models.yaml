@@ -104,7 +104,7 @@ models:
     purpose: Fast prefill-bound classification tier; vision FALLBACK only (primary vision moved to analyst-vision).
     when_used:
       - Tier-1.5 / Tier-2 classification (email triage, relationship, attachments)
-      - Vision escalation fallback (browser_broker page-perception; analyst-vision's fallback target)
+      - Vision escalation fallback (analyst-vision's `fallback:` target — no live caller routes here as PRIMARY vision, including browser_broker as of 2026-07-03)
       - Vision fallback behind `ocr` (got-ocr)
     fallback: composer
     notes: |
@@ -118,13 +118,17 @@ models:
       page-state + the AXTree perceive() fallback) were ALSO benched 2026-07-03
       against this domain specifically (button/form/status-banner/CAPTCHA
       legibility, not document OCR) — see
-      originfleet/infra/nexus/bench_results/goose_vision_ab_20260703.md — and DELIBERATELY
-      STAY on analyst: no accuracy win over analyst-vision on this corpus, and
-      analyst-vision ran ~33% slower, which matters here because goose's vision
-      calls block an active browser session (unlike attachments/knowledge_v3's
-      background-intake domain, where the 06-30 bench correctly traded speed
-      for quality). Revisit only if a future vision candidate beats analyst on
-      speed or accuracy for THIS domain — the document-OCR bench doesn't transfer.
+      originfleet/infra/nexus/bench_results/goose_vision_ab_20260703.md
+      (addendum at the top). Initial verdict was "stay on analyst" (tied
+      accuracy, analyst-vision ~33% slower) under a mistaken assumption that
+      goose's vision calls are human-interactive — they are NOT (recipes run
+      autonomously), so speed isn't a deciding factor here. Corrected same day:
+      goose's vision-routed prefixes MIGRATED to analyst-vision (tied accuracy
+      = no regression), which is what validated it's safe to deprecate 30B
+      analyst's vision half. analyst is now purely the escalation fallback for
+      both attachments/knowledge_v3's hardest cases and analyst-vision's own
+      `fallback:` target — no live caller routes to it as PRIMARY vision
+      anymore.
 
   analyst-vision:
     kind: chat
@@ -151,10 +155,11 @@ models:
       tool_calling: false
       structured_output: grammar
     token_speed: {note: "dedicated VLM, ~24 t/s decode, ~295 t/s prefill; faster+cheaper than the v1 9B dense candidate"}
-    purpose: Dedicated document/calendar-photo vision — replaces analyst's vision half for its validated callers.
+    purpose: Dedicated vision model — replaces analyst's vision half for all its callers (analyst's 30B vision is being deprecated).
     when_used:
       - attachments stage-2 full-resolution image extraction
       - knowledge_v3 ground-truth PII/document intake
+      - browser_broker vision-routed capabilities (perceive./vision./insurance./portal. — recipe-runner Suno/portal/CAPTCHA screenshots, migrated 2026-07-03)
     fallback: analyst
     notes: |
       Split out of `analyst` (Qwen3-VL-30B) 2026-07-03 — analyst's Q4 VL quant
@@ -167,14 +172,16 @@ models:
       bolted-on-mmproj is the fleet's standing lesson here. `qwen-vision-9b`
       kept as a legacy alias (nothing in-repo should reference it going
       forward; use `qwen-vision-8b`/`analyst-vision`). analyst keeps serving
-      its TEXT-only callers (classify tier) unchanged — this is a vision-only
-      split, not a decommission. browser_broker's page-perception prefixes
-      (screenshots — a different visual domain) were benched 2026-07-03 (see
-      analyst's own notes above + originfleet/infra/nexus/bench_results/
-      goose_vision_ab_20260703.md) and DELIBERATELY STAY on analyst: no
-      accuracy win here, and this model ran ~33% slower on that corpus, which
-      matters for goose's blocking/interactive vision calls. Hard-handwriting
-      cases escalate to `creative`
+      its TEXT-only callers (classify tier) unchanged. browser_broker's
+      page-perception prefixes (screenshots — a different visual domain) were
+      ALSO benched 2026-07-03 (see analyst's own notes above +
+      originfleet/infra/nexus/bench_results/goose_vision_ab_20260703.md,
+      addendum at top) — tied on accuracy (this model ran ~33% slower, but
+      goose's vision calls are NOT human-interactive, so that didn't matter)
+      — and MIGRATED here same day. That migration is what validated it's
+      safe to deprecate 30B analyst's vision half entirely: every live vision
+      caller now routes to analyst-vision, analyst's vision role is
+      fallback-only. Hard-handwriting cases escalate to `creative`
       (extra_body: {"mm_processor_kwargs": {"max_soft_tokens": 560}}) or
       on-demand analyst, per vision_model_comparison_2026-06.md /
       nexus_qwen35_loadout_plan.md.
