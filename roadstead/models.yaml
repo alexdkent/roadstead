@@ -61,6 +61,7 @@ meta:
     nexus: 10.0.0.6
     anvil: 10.0.0.3
     nasbox: 10.0.0.10
+    kestrel-speech: 10.0.0.13
   # Provider context-window values preserved VERBATIM for callers/DB rows that
   # are not (yet) covered by a role entry. anthropic is the no-op v2 fallback;
   # the nexus-* legacy values are intentionally the OLD numbers — un-migrated
@@ -444,7 +445,7 @@ models:
     proxy_endpoint: false
     role: whisper-1
     aliases: [whisper-1, whisper]
-    host: nasbox                     # RELOCATED off nexus 2026-06-12 (OpenVINO NPU)
+    host: kestrel-speech                # RELOCATED off Nasbox 2026-07-03 (Kestrel CTnnn iGPU)
     port: 8086
     backend_engine: shim
     model_family: Whisper Large v3 (int8, OpenVINO)
@@ -452,7 +453,10 @@ models:
     when_used:
       - Tideway transcription, voice intake, Wyoming ASR for HA
     fallback: null
-    notes: Runs on the Nasbox Intel Xe/NPU box (10.0.0.10) since 2026-06-12.
+    notes: |
+      Runs on the Nasbox Intel Xe/NPU box (10.0.0.10) since 2026-06-12; relocated
+      to Kestrel CTnnn "audio" (10.0.0.13, same image/port, Iris Xe iGPU) 2026-07-03.
+      Nasbox's copy left running as rollback during soak.
 
   diarize:
     kind: diarize
@@ -460,7 +464,7 @@ models:
     proxy_endpoint: false
     role: diarize-gpu
     aliases: [diarize-gpu, nexus-diarize-gpu]
-    host: nasbox                     # RELOCATED off anvil 2026-06-12 (OpenVINO iGPU)
+    host: kestrel-speech                # RELOCATED off Nasbox 2026-07-03 (Kestrel CTnnn iGPU)
     port: 8086
     backend_engine: shim
     model_family: DiariZen (WavLM, OpenVINO)
@@ -471,10 +475,12 @@ models:
       - multi-speaker transcript attribution
     fallback: null
     notes: |
-      Gated by DIARIZE_ENABLED (default off). Runs on the Nasbox iGPU (10.0.0.10:8086,
-      OpenVINO) since 2026-06-12, reached via the gateway facade. The anvil
-      dispatcher row was removed 2026-06-16 (build_dispatcher_entries excludes
-      non-anvil hosts), so this is no longer a anvil-dispatcher capability.
+      Gated by DIARIZE_ENABLED (default off). Ran on the Nasbox iGPU (10.0.0.10:8086,
+      OpenVINO) 2026-06-12 through 2026-07-02; relocated to Kestrel CTnnn "audio"
+      (10.0.0.13, same image/port) 2026-07-03, reached via the gateway facade.
+      Nasbox's copy left running as rollback during soak. The anvil dispatcher
+      row was removed 2026-06-16 (build_dispatcher_entries excludes non-anvil
+      hosts), so this is no longer a anvil-dispatcher capability.
 
   stream:
     kind: stream
@@ -482,7 +488,7 @@ models:
     proxy_endpoint: false
     role: nexus-stream
     aliases: [nexus-stream, stream]
-    host: nasbox                     # RELOCATED off anvil 2026-06-12
+    host: kestrel-speech                # RELOCATED off Nasbox 2026-07-03 (Kestrel CTnnn iGPU)
     port: 8190
     wyoming_port: 10300
     backend_engine: shim
@@ -491,7 +497,10 @@ models:
     when_used:
       - real-time voice capture pipeline, HA Wyoming ASR
     fallback: null
-    notes: Nasbox (10.0.0.10) :8190 + Wyoming :10300 since 2026-06-12.
+    notes: |
+      Ran on Nasbox (10.0.0.10) :8190 + Wyoming :10300 2026-06-12 through
+      2026-07-02; relocated to Kestrel CTnnn "audio" (10.0.0.13, same
+      image/port) 2026-07-03. Nasbox's copy left running as rollback during soak.
 
   # ---------------------------------------------------------------- media / generation
   # All dispatcher-managed, on-demand (GPU-slot lease). Keyed by
