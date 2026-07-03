@@ -101,15 +101,63 @@ models:
       tool_calling: true
       structured_output: grammar
     token_speed: {note: "~0.1-1.5s classify; ~1-2s vision"}
-    purpose: Vision (OCR/description) + fast prefill-bound classification tier.
+    purpose: Fast prefill-bound classification tier; vision FALLBACK only (primary vision moved to analyst-vision).
     when_used:
-      - Image/screenshot/calendar-photo vision (description + OCR)
       - Tier-1.5 / Tier-2 classification (email triage, relationship, attachments)
+      - Vision escalation fallback (browser_broker page-perception; analyst-vision's fallback target)
       - Vision fallback behind `ocr` (got-ocr)
     fallback: composer
     notes: |
       Not the streaming-synth path. Lives on nexus so anvil stays free for
-      the user-facing composer slot.
+      the user-facing composer slot. 2026-07-03: analyst-vision (Qwen3.5-9B-Q8)
+      split out as the PRIMARY vision backend for attachments + knowledge_v3
+      ground-truth (real calendar-photo bench found this 30B's Q4 VL quant
+      garbles time fields). analyst still serves ALL text-only classify callers
+      unchanged, and is analyst-vision's escalation fallback for the hardest
+      cases plus browser_broker's still-unmigrated screenshot-perception calls.
+
+  analyst-vision:
+    kind: chat
+    status: active
+    proxy_endpoint: true
+    endpoint_class: vision9b
+    role: qwen-vision-9b
+    aliases: [qwen-vision-9b, analyst-vision, vision-9b]
+    host: nexus
+    port: 8082
+    backend_engine: llama.cpp
+    systemd_unit: llama-vision-9b
+    probe_kind: llama
+    model_family: Qwen3.5-9B-Instruct + mmproj (vision)
+    quant: Q8_0
+    context_per_slot: 32768
+    context_window: 65536
+    slots: 2
+    timeout_floor_s: 45
+    capabilities:
+      vision: true
+      streaming: false
+      reasoning: false
+      tool_calling: false
+      structured_output: grammar
+    token_speed: {note: "~equal-to-slower than analyst; dense Q8 decode ~22 t/s, vision prefill ~4000 tok"}
+    purpose: Dedicated document/calendar-photo vision — replaces analyst's vision half for its validated callers.
+    when_used:
+      - attachments stage-2 full-resolution image extraction
+      - knowledge_v3 ground-truth PII/document intake
+    fallback: analyst
+    notes: |
+      Split out of `analyst` (Qwen3-VL-30B) 2026-07-03 — analyst's Q4 VL quant
+      garbles calendar time-fields; this Q8 dense+mmproj model fixed it on
+      real-photo validation (infra/nexus/bench_results/9b_q8_vision_vs_analyst_20260630.md).
+      analyst keeps serving its TEXT-only callers (classify tier) unchanged —
+      this is a vision-only split, not a decommission. browser_broker's
+      page-perception prefixes (screenshots, a different visual domain with no
+      supporting bench) stay on analyst pending their own smoke test. Hard-
+      handwriting cases escalate to `creative`
+      (extra_body: {"mm_processor_kwargs": {"max_soft_tokens": 560}}) or
+      on-demand analyst, per vision_model_comparison_2026-06.md /
+      nexus_qwen35_loadout_plan.md.
 
   composer:
     kind: chat

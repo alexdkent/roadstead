@@ -59,6 +59,11 @@ FLOOR_S: dict[str, float] = {
     "gemma-hot": 8.0,
     "rerank": 10.0,
     "embed": 15.0,
+    # Dedicated document/calendar-photo vision (dense Q8, split off analyst
+    # 2026-07-03). Background/intake path, not streaming; bench wall times ran
+    # 40-60s on full calendar-photo extraction — keep matching the models.yaml
+    # analyst-vision `timeout_floor_s` value.
+    "vision9b": 45.0,
 }
 
 # Fallback floor for an unknown endpoint class.
