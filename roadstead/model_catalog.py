@@ -266,6 +266,24 @@ def build_class_to_role(cat: Catalog | None = None) -> dict[str, str]:
     return {e.endpoint_class: e.role for e in cat.proxy_endpoints() if e.endpoint_class}
 
 
+def build_class_floors(cat: Catalog | None = None) -> dict[str, float]:
+    """endpoint class → per-class timeout floor (seconds), from ``timeout_floor_s``.
+
+    This is what makes ``models.yaml`` the ENFORCED authority for timeout floors
+    (it declares itself the single source of truth). ``TimeoutModel`` is seeded
+    from this so a floor bump in the yaml — e.g. classify 45→180 / composer
+    180→360 for the 2026-07 nexus model swap — actually changes enforcement
+    instead of being an inert field. Only proxy-endpoint owners with a positive
+    floor are emitted; classes absent here fall back to ``timeout_model.FLOOR_S``.
+    Deterministic (proxy-endpoint owner per class, like ``build_class_to_role``)."""
+    cat = cat or load_catalog()
+    out: dict[str, float] = {}
+    for e in cat.proxy_endpoints():
+        if e.endpoint_class and e.timeout_floor_s and e.timeout_floor_s > 0:
+            out[e.endpoint_class] = float(e.timeout_floor_s)
+    return out
+
+
 def build_role_aliases(cat: Catalog | None = None) -> dict[str, str]:
     """alias → role string (mirrors the old _ROLE_ALIASES). Every non-role
     alias of every entry resolves to that entry's role string."""

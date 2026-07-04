@@ -40,15 +40,26 @@ from .config import normalize_endpoint
 # every endpoint class has a floor here.
 # ---------------------------------------------------------------------------
 
+#
+# THIS TABLE IS A SYNCED MIRROR OF models.yaml `timeout_floor_s`, not a second
+# source of truth. models.yaml is authoritative: it seeds the SERVER's
+# TimeoutModel floors (state.py, via model_catalog.build_class_floors), layered
+# over these as the fallback for any class absent from the yaml. These values
+# ALSO back the CLIENT-side floor_for() (framework/timeout_advice) — which has a
+# one-way dep on this module and can't read the catalog — so a value here that
+# disagrees with the yaml makes the client's sub-floor-honor decision drift from
+# what the server enforces. Keep them equal; test_timeout_floor_yaml_sync pins it.
 FLOOR_S: dict[str, float] = {
-    # classify (2026-07-03): consolidated text-classify + vision tier — the
-    # vision half (image encode + extraction) runs 15-30s/call, so it needs its
-    # own floor. Matches models.yaml's classify.timeout_floor_s. (The old
-    # "chat": 30.0 key was dropped 2026-07-03 — normalize_endpoint() resolves
-    # "chat"→"classify" before this dict is consulted, so a "chat" key is
-    # permanently unreachable, same as the removed "gemma-hot" entry below.)
-    "classify": 45.0,
-    "companion": 180.0,
+    # classify (Qwen3.6-35B + vision): raised 45→180 in the 2026-07-04 nexus
+    # loadout (commit 35df6545). kv-unified allows big single requests; a cold
+    # ~37K prefill was hitting the old 45s floor. The vision half (image encode +
+    # extraction) also runs 15-30s/call. Mirrors models.yaml classify.timeout_floor_s.
+    "classify": 180.0,
+    # companion = the `composer` role, now Qwen3.5-122B (2026-07-03 cutover from
+    # the 80B). Raised 180→360 (commit 35df6545): the 122B is materially slower,
+    # and the old 180s floor was truncating turns + streams under load. Mirrors
+    # models.yaml composer.timeout_floor_s.
+    "companion": 360.0,
     "thinker": 180.0,
     # creative (Gemma-4-31B abliterated) is dense (~25 tok/s single-stream, 16 slots on the Arc Pro boxa);
     # long-form creative generation needs a high floor so cold-start (no history) doesn't

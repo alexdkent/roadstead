@@ -52,10 +52,20 @@ class ProxyState:
 
         # Core components
         self.cost_model = CostModel()
+        # Per-class timeout floors come from models.yaml (`timeout_floor_s`), the
+        # declared single source of truth, layered OVER the hardcoded FLOOR_S
+        # fallback. Without this the yaml field was inert and a floor bump for a
+        # model swap (e.g. classify 45→180 / composer 180→360, 2026-07 nexus
+        # loadout) silently did nothing — enforcement kept using the stale
+        # hardcoded values. Fallback covers any class absent from the yaml.
+        from .model_catalog import build_class_floors
+        from .timeout_model import FLOOR_S
+        floors = {**FLOOR_S, **build_class_floors()}
         self.timeout_model = TimeoutModel(
             margin=config.timeout_advice_margin,
             window_s=config.timeout_advice_window_s,
             min_samples=config.timeout_advice_min_samples,
+            floors=floors,
         )
         self.budget_mgr = BudgetManager(starvation_timeout_s=config.starvation_timeout_s)
         self.scheduler = Scheduler(config, self.cost_model, self.budget_mgr)
