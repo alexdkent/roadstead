@@ -94,7 +94,7 @@ models:
     context_per_slot: 131072   # 2026-07-04: --kv-unified shared pool (live /props confirms); was 32768/slot
     context_window: 32768      # fleet chunkers size against 32K on purpose (policy, not slot size)
     slots: 4
-    timeout_floor_s: 45
+    timeout_floor_s: 180       # 2026-07-04: raised 45->180 — kv-unified allows big single requests; a cold ~37K prefill was hitting the old 45s floor
     capabilities:
       vision: true
       streaming: false
@@ -159,7 +159,7 @@ models:
     context_per_slot: 131072   # 2026-07-04: --kv-unified shared pool (live /props confirms); was 32768/slot
     context_window: 32768      # fleet chunkers size against 32K on purpose (policy, not slot size)
     slots: 4
-    timeout_floor_s: 180
+    timeout_floor_s: 360       # 2026-07-04: raised 180->360 — kv-unified allows big single requests; 122B prefill at ~300 t/s needs headroom past 128K
     policy:
       dispatch_concurrency_cap: 4   # re-validated for the 122B via llama-batched-bench (1/2/4/8 parallel,
                                     # no instability found through 8) — the old cap:3 was specific to the
