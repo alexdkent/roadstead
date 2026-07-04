@@ -557,12 +557,25 @@ class Health:
                     ep_name, old, n_parallel,
                 )
 
-        # Context size
-        n_ctx = gen_settings.get("n_ctx") or props.get("n_ctx")
-        if n_ctx and n_parallel:
-            ctx_per_slot = n_ctx // n_parallel
-            if ctx_per_slot != ep_cfg.context_per_slot:
-                ep_cfg.context_per_slot = ctx_per_slot
+        # Context size. default_generation_settings.n_ctx is ALREADY per-slot
+        # in current llama.cpp builds (confirmed live: --ctx-size 131072
+        # --parallel 4 reports n_ctx=32768 there, not 131072) — dividing it by
+        # n_parallel again silently quartered every multi-slot llama.cpp
+        # endpoint's discovered context_per_slot (e.g. 32768 -> 8192 for a
+        # 4-slot unit), which feeds the context-gate admission check and could
+        # wrongly reject requests that actually fit. Only the top-level
+        # `props["n_ctx"]` fallback (older/different builds, unconfirmed
+        # whether it's ever populated as an aggregate) still gets divided.
+        gen_n_ctx = gen_settings.get("n_ctx")
+        if gen_n_ctx:
+            if gen_n_ctx != ep_cfg.context_per_slot:
+                ep_cfg.context_per_slot = gen_n_ctx
+        else:
+            top_n_ctx = props.get("n_ctx")
+            if top_n_ctx and n_parallel:
+                ctx_per_slot = top_n_ctx // n_parallel
+                if ctx_per_slot != ep_cfg.context_per_slot:
+                    ep_cfg.context_per_slot = ctx_per_slot
     def apply_discovered_vllm_capacity(
         self, ep_name: str, ep_cfg: EndpointConfig, cap: dict,
     ) -> None:
