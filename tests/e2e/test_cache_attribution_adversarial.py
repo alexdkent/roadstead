@@ -326,7 +326,9 @@ async def test_north_face_hostile_caller_cannot_corrupt_attribution(proxy):
     assert r.status_code == 200
     proxy.svc._queue_db.flush(timeout=5.0)
     attr = proxy.svc._queue_db.cache_attribution(window_s=3600)
-    chat_ep = next(e for e in attr["by_endpoint"] if e["endpoint"] == "chat")
+    # The proxy normalizes model="chat" to its class "classify" (2026-07-03
+    # analyst decommission), so attribution rows land under "classify".
+    chat_ep = next(e for e in attr["by_endpoint"] if e["endpoint"] == "classify")
     assert chat_ep["cached_tokens"] == 6           # backend value, not 999999/123456
     assert chat_ep["attributable_input_tokens"] == 12
     assert chat_ep["hit_rate"] == 0.5

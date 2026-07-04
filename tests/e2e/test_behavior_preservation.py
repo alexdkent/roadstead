@@ -80,6 +80,22 @@ _BASELINE_PATH = Path(__file__).parent / "golden" / "behavior_baseline.json"
 _CAPTURE = os.environ.get("LLMPROXY_GOLDEN_CAPTURE", "").strip() in ("1", "true", "yes", "on")
 _INTERNAL_CLIENT = ("127.0.0.1", 41999)
 
+
+@pytest.fixture(autouse=True)
+def _pin_schema_backstop_off(monkeypatch):
+    """Pin the Phase-3 schema-backstop OFF for this golden-corpus file.
+
+    The fake backend echoes plain "echo: ..." text, so a grammar/schema case is
+    intentionally non-conformant. The production schema-backstop
+    (``COLLECTIVE_PROXY_SCHEMA_BACKSTOP``, ON in the container) would 502 it —
+    an artifact of the fake backend, not the transform this corpus pins. The
+    backstop has its own suite (test_schema_backstop*). The golden baseline was
+    captured with the flag OFF (its default), so pin it OFF to keep this file
+    hermetic w.r.t. the ambient container env (it reads os.environ live). Fixes
+    the container-only 502 in the chat_sync_grammar case after "chat"→classify.
+    """
+    monkeypatch.setenv("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", "0")
+
 _OPENAI_ENVELOPE_OBJECTS = ("chat.completion", "chat.completion.chunk", "list")
 
 

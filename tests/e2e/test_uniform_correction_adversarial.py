@@ -42,6 +42,19 @@ from originfleet.llmproxy.correction import Correction
 FLAG = "COLLECTIVE_PROXY_UNIFORM_CORRECTION"
 
 
+@pytest.fixture(autouse=True)
+def _pin_schema_backstop_off(monkeypatch):
+    """Pin the Phase-3 schema-backstop OFF for this file (it tests the uniform
+    correction / shadow-egress path, not the backstop). The fake backend echoes
+    non-conformant text, so with the backstop ON (as in the container) a grammar
+    case 502s before the correction path runs. It reads os.environ live per
+    request; pin OFF so these tests are hermetic w.r.t. the ambient container
+    env. Fixes the container-only 502 in test_sync_door_shadow_egress_wired_
+    through_apply after the "chat"→classify (grammar-capable) cutover.
+    """
+    monkeypatch.setenv("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", "0")
+
+
 # --------------------------------------------------------------------------- #
 # door drivers
 # --------------------------------------------------------------------------- #
