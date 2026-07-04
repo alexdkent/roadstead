@@ -94,17 +94,20 @@ def test_shadow_off_returns_flat_default_and_tallies():
     tally = svc._smart_default_shadow["classify"]
     assert tally["count"] == 1
     assert tally["flat_s"] == _DEFAULT_TIMEOUT_S
-    # Cold model (no samples) → the "classify" per-class floor (45s) is what
-    # the smart default WOULD be — recorded even though the flat value is applied.
-    assert tally["smart_s_min"] == tally["smart_s_max"] == 45.0
-    assert tally["smart_s_sum"] == 45.0
+    # Cold model (no samples) → the "classify" per-class floor (180s, raised
+    # 45→180 in the 2026-07-04 nexus loadout) is what the smart default WOULD
+    # be — recorded even though the flat value is applied.
+    assert tally["smart_s_min"] == tally["smart_s_max"] == 180.0
+    assert tally["smart_s_sum"] == 180.0
 
 
 def test_enforce_uses_class_floor_advice_cold():
     svc = ProxyService(ProxyConfig())
     svc._flags.set_many({"smart_default_timeout": True})
-    # chat/classify (not on-demand) → the flag's effect is visible: 45s (floor) not 180s.
-    assert svc._lifecycle.resolve_default_timeout("chat", _submit_body()) == 45.0
+    # chat/classify (not on-demand) → the flag's effect is visible: the classify
+    # floor is 180s (raised 45→180, 2026-07-04) — coincidentally equal to the flat
+    # _DEFAULT_TIMEOUT_S here, so assert against the floor constant directly below.
+    assert svc._lifecycle.resolve_default_timeout("chat", _submit_body()) == 180.0
     # embed floor is 15s; gemma 60s — per-class, not a blanket number.
     assert svc._lifecycle.resolve_default_timeout("bge-m3-embed", _submit_body("bge-m3-embed")) == 15.0
     assert svc._lifecycle.resolve_default_timeout("gemma-router", _submit_body("gemma-router")) == 60.0
@@ -119,7 +122,7 @@ def test_enforce_honors_warm_recommendation_and_cap():
     # the floor still governs (recommendation never drops below the class floor).
     for i in range(60):
         tm.record("classify", 1, 8, 8, 500.0, "ok", now + i)
-    assert svc._lifecycle.resolve_default_timeout("chat", _submit_body()) == 45.0
+    assert svc._lifecycle.resolve_default_timeout("chat", _submit_body()) == 180.0
     # Now seed a huge-latency cell so p99*margin >> floor and > cap → capped.
     for i in range(60):
         tm.record("classify", 1, 8, 8, 5_000_000.0, "ok", now + 100 + i)
@@ -135,7 +138,7 @@ def test_tally_records_both_modes_and_accumulates():
     svc._lifecycle.resolve_default_timeout("chat", _submit_body())
     tally = svc._smart_default_shadow["classify"]
     assert tally["count"] == 4                # tallied whether flag on or off
-    assert tally["smart_s_sum"] == 45.0 * 4   # mean = sum/count
+    assert tally["smart_s_sum"] == 180.0 * 4  # mean = sum/count (classify floor 180)
 
 
 def test_guarded_against_bad_priority_and_payload():
@@ -146,7 +149,7 @@ def test_guarded_against_bad_priority_and_payload():
     bad = {"agent_id": "a", "endpoint": "chat", "priority": "NONSENSE",
            "call_site": "t", "payload_type": "chat_completion", "payload": "not-a-dict"}
     got = svc._lifecycle.resolve_default_timeout("chat", bad)
-    assert got == 45.0  # floor still applies; no crash
+    assert got == 180.0  # classify floor still applies; no crash
 
 
 # --------------------------------------------------------------------------
@@ -164,12 +167,12 @@ async def test_bare_submit_omitted_timeout_applies_default():
             r = await asyncio.wait_for(svc.handle_submit(_submit_body(), _Req()), timeout=10.0)
             assert r.status_code == 200
             assert created[-1].timeout_s == _DEFAULT_TIMEOUT_S
-            # Flag ON → the smart default (classify floor 45, "chat" resolves
+            # Flag ON → the smart default (classify floor 180, "chat" resolves
             # there since analyst's decommission made it a pure alias) applied.
             svc._flags.set_many({"smart_default_timeout": True})
             r = await asyncio.wait_for(svc.handle_submit(_submit_body(), _Req()), timeout=10.0)
             assert r.status_code == 200
-            assert created[-1].timeout_s == 45.0
+            assert created[-1].timeout_s == 180.0
         status = json.loads((await svc.handle_status(_Req())).body)
         assert "classify" in status["reliability"]["smart_default_shadow"]
     finally:
@@ -209,12 +212,12 @@ async def test_openai_door_omits_timeout_and_inherits_default():
             r = await asyncio.wait_for(svc.handle_openai_chat(dict(body), _Req()), timeout=10.0)
             assert r.status_code == 200
             assert created[-1].timeout_s == _DEFAULT_TIMEOUT_S
-            # ON → the classify smart default (45) — qwen-analyst is a legacy
+            # ON → the classify smart default (180) — qwen-analyst is a legacy
             # alias resolving to classify since the 2026-07-03 decommission.
             svc._flags.set_many({"smart_default_timeout": True})
             r = await asyncio.wait_for(svc.handle_openai_chat(dict(body), _Req()), timeout=10.0)
             assert r.status_code == 200
-            assert created[-1].timeout_s == 45.0
+            assert created[-1].timeout_s == 180.0
             # A client-supplied timeout_s in the OpenAI body still wins.
             r = await asyncio.wait_for(
                 svc.handle_openai_chat({**body, "timeout_s": 42}, _Req()), timeout=10.0)

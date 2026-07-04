@@ -133,3 +133,29 @@ def test_every_endpoint_class_has_a_floor():
     """Doctrine: a new endpoint class must add a FLOOR_S entry."""
     for ep_class in DEFAULT_ENDPOINTS:
         assert ep_class in FLOOR_S, f"missing FLOOR_S entry for {ep_class!r}"
+
+
+def test_timeout_floor_yaml_sync():
+    """Doctrine: the hardcoded FLOOR_S mirror MUST equal models.yaml's
+    per-class ``timeout_floor_s`` for every class the yaml declares.
+
+    models.yaml is the authoritative source (it seeds the SERVER TimeoutModel
+    via build_class_floors). FLOOR_S is a synced fallback that ALSO backs the
+    client-side floor_for() sub-floor-honor decision (framework/timeout_advice),
+    which cannot read the catalog. If the two drift, the client honors a
+    different floor than the server enforces. This test caught the inert-yaml
+    bug where classify 45→180 / composer 180→360 (commit 35df6545) were bumped
+    in the yaml but never took effect. Bump BOTH in lockstep; this pins it."""
+    from originfleet.llmproxy.model_catalog import build_class_floors
+
+    yaml_floors = build_class_floors()
+    assert yaml_floors, "models.yaml declares no timeout_floor_s — regression"
+    mismatched = {
+        ep: (FLOOR_S.get(ep), floor)
+        for ep, floor in yaml_floors.items()
+        if FLOOR_S.get(ep) != floor
+    }
+    assert not mismatched, (
+        "FLOOR_S mirror drifted from models.yaml timeout_floor_s "
+        f"(class: (FLOOR_S, yaml)): {mismatched}"
+    )

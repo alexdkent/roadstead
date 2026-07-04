@@ -50,7 +50,11 @@ from tests.llmproxy.fake_backend import (
 )
 
 _INTERNAL_CLIENT = ("127.0.0.1", 41999)
-_CLASS_FLOORS = {"chat": 30.0, "bge-m3-embed": 15.0, "gemma-router": 60.0}
+# "chat" resolves to the "classify" class (2026-07-03 analyst decommission);
+# its floor was raised 45→180 in the 2026-07-04 nexus loadout. (Pre-decommission
+# this said 30.0 — stale on both counts, undetected while in-container llmproxy
+# tests were blocked by the ship restart-poll bug.)
+_CLASS_FLOORS = {"chat": 180.0, "bge-m3-embed": 15.0, "gemma-router": 60.0}
 
 
 # --------------------------------------------------------------------------- #
@@ -185,13 +189,14 @@ def test_tally_written_both_modes_and_never_corrupts():
     N = 500
     for _ in range(N):
         svc._lifecycle.resolve_default_timeout("chat", _body())
-    t = svc._smart_default_shadow["chat"]
+    # "chat" tallies under its resolved class "classify"; floor 180 (2026-07-04).
+    t = svc._smart_default_shadow["classify"]
     assert t["count"] == N
     assert t["flat_s"] == _DEFAULT_TIMEOUT_S
-    assert t["smart_s_min"] == t["smart_s_max"] == 30.0
-    assert t["smart_s_sum"] == 30.0 * N  # exact — no float drift at this scale
+    assert t["smart_s_min"] == t["smart_s_max"] == 180.0
+    assert t["smart_s_sum"] == 180.0 * N  # exact — no float drift at this scale
     # mean is recoverable
-    assert t["smart_s_sum"] / t["count"] == 30.0
+    assert t["smart_s_sum"] / t["count"] == 180.0
 
 
 # ========================================================================== #
@@ -204,13 +209,17 @@ def test_guardbite_flag_gate_is_load_bearing():
     (always-smart), the OFF==180 assertion below would fail — so its passing
     means the gate is genuinely governing."""
     svc = ProxyService(ProxyConfig())
-    body = _body()
+    # Use gemma-router (class floor 60) as the guard-bite endpoint: its floor
+    # DIFFERS from the flat default (180), so flag ON vs OFF is observably
+    # different. NB "chat"/classify can no longer guard-bite here — its floor was
+    # raised to 180 (2026-07-04), which now coincides with _DEFAULT_TIMEOUT_S.
+    body = _body("gemma-router")
     # E-i: the two modes DIFFER — the smart value is reachable and != 180.
-    off = svc._lifecycle.resolve_default_timeout("chat", body)
+    off = svc._lifecycle.resolve_default_timeout("gemma-router", body)
     svc._flags.set_many({"smart_default_timeout": True})
-    on = svc._lifecycle.resolve_default_timeout("chat", body)
+    on = svc._lifecycle.resolve_default_timeout("gemma-router", body)
     assert off == _DEFAULT_TIMEOUT_S
-    assert on == 30.0
+    assert on == 60.0  # gemma class floor
     assert on != off, "flag had NO observable effect — gate is dead"
 
 
@@ -308,8 +317,9 @@ async def test_wire_omitted_uses_default_and_tallies(okproxy, flag_on):
     with _capture_applied() as created:
         resp = await asyncio.wait_for(svc.handle_submit(_body(), _Req()), timeout=8.0)
     assert resp.status_code == 200
-    assert created[-1].timeout_s == (30.0 if flag_on else _DEFAULT_TIMEOUT_S)
-    assert svc._smart_default_shadow["chat"]["count"] == 1
+    # chat→classify, floor 180 (2026-07-04) — coincides with the flat default here.
+    assert created[-1].timeout_s == (180.0 if flag_on else _DEFAULT_TIMEOUT_S)
+    assert svc._smart_default_shadow["classify"]["count"] == 1
     await _drain(svc)
 
 
@@ -433,11 +443,13 @@ async def fakeproxy():
             return True
         svc._backend.probe_health = _healthy
 
-        # Flag ON + a TINY chat floor so the SMART DEFAULT (which floors at the
-        # class floor) becomes a sub-second, fast-to-fire deadline — this is the
-        # "tighter default" the mandate wants exercised, without a 30s wait.
+        # Flag ON + a TINY classify floor so the SMART DEFAULT (which floors at
+        # the class floor) becomes a sub-second, fast-to-fire deadline — this is
+        # the "tighter default" the mandate wants exercised, without a 30s wait.
+        # Override "classify" (the resolved class for "chat"), NOT "chat" — the
+        # latter normalizes away and the override would be a no-op.
         svc._flags.set_many({"smart_default_timeout": True})
-        svc._timeout_model._floors["chat"] = 0.5  # → smart default ~1s (ceil)
+        svc._timeout_model._floors["classify"] = 0.5  # → smart default ~1s (ceil)
 
         await svc.startup()
         transport = httpx.ASGITransport(
@@ -528,4 +540,4 @@ async def test_smartdefault_duplicate_storm_no_leak(fakeproxy):
         assert not isinstance(r, Exception), f"raised: {r!r}"
         assert not (r.status_code == 500 and "internal proxy error" in r.text)
     await _drain_client(svc)
-    assert svc._smart_default_shadow["chat"]["count"] == N
+    assert svc._smart_default_shadow["classify"]["count"] == N
