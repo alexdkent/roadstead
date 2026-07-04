@@ -91,8 +91,8 @@ models:
     probe_kind: llama
     model_family: Qwen3.6-35B-A3B + mmproj (chat + vision)
     quant: UD-Q4_K_XL
-    context_per_slot: 32768
-    context_window: 32768
+    context_per_slot: 131072   # 2026-07-04: --kv-unified shared pool (live /props confirms); was 32768/slot
+    context_window: 32768      # fleet chunkers size against 32K on purpose (policy, not slot size)
     slots: 4
     timeout_floor_s: 45
     capabilities:
@@ -156,8 +156,8 @@ models:
     probe_kind: llama
     model_family: Qwen3.5-122B-A10B (Huihui abliterated)
     quant: Q4_K_M
-    context_per_slot: 32768
-    context_window: 32768
+    context_per_slot: 131072   # 2026-07-04: --kv-unified shared pool (live /props confirms); was 32768/slot
+    context_window: 32768      # fleet chunkers size against 32K on purpose (policy, not slot size)
     slots: 4
     timeout_floor_s: 180
     policy:
