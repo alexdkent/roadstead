@@ -72,6 +72,52 @@ def _translate_anthropic_image_blocks(messages: Any) -> list:
     return out
 
 
+def _has_consecutive_system_messages(messages: Any) -> bool:
+    """True if ``messages`` contains two or more ADJACENT ``role: system``
+    entries — the shape that trips some chat templates."""
+    prev_system = False
+    for msg in messages or []:
+        is_system = isinstance(msg, dict) and msg.get("role") == "system"
+        if is_system and prev_system:
+            return True
+        prev_system = is_system
+    return False
+
+
+def _coalesce_system_messages(messages: Any) -> list:
+    """Collapse each run of ADJACENT ``role: system`` messages into one,
+    joining their ``content`` with ``"\\n\\n"``.
+
+    The Qwen3.5-122B (composer) chat template raises a Jinja exception
+    (``System message must be at the beginning``) on more than one system
+    message, 400ing the whole request ("Unable to generate parser for this
+    template"). Callers that legitimately split a stable leading system block
+    from a dynamic one (dj crew, and any future caller) send two consecutive
+    system messages — semantically one system prompt. Merging adjacent system
+    messages is content-preserving (order kept, byte-stable prefix retained for
+    the prefix cache) and only affects the llama.cpp path (see the ``not vllm``
+    gate at the call site). Builds new dicts — never mutates the caller's
+    objects (corpus capture stores ``req.payload``). Only string ``content`` is
+    joined; a non-string (e.g. a multimodal block list) starts a new run so
+    vision system blocks are never mangled.
+    """
+    out: list = []
+    for msg in messages or []:
+        is_system = isinstance(msg, dict) and msg.get("role") == "system"
+        if (
+            is_system
+            and out
+            and out[-1].get("role") == "system"
+            and isinstance(out[-1].get("content"), str)
+            and isinstance(msg.get("content"), str)
+        ):
+            prev = out[-1]
+            out[-1] = {**prev, "content": f"{prev['content']}\n\n{msg['content']}"}
+        else:
+            out.append(msg)
+    return out
+
+
 def _normalize_chat_payload(
     payload: dict, vllm: bool = False, model_id: str | None = None,
 ) -> dict:
@@ -113,6 +159,9 @@ def _normalize_chat_payload(
     needs_model_set = bool(vllm and model_id and payload.get("model") != model_id)
     needs_thinking_default = bool(vllm and not _has_enable_thinking(payload))
     needs_vision_xlate = _has_anthropic_image_block(payload.get("messages"))
+    # llama.cpp only: >1 adjacent system message 400s the composer 122B template.
+    needs_system_coalesce = (not vllm) and _has_consecutive_system_messages(
+        payload.get("messages"))
     if (
         "system" not in payload
         and "extra_body" not in payload
@@ -120,6 +169,7 @@ def _normalize_chat_payload(
         and not needs_model_set
         and not needs_thinking_default
         and not needs_vision_xlate
+        and not needs_system_coalesce
     ):
         return payload
     p = dict(payload)
@@ -134,6 +184,12 @@ def _normalize_chat_payload(
     # inline so the prepended system message is walked too (it's a no-op there).
     if needs_vision_xlate:
         p["messages"] = _translate_anthropic_image_blocks(p.get("messages"))
+    # llama.cpp only: merge adjacent system messages (the composer 122B template
+    # rejects >1). Runs AFTER the system-inline above so a top-level `system`
+    # prepended in front of a messages list that already starts with a system
+    # message is collapsed too. No-op when there is no adjacency.
+    if not vllm and _has_consecutive_system_messages(p.get("messages")):
+        p["messages"] = _coalesce_system_messages(p.get("messages"))
     extra_body = p.pop("extra_body", None)
     if isinstance(extra_body, dict):
         p.update(extra_body)

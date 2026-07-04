@@ -12,6 +12,8 @@ This is the test that would have caught the original bug.
 from __future__ import annotations
 
 from originfleet.llmproxy.backend import (
+    _coalesce_system_messages,
+    _has_consecutive_system_messages,
     _normalize_chat_payload,
     _translate_anthropic_image_blocks,
 )
@@ -107,6 +109,102 @@ def test_normalize_does_not_mutate_input():
     # original must be unmodified (corpus capture stores req.payload)
     assert payload["system"] == "s"
     assert len(payload["messages"]) == 1
+
+
+# --- adjacent-system coalesce (composer 122B template rejects >1 system msg) ---
+# The Qwen3.5-122B chat template raises Jinja "System message must be at the
+# beginning" on more than one system message, 400ing every dj crew turn. The
+# llama.cpp path merges adjacent system messages; the vLLM path leaves them.
+
+def test_coalesce_merges_adjacent_system_messages_llamacpp():
+    payload = {
+        "model": "qwen-composer",
+        "messages": [
+            {"role": "system", "content": "Crew roster + craft."},
+            {"role": "system", "content": "You are Nils."},
+            {"role": "user", "content": "tell a joke"},
+        ],
+    }
+    out = _normalize_chat_payload(payload)  # vllm=False
+    assert [m["role"] for m in out["messages"]] == ["system", "user"]
+    assert out["messages"][0]["content"] == "Crew roster + craft.\n\nYou are Nils."
+
+
+def test_coalesce_left_untouched_on_vllm():
+    payload = {
+        "model": "llama-thinker",
+        "messages": [
+            {"role": "system", "content": "A."},
+            {"role": "system", "content": "B."},
+            {"role": "user", "content": "x"},
+        ],
+    }
+    out = _normalize_chat_payload(payload, vllm=True, model_id="llama-thinker")
+    # vLLM (thinker) tolerates multiple system messages — leave them intact.
+    assert [m["role"] for m in out["messages"]] == ["system", "system", "user"]
+
+
+def test_coalesce_noop_for_single_system():
+    payload = {
+        "model": "qwen-composer",
+        "messages": [
+            {"role": "system", "content": "one"},
+            {"role": "user", "content": "x"},
+        ],
+    }
+    out = _normalize_chat_payload(payload)
+    assert out == payload
+
+
+def test_coalesce_of_inlined_top_level_system():
+    # Top-level `system` inlined in front of a messages list that already opens
+    # with a system message must collapse to one (both transforms compose).
+    payload = {
+        "model": "qwen-composer",
+        "system": "leading",
+        "messages": [
+            {"role": "system", "content": "persona"},
+            {"role": "user", "content": "x"},
+        ],
+    }
+    out = _normalize_chat_payload(payload)
+    assert "system" not in out
+    assert [m["role"] for m in out["messages"]] == ["system", "user"]
+    assert out["messages"][0]["content"] == "leading\n\npersona"
+
+
+def test_coalesce_does_not_mutate_input():
+    payload = {
+        "model": "qwen-composer",
+        "messages": [
+            {"role": "system", "content": "A."},
+            {"role": "system", "content": "B."},
+            {"role": "user", "content": "x"},
+        ],
+    }
+    _normalize_chat_payload(payload)
+    assert len(payload["messages"]) == 3
+    assert payload["messages"][0]["content"] == "A."
+
+
+def test_coalesce_preserves_non_string_system_block():
+    # A multimodal/system block-list content must not be string-joined.
+    block = {"role": "system", "content": [{"type": "text", "text": "x"}]}
+    msgs = [block, {"role": "system", "content": "after"},
+            {"role": "user", "content": "u"}]
+    out = _coalesce_system_messages(msgs)
+    # The list-content system starts a fresh run; only compatible string runs merge.
+    assert out[0]["content"] == [{"type": "text", "text": "x"}]
+    assert [m["role"] for m in out] == ["system", "system", "user"]
+
+
+def test_has_consecutive_system_detector():
+    assert _has_consecutive_system_messages([
+        {"role": "system"}, {"role": "system"}, {"role": "user"}])
+    assert not _has_consecutive_system_messages([
+        {"role": "system"}, {"role": "user"}, {"role": "system"}])
+    assert not _has_consecutive_system_messages([{"role": "user"}])
+    assert not _has_consecutive_system_messages(None)
 
 
 # --- vLLM thinking-leak fix: default chat_template_kwargs.enable_thinking off ---

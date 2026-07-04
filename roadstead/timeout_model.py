@@ -41,11 +41,12 @@ from .config import normalize_endpoint
 # ---------------------------------------------------------------------------
 
 FLOOR_S: dict[str, float] = {
-    "chat": 30.0,
     # classify (2026-07-03): consolidated text-classify + vision tier — the
-    # vision half (image encode + extraction) runs 15-30s/call, well above the
-    # 30s "chat" floor, so this needs its own higher floor. Matches
-    # models.yaml's classify.timeout_floor_s.
+    # vision half (image encode + extraction) runs 15-30s/call, so it needs its
+    # own floor. Matches models.yaml's classify.timeout_floor_s. (The old
+    # "chat": 30.0 key was dropped 2026-07-03 — normalize_endpoint() resolves
+    # "chat"→"classify" before this dict is consulted, so a "chat" key is
+    # permanently unreachable, same as the removed "gemma-hot" entry below.)
     "classify": 45.0,
     "companion": 180.0,
     "thinker": 180.0,
@@ -66,11 +67,9 @@ FLOOR_S: dict[str, float] = {
     # "rerank" instead.
     "rerank": 10.0,
     "embed": 15.0,
-    # Dedicated document/calendar-photo vision (dense Q8, split off analyst
-    # 2026-07-03). Background/intake path, not streaming; bench wall times ran
-    # 40-60s on full calendar-photo extraction — keep matching the models.yaml
-    # analyst-vision `timeout_floor_s` value.
-    "vision9b": 45.0,
+    # ("vision9b": 45.0 dropped 2026-07-03 — the dedicated 8B analyst-vision was
+    # consolidated into `classify`; no role/alias resolves to "vision9b", so the
+    # key was unreachable. Vision now uses the classify floor above.)
 }
 
 # Fallback floor for an unknown endpoint class.
