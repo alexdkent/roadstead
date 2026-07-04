@@ -207,7 +207,7 @@ models:
     systemd_unit: llama-gemma
     probe_kind: llama
     model_family: Gemma-4-E4B-it
-    quant: Q5_K_M
+    quant: Q4_K_XL
     context_per_slot: 16384
     context_window: 16384
     slots: 2
@@ -239,7 +239,7 @@ models:
     port: 9091
     backend_engine: llama.cpp
     model_family: Gemma-4-E4B-it
-    quant: Q5_K_M
+    quant: Q4_K_XL
     context_per_slot: 16384
     context_window: 4096             # legacy greeter default (small prompts)
     slots: 2
