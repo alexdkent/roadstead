@@ -38,7 +38,9 @@ def _make_scheduler(
 
 def _req(
     agent_id: str = "agent_a",
-    endpoint: str = "qwen-analyst",
+    # qwen-analyst (30B) fully decommissioned 2026-07-03 — it's now a legacy
+    # alias resolving to "classify", so default to that class name directly.
+    endpoint: str = "classify",
     priority: str = "P1_TURN_SUPPORT",
     call_site: str = "test",
     now: float | None = None,
@@ -285,7 +287,7 @@ class TestBackgroundFloor:
 
 class TestConcurrencyAwareAdmission:
     def test_respects_max_slots(self):
-        sched, *_ = _make_scheduler(endpoints={"chat": 2})
+        sched, *_ = _make_scheduler(endpoints={"classify": 2})
         now = time.monotonic()
 
         # Submit 5 requests
@@ -295,7 +297,7 @@ class TestConcurrencyAwareAdmission:
         decisions = sched.tick(now + 0.01)
         # Should dispatch at most 2 (max_slots)
         assert len(decisions) <= 2
-        assert sched.active_count("chat") == len(decisions)
+        assert sched.active_count("classify") == len(decisions)
 
 
 class TestTimeout:
@@ -357,7 +359,9 @@ class TestInflightSnapshot:
         assert len(reqs) == 1
         row = reqs[0]
         assert row["request_id"] == req.request_id
-        assert row["endpoint"] == "chat"        # qwen-analyst normalizes to the chat class
+        # qwen-analyst (30B) fully decommissioned 2026-07-03 — it's now a
+        # legacy alias normalizing to the classify class, not "chat".
+        assert row["endpoint"] == "classify"
         # `backend` = the actual host:port doing the processing (UI "Endpoint");
         # `served_model` = the model the backend answers to. Both derived from
         # the endpoint config so the In-Flight view can show model + endpoint.
@@ -366,7 +370,7 @@ class TestInflightSnapshot:
         assert row["agent"] == "agent_a"
         assert row["input_tokens"] > 0          # context size flowing through
         assert 0.9 <= row["elapsed_s"] <= 1.2   # ~1s since dispatch
-        assert snap["per_endpoint"]["chat"]["in_flight"] == 1
+        assert snap["per_endpoint"]["classify"]["in_flight"] == 1
 
     def test_inflight_snapshot_drops_completed(self):
         sched, *_ = _make_scheduler()
@@ -384,7 +388,7 @@ class TestInflightSnapshot:
             now + 0.5,
         )
         assert sched.inflight_snapshot(now + 0.6)["requests"] == []
-        assert sched.inflight_snapshot(now + 0.6)["per_endpoint"]["chat"]["in_flight"] == 0
+        assert sched.inflight_snapshot(now + 0.6)["per_endpoint"]["classify"]["in_flight"] == 0
 
 
 class TestQueuedRequestsAccessor:

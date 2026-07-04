@@ -82,22 +82,22 @@ def test_advise_falls_back_to_tier_then_floor():
 
 
 def test_recommended_is_p99_times_margin_when_above_floor():
-    # gemma-hot floor is 8s; seed 10s latencies so p99*1.5 = 15s wins.
+    # rerank floor is 10s; seed 10s latencies so p99*1.5 = 15s wins.
     # Query matches the seed's token buckets so it resolves at cell level.
     m = TimeoutModel(min_samples=5, margin=1.5)
-    _seed(m, "gemma-hot", 1, 10000.0, 100)
-    advice = m.advise("gemma-hot", 1, 2000, 256)
+    _seed(m, "rerank", 1, 10000.0, 100)
+    advice = m.advise("rerank", 1, 2000, 256)
     assert advice["source"] == "cell"
     assert advice["recommended_ms"] == 15000.0
     assert advice["recommended_timeout_s"] == 15
 
 
 def test_floor_dominates_when_samples_are_fast():
-    # Fast 1s latencies: p99*1.5 = 1.5s < 8s floor → floor wins.
+    # Fast 1s latencies: p99*1.5 = 1.5s < 10s floor → floor wins.
     m = TimeoutModel(min_samples=5, margin=1.5)
-    _seed(m, "gemma-hot", 1, 1000.0, 100)
-    advice = m.advise("gemma-hot", 1, 2000, 256)
-    assert advice["recommended_ms"] == FLOOR_S["gemma-hot"] * 1000.0
+    _seed(m, "rerank", 1, 1000.0, 100)
+    advice = m.advise("rerank", 1, 2000, 256)
+    assert advice["recommended_ms"] == FLOOR_S["rerank"] * 1000.0
     assert advice["source"] == "cell"  # cell had the samples; floor still clamps
 
 

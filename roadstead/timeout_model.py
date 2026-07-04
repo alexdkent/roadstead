@@ -58,10 +58,12 @@ FLOOR_S: dict[str, float] = {
     "gemma": 60.0,
     # 2026-06-08: the "gemma-hot" endpoint class was removed from DEFAULT_ENDPOINTS
     # (E2B :9090 decommissioned; gemma-greeter consolidated onto the "gemma"/E4B
-    # backend). This floor is RETAINED as a harmless legacy label — the forward-only
-    # doctrine (test_every_endpoint_class_has_a_floor) doesn't require it, and several
-    # timeout tests still exercise the model mechanics with a "gemma-hot" label.
-    "gemma-hot": 8.0,
+    # backend). The "gemma-hot" legacy-label entry that used to live here was
+    # dropped 2026-07-03: "gemma-hot" is a real catalog alias (of gemma/E4B),
+    # so normalize_endpoint() now resolves it to "gemma" before this dict is
+    # ever consulted, making a separate "gemma-hot" key permanently
+    # unreachable dead code. Tests needing an isolated small-floor target use
+    # "rerank" instead.
     "rerank": 10.0,
     "embed": 15.0,
     # Dedicated document/calendar-photo vision (dense Q8, split off analyst

@@ -99,10 +99,12 @@ def test_top_callers_groups_by_endpoint(tmp_path):
 
 def test_endpoint_series(tmp_path):
     pq = PersistentQueue(str(tmp_path / "q.db"))
-    _llm(pq, "l1", endpoint="chat", dur=1.0, status="ok")
-    _llm(pq, "l2", endpoint="chat", dur=2.0, status="error")
+    _llm(pq, "l1", endpoint="classify", dur=1.0, status="ok")
+    _llm(pq, "l2", endpoint="classify", dur=2.0, status="error")
+    # qwen-analyst (30B) fully decommissioned 2026-07-03 — now a legacy alias
+    # resolving to classify, not a distinct "chat" endpoint class.
     out = pq.endpoint_series("qwen-analyst", window_s=3600, bin_s=60)  # role → class
-    assert out["endpoint"] == "chat"
+    assert out["endpoint"] == "classify"
     total = sum(b["n"] for b in out["calls_series"])
     assert total == 2
     pq.close()

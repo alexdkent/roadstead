@@ -58,19 +58,27 @@ def test_no_endpoint_floor_starves_interactive():
 
 
 def test_companion_dispatch_concurrency_cap():
-    """G1 (2026-06-01): the companion is concurrency-fragile (a llama.cpp
-    KV-seq-removal assertion aborted it under full pressure), so the 3-wide
-    ceiling is kept explicit via dispatch_concurrency_cap.
+    """G1 (2026-06-01): the companion (then Qwen3-Next-80B) was
+    concurrency-fragile (a llama.cpp KV-seq-removal assertion aborted it
+    under full pressure), so a 3-wide ceiling was kept explicit via
+    dispatch_concurrency_cap.
 
     2026-06-05 (1ca82e2f): companion was downsized from 4×98304 to --parallel 3
-    (3×32768) to free nexus memory for Chatterbox Turbo TTS, so the PHYSICAL
-    slot count is now 3 — cap == max_slots. effective_max_slots == 3; the
-    interactive reserve is preserved (background cap = 3 - 1 = 2)."""
+    (3×32768) to free nexus memory for Chatterbox Turbo TTS.
+
+    2026-07-03: companion swapped to Qwen3.5-122B-A10B (a different model —
+    the 80B's specific G1 crash history doesn't carry over) on a newer
+    llama.cpp build (b9849). Re-validated via llama-batched-bench at 1/2/4/8
+    parallel with no instability found through 8 — see
+    infra/nexus/bench_results/composer_122b_optimization_20260703.md.
+    Physical slot count is now 4, cap == max_slots (no G1-style ceiling
+    needed for this model). effective_max_slots == 4; the interactive
+    reserve is preserved (background cap = 4 - 1 = 3)."""
     comp = DEFAULT_ENDPOINTS["companion"]
-    assert comp.max_slots == 3               # physical (downsized 2026-06-05)
-    assert comp.dispatch_concurrency_cap == 3
-    assert comp.effective_max_slots == 3     # dispatch ceiling (== physical now)
-    assert comp.background_cap_slots == 2    # leaves 1 for interactive
+    assert comp.max_slots == 4               # physical (122B swap, 2026-07-03)
+    assert comp.dispatch_concurrency_cap == 4
+    assert comp.effective_max_slots == 4     # dispatch ceiling (== physical now)
+    assert comp.background_cap_slots == 3    # leaves 1 for interactive
     # An uncapped endpoint is unaffected: effective == physical.
     thinker = DEFAULT_ENDPOINTS["thinker"]
     assert thinker.dispatch_concurrency_cap == 0

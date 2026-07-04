@@ -45,16 +45,16 @@ def _shadow_rows(svc, request_id: str):
 def test_shadow_row_written_and_model_fed(tmp_path):
     svc = _make_service(tmp_path)
     t0 = time.monotonic()
-    req = _make_req("gemma-hot", now=t0, timeout_s=300.0)
+    req = _make_req("rerank", now=t0, timeout_s=300.0)
 
-    # 10s end-to-end vs gemma-hot's 8s floor → would_timeout True.
-    svc._record_timeout_shadow(req, t0 + 10.0, duration_s=9.0, output_tokens=40, status="ok")
+    # 12s end-to-end vs rerank's 10s floor → would_timeout True.
+    svc._record_timeout_shadow(req, t0 + 12.0, duration_s=11.0, output_tokens=40, status="ok")
 
     rows = _shadow_rows(svc, req.request_id)
     assert len(rows) == 1
     actual_ms, recommended_ms, would_timeout, applied_s = rows[0]
-    assert actual_ms == pytest.approx(10000.0, abs=50)
-    assert recommended_ms == 8000.0  # cold → floor
+    assert actual_ms == pytest.approx(12000.0, abs=50)
+    assert recommended_ms == 10000.0  # cold → floor
     assert would_timeout == 1
     assert applied_s == 300.0
     # The model received the sample.

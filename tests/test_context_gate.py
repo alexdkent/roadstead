@@ -57,17 +57,17 @@ async def test_shadow_counts_but_admits():
     _ok_backend(svc)
     await svc.startup()
     try:
-        # chat = 32768/slot; 50K tokens ≈ 200K chars blows it.
+        # chat (-> classify, 32768/slot); 50K tokens ≈ 200K chars blows it.
         resp = await asyncio.wait_for(
             svc.handle_submit(_body("chat", 200_000, timeout_s=10.0), _Req()),
             timeout=10.0)
         assert resp.status_code == 200  # shadow: admitted (backend faked ok)
-        tally = svc._context_overflows["chat"]
+        tally = svc._context_overflows["classify"]
         assert tally["count"] == 1
         assert tally["callers"] == {"a": 1}
         assert tally["max_est_in"] >= 49_000
         status = json.loads((await svc.handle_status(_Req())).body)
-        assert "chat" in status["reliability"]["context_overflows_shadow"]
+        assert "classify" in status["reliability"]["context_overflows_shadow"]
     finally:
         await svc.shutdown()
 
@@ -134,11 +134,11 @@ async def test_non_chat_and_unknown_context_skip_the_gate():
         assert resp.status_code == 200
         # An endpoint with context_per_slot == 0 (nothing discovered/seeded)
         # must skip rather than reject everything.
-        svc._config.endpoints["chat"].context_per_slot = 0
+        svc._config.endpoints["classify"].context_per_slot = 0
         resp = await asyncio.wait_for(
             svc.handle_submit(_body("chat", 200_000, timeout_s=10.0), _Req()),
             timeout=10.0)
         assert resp.status_code == 200
-        assert "chat" not in svc._context_overflows
+        assert "classify" not in svc._context_overflows
     finally:
         await svc.shutdown()

@@ -237,12 +237,23 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
 
 
 def build_role_to_class(cat: Catalog | None = None) -> dict[str, str]:
-    """role string → endpoint class (mirrors the old ROLE_TO_CLASS)."""
+    """role string OR alias → endpoint class (mirrors the old ROLE_TO_CLASS).
+
+    Must cover aliases too, not just the canonical ``role:`` string: when a
+    role is retired and its old name becomes a pure alias of a different
+    model (e.g. ``qwen-analyst``/``chat`` -> ``classify`` after the
+    2026-07-03 decommission), callers passing the legacy name as
+    ``endpoint=`` need it to keep resolving. Role wins over alias on
+    collision (checked second so it can't be overwritten by another entry's
+    alias)."""
     cat = cat or load_catalog()
     out: dict[str, str] = {}
     for e in cat.models.values():
-        if e.endpoint_class:
-            out[e.role] = e.endpoint_class
+        if not e.endpoint_class:
+            continue
+        for a in e.aliases:
+            out[a] = e.endpoint_class
+        out[e.role] = e.endpoint_class
     return out
 
 

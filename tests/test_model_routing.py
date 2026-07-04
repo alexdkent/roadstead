@@ -32,17 +32,19 @@ def test_requested_model_wins_when_known_and_different():
         "payload_type": "chat_completion",
         "payload": {"model": "qwen-analyst"},  # but asks for qwen-analyst
     })
-    assert ep == "chat"  # routed to qwen-analyst's endpoint, not thinker
+    # qwen-analyst (30B) fully decommissioned 2026-07-03 — it's now a legacy
+    # alias resolving to classify, not a distinct "chat" endpoint.
+    assert ep == "classify"  # routed to classify, not thinker
 
 
 def test_no_override_when_model_matches_submit_endpoint():
     svc = _svc()
     ep = svc._resolve_endpoint({
-        "endpoint": "chat",
+        "endpoint": "classify",
         "payload_type": "chat_completion",
-        "payload": {"model": "qwen-analyst"},  # normalizes to chat == submit
+        "payload": {"model": "qwen-analyst"},  # normalizes to classify == submit
     })
-    assert ep == "chat"
+    assert ep == "classify"
 
 
 def test_falls_back_when_model_absent():
@@ -105,7 +107,7 @@ def test_resolved_endpoint_flows_into_queued_request():
         priority="P4_HYGIENE", call_site="orchestrator.autonomous_chat-agent.reflect",
         payload_type="chat_completion", payload=body["payload"],
     )
-    assert req.endpoint == "chat"
+    assert req.endpoint == "classify"
 
 
 # ----- effective_model_id -----
