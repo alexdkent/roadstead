@@ -267,7 +267,11 @@ models:
     proxy_endpoint: true
     endpoint_class: thinker
     role: llama-thinker
-    aliases: [llama-thinker, thinker]
+    # `reasoner` is this stanza's YAML key but was NOT a resolvable dispatch name
+    # (build_role_to_class registers role + aliases, never the key), so callers
+    # passing model="reasoner" 404'd with unknown_endpoint. Registered as an alias
+    # so the semantic role name resolves to the live anvil thinker backend.
+    aliases: [reasoner, llama-thinker, thinker]
     host: anvil
     port: 9083
     backend_engine: vllm
