@@ -23,6 +23,19 @@ logger = logging.getLogger(__name__)
 # — the JSONL is the authoritative per-request record. (persistence cleanup)
 _PROBLEM_STATUSES = frozenset({"error", "timeout", "truncated"})
 
+# endpoint_stalled tuning (2026-07-05, gemma stall-burst fix). The heuristic
+# counts non-premature, non-best-effort timeouts on an endpoint with free slots.
+# `best_effort` (see MetricsSample) now also excludes proxy-initiated aborts on
+# sub-floor callers, which `premature` could not — that closed a feedback loop
+# where the proxy's own endpoint-paused fast-fails on gemma's best-effort paths
+# (greeter advisory ~0.9s, sidekick.extract ~3s) re-latched the alert every ~10-30s.
+# With those excluded, the surviving count is real backend-stall evidence, so
+# the fire threshold gets headroom (3 -> 8). Gemma is a best-effort router/greeter
+# — a genuine stall there degrades gracefully (no greeting hint / retried
+# extract), so it's a WARNING, not the ERROR that pages / reads as fleet-degraded.
+_ENDPOINT_STALL_MIN_TIMEOUTS = 8
+_ENDPOINT_STALL_WARN_ENDPOINTS = frozenset({"gemma"})
+
 
 # ---------------------------------------------------------------------------
 # Request log record
@@ -134,6 +147,15 @@ class MetricsSample:
     # sidekick.extract_obs) deliberately apply sub-second deadlines well under the
     # gemma 60s floor; their give-ups must NOT be read as a backend stall.
     premature: bool = False
+    # True when the caller APPLIED a deadline far below the model's recommended
+    # time (see lifecycle._timeout_below_recommended). Unlike `premature` this is
+    # also set for PROXY-initiated aborts (TTFT watchdog, endpoint-paused
+    # fast-fail) on those sub-floor paths — `premature` forces itself False for
+    # proxy-initiated kills (2026-07-02 caller-blame rollup), which let the
+    # proxy's own fast-fails on best-effort gemma paths latch `endpoint_stalled`
+    # in a feedback loop (2026-07-04 gemma stall bursts). Excluded from the
+    # stall heuristic so only timeouts that gave the backend FAIR time count.
+    best_effort: bool = False
 
 
 class RollingMetrics:
@@ -184,6 +206,7 @@ class RollingMetrics:
         agent_id: str | None = None,
         status: str | None = None,
         premature: bool | None = None,
+        best_effort: bool | None = None,
         now: float | None = None,
     ) -> int:
         if now:
@@ -197,6 +220,8 @@ class RollingMetrics:
             if status and s.status != status:
                 continue
             if premature is not None and s.premature != premature:
+                continue
+            if best_effort is not None and s.best_effort != best_effort:
                 continue
             n += 1
         return n
@@ -294,26 +319,31 @@ def check_alerts(
     # so fast-failing all of its traffic would be worse than letting the healthy
     # majority through. Distinct from admission_timeout_spike (global, load).
     #
-    # Count only GENUINE timeouts (premature=False). A premature timeout fired
-    # below the proxy's own recommended deadline — a client-side give-up, not a
-    # backend stall. Best-effort interactive gemma paths (greeter advisory ~0.9s,
-    # sidekick.extract_obs 3.0s) deliberately apply sub-second deadlines well under
-    # the gemma 60s floor and routinely give up early; counting those manufactured
-    # false `endpoint_stalled` ERROR bursts (same root cause as the creative-boxa
-    # 120/220s-constant episode, fixed there by deriving from the advice). A real
-    # stall makes requests wait PAST the recommended deadline → premature=False →
-    # still counted, so the genuine signal is preserved, only sharper.
+    # Count only GENUINE timeouts (premature=False AND best_effort=False). A
+    # premature timeout fired below the proxy's own recommended deadline — a
+    # client-side give-up. A best_effort timeout applied a deadline far below the
+    # recommended time (greeter advisory ~0.9s, sidekick.extract ~3s vs the gemma 60s
+    # floor); unlike premature, best_effort ALSO excludes proxy-initiated aborts
+    # (TTFT watchdog, endpoint-paused fast-fail) on those sub-floor paths, which
+    # is what let the proxy's own fast-fails re-latch this alert into the
+    # 2026-07-04 gemma bursts. Only timeouts that gave the backend FAIR time
+    # survive → a real stall (2026-06-06 thinker episode) makes requests wait PAST
+    # the recommended deadline → best_effort=False → still counted, sharper.
     for ep, snap in endpoint_snapshots.items():
         ep_timeouts = metrics.count(
-            endpoint=ep, status="timeout", premature=False, now=now)
+            endpoint=ep, status="timeout",
+            premature=False, best_effort=False, now=now)
         max_slots = snap.get("max_slots", 0) or 0
-        if (ep_timeouts >= 3
+        if (ep_timeouts >= _ENDPOINT_STALL_MIN_TIMEOUTS
                 and snap.get("queued", 0) == 0
                 and (max_slots == 0 or snap.get("in_flight", 0) < max_slots)):
+            severity = ("WARNING" if ep in _ENDPOINT_STALL_WARN_ENDPOINTS
+                        else "ERROR")
             alerts.append(AlertCondition(
-                "endpoint_stalled", "ERROR", True,
-                f"endpoint {ep}: {ep_timeouts} non-premature timeouts in 5min "
-                f"with free slots (in_flight={snap.get('in_flight', 0)}/"
+                "endpoint_stalled", severity, True,
+                f"endpoint {ep}: {ep_timeouts} non-premature non-best-effort "
+                f"timeouts in 5min with free slots "
+                f"(in_flight={snap.get('in_flight', 0)}/"
                 f"{max_slots or '?'}, queued=0) — backend likely stalling, "
                 f"not saturated",
             ))

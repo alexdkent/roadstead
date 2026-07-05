@@ -63,6 +63,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# A timeout whose caller-APPLIED deadline is below this fraction of the model's
+# size-aware recommended time is a best-effort sub-floor give-up (gemma greeter
+# advisory ~0.9s / sidekick.extract ~3s vs the 60s gemma floor), NOT reliable
+# backend-stall evidence. Tagged on the timeout metric (best_effort) so the
+# endpoint_stalled heuristic can exclude it — including PROXY-initiated aborts
+# (TTFT watchdog / endpoint-paused fast-fail) that `premature` can't flag. See
+# observability._ENDPOINT_STALL_MIN_TIMEOUTS (2026-07-05 gemma stall-burst fix).
+_STALL_BEST_EFFORT_RATIO = 0.5
+
+
+def _timeout_below_recommended(applied_timeout_s, recommended_ms) -> bool:
+    """True if the applied deadline is far under the recommended time — a
+    best-effort caller that never gave the backend a fair chance. Cheap + total:
+    a missing/zero recommended or applied returns False (counts as genuine)."""
+    applied_ms = float(applied_timeout_s or 0.0) * 1000.0
+    return bool(
+        recommended_ms
+        and applied_ms
+        and applied_ms < float(recommended_ms) * _STALL_BEST_EFFORT_RATIO
+    )
+
+
 # OpenAI-shaped error envelope — shared by Lifecycle + the HTTP front door.
 def _openai_error(
     message: str, err_type: str, status_code: int, code: str | None = None,
@@ -1191,6 +1213,22 @@ class Lifecycle:
             caller_id=req.caller_id,
         ))
 
+        # A backend/stream timeout on a best-effort sub-floor caller (applied
+        # deadline far under the recommended time) is not reliable stall evidence
+        # — tag it so endpoint_stalled excludes it (2026-07-05 gemma bursts).
+        # Only recomputes the advice on the rare timeout completion; fully guarded.
+        _best_effort = False
+        if status == "timeout":
+            try:
+                _rec = self.state.timeout_model.advise(
+                    req.endpoint, int(req.priority),
+                    req.est_input_tokens or estimate_input_tokens(req.payload),
+                    int(req.payload.get("max_tokens", 0) or 0),
+                )["recommended_ms"]
+                _best_effort = _timeout_below_recommended(req.timeout_s, _rec)
+            except Exception:  # noqa: BLE001
+                _best_effort = False
+
         # Metrics
         self.state.metrics.record(MetricsSample(
             timestamp=now,
@@ -1201,6 +1239,7 @@ class Lifecycle:
             backend_latency_ms=duration_s * 1000,
             status=status,
             slot_seconds=duration_s,
+            best_effort=_best_effort,
         ))
 
         # Timeout-advice model + shadow log (observational only — guarded
@@ -1421,6 +1460,11 @@ class Lifecycle:
                     # client-side give-up, excluded from the endpoint_stalled
                     # backend-stall heuristic (best-effort sub-floor callers).
                     premature=under,
+                    # best_effort also catches proxy-initiated aborts (fast-fail
+                    # / TTFT watchdog) on sub-floor callers, which `under` forces
+                    # False for — the gemma stall-burst amplifier (2026-07-05).
+                    best_effort=_timeout_below_recommended(
+                        req.timeout_s, recommended_ms),
                 ))
                 self.state.request_logger.log(RequestLogRecord(
                     ts=datetime.now(timezone.utc).isoformat(),
