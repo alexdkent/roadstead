@@ -48,6 +48,12 @@ DEFAULT_FLAGS: dict[str, bool] = {
     # framework callers already get via apply_extend_only (embed→~15s not 180s;
     # a cold on-demand load can wait out its multi-minute load). Caller-supplied
     # timeout_s ALWAYS wins regardless of this flag.
+    # NB: the smart path now consumes effective_timeout_advice (load+size uplift,
+    # ceiling-bounded), so flipping this on gives no-deadline callers an ADAPTIVE
+    # default. Shadow shows 0.0% would-timeout on every cell — safe to flip live
+    # via POST /v1/admin/flags once the surge math has soaked. Kept False here so
+    # the flip is an explicit, reversible operator action, not a code-default
+    # behavior change to every no-deadline caller in one push.
     "smart_default_timeout": False,
 }
 

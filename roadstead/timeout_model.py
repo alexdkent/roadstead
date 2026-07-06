@@ -86,6 +86,108 @@ FLOOR_S: dict[str, float] = {
 # Fallback floor for an unknown endpoint class.
 _DEFAULT_FLOOR_S = 60.0
 
+# ---------------------------------------------------------------------------
+# Per-caller-class timeout CEILINGS (seconds).
+#
+# The upper bound on the adaptive (surge × size) recommendation, split by
+# caller class per the operator decision (2026-07-05): interactive turn/app
+# traffic gets a tighter ceiling; background/ingestion + long-form author
+# roles get a generous one.  Resolution order (see ``resolve_ceiling_s``):
+#   1. a per-role ``timeout_ceiling_s`` override from models.yaml (for roles
+#      that are inherently long-running regardless of tier — e.g. creative
+#      song-compose, the generation roles), else
+#   2. the interactive band if the request is P0/P1/P2, else the background
+#      band (P3_INGESTION / P4_HYGIENE).
+# The resolved ceiling is ALWAYS lifted to at least the class floor, so a
+# ceiling can never strangle a call below the deadline the model already
+# guarantees (that would re-introduce the sub-floor-cliff regression).
+# ---------------------------------------------------------------------------
+_INTERACTIVE_CEILING_S = 600.0
+_BACKGROUND_CEILING_S = 1800.0
+
+
+def resolve_ceiling_s(
+    endpoint: str,
+    *,
+    interactive: bool,
+    role_ceilings: dict[str, float] | None = None,
+    floor_s: float,
+    interactive_s: float = _INTERACTIVE_CEILING_S,
+    background_s: float = _BACKGROUND_CEILING_S,
+) -> float:
+    """Upper bound (seconds) for the adaptive recommendation of this call.
+
+    ``interactive`` is ``priority <= P2_POST_TURN`` (computed at the call site
+    so this stays enum-agnostic and pure).  A per-role override in
+    ``role_ceilings`` (from ``models.yaml timeout_ceiling_s``) wins over the
+    tier band.  The result is never below ``floor_s``."""
+    ep = normalize_endpoint(endpoint)
+    override = (role_ceilings or {}).get(ep)
+    ceiling = float(override) if override and override > 0 else (
+        interactive_s if interactive else background_s
+    )
+    return max(ceiling, float(floor_s))
+
+
+def surge_factor(
+    in_flight: int,
+    queued: int,
+    max_slots: int,
+    *,
+    k_load: float = 0.5,
+    surge_max: float = 3.0,
+) -> float:
+    """Live-contention multiplier ≥ 1.0.
+
+    At or under capacity the factor is 1.0 (no change).  Backlog beyond
+    capacity — the number of requests that must clear before this one starts —
+    stretches the deadline roughly with expected queue wait: ``over`` is the
+    backlog measured in units of endpoint capacity, clamped at ``surge_max``.
+    ``max_slots <= 0`` (unknown capacity) yields 1.0."""
+    if max_slots <= 0:
+        return 1.0
+    over = max(0.0, (int(in_flight) + int(queued) - int(max_slots)) / float(max_slots))
+    return 1.0 + k_load * min(over, surge_max)
+
+
+def size_stretch(
+    est_in: int,
+    *,
+    k_size: float = 0.5,
+    size_max: float = 4.0,
+) -> float:
+    """Continuous multiplier ≥ 1.0 for prompts past the top input bucket.
+
+    The coarse ``_IN_EDGES`` buckets top out at 16K, so a 60K-token prompt gets
+    the same empirical cell as a 17K one.  This smooths that cliff: ``over`` is
+    how many multiples of the top edge the prompt exceeds, clamped at
+    ``size_max``.  At or below the top edge the factor is 1.0."""
+    top = _IN_EDGES[-1]
+    over = max(0.0, (int(est_in) - top) / float(top))
+    return 1.0 + k_size * min(over, size_max)
+
+
+def apply_load_and_ceiling(
+    recommended_ms: float,
+    *,
+    in_flight: int,
+    queued: int,
+    max_slots: int,
+    est_in: int,
+    ceiling_ms: float,
+    k_load: float = 0.5,
+    surge_max: float = 3.0,
+    k_size: float = 0.5,
+    size_max: float = 4.0,
+) -> tuple[float, float, float]:
+    """Apply the live-load surge and size-stretch to a base recommendation,
+    bounded by ``ceiling_ms``.  Returns ``(effective_ms, surge, stretch)`` so
+    the caller can surface the factors for observability.  Pure."""
+    surge = surge_factor(in_flight, queued, max_slots, k_load=k_load, surge_max=surge_max)
+    stretch = size_stretch(est_in, k_size=k_size, size_max=size_max)
+    effective = min(recommended_ms * surge * stretch, ceiling_ms)
+    return effective, surge, stretch
+
 # Token-size bucket edges.  Output dominates decode time, so it is the
 # finer dimension; input (prefill) is coarse.
 _OUT_EDGES = [128, 512, 2048, 8192]   # → 5 buckets (indices 0..4)

@@ -576,6 +576,19 @@ class ProxyConfig:
     timeout_advice_margin: float = 1.5
     timeout_advice_window_s: float = 7 * 86400.0
     timeout_advice_min_samples: int = 30
+    # Adaptive (load × size) uplift on top of the empirical recommendation, so a
+    # deadline widens with LIVE contention and prompt size instead of failing a
+    # merely-busy/slow call (2026-07-05). ``surge = 1 + k_load*min(over, max)``
+    # where ``over`` is backlog measured in units of endpoint capacity;
+    # ``size_stretch`` smooths the coarse-bucket cliff past the 16K top edge.
+    # Bounded by the per-caller-class ceiling (interactive vs background band +
+    # per-role ``timeout_ceiling_s`` override).
+    timeout_surge_k: float = 0.5
+    timeout_surge_max: float = 3.0
+    timeout_size_k: float = 0.5
+    timeout_size_max: float = 4.0
+    timeout_ceiling_interactive_s: float = 600.0
+    timeout_ceiling_background_s: float = 1800.0
 
     @property
     def total_fleet_slots(self) -> int:

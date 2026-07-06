@@ -57,6 +57,7 @@ class ModelEntry:
     context_window: int = 0
     slots: int = 0
     timeout_floor_s: float = 0.0
+    timeout_ceiling_s: float = 0.0
     policy: dict[str, Any] = field(default_factory=dict)
     capabilities: dict[str, Any] = field(default_factory=dict)
     dispatcher_capability: str = ""
@@ -143,6 +144,7 @@ def _coerce_entry(name: str, raw: dict[str, Any]) -> ModelEntry:
         context_window=int(raw.get("context_window", 0) or 0),
         slots=int(raw.get("slots", 0) or 0),
         timeout_floor_s=float(raw.get("timeout_floor_s", 0) or 0),
+        timeout_ceiling_s=float(raw.get("timeout_ceiling_s", 0) or 0),
         policy=dict(raw.get("policy") or {}),
         capabilities=dict(raw.get("capabilities") or {}),
         dispatcher_capability=raw.get("dispatcher_capability", ""),
@@ -281,6 +283,23 @@ def build_class_floors(cat: Catalog | None = None) -> dict[str, float]:
     for e in cat.proxy_endpoints():
         if e.endpoint_class and e.timeout_floor_s and e.timeout_floor_s > 0:
             out[e.endpoint_class] = float(e.timeout_floor_s)
+    return out
+
+
+def build_class_ceilings(cat: Catalog | None = None) -> dict[str, float]:
+    """endpoint class → per-class timeout CEILING (seconds), from
+    ``timeout_ceiling_s``.  The per-role override that lets an inherently
+    long-running class (e.g. ``creative`` song-compose, the generation roles)
+    keep a generous upper bound even on an interactive tier, overriding the
+    interactive/background tier band in ``timeout_model.resolve_ceiling_s``.
+    Only proxy-endpoint owners with a positive ceiling are emitted; classes
+    absent here fall back to the tier band.  Deterministic (proxy-endpoint
+    owner per class, like ``build_class_floors``)."""
+    cat = cat or load_catalog()
+    out: dict[str, float] = {}
+    for e in cat.proxy_endpoints():
+        if e.endpoint_class and e.timeout_ceiling_s and e.timeout_ceiling_s > 0:
+            out[e.endpoint_class] = float(e.timeout_ceiling_s)
     return out
 
 

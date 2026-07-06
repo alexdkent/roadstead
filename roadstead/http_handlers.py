@@ -828,7 +828,10 @@ class ProxyHttpHandlers:
                 {"error": "est_in/est_out must be integers"}, status_code=400,
             )
 
-        advice = self.state.timeout_model.advise(endpoint, priority, est_in, est_out)
+        # Uplifted for live load + prompt size, bounded by the caller-class
+        # ceiling — so the extend-only client actually waits long enough under
+        # contention instead of severing a merely-slow call.
+        advice = self.state.effective_timeout_advice(endpoint, priority, est_in, est_out)
         return JSONResponse({
             "model": endpoint,
             "priority": LLMPriority(priority).name,

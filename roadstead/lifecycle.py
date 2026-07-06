@@ -1299,7 +1299,7 @@ class Lifecycle:
                 est_out = mt if isinstance(mt, int) and mt > 0 else 0
             else:
                 est_in = est_out = 0
-            rec = self.state.timeout_model.advise(
+            rec = self.state.effective_timeout_advice(
                 endpoint, priority, est_in, est_out)["recommended_timeout_s"]
             if rec and rec > 0:
                 smart_s = min(float(rec), _SMART_DEFAULT_CAP_S)

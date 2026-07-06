@@ -49,6 +49,8 @@
 #   context_window      framework chunker/preflight default (_DEFAULT_CONTEXT_WINDOW)
 #   slots               max_slots seed
 #   timeout_floor_s     per-class floor (llmproxy/timeout_model.FLOOR_S)
+#   timeout_ceiling_s   per-role override of the adaptive-timeout upper bound (else the
+#                       interactive/background tier band; llmproxy/timeout_model.resolve_ceiling_s)
 #   policy.*            EndpointConfig knobs (reserve / floor_pct / cap / affinity / skip_discovery)
 #   capabilities.*      vision / streaming / reasoning / tool_calling / structured_output
 #   dispatcher_capability   media: the GenerationCapability key the dispatcher uses
@@ -160,6 +162,7 @@ models:
     context_window: 32768      # fleet chunkers size against 32K on purpose (policy, not slot size)
     slots: 4
     timeout_floor_s: 360       # 2026-07-04: raised 180->360 — kv-unified allows big single requests; 122B prefill at ~300 t/s needs headroom past 128K
+    timeout_ceiling_s: 900     # 2026-07-05: the 122B is legitimately slow even on turn-support tiers; a role override so the interactive band (600s) can't strangle a big synth under load. Adaptive surge×size widens up to here.
     policy:
       dispatch_concurrency_cap: 4   # re-validated for the 122B via llama-batched-bench (1/2/4/8 parallel,
                                     # no instability found through 8) — the old cap:3 was specific to the
@@ -339,6 +342,7 @@ models:
     # proxy forwards it verbatim (no boxa change). VERIFIED 2026-06-30: 560 is safe + lifts fine-text
     # (fixed an SSN date the default missed); 1120 OOM-crashes the boxa engine — do NOT exceed ~560.
     timeout_floor_s: 900            # tolerates cold multi-minute vLLM load + long-context prefill
+    timeout_ceiling_s: 1800         # 2026-07-05: inherently long-running (cold load + long-form gen); a role override so the generous background band applies on EVERY tier (song-compose runs at P1). Adaptive surge×size widens up to here.
     policy:
       background_floor_pct: 0.0
       fast_path_reserve_slots: 1

@@ -17,6 +17,7 @@ white-box tests that reach into those privates keep biting through the refactor.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from typing import TYPE_CHECKING
 
@@ -24,7 +25,7 @@ from .acl import IPIdentityMap
 from .agent_budget import BudgetManager
 from .backend import BackendClientPool
 from .coalesce import DeterministicCache
-from .config import ProxyConfig
+from .config import ProxyConfig, normalize_endpoint
 from .cost_model import CostModel
 from .flags import RuntimeFlags
 from .observability import RequestLogger, RollingMetrics
@@ -58,7 +59,7 @@ class ProxyState:
         # model swap (e.g. classify 45→180 / composer 180→360, 2026-07 nexus
         # loadout) silently did nothing — enforcement kept using the stale
         # hardcoded values. Fallback covers any class absent from the yaml.
-        from .model_catalog import build_class_floors
+        from .model_catalog import build_class_ceilings, build_class_floors
         from .timeout_model import FLOOR_S
         floors = {**FLOOR_S, **build_class_floors()}
         self.timeout_model = TimeoutModel(
@@ -67,6 +68,10 @@ class ProxyState:
             min_samples=config.timeout_advice_min_samples,
             floors=floors,
         )
+        # Per-role timeout-ceiling overrides (models.yaml `timeout_ceiling_s`) —
+        # let an inherently long-running class keep a generous ceiling even on an
+        # interactive tier, overriding the interactive/background tier band.
+        self.timeout_ceilings = build_class_ceilings()
         self.budget_mgr = BudgetManager(starvation_timeout_s=config.starvation_timeout_s)
         self.scheduler = Scheduler(config, self.cost_model, self.budget_mgr)
         self.backend = BackendClientPool()
@@ -258,6 +263,59 @@ class ProxyState:
     # them here removes the only cross-collaborator method calls (contract §5.1
     # prefers the shared-state form). ProxyService keeps `_resolve_error` /
     # `_metrics_payload` as thin delegators to these.
+
+    def effective_timeout_advice(
+        self, endpoint: str, priority: int, est_in: int, est_out: int,
+    ) -> dict:
+        """The empirical ``advise()`` result UPLIFTED for live load + prompt
+        size and bounded by the per-caller-class ceiling.
+
+        This is what callers (the ``/v1/timeout-advice`` endpoint) and the
+        server default resolver consume, so the deadline widens when the
+        endpoint is busy or the prompt is large — instead of the flat empirical
+        p99×margin failing a merely-slow call. The RECORDING/counterfactual
+        sites keep raw ``advise()`` (load-neutral base for the shadow compare).
+
+        Fully guarded: any fault falls back to the raw advice so timeout
+        resolution can never 500 a request. Adds ``surge`` / ``size_stretch`` /
+        ``ceiling_s`` to the dict for observability."""
+        from .timeout_model import apply_load_and_ceiling, resolve_ceiling_s
+
+        advice = self.timeout_model.advise(endpoint, priority, est_in, est_out)
+        try:
+            snap = self.scheduler.endpoint_snapshot(normalize_endpoint(endpoint))
+            floor_s = self.timeout_model.floor_ms(endpoint) / 1000.0
+            ceiling_s = resolve_ceiling_s(
+                endpoint,
+                interactive=int(priority) <= 2,  # P0/P1/P2 (see LLMPriority)
+                role_ceilings=self.timeout_ceilings,
+                floor_s=floor_s,
+                interactive_s=self.config.timeout_ceiling_interactive_s,
+                background_s=self.config.timeout_ceiling_background_s,
+            )
+            effective_ms, surge, stretch = apply_load_and_ceiling(
+                advice["recommended_ms"],
+                in_flight=snap.get("in_flight", 0),
+                queued=snap.get("queued", 0),
+                max_slots=snap.get("max_slots", 0),
+                est_in=est_in,
+                ceiling_ms=ceiling_s * 1000.0,
+                k_load=self.config.timeout_surge_k,
+                surge_max=self.config.timeout_surge_max,
+                k_size=self.config.timeout_size_k,
+                size_max=self.config.timeout_size_max,
+            )
+            advice = {
+                **advice,
+                "recommended_ms": round(effective_ms, 1),
+                "recommended_timeout_s": math.ceil(effective_ms / 1000.0),
+                "surge": round(surge, 3),
+                "size_stretch": round(stretch, 3),
+                "ceiling_s": round(ceiling_s, 1),
+            }
+        except Exception:  # noqa: BLE001 — advice uplift must never 500 a request
+            pass
+        return advice
 
     def resolve_error(self, req: "QueuedRequest", error: str) -> None:
         """Release a queued/pending request with a deferrable error, resolving
