@@ -29,6 +29,16 @@ from .service import _DRAIN_DEADLINE_S, ProxyService
 
 logger = logging.getLogger("originfleet.llmproxy")
 
+# Server-side idle keepalive close (seconds). Raised from uvicorn's DEFAULT 5s
+# (2026-07-06 — regression_ledger: llmproxy-keepalive-disconnect): 5s coincided
+# with httpx's default client keepalive_expiry, so under a concurrent burst either
+# side could close an idle socket first and a POST reusing a server-closed one
+# raised RemoteProtocolError("Server disconnected without sending a response.").
+# MUST stay ABOVE the client's keepalive (llm_proxy_client._CLIENT_KEEPALIVE_EXPIRY_S,
+# 4.5s) with margin, so the CLIENT always retires idle connections first — the proxy
+# never yanks a socket an agent is about to reuse. test_proxy_keepalive_invariant pins it.
+PROXY_SERVER_KEEPALIVE_S = int(os.environ.get("COLLECTIVE_PROXY_SERVER_KEEPALIVE_S", "30"))
+
 
 async def _on_invalid_json(request: Request, exc: Exception) -> JSONResponse:
     """Malformed request body → clean 400 (not an unhandled ASGI 500)."""
@@ -163,6 +173,9 @@ def main() -> None:
         # hard-kills the process mid-flush and drops queued writes (budgets +
         # completions). Derive it so the two can't drift apart.
         timeout_graceful_shutdown=int(_DRAIN_DEADLINE_S) + 18,  # 30 + 18 = 48s
+        # Idle keepalive close — raised above the client's keepalive_expiry so the
+        # client retires idle sockets first (no stale-reuse RemoteProtocolError).
+        timeout_keep_alive=PROXY_SERVER_KEEPALIVE_S,
     )
 
 

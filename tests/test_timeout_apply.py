@@ -276,3 +276,48 @@ def test_explicit_sub_floor_deadline_is_still_honored(monkeypatch):
     _, post_kwargs = http.post.call_args
     assert post_kwargs["json"]["timeout_s"] == 5.0   # honored
     assert not http.get.called   # advice never fetched for an explicit sub-floor budget
+
+
+# --- keepalive-disconnect resilience (2026-07-06) ---
+# LEDGER: llmproxy-keepalive-disconnect
+
+import httpx  # noqa: E402
+import pytest  # noqa: E402
+
+from originfleet.framework.nexus_errors import is_deferrable_llm_error  # noqa: E402
+from originfleet.framework.llm_proxy_client import _CLIENT_KEEPALIVE_EXPIRY_S  # noqa: E402
+
+
+def test_keepalive_invariant_client_below_server():
+    """The client must retire idle connections BEFORE the proxy does, so a POST
+    never reuses a server-closed keepalive socket (the RemoteProtocolError race).
+    Pins client keepalive_expiry < server timeout_keep_alive with real margin."""
+    from originfleet.llmproxy.__main__ import PROXY_SERVER_KEEPALIVE_S
+    assert _CLIENT_KEEPALIVE_EXPIRY_S < PROXY_SERVER_KEEPALIVE_S
+    # margin must exceed plausible clock/RTT jitter, not just be positive
+    assert PROXY_SERVER_KEEPALIVE_S - _CLIENT_KEEPALIVE_EXPIRY_S >= 5.0
+
+
+def test_client_keepalive_expiry_applied_to_pool():
+    c = ProxyLLMClient(role="gemma-router", agent_id="test")
+    assert c._http._transport._pool._keepalive_expiry == _CLIENT_KEEPALIVE_EXPIRY_S
+
+
+@pytest.mark.parametrize("exc", [
+    httpx.RemoteProtocolError("Server disconnected without sending a response."),
+    httpx.ReadError("connection reset"),
+    httpx.WriteError("broken pipe"),
+])
+def test_midflight_disconnect_normalized_to_deferrable(monkeypatch, exc):
+    """A mid-flight transport drop on the submit POST must surface as a DEFERRABLE
+    ConnectionError (not a raw httpx error) so every caller defers + retries."""
+    import originfleet.framework.llm_proxy_client as mod
+    monkeypatch.setattr(mod, "resolve_identity", lambda *a, **k: {}, raising=False)
+    http = MagicMock()
+    http.post.side_effect = exc
+    c = _client_with_http(http)
+    with pytest.raises(ConnectionError) as ei:
+        c.chat.completions.create(messages=[{"role": "user", "content": "x"}], max_tokens=10)
+    assert "connection lost" in str(ei.value).lower()
+    # and the canonical fleet classifier treats it as deferrable (embeds orig text)
+    assert is_deferrable_llm_error(ei.value)

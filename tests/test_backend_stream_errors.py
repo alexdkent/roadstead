@@ -96,6 +96,19 @@ def _call(pool):
                                  "chat_completion", "rid", timeout_s=5))
 
 
+def test_call_remote_protocol_error_maps_to_unavailable():
+    # Parity with the stream path (2026-07-06 keepalive-disconnect fix): a backend
+    # keep-alive drop on the NON-stream call() must be transient (BackendUnavailable
+    # → in-proxy retry), not a hard 502 that surfaces to the caller.
+    def handler(request):
+        raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+
+    with pytest.raises(BackendError) as exc:
+        _call(_pool_with(handler))
+    assert isinstance(exc.value, BackendUnavailable)
+    assert exc.value.status_code == 503
+
+
 def test_call_empty_completion_raises():
     body = {"choices": [{"message": {"content": ""}}], "usage": {"completion_tokens": 0}}
     with pytest.raises(BackendError) as exc:

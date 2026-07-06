@@ -406,6 +406,13 @@ class BackendClientPool:
             # in-proxy retry + caller deferral engage instead of a hard 502.
             raise BackendUnavailable(
                 f"backend {ep_cfg.role} connection pool exhausted: {exc}")
+        except httpx.RemoteProtocolError as exc:
+            # Backend dropped the connection before responding — a server-closed
+            # keep-alive socket reused from the pool, or a crash. Transient by
+            # nature → BackendUnavailable so the in-proxy retry engages, parity
+            # with the stream() path (must precede the HTTPError catch below —
+            # RemoteProtocolError is an httpx.HTTPError subclass).
+            raise BackendUnavailable(f"backend {ep_cfg.role} disconnected: {exc}")
         except httpx.HTTPError as exc:
             raise BackendError(502, f"backend {ep_cfg.role} http error: {exc}")
 
