@@ -159,3 +159,91 @@ def test_timeout_floor_yaml_sync():
         "FLOOR_S mirror drifted from models.yaml timeout_floor_s "
         f"(class: (FLOOR_S, yaml)): {mismatched}"
     )
+
+
+# ----- adaptive load × size uplift + split ceilings (2026-07-05) -----
+
+from originfleet.llmproxy.timeout_model import (  # noqa: E402
+    _BACKGROUND_CEILING_S,
+    _INTERACTIVE_CEILING_S,
+    apply_load_and_ceiling,
+    resolve_ceiling_s,
+    size_stretch,
+    surge_factor,
+)
+
+
+def test_surge_is_one_at_or_under_capacity():
+    # in_flight + queued <= max_slots → no backlog → factor 1.0 (never shrinks).
+    assert surge_factor(0, 0, 4) == 1.0
+    assert surge_factor(4, 0, 4) == 1.0
+    assert surge_factor(2, 2, 4) == 1.0
+
+
+def test_surge_scales_with_backlog_and_clamps():
+    # backlog of one capacity-unit over → 1 + k(0.5)*1 = 1.5
+    assert surge_factor(4, 4, 4) == 1.5
+    # huge backlog clamps `over` at surge_max (3.0) → 1 + 0.5*3 = 2.5
+    assert surge_factor(100, 0, 4) == 2.5
+
+
+def test_surge_unknown_capacity_is_neutral():
+    assert surge_factor(10, 10, 0) == 1.0
+
+
+def test_size_stretch_only_past_top_bucket():
+    assert size_stretch(1000) == 1.0
+    assert size_stretch(_IN_EDGES[-1]) == 1.0            # exactly at 16K edge
+    # 2x the top edge over → (32768-16384)/16384 = 1 → 1.5
+    assert size_stretch(_IN_EDGES[-1] * 2) == 1.5
+    # clamped at size_max (4) → 1 + 0.5*4 = 3.0
+    assert size_stretch(_IN_EDGES[-1] * 100) == 3.0
+
+
+def test_ceiling_tier_bands_and_role_override():
+    # interactive tier → interactive band; background tier → background band.
+    assert resolve_ceiling_s("thinker", interactive=True, floor_s=180) == _INTERACTIVE_CEILING_S
+    assert resolve_ceiling_s("thinker", interactive=False, floor_s=180) == _BACKGROUND_CEILING_S
+    # a per-role override wins over the band, on EITHER tier (creative song-
+    # compose runs at an interactive tier but must keep its generous ceiling).
+    assert resolve_ceiling_s(
+        "creative", interactive=True, role_ceilings={"creative": 1800}, floor_s=900,
+    ) == 1800.0
+
+
+def test_ceiling_never_below_floor():
+    # A band tighter than the class floor must be lifted to the floor — a
+    # ceiling that strangles below the model's guaranteed deadline would
+    # re-introduce the sub-floor-cliff regression.
+    assert resolve_ceiling_s("creative", interactive=True, floor_s=900) == 900.0
+
+
+def test_apply_load_and_ceiling_bounds_and_reports_factors():
+    # No load, small prompt → recommendation unchanged, factors 1.0.
+    eff, surge, stretch = apply_load_and_ceiling(
+        180_000.0, in_flight=0, queued=0, max_slots=4, est_in=100,
+        ceiling_ms=600_000.0,
+    )
+    assert (eff, surge, stretch) == (180_000.0, 1.0, 1.0)
+    # Load + big prompt widen the deadline, but the ceiling caps it.
+    eff2, surge2, stretch2 = apply_load_and_ceiling(
+        400_000.0, in_flight=100, queued=0, max_slots=4, est_in=_IN_EDGES[-1] * 4,
+        ceiling_ms=600_000.0,
+    )
+    assert surge2 > 1.0 and stretch2 > 1.0
+    assert eff2 == 600_000.0  # capped at ceiling
+
+
+def test_ceiling_yaml_sync():
+    """The per-role ceiling overrides in models.yaml are parsed and non-empty.
+
+    Companion (122B, slow) + creative (long-form author) carry an explicit
+    timeout_ceiling_s so the interactive band can't strangle them. This pins
+    that the yaml field is wired through build_class_ceilings (mirrors the
+    timeout_floor_yaml_sync doctrine)."""
+    from originfleet.llmproxy.model_catalog import build_class_ceilings
+
+    ceilings = build_class_ceilings()
+    assert ceilings, "models.yaml declares no timeout_ceiling_s — regression"
+    # every declared ceiling is a positive float
+    assert all(isinstance(v, float) and v > 0 for v in ceilings.values())

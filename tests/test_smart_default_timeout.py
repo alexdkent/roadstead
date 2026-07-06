@@ -123,11 +123,15 @@ def test_enforce_honors_warm_recommendation_and_cap():
     for i in range(60):
         tm.record("classify", 1, 8, 8, 500.0, "ok", now + i)
     assert svc._lifecycle.resolve_default_timeout("chat", _submit_body()) == 180.0
-    # Now seed a huge-latency cell so p99*margin >> floor and > cap → capped.
+    # Now seed a huge-latency cell so p99*margin >> floor. The per-class CEILING
+    # now governs the tail (2026-07-05 adaptive-timeout uplift): classify is an
+    # interactive-tier class, so the recommendation is bounded by the interactive
+    # ceiling (600s) — which is tighter than, and reached before, the flat
+    # _SMART_DEFAULT_CAP_S (1800s) fallback.
     for i in range(60):
         tm.record("classify", 1, 8, 8, 5_000_000.0, "ok", now + 100 + i)
     got = svc._lifecycle.resolve_default_timeout("chat", _submit_body())
-    assert got == 1800.0  # _SMART_DEFAULT_CAP_S
+    assert got == svc._config.timeout_ceiling_interactive_s  # 600s class ceiling
 
 
 def test_tally_records_both_modes_and_accumulates():

@@ -170,15 +170,19 @@ def test_resolve_off_is_flat_even_when_model_is_hot():
 
 
 def test_resolve_on_caps_pathological_tail_and_stays_finite():
-    """C: a heavy-tailed cell (recommended = p99*margin) is clamped to the cap,
-    never leaking a multi-hour or non-finite deadline."""
+    """C: a heavy-tailed cell (recommended = p99*margin) is clamped, never
+    leaking a multi-hour or non-finite deadline. Since the 2026-07-05 adaptive
+    uplift the per-class CEILING governs first: chat/classify is interactive so
+    the pathological tail is bounded by the interactive ceiling (600s), reached
+    before the flat _SMART_DEFAULT_CAP_S (1800s) fallback."""
     svc = ProxyService(ProxyConfig())
     svc._flags.set_many({"smart_default_timeout": True})
     tm = svc._timeout_model
     for i in range(80):
         tm.record("chat", 1, 8, 8, 9_999_999_999.0, "ok", 1000.0 + i)
     d = svc._lifecycle.resolve_default_timeout("chat", _body())
-    assert d == _SMART_DEFAULT_CAP_S
+    assert d == svc._config.timeout_ceiling_interactive_s  # 600s class ceiling
+    assert d <= _SMART_DEFAULT_CAP_S
     assert math.isfinite(d)
 
 

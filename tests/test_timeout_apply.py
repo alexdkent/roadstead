@@ -212,3 +212,67 @@ def test_qos_direct_submit_honors_sub_floor(monkeypatch):
         0.9,
     )
     assert eff == 0.9
+
+
+# --- Phase 0 regression: inherited default vs explicit sub-floor deadline ---
+# (regression_ledger: llmproxy-subfloor-default-cliff, 2026-07-05)
+
+def _creative_client(http) -> ProxyLLMClient:
+    c = ProxyLLMClient(role="creative", agent_id="test")  # class floor 900s
+    c._http = http
+    return c
+
+
+def test_inherited_default_below_floor_is_extended_not_honored(monkeypatch):
+    """The client's 300s CONSTRUCTOR DEFAULT sits below creative's 900s floor.
+    It must NOT be treated as a deliberate sub-floor budget — extend-only runs
+    and lifts the deadline to the recommendation, instead of pinning the call at
+    300s (the bug that killed 36% of timeouts, all premature)."""
+    import originfleet.framework.llm_proxy_client as mod
+    monkeypatch.setattr(mod, "resolve_identity", lambda *a, **k: {}, raising=False)
+
+    advice = MagicMock(status_code=200)
+    advice.json.return_value = {"recommended_timeout_s": 900}
+    submit_resp = MagicMock(status_code=200)
+    submit_resp.json.return_value = {
+        "status": "ok",
+        "response": {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+    }
+    http = MagicMock()
+    http.get.return_value = advice
+    http.post.return_value = submit_resp
+
+    c = _creative_client(http)
+    # NO explicit timeout= → base falls to the 300s constructor default.
+    c.chat.completions.create(messages=[{"role": "user", "content": "compose"}], max_tokens=2000)
+
+    _, post_kwargs = http.post.call_args
+    assert post_kwargs["json"]["timeout_s"] == 900.0   # extended, NOT pinned at 300
+    assert post_kwargs["timeout"] == 900.0
+    assert http.get.called   # the recommendation WAS consulted
+
+
+def test_explicit_sub_floor_deadline_is_still_honored(monkeypatch):
+    """A caller that EXPLICITLY passes a tight deadline below the floor still
+    gets it honored (deliberate best-effort budget) — and the recommendation is
+    not even consulted, so no backend over-run. The fix narrows sub-floor honor
+    to explicit deadlines only; it must not break the explicit case."""
+    import originfleet.framework.llm_proxy_client as mod
+    monkeypatch.setattr(mod, "resolve_identity", lambda *a, **k: {}, raising=False)
+
+    submit_resp = MagicMock(status_code=200)
+    submit_resp.json.return_value = {
+        "status": "ok",
+        "response": {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+    }
+    http = MagicMock()
+    http.post.return_value = submit_resp
+
+    c = _creative_client(http)
+    c.chat.completions.create(
+        messages=[{"role": "user", "content": "quick"}], max_tokens=50, timeout=5,
+    )
+
+    _, post_kwargs = http.post.call_args
+    assert post_kwargs["json"]["timeout_s"] == 5.0   # honored
+    assert not http.get.called   # advice never fetched for an explicit sub-floor budget
