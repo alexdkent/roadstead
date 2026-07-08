@@ -131,6 +131,59 @@ def test_budget_env_override():
     os.environ.pop("COLLECTIVE_PROXY_THINKING_BUDGET"); os.environ.pop("COLLECTIVE_PROXY_THINKING")
 
 
+def _mock_self_forced(reasoning=True, endpoint="creative"):
+    """Mock `self` for apply_forced_reasoning_budget: one endpoint carrying a
+    capabilities dict."""
+    state = types.SimpleNamespace()
+    ep = types.SimpleNamespace(backend_engine="llama.cpp",
+                               forces_reasoning=reasoning)
+    state.config = types.SimpleNamespace(endpoints={endpoint: ep})
+    m = types.SimpleNamespace(state=state)
+    m.apply_forced_reasoning_budget = C.apply_forced_reasoning_budget.__get__(m, C)
+    return m
+
+
+def test_forced_reasoning_budget_bumps_small_cap():
+    """A forced-reasoning endpoint gets reasoning headroom added to max_tokens so a
+    small caller cap (crew turn ~240) can't be eaten by the un-disable-able CoT."""
+    m = _mock_self_forced(reasoning=True)
+    req = _req({"max_tokens": 240, "messages": []}, endpoint="creative")
+    m.apply_forced_reasoning_budget(req)
+    assert req.payload["max_tokens"] == 240 + config.forced_reasoning_budget()
+
+
+def test_forced_reasoning_budget_noop_when_not_reasoning():
+    """An endpoint that does NOT force reasoning is left untouched."""
+    m = _mock_self_forced(reasoning=False)
+    req = _req({"max_tokens": 240, "messages": []}, endpoint="creative")
+    m.apply_forced_reasoning_budget(req)
+    assert req.payload["max_tokens"] == 240
+
+
+def test_forced_reasoning_budget_noop_without_cap():
+    """No positive max_tokens → nothing to protect (model self-limits)."""
+    m = _mock_self_forced(reasoning=True)
+    req = _req({"messages": []}, endpoint="creative")
+    m.apply_forced_reasoning_budget(req)
+    assert "max_tokens" not in req.payload
+    # streaming path is covered too (method is stream-agnostic)
+    req2 = _req({"max_tokens": 300, "messages": []}, endpoint="creative", stream=True)
+    m.apply_forced_reasoning_budget(req2)
+    assert req2.payload["max_tokens"] == 300 + config.forced_reasoning_budget()
+
+
+def test_forced_reasoning_budget_env_override():
+    os.environ["COLLECTIVE_PROXY_FORCED_REASONING_BUDGET"] = "700"
+    try:
+        assert config.forced_reasoning_budget() == 700
+        m = _mock_self_forced(reasoning=True)
+        req = _req({"max_tokens": 100, "messages": []}, endpoint="creative")
+        m.apply_forced_reasoning_budget(req)
+        assert req.payload["max_tokens"] == 800
+    finally:
+        os.environ.pop("COLLECTIVE_PROXY_FORCED_REASONING_BUDGET")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0
