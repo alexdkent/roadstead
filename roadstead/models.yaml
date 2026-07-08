@@ -336,23 +336,23 @@ models:
     model_family: Arcee Trinity-Mini (2026-01, MoE 26B-A3B), Q5_K_M GGUF
     quant: Q5_K_M
     params: {active: 3B, total: 26B}
-    context_per_slot: 65536          # llama.cpp -c 65536 --kv-unified shared pool (a single request can use the whole pool); ~18.8GB resident on the 32GB boxa
+    context_per_slot: 65536          # llama.cpp -c 131072 --parallel 2 SEPARATE KV -> 64K PER SLOT (2x the 32K chunk policy), f16 KV cache; ~21.3GB resident on the 32GB boxa (2026-07-08 perf tuning)
     context_window: 32768            # fleet chunkers size against 32K on purpose (policy, not slot size)
-    slots: 4                         # llama.cpp --parallel 4
+    slots: 2                         # llama.cpp --parallel 2 (2026-07-08 tuning: np4 imposed a standing single-stream decode tax; np2 matches the np1 ceiling AND keeps 2-way concurrency so a real-time crew turn isn't head-of-line blocked behind a song-compose)
     timeout_floor_s: 900            # generous floor for long song-compose + forced reasoning (llama.cpp load is now ~30s, but the floor is a min-budget, not a target; kept at 900 to stay synced with the FLOOR_S mirror + the client sub-floor-honor path)
     timeout_ceiling_s: 1800         # 2026-07-05: inherently long-running (cold load + long-form gen); a role override so the generous background band applies on EVERY tier (song-compose runs at P1). Adaptive surge×size widens up to here.
     policy:
       background_floor_pct: 0.0
       fast_path_reserve_slots: 1
-      # llama.cpp --parallel. Keep EQUAL to `slots: 4` above; the shadow reconciler warns on drift.
-      documented_max_num_seqs: 4
+      # llama.cpp --parallel. Keep EQUAL to `slots: 2` above; the shadow reconciler warns on drift.
+      documented_max_num_seqs: 2
     capabilities:
       vision: false                 # Trinity-Mini is TEXT-ONLY. The prior Gemma-4 served image+video; that capability is DROPPED in this swap (speed + family-diversity prioritized; classify(qwen3vl) remains the fleet's primary vision path — no creative-role caller sends images, verified 2026-07-08).
       streaming: true
       reasoning: true               # Trinity ALWAYS thinks (cannot disable). llama.cpp --jinja routes CoT to the reasoning_content channel; VERIFIED 2026-07-08 NO <think> bleed into content (streaming + non-streaming). ~4-5s/call reasoning tax, absorbed by 88 t/s decode.
       tool_calling: false           # auto-tool-choice OFF
       structured_output: grammar    # llama.cpp GBNF / json_schema grammar. NOTE: give structured calls a generous max_tokens — forced reasoning consumes budget BEFORE the JSON (too-tight budget -> empty content).
-    token_speed: {decode_tok_s_at_1: 88, aggregate_tok_s_full: 250}
+    token_speed: {decode_tok_s_at_1: 91, aggregate_tok_s_full: 57}   # measured 2026-07-08 (f16 KV, np2): ~91 t/s single-stream decode, ~2000 t/s prefill@4K, ~57 t/s conc-2 aggregate. NOTE: this card's decode is ~FLAT vs concurrency (GPU saturates on one stream) — more slots spread it thinner, they don't add aggregate.
     purpose: Creative / counterpoint voice — a different-family (Arcee) generative model.
     when_used:
       - sidekick song authoring (theme/hook/expand), dj crew speaker voice
@@ -363,8 +363,12 @@ models:
       (/models/trinity-mini-gguf/ on the box). Served on the DEDICATED Intel Arc Pro boxa
       (10.0.0.10:9196) by a standalone always-on docker container `llamacpp-creative-boxa`
       (`ghcr.io/ggml-org/llama.cpp:server-intel`, SYCL/level_zero:0, --restart always;
-      `-ngl 99 -c 65536 --parallel 4 --kv-unified -fa on -ctk q8_0 -ctv q8_0 --jinja`). NO dispatcher,
-      NO systemd — docker owns lifecycle. Depends on the /mnt/cache/llm NVMe mount.
+      `-ngl 99 -c 131072 --parallel 2 -fa on -ctk f16 -ctv f16 -b 4096 -ub 2048 --jinja`). NO dispatcher,
+      NO systemd — docker owns lifecycle. Depends on the /mnt/cache/llm NVMe mount. CANONICAL LAUNCH +
+      per-flag perf rationale: `infra/nasbox-vllm-xpu/serve_creative_llamacpp.sh` (re-run to recreate/retune).
+      PERF TUNING 2026-07-08 (A/B-benchmarked on the dedicated card, GPU serves creative + nothing else):
+      f16 KV (q8_0 dequant-on-read was the main decode cap here) + np2/separate-KV (np4 taxed single-stream) +
+      -ub 2048 (prefill) + 64K/slot (uses the free VRAM) => single-stream decode +79%, conc-2 agg +64%, prefill +28%.
       WHY THE SWAP: the prior Gemma-4-31B-it-abliterated AWQ W4A16 on custom vLLM 0.23 XPU (config-C)
       was DENSE -> bandwidth-bound on the 608 GB/s card -> pathological cold PREFILL (~30 t/s; a 16K
       request took ~10 min). Trinity measured 2026-07-08 bake-off: prefill 1697 t/s @3K / 842 @16K,
