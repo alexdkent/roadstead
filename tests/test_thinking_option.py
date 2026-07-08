@@ -166,6 +166,18 @@ def test_forced_reasoning_budget_noop_without_cap():
     req = _req({"messages": []}, endpoint="creative")
     m.apply_forced_reasoning_budget(req)
     assert "max_tokens" not in req.payload
+
+
+def test_forced_reasoning_budget_applies_even_to_tiny_cap():
+    """A tiny cap (e.g. the dj warm-up ping's max_tokens=1) is NOT exempted: a
+    forced-reasoning model spends its first tokens on the CoT, so an un-padded
+    1-token cap returns EMPTY → the backend 502s and the warmer logs a false
+    failure. Padding makes the warm-up succeed."""
+    m = _mock_self_forced(reasoning=True)
+    req = _req({"max_tokens": 1, "messages": [{"role": "user", "content": "ok"}]},
+               endpoint="creative")
+    m.apply_forced_reasoning_budget(req)
+    assert req.payload["max_tokens"] == 1 + config.forced_reasoning_budget()
     # streaming path is covered too (method is stream-agnostic)
     req2 = _req({"max_tokens": 300, "messages": []}, endpoint="creative", stream=True)
     m.apply_forced_reasoning_budget(req2)

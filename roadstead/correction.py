@@ -1059,6 +1059,12 @@ class Correction:
         cur = p.get("max_tokens")
         if not (isinstance(cur, int) and cur > 0):
             return
+        # NB: we deliberately do NOT exempt tiny caps (e.g. the dj crew/warm.py
+        # max_tokens=1 warm-up ping). A forced-reasoning model spends its first
+        # tokens on the CoT, so a 1-token cap returns EMPTY → the backend's
+        # empty-completion path 502s and the warmer records a FALSE failure
+        # (ok=0). Padding it makes the warm-up SUCCEED and, as a bonus, exercises
+        # decode (a fuller warm) — the ~200 discarded tokens are cheap + rare.
         p["max_tokens"] = cur + forced_reasoning_budget()
     def apply_thinking(self, req: QueuedRequest) -> None:
         """Request-side: honor a per-request ``thinking: true`` opt-in. On a vLLM
