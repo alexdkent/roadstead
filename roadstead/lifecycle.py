@@ -429,6 +429,12 @@ class Lifecycle:
                 resp.headers["Retry-After"] = str(retry_after)
                 return resp
 
+        # Forced-reasoning endpoints (e.g. creative/Trinity-Mini, capabilities.reasoning
+        # =true) ALWAYS spend max_tokens on an un-disable-able CoT before the answer, so
+        # small caller caps truncate mid-reasoning. Reserve answer headroom for BOTH the
+        # streaming and sync paths (must precede the branch — apply_thinking is sync-only).
+        self.correction.apply_forced_reasoning_budget(req)
+
         # Streaming vs non-streaming
         if req.stream:
             return await self.handle_streaming_submit(req, openai=openai)

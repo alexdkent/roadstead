@@ -323,64 +323,62 @@ models:
 
   creative:
     kind: chat
-    status: active                  # PINNED always-resident on the DEDICATED boxa (docker --restart always auto-starts vLLM); standalone — no dispatcher/systemd, proxy dispatches directly
+    status: active                  # PINNED always-resident on the DEDICATED boxa. Standalone docker container `llamacpp-creative-boxa` (--restart always) — no dispatcher/systemd; proxy dispatches directly. Swapped 2026-07-08: Gemma-4-31B vLLM-XPU -> Trinity-Mini llama.cpp-SYCL.
     proxy_endpoint: true
     endpoint_class: creative
     role: creative
     aliases: [deckard, deckard-31b]   # HISTORICAL — from the prior anvil NVFP4 DECKARD model; kept as compat role aliases only (the deployed model is NOT a DECKARD finetune)
     host: nasbox
     port: 9196
-    backend_engine: vllm
-    served_model_names: [creative, deckard-31b, deckard]   # `creative` = the LIVE boxa server (serve_prod.sh); `deckard`/`deckard-31b` = the DORMANT anvil rollback (serve_deckard.sh) — all declared so the naming-doctrine test covers both serve scripts
-    model_family: Gemma-4-31B-it abliterated (Heretic-ARA), AWQ W4A16
-    quant: W4A16
-    params: {active: 31B, total: 31B}
-    context_per_slot: 40960          # boxa vLLM --max-model-len (config-C cutover 2026-06-27)
-    slots: 16                        # boxa vLLM --max-num-seqs hard cap
-    # Vision resolution: Gemma-4 default visual budget is 280 tokens/image. Callers can raise it
-    # PER-REQUEST for fine OCR via extra_body={"mm_processor_kwargs":{"max_soft_tokens": 560}} — the
-    # proxy forwards it verbatim (no boxa change). VERIFIED 2026-06-30: 560 is safe + lifts fine-text
-    # (fixed an SSN date the default missed); 1120 OOM-crashes the boxa engine — do NOT exceed ~560.
-    timeout_floor_s: 900            # tolerates cold multi-minute vLLM load + long-context prefill
+    backend_engine: llama.cpp
+    probe_kind: llama
+    served_model_names: [creative, deckard-31b, deckard]   # `creative` = the LIVE boxa llama.cpp server (-a creative); `deckard`/`deckard-31b` = the DORMANT anvil rollback (serve_deckard.sh) — declared so the naming-doctrine test covers both. (serve_prod.sh vLLM path also preserved as rollback.)
+    model_family: Arcee Trinity-Mini (2026-01, MoE 26B-A3B), Q5_K_M GGUF
+    quant: Q5_K_M
+    params: {active: 3B, total: 26B}
+    context_per_slot: 65536          # llama.cpp -c 65536 --kv-unified shared pool (a single request can use the whole pool); ~18.8GB resident on the 32GB boxa
+    context_window: 32768            # fleet chunkers size against 32K on purpose (policy, not slot size)
+    slots: 4                         # llama.cpp --parallel 4
+    timeout_floor_s: 900            # generous floor for long song-compose + forced reasoning (llama.cpp load is now ~30s, but the floor is a min-budget, not a target; kept at 900 to stay synced with the FLOOR_S mirror + the client sub-floor-honor path)
     timeout_ceiling_s: 1800         # 2026-07-05: inherently long-running (cold load + long-form gen); a role override so the generous background band applies on EVERY tier (song-compose runs at P1). Adaptive surge×size widens up to here.
     policy:
       background_floor_pct: 0.0
       fast_path_reserve_slots: 1
-      # Step 4c: the boxa's real --max-num-seqs (serve_prod.sh). Keep EQUAL to
-      # `slots: 16` above; the shadow reconciler warns on drift.
-      documented_max_num_seqs: 16
+      # llama.cpp --parallel. Keep EQUAL to `slots: 4` above; the shadow reconciler warns on drift.
+      documented_max_num_seqs: 4
     capabilities:
-      vision: true                  # IMAGE + VIDEO input LIVE in prod since 2026-06-21 (serve_prod.sh: --dtype bfloat16 + --limit-mm-per-prompt image:2,video:1). Validated end-to-end through the proxy (Anthropic image block → OAI translate → vLLM). bf16 is MANDATORY for vision (fp16 silently breaks it via SigLIP overflow, vLLM #40290); text throughput unchanged (24.8 vs 25.9 tok/s). AUDIO is NOT supported — the checkpoint has no audio tower (audio_config vestigial → vLLM 400s); keep audio:0. Video routes as frames THROUGH the vision tower (no separate video tower).
+      vision: false                 # Trinity-Mini is TEXT-ONLY. The prior Gemma-4 served image+video; that capability is DROPPED in this swap (speed + family-diversity prioritized; classify(qwen3vl) remains the fleet's primary vision path — no creative-role caller sends images, verified 2026-07-08).
       streaming: true
-      reasoning: false              # served as a non-thinking chat model — no <think>/reasoning_content channel
+      reasoning: true               # Trinity ALWAYS thinks (cannot disable). llama.cpp --jinja routes CoT to the reasoning_content channel; VERIFIED 2026-07-08 NO <think> bleed into content (streaming + non-streaming). ~4-5s/call reasoning tax, absorbed by 88 t/s decode.
       tool_calling: false           # auto-tool-choice OFF
-      structured_output: guidance
-    token_speed: {decode_tok_s_at_1: 25, aggregate_tok_s_full: 250}
-    purpose: Creative / counterpoint voice — a different-family generative model.
+      structured_output: grammar    # llama.cpp GBNF / json_schema grammar. NOTE: give structured calls a generous max_tokens — forced reasoning consumes budget BEFORE the JSON (too-tight budget -> empty content).
+    token_speed: {decode_tok_s_at_1: 88, aggregate_tok_s_full: 250}
+    purpose: Creative / counterpoint voice — a different-family (Arcee) generative model.
     when_used:
       - sidekick song authoring (theme/hook/expand), dj crew speaker voice
     fallback: composer
     notes: |
-      DEPLOYED MODEL (ground-truth, /models/alonsoko-ct-w4a16 on the box): the pre-quantized HF
-      download `alonsoko/Gemma-4-31B-it-abliterated-heretic-AWQ-W4A16` — an AWQ W4A16 quant
-      (group_size 128 symmetric, compressed-tensors, calibrated on ultrachat_200k) of
-      `trohrbaugh/gemma-4-31b-it-heretic-ara`, itself a HERETIC-ARA abliterated derivative of
-      `google/gemma-4-31b-it`. This is NOT the DavidAU "DECKARD" finetune nor a locally
-      AutoRound-quantized model — the earlier `infra/nasbox-vllm-xpu/` build plan targeted DECKARD
-      but production switched to this downloaded AWQ artifact. Runs on the DEDICATED Intel Arc Pro
-      boxa (10.0.0.10:9196, custom vLLM 0.23 XPU build) since 2026-06-20 — replaced the anvil GB10
-      NVFP4 DECKARD (kept as hot rollback; the `deckard` aliases are historical from that prior
-      model). Standalone always-on docker container `vllm-creative-boxa` (--restart always;
-      entrypoint auto-starts vLLM on boot/crash — flipped 2026-07-01 from unless-stopped, which
-      skips the auto-restart if the container was stopped when the daemon last came down, e.g. an
-      Nasbox array stop/start); NO anvil dispatcher, NO systemd. gpu-mem-util
-      0.98, max-num-seqs 16, max-model-len 65536 (~108K KV tokens). Depends on the /mnt/cache/llm
-      NVMe mount (editable vLLM install + model + serve_prod.sh). MULTIMODAL LIVE (2026-06-21, see
-      capabilities + PRODUCTION.md): prod serves --dtype bfloat16 with --limit-mm-per-prompt
-      image:2,video:1 → IMAGE + VIDEO input work (vision tower = 356 tensors; video = frames through
-      the vision tower). bf16 is mandatory (fp16 silently breaks vision: SigLIP overflow, vLLM #40290);
-      text throughput unchanged. NO audio tower → audio unsupported (audio:0). Callers reach it like any
-      vision role: make_nexus_client("creative") with image content; the proxy translates + forwards.
+      DEPLOYED MODEL (2026-07-08 swap): `arcee-ai/Trinity-Mini` (base released 2026-01) — a diverse
+      NON-Qwen/NON-Gemma MoE (26B total / ~3B active), Q5_K_M GGUF from `arcee-ai/Trinity-Mini-GGUF`
+      (/models/trinity-mini-gguf/ on the box). Served on the DEDICATED Intel Arc Pro boxa
+      (10.0.0.10:9196) by a standalone always-on docker container `llamacpp-creative-boxa`
+      (`ghcr.io/ggml-org/llama.cpp:server-intel`, SYCL/level_zero:0, --restart always;
+      `-ngl 99 -c 65536 --parallel 4 --kv-unified -fa on -ctk q8_0 -ctv q8_0 --jinja`). NO dispatcher,
+      NO systemd — docker owns lifecycle. Depends on the /mnt/cache/llm NVMe mount.
+      WHY THE SWAP: the prior Gemma-4-31B-it-abliterated AWQ W4A16 on custom vLLM 0.23 XPU (config-C)
+      was DENSE -> bandwidth-bound on the 608 GB/s card -> pathological cold PREFILL (~30 t/s; a 16K
+      request took ~10 min). Trinity measured 2026-07-08 bake-off: prefill 1697 t/s @3K / 842 @16K,
+      decode 88 t/s single-stream (see docs/creative_model_bakeoff_results_2026-07-07.md).
+      Uncensored-native — 0/8 refusals on the edgy creative battery, NO abliteration needed.
+      REASONING: Trinity ALWAYS thinks and it CANNOT be disabled; llama.cpp --jinja separates CoT into
+      the reasoning_content channel (VERIFIED no <think> bleed into content, streaming + non-streaming),
+      costing ~4-5s/call absorbed by the fast decode. STRUCTURED: give grammar/JSON calls a generous
+      max_tokens (reasoning consumes budget before the JSON). VISION DROPPED (Trinity is text-only; no
+      creative-role caller sends images). ROLLBACK: the prior `vllm-creative-boxa` container is preserved
+      STOPPED (--restart no) with serve_prod.sh intact — `docker start vllm-creative-boxa`, then revert
+      this entry (backend_engine: vllm, drop probe_kind, model_family/quant/params/context/caps back to
+      the Gemma values) to restore the incumbent. The `deckard` aliases + serve_deckard.sh anvil
+      rollback are untouched.
 
   # ---------------------------------------------------------------- retrieval
   embed:

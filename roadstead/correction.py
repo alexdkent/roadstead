@@ -19,6 +19,7 @@ from .backend import BackendError, BackendUnavailable
 from .config import (
     degeneration_guard_enabled,
     degeneration_shadow_only,
+    forced_reasoning_budget,
     normalize_endpoint,
     schema_backstop_enabled,
     schema_backstop_shadow,
@@ -1037,6 +1038,28 @@ class Correction:
             if isinstance(props, dict):
                 return list(props.keys())
         return []
+    def apply_forced_reasoning_budget(self, req: QueuedRequest) -> None:
+        """Request-side: an endpoint whose model ALWAYS emits a reasoning trace it
+        CANNOT disable (``capabilities.reasoning=true`` — e.g. ``creative``/Trinity-Mini)
+        spends max_tokens on the CoT BEFORE the answer. A small caller cap (dj-crew
+        speaker turns run ~240-360) then truncates mid-reasoning → empty/partial
+        content that the caller rejects. Reserve reasoning headroom ON TOP of the
+        caller's answer budget so the answer still fits. Unlike ``apply_thinking``
+        (an explicit, vLLM-only, non-streaming opt-in), this fires for the FORCED
+        case on BOTH streaming and sync, any engine — it's a property of the
+        endpoint, not a per-request flag. Transparent when the endpoint doesn't force
+        reasoning or the payload carries no positive ``max_tokens`` (no cap → the
+        model self-limits and there's nothing to protect)."""
+        p = req.payload
+        if not isinstance(p, dict) or req.payload_type != "chat_completion":
+            return
+        ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
+        if ep is None or not getattr(ep, "forces_reasoning", False):
+            return
+        cur = p.get("max_tokens")
+        if not (isinstance(cur, int) and cur > 0):
+            return
+        p["max_tokens"] = cur + forced_reasoning_budget()
     def apply_thinking(self, req: QueuedRequest) -> None:
         """Request-side: honor a per-request ``thinking: true`` opt-in. On a vLLM
         (reasoning-parser) backend, enable native <think> and add a GENEROUS

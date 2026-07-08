@@ -221,6 +221,15 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
         }
         if e.backend_engine == "vllm":
             kw["backend_engine"] = "vllm"
+        if e.capabilities.get("reasoning") and e.backend_engine != "vllm":
+            # A non-vLLM (llama.cpp) reasoning model emits its CoT UNCONDITIONALLY —
+            # there is no proxy-side kill switch (unlike vLLM, where reasoning is OFF
+            # by default and only a per-request `thinking:true` opt-in turns it on, via
+            # apply_thinking which adds its OWN budget). So only the forced/llama.cpp
+            # case needs the submit-time answer-headroom reserve (forced_reasoning_budget);
+            # a vLLM reasoning endpoint (e.g. the thinker) must NOT get it. e.g. creative
+            # / Trinity-Mini.
+            kw["forces_reasoning"] = True
         for src, dst in (
             ("background_floor_pct", "background_floor_pct"),
             ("fast_path_reserve_slots", "fast_path_reserve_slots"),

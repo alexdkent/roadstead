@@ -213,6 +213,15 @@ class EndpointConfig:
     # (structured_outputs.grammar). Controls proxy-side payload normalization. ---
     backend_engine: str = "llama.cpp"
 
+    # --- the model ALWAYS emits an un-disable-able reasoning trace (mirrored from
+    # models.yaml ``capabilities.reasoning``; e.g. creative/Trinity-Mini). The CoT
+    # counts against max_tokens, so the submit path reserves reasoning headroom
+    # (forced_reasoning_budget) on top of the caller's answer cap — otherwise a
+    # small cap is consumed mid-reasoning → empty/truncated completion. Harmless on
+    # endpoints where thinking is disablable (the proxy forces enable_thinking=False
+    # by default, so no reasoning is emitted and the extra cap is never reached). ---
+    forces_reasoning: bool = False
+
     # --- on-demand lifecycle (see on_demand.OnDemandManager) ---
     # When True, this endpoint's model is NOT always-resident: before a request
     # dispatches, the proxy acquires the anvil GPU-slot dispatcher lease
@@ -506,6 +515,22 @@ def thinking_reasoning_budget() -> int:
         return max(0, int(os.environ.get("COLLECTIVE_PROXY_THINKING_BUDGET", "8000")))
     except ValueError:
         return 8000
+
+
+def forced_reasoning_budget() -> int:
+    """Tokens of reasoning headroom ADDED to max_tokens for an endpoint whose model
+    ALWAYS emits an un-disable-able reasoning trace (``capabilities.reasoning=true``
+    — e.g. ``creative``/Trinity-Mini). The CoT is generated output and counts against
+    max_tokens, so a small caller cap (dj-crew speaker turns run ~240-360) truncates
+    mid-reasoning → empty/partial content. This reserves room for the answer AFTER
+    the reasoning. Deliberately smaller than ``thinking_reasoning_budget`` (that's for
+    explicit vLLM long-form thinking); creative turns reason ~350-500 tokens, so the
+    default gives ~3x headroom without inflating tiny caps into runaway generations.
+    Env override ``COLLECTIVE_PROXY_FORCED_REASONING_BUDGET``."""
+    try:
+        return max(0, int(os.environ.get("COLLECTIVE_PROXY_FORCED_REASONING_BUDGET", "1536")))
+    except ValueError:
+        return 1536
 
 
 def _inflight_stream_interval_s() -> float:
