@@ -102,3 +102,33 @@ async def test_inflight_handler_shape():
     for ep, snap in body["per_endpoint"].items():
         assert set(snap) >= {"max_slots", "in_flight", "queued", "queue_by_band"}
     assert "ts" in body
+
+
+@pytest.mark.asyncio
+async def test_status_admin_paused_endpoint_reads_unhealthy():
+    """Regression (2026-07-09): /v1/status must NOT report an administratively
+    paused endpoint (e.g. classify evicted for a media-gen job) as healthy. The
+    poller stops probing a paused endpoint, so endpoint_health.healthy freezes
+    True — /status derives `healthy` from it and used to show the evicted
+    endpoint healthy+serving the whole eviction window. `healthy` now folds in
+    the admin-pause set; the deliberate pause is surfaced via `admin_paused`.
+    `paused` stays PROBE-only ("unexpectedly down" — check_alerts keys on it),
+    so an operator/coordinator pause reads paused:False by design."""
+    svc = ProxyService(ProxyConfig())
+    ep = next(iter(svc._config.endpoints))
+    # Simulate a live, probe-healthy endpoint that then gets admin-paused.
+    svc._endpoint_health[ep] = {"healthy": True, "consecutive_failures": 0,
+                                "unhealthy_since": None}
+    svc._paused_endpoints.add(ep)
+    resp = await svc.handle_status(_FakeRequest())
+    snap = json.loads(resp.body)["endpoints"][ep]
+    assert snap["healthy"] is False        # not serving while paused
+    assert snap["admin_paused"] is True    # deliberate pause is VISIBLE
+    assert snap["paused"] is False         # probe-only; unexpected-down semantics preserved
+
+    # Resuming clears the admin pause → healthy tracks probe state again.
+    svc._paused_endpoints.discard(ep)
+    resp = await svc.handle_status(_FakeRequest())
+    snap = json.loads(resp.body)["endpoints"][ep]
+    assert snap["healthy"] is True
+    assert "admin_paused" not in snap

@@ -285,8 +285,20 @@ class ProxyHttpHandlers:
                     (ss_consumed / ss_available * 100) if ss_available > 0 else 0, 1,
                 )
             h = self.state.endpoint_health.get(ep_name, {})
-            snap["healthy"] = h.get("healthy", True)
+            admin_paused = ep_name in self.state.paused_endpoints
+            # `healthy` must reflect an ADMIN pause too. The poller STOPS probing a
+            # paused endpoint (handle_pause), so `endpoint_health[ep].healthy`
+            # freezes at its last (usually True) value — which made /status report
+            # an evicted classify as healthy+serving the whole eviction window
+            # (blind spot, 2026-07-09). A paused endpoint is not serving, so fold
+            # the pause in. Keep `paused` PROBE-only (it means "unexpectedly down"
+            # for check_alerts Phase 2.5 — an operator/coordinator pause reads
+            # paused:False by design); surface the deliberate pause via the
+            # explicit `admin_paused` field instead.
+            snap["healthy"] = h.get("healthy", True) and not admin_paused
             snap["paused"] = not h.get("healthy", True)  # check_alerts (Phase 2.5) keys on this
+            if admin_paused:
+                snap["admin_paused"] = True
             # Step 4b — rate-windowed cooldown surface (shadow report + enforce
             # state). `cooldown_trips` accrues even in shadow mode so the operator
             # can review the trip rate before flipping enforce; `cooling` +
