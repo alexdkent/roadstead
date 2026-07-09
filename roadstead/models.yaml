@@ -173,10 +173,10 @@ models:
     probe_kind: llama
     model_family: Qwen3.5-122B-A10B (Huihui abliterated)
     quant: Q4_K_M
-    context_per_slot: 131072   # 2026-07-04: --kv-unified shared pool (live /props confirms); was 32768/slot
-    context_window: 32768      # fleet chunkers size against 32K on purpose (policy, not slot size)
+    context_per_slot: 262144   # 2026-07-09: raised 131072->262144 (256K = native n_ctx_train; classify freed the mem, ~2 KV heads make 256K KV only ~14GB). --kv-unified shared pool; seed only, live value comes from /props. Was 131072 (2026-07-04), 32768/slot before that.
+    context_window: 32768      # fleet chunkers size against 32K on purpose (policy, not slot size) — deliberately NOT bumped with the 256K slot; 256K is rare-need headroom, not the default feed
     slots: 4
-    timeout_floor_s: 360       # 2026-07-04: raised 180->360 — kv-unified allows big single requests; 122B prefill at ~300 t/s needs headroom past 128K
+    timeout_floor_s: 360       # 2026-07-04: raised 180->360 — kv-unified allows big single requests; 122B prefill at ~300 t/s needs headroom past 128K (NB 2026-07-09: a FULL 256K prefill ~approaches timeout_ceiling_s 900 — the rare extreme, revisit ceiling if huge prompts become common)
     timeout_ceiling_s: 900     # 2026-07-05: the 122B is legitimately slow even on turn-support tiers; a role override so the interactive band (600s) can't strangle a big synth under load. Adaptive surge×size widens up to here.
     policy:
       dispatch_concurrency_cap: 4   # re-validated for the 122B via llama-batched-bench (1/2/4/8 parallel,
