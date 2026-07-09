@@ -67,6 +67,10 @@ FLOOR_S: dict[str, float] = {
     # 900s (15min) so an ON-DEMAND cold model LOAD (several minutes) + generation can WAIT
     # in-queue rather than time out — the song-compose author stages tolerate the wait.
     "creative": 900.0,
+    # mellum (JetBrains Mellum2-12B-A2.5B focal, boxa co-tenant, 2026-07-08): fast
+    # focal compress/classify + RAG-synth calls (~98 t/s decode, quick prefill).
+    # 60s floor mirrors models.yaml mellum.timeout_floor_s (bump BOTH in lockstep).
+    "mellum": 60.0,
     "gemma": 60.0,
     # 2026-06-08: the "gemma-hot" endpoint class was removed from DEFAULT_ENDPOINTS
     # (E2B :9090 decommissioned; gemma-greeter consolidated onto the "gemma"/E4B
