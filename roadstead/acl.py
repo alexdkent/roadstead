@@ -28,6 +28,18 @@ class IPIdentityMap:
             ipaddress.ip_network("172.16.0.0/12"),
             ipaddress.ip_network("::1/128"),
         ]
+        # Admin surfaces (drain/pause, maintenance, flags) accept the internal
+        # nets PLUS an explicit allow-list — deliberately SEPARATE from
+        # _internal_nets so granting admin never changes a host's inference
+        # PRIORITY (identify() matches _internal_nets first, before subnet
+        # entries — see is_admin). 2026-07-09: anvil (10.0.0.3) added so the
+        # anvil-dispatcher can pause/resume the `classify` endpoint when it
+        # evicts classify to free GPU memory for an image/video job. This is the
+        # one deliberate widening of the 2026-06-10 loopback-only tightening;
+        # the admin-audit IP log still records every admin call.
+        self._admin_nets = list(self._internal_nets) + [
+            ipaddress.ip_network("10.0.0.3/32"),
+        ]
 
     def register(
         self,
@@ -82,12 +94,13 @@ class IPIdentityMap:
         internal (port not published) and every legitimate admin caller goes
         through ``docker exec curl localhost`` (restart_llm.sh) or the gateway
         on loopback — verified by the admin-audit IP log before tightening
-        (2026-06-10: 127.0.0.1 only)."""
+        (2026-06-10: 127.0.0.1 only). 2026-07-09: anvil (10.0.0.3) added to
+        _admin_nets for the classify-evict pause/resume (see __init__)."""
         try:
             addr = ipaddress.ip_address(remote_ip)
         except ValueError:
             return False
-        return any(addr in net for net in self._internal_nets)
+        return any(addr in net for net in self._admin_nets)
 
     @classmethod
     def from_env(cls) -> "IPIdentityMap":
