@@ -86,32 +86,47 @@ models:
     endpoint_class: classify
     role: qwen-classify
     aliases: [qwen-classify, classify, chat, nexus-chat, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]
-    host: nexus
-    port: 8091
+    host: anvil   # 2026-07-09: MIGRATED nexus->anvil (CUDA) — nexus is now composer-only. See notes.
+    port: 9092
     backend_engine: llama.cpp
-    systemd_unit: llama-chat
+    systemd_unit: llama-classify
     probe_kind: llama
     model_family: Qwen3.6-35B-A3B + mmproj (chat + vision)
-    quant: UD-Q4_K_XL
+    quant: UD-Q4_K_M
     context_per_slot: 131072   # 2026-07-04: --kv-unified shared pool (live /props confirms); was 32768/slot
     context_window: 32768      # fleet chunkers size against 32K on purpose (policy, not slot size)
     slots: 4
     timeout_floor_s: 180       # 2026-07-04: raised 45->180 — kv-unified allows big single requests; a cold ~37K prefill was hitting the old 45s floor
+    evictable: true            # 2026-07-09: yielding co-tenant of the anvil imagegen/videogen dispatcher — stopped+proxy-paused when a diffusion/video job can't fit residual VRAM, restored on idle-unload. See anvil_imagegen/classify_evict.py.
     capabilities:
       vision: true
       streaming: false
       reasoning: false
       tool_calling: true
       structured_output: grammar
-    token_speed: {note: "~55 t/s decode text; vision extract ~15-30s/image incl. encode"}
-    purpose: Consolidated text-classify + vision tier — replaces both analyst's TEXT-classify half and the separate analyst-vision (8B) service. Nexus now runs exactly two models — classify and composer.
+    token_speed: {note: "~56 t/s decode text (anvil CUDA, >= nexus 55); prefill ~4x nexus (2210/2640 t/s pp); vision extract ~15-30s/image incl. encode"}
+    purpose: Consolidated text-classify + vision tier — replaces both analyst's TEXT-classify half and the separate analyst-vision (8B) service. As of 2026-07-09 runs on anvil (CUDA); nexus is now composer-only.
     when_used:
       - Tier-1.5 / Tier-2 text classification (sidekick.extract_pad fallback, temporal.daily_summary, mail-agent.email_recent_overview, orchestrator.autonomous_chat-agent.reflect, forum-agent.peer_playbook)
       - attachments stage-2 full-resolution image extraction
       - knowledge_v3 ground-truth PII/document intake
       - browser_broker vision-routed capabilities (perceive./vision./insurance./portal.)
-    fallback: composer   # analyst (30B) fully decommissioned 2026-07-03 — nexus has only classify + composer now
+    fallback: composer   # analyst (30B) fully decommissioned 2026-07-03; classify itself migrated to anvil 2026-07-09, nexus is composer-only
     notes: |
+      **MIGRATED nexus->anvil 2026-07-09** (docs plan
+      this-session-is-going-dapper-horizon): moved off the nexus Vulkan iGPU to
+      the anvil GB10 (CUDA), where vision (mmproj) is better-supported and
+      prefill is ~4x faster. Config is behavior-identical (kv-unified 131072
+      shared pool, --reasoning off, q8_0 KV, 4 slots) on a fresh CUDA llama.cpp
+      build (HEAD c15c5c77, sm_121a) at /opt/llama.cpp-build-src/build/bin; unit
+      infra/anvil/systemd/llama-classify.service. Decode ~56 t/s (>= nexus's
+      55), prefill ~4x. **nexus is now composer-only** — the old
+      llama-chat.service there is stopped+disabled. classify is an EVICTABLE
+      co-tenant of the anvil imagegen/videogen dispatcher (see `evictable:
+      true` above). Rationale + usage data: the swap that motivated this
+      (classify<->creative) was invalidated — creative is used 6.4x more than
+      classify, so classify is the light model that yields the GB10 to imagegen.
+
       Stood up 2026-07-03 as the classify leg of the nexus model swap-out
       (docs/nexus_qwen35_loadout_plan.md); resurrects the pre-2026-05-30
       `llama-chat.service` model (this IS the model that ran as "chat" before
