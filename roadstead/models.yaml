@@ -405,6 +405,7 @@ models:
     proxy_endpoint: true
     endpoint_class: companion-lite
     role: companion-lite
+    reserved: true                    # RESERVED EXCLUSIVELY for the orchestrator chat loop. Active + shown on the Inference page, but the Model Playground filters it out (`_enrich` -> chat_roles.reserved) so it can't be manually driven — it must stay dedicated to the loop's warm single-slot prefix.
     aliases: []                       # DEDICATED single-purpose role — NO aliases. The prior `mellum`/`mellum2`/`focal` aliases are RETIRED with the Mellum2 model. Do NOT reintroduce a `focal` alias here: this slot is the chat loop ONLY, not a focal/offload tier.
     host: nasbox
     port: 9197                        # host port -> container :8080 (docker -p 9197:8080)

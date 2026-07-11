@@ -69,6 +69,10 @@ class ModelEntry:
     token_speed: dict[str, Any] = field(default_factory=dict)
     purpose: str = ""
     when_used: tuple[str, ...] = ()
+    # RESERVED: active but pinned to a single consumer (e.g. the chat loop) — not a
+    # general-purpose role. The Inference page still shows it (it IS live), but the
+    # Model Playground filters it out so it can't be manually driven.
+    reserved: bool = False
     fallback: str | None = None
     notes: str = ""
 
@@ -156,6 +160,7 @@ def _coerce_entry(name: str, raw: dict[str, Any]) -> ModelEntry:
         token_speed=dict(raw.get("token_speed") or {}),
         purpose=raw.get("purpose", ""),
         when_used=_t("when_used"),
+        reserved=bool(raw.get("reserved", False)),
         fallback=raw.get("fallback"),
         notes=raw.get("notes", "") or "",
     )
