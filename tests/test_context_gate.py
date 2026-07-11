@@ -106,12 +106,15 @@ async def test_boundaries_thinker_vs_companion():
     _ok_backend(svc)
     await svc.startup()
     try:
-        # Post-kv-unified (2026-07-04) both companion (composer 122B) and thinker
-        # (reasoner) run at 131072/slot, so the gate is exercised PER-ENDPOINT
-        # against each one's own live limit: an over-131072 prompt to companion
-        # 422s; an under-131072 prompt to thinker admits.
-        over = 600_000   # ~150K tokens > 131072
-        under = 200_000  # ~50K tokens, comfortably inside 131072
+        # The gate is exercised PER-ENDPOINT against each one's own configured
+        # limit — derived from context_per_slot at runtime so a capacity bump
+        # (131072→262144 on 2026-07-09 when classify freed composer memory)
+        # can't strand this test on a stale constant again: an over-limit
+        # prompt to companion 422s; a comfortably-under prompt to thinker admits.
+        composer_slot = next(ep.context_per_slot for ep in svc._config.endpoints.values()
+                             if ep.role == "qwen-composer")
+        over = composer_slot * 4 + 200_000   # chars ≈ 4/token → safely past the slot limit
+        under = 200_000                      # ~50K tokens, inside any live thinker limit
         resp = await svc.handle_submit(_body("qwen-composer", over), _Req())
         assert resp.status_code == 422
         resp = await asyncio.wait_for(
