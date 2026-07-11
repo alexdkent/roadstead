@@ -347,11 +347,11 @@ models:
     port: 9196
     backend_engine: llama.cpp
     probe_kind: llama
-    served_model_names: [creative, deckard-31b, deckard]   # `creative` = the LIVE boxa llama.cpp server (-a creative); `deckard`/`deckard-31b` = the DORMANT anvil rollback (serve_deckard.sh) — declared so the naming-doctrine test covers both. (serve_prod.sh vLLM path also preserved as rollback.)
-    model_family: Arcee Trinity-Mini (2026-01, MoE 26B-A3B), Q5_K_M GGUF
-    quant: Q5_K_M
+    served_model_names: [creative, deckard-31b, deckard]   # `creative` = the LIVE boxa llama.cpp server (-a creative); `deckard`/`deckard-31b` = the DORMANT anvil rollback (serve_deckard.sh, on anvil — untouched by the .10 cleanup) — declared so the naming-doctrine test covers both. (The .10 serve_prod.sh vLLM creative model was REMOVED 2026-07-11 — re-provision from HF to use that rollback.)
+    model_family: Arcee Trinity-Mini (2026-01, MoE 26B-A3B), Q4_K_M GGUF
+    quant: Q4_K_M                    # squeezed from Q5_K_M 2026-07-11 (commit 42138723) to free co-tenant VRAM for companion-lite; +11% decode (~91->~101 t/s), MoE experts quant-robust, craft A/B'd top-tier
     params: {active: 3B, total: 26B}
-    context_per_slot: 65536          # llama.cpp -c 131072 --parallel 2 SEPARATE KV -> 64K PER SLOT (2x the 32K chunk policy), f16 KV cache; ~21.3GB resident on the 32GB boxa (2026-07-08 perf tuning)
+    context_per_slot: 65536          # llama.cpp -c 131072 --parallel 2 SEPARATE KV -> 64K PER SLOT (2x the 32K chunk policy), f16 KV cache; ~17.3GB resident on the 32GB boxa (post Q4_K_M squeeze 2026-07-11; was ~21.3GB at Q5_K_M)
     context_window: 32768            # fleet chunkers size against 32K on purpose (policy, not slot size)
     slots: 2                         # llama.cpp --parallel 2 (2026-07-08 tuning: np4 imposed a standing single-stream decode tax; np2 matches the np1 ceiling AND keeps 2-way concurrency so a real-time crew turn isn't head-of-line blocked behind a song-compose)
     timeout_floor_s: 900            # generous floor for long song-compose + forced reasoning (llama.cpp load is now ~30s, but the floor is a min-budget, not a target; kept at 900 to stay synced with the FLOOR_S mirror + the client sub-floor-honor path)
@@ -374,8 +374,10 @@ models:
     fallback: composer
     notes: |
       DEPLOYED MODEL (2026-07-08 swap): `arcee-ai/Trinity-Mini` (base released 2026-01) — a diverse
-      NON-Qwen/NON-Gemma MoE (26B total / ~3B active), Q5_K_M GGUF from `arcee-ai/Trinity-Mini-GGUF`
-      (/models/trinity-mini-gguf/ on the box). Served on the Intel Arc Pro boxa
+      NON-Qwen/NON-Gemma MoE (26B total / ~3B active), Q4_K_M GGUF from `arcee-ai/Trinity-Mini-GGUF`
+      (/models/trinity-mini-gguf/Trinity-Mini-Q4_K_M.gguf on the box; squeezed from Q5_K_M 2026-07-11,
+      commit 42138723, to free co-tenant VRAM for companion-lite — +11% decode, MoE quant-robust).
+      Served on the Intel Arc Pro boxa
       (10.0.0.10:9196, now CO-TENANT with `companion-lite` on :9197) by a standalone always-on docker container `llamacpp-creative-boxa`
       (`ghcr.io/ggml-org/llama.cpp:server-intel`, SYCL/level_zero:0, --restart always;
       `-ngl 99 -c 131072 --parallel 2 -fa on -ctk f16 -ctv f16 -b 4096 -ub 2048 --jinja`). NO dispatcher,
@@ -387,17 +389,19 @@ models:
       WHY THE SWAP: the prior Gemma-4-31B-it-abliterated AWQ W4A16 on custom vLLM 0.23 XPU (config-C)
       was DENSE -> bandwidth-bound on the 608 GB/s card -> pathological cold PREFILL (~30 t/s; a 16K
       request took ~10 min). Trinity measured 2026-07-08 bake-off: prefill 1697 t/s @3K / 842 @16K,
-      decode 88 t/s single-stream (see docs/creative_model_bakeoff_results_2026-07-07.md).
+      decode 88 t/s single-stream at Q5 (see docs/creative_model_bakeoff_results_2026-07-07.md; ~101 t/s post Q4_K_M squeeze).
       Uncensored-native — 0/8 refusals on the edgy creative battery, NO abliteration needed.
       REASONING: Trinity ALWAYS thinks and it CANNOT be disabled; llama.cpp --jinja separates CoT into
       the reasoning_content channel (VERIFIED no <think> bleed into content, streaming + non-streaming),
       costing ~4-5s/call absorbed by the fast decode. STRUCTURED: give grammar/JSON calls a generous
       max_tokens (reasoning consumes budget before the JSON). VISION DROPPED (Trinity is text-only; no
-      creative-role caller sends images). ROLLBACK: the prior `vllm-creative-boxa` container is preserved
-      STOPPED (--restart no) with serve_prod.sh intact — `docker start vllm-creative-boxa`, then revert
-      this entry (backend_engine: vllm, drop probe_kind, model_family/quant/params/context/caps back to
-      the Gemma values) to restore the incumbent. The `deckard` aliases + serve_deckard.sh anvil
-      rollback are untouched.
+      creative-role caller sends images). ROLLBACK: the prior Gemma-4-31B vLLM-XPU creative model files
+      (alonsoko-ct-w4a16 W4A16 + the gemma-4-31b-deckard bf16 source) were REMOVED in the 2026-07-11
+      cleanup, so the `vllm-creative-boxa` rollback is no longer a one-command `docker start` — to revert
+      to the vLLM creative you must first re-provision the W4A16 model from HF (serve_prod.sh + quantize.sh
+      show the source), then revert this entry (backend_engine: vllm, drop probe_kind, model_family/quant/
+      params/context/caps back to the Gemma values). The `deckard` aliases remain declared for the
+      naming-doctrine; serve_deckard.sh (anvil) is unaffected by the .10 cleanup.
 
   companion-lite:
     kind: chat
@@ -473,8 +477,10 @@ models:
       to it. The `--parallel 1` single slot plus cache_prompt/id_slot:0 requests keep the ~9k-token
       static persona+catalog prefix permanently warm, so only the dynamic delta prefills. WIRED-LOOP
       VALIDATED (/chat-perf): 16/16 completed, ~2-3x faster than the 122B baseline; streaming TTFT ~4.3s
-      direct / p50 6.7s w/ tools; wall p50 ~10s. ROLLBACK to Ministral-3-8B (GGUF still on the box):
-      set the serve script MODEL back + drop the --chat-template-kwargs line, re-run, revert this stanza.
+      direct / p50 6.7s w/ tools; wall p50 ~10s. ROLLBACK to Ministral-3-8B (GGUF was removed in the
+      2026-07-11 cleanup — re-pull an abliterated Ministral-3-8B Q4_K_M from HF into
+      /models/ministral3-8b-gguf/): set the serve script MODEL back + drop the --chat-template-kwargs
+      line, re-run, revert this stanza.
       The prior Mellum2 'focal' / RAG-compression capability is RETIRED from the boxa — if focal /
       RAG-compression is ever needed again it re-homes to `qwen-classify`, NOT here.
 
