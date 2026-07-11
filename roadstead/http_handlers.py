@@ -410,6 +410,16 @@ class ProxyHttpHandlers:
                 # with min_tokens, and how many produced a real response.
                 "empty_rescue_attempts": self.state.empty_rescue_attempts,
                 "empty_rescue_recovered": self.state.empty_rescue_recovered,
+                # Truncation / structured-validity guard (operator mandate
+                # 2026-07-11): per-(model, caller) finish_reason=length tallies
+                # (structured vs freetext) and structured json.loads failures.
+                # Grep markers: LLMPROXY_TRUNCATION / LLMPROXY_STRUCTURED_INVALID.
+                "truncation_total": self.state.truncation_total,
+                "truncation_by_model_caller": self.state.truncation_by_model_caller,
+                "structured_parse_failure_total":
+                    self.state.structured_parse_failure_total,
+                "structured_parse_failures_by_model_caller":
+                    self.state.structured_parse_failures_by_model_caller,
                 # Egress degeneration guard — repetition-loop responses detected,
                 # and how many an anti-repetition re-dispatch recovered.
                 "degeneration_detected": self.state.degeneration_detected,

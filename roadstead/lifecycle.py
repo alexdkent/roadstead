@@ -36,6 +36,7 @@ from .config import (
     LLMPriority,
     PriorityBand,
     normalize_endpoint,
+    structured_validity_guard_enabled,
     uniform_correction_enabled,
 )
 from .constants import (
@@ -509,8 +510,25 @@ class Lifecycle:
         # cache anyway), but we pop it for symmetry + response hygiene.
         degen_unrecovered = result.pop("_degenerate_unrecovered", False)
         schema_unrecovered = result.pop("_schema_unrecoverable", False)
+        # …and NEVER cache a truncated (finish_reason=length) body (operator
+        # mandate 2026-07-11): a temperature=0 free-text truncation passes as
+        # status=ok, and caching it would re-serve the cut-off text for the
+        # whole cache TTL — one capped call poisoning every identical call
+        # after it. Cheap, total shape probe; a non-chat/odd body reads as
+        # not-truncated (cached as before).
+        truncated_ok = False
+        try:
+            _resp_body = result.get("response")
+            if isinstance(_resp_body, dict):
+                _ch0 = (_resp_body.get("choices") or [{}])[0]
+                truncated_ok = (
+                    isinstance(_ch0, dict)
+                    and _ch0.get("finish_reason") == "length")
+        except (AttributeError, IndexError, TypeError):
+            truncated_ok = False
         if (cache_key and result.get("status") == "ok"
-                and not degen_unrecovered and not schema_unrecovered):
+                and not degen_unrecovered and not schema_unrecovered
+                and not truncated_ok):
             self.state.cache.put(cache_key, result.get("response", {}))
 
         # OpenAI consumers get the bare chat.completion (or an OpenAI-shaped
@@ -989,6 +1007,20 @@ class Lifecycle:
         # DETECTION (degeneration loop / silent grammar-drop) — gated on the flag
         # so the flag-OFF path adds zero per-chunk work and stays byte-identical.
         uniform_on = uniform_correction_enabled()
+        # Operator mandate (2026-07-11): a STRUCTURED stream must terminate with
+        # an error frame — never a clean 'done' — when it truncated or its
+        # reassembled content is not valid JSON. Computed once per stream (cheap
+        # payload inspection); ``expects_json`` additionally requires a JSON-
+        # implying constraint so guided_choice / bare-token grammars are never
+        # parse-gated. Structured streams pay the per-chunk content append even
+        # with uniform correction off — bounded by the request's max_tokens.
+        guard_on = structured_validity_guard_enabled()
+        stream_structured = (
+            guard_on and req.payload_type == "chat_completion"
+            and self.correction.request_is_structured(req))
+        stream_expects_json = (
+            stream_structured and self.correction.request_expects_json(req))
+        accumulate = uniform_on or stream_expects_json
         accumulated_content = ""
 
         # Phase 1.5: bound the stream to the caller's remaining deadline so an
@@ -1049,7 +1081,7 @@ class Lifecycle:
                                 fr = choices[0].get("finish_reason")
                                 if fr:
                                     last_finish_reason = fr
-                                if uniform_on:
+                                if accumulate:
                                     delta = choices[0].get("delta")
                                     piece = delta.get("content") if isinstance(delta, dict) else None
                                     if isinstance(piece, str):
@@ -1096,20 +1128,56 @@ class Lifecycle:
             return
 
         duration = time.monotonic() - t0
-        await stream_q.put({
-            "type": "done",
-            "queue_wait_ms": round(decision.queue_wait_ms, 1),
-            "backend_latency_ms": round(duration * 1000, 1),
-            "ttft_ms": round(ttft_ms or 0.0, 1),  # Phase 4.1
-            "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
-        })
-        # Phase 1.1: the chunks already streamed (can't un-send), but record
-        # truncation of a structured stream so the storm is visible in metrics.
-        status = (
-            "truncated"
-            if last_finish_reason == "length" and self.correction.request_is_structured(req)
-            else "ok"
-        )
+
+        # Operator-mandated structured end-of-stream guard (2026-07-11): the
+        # chunks already streamed (can't un-send), but every structured-stream
+        # consumer reassembles + json-parses at 'done' — so terminating with the
+        # ESTABLISHED error frame (instead of a clean 'done') is what converts
+        # silent garbage into an explicit, retryable failure, mirroring the sync
+        # path's truncation-integrity 502. Truncation checks any structured
+        # constraint; the json.loads validity check only JSON-implying ones
+        # (guided_choice / bare-token grammars are exempt) and is bounded by the
+        # request's max_tokens. Kill-switch COLLECTIVE_PROXY_STRUCTURED_VALIDITY
+        # (guard_on) restores the legacy clean-'done' behavior.
+        stream_guard_err: str | None = None
+        stream_guard_status = "ok"
+        if stream_structured and last_finish_reason == "length":
+            # Same message shape as the sync truncation error so existing client
+            # deferral classification ("truncated structured output") engages.
+            stream_guard_err = (
+                f"backend {ep_cfg.role} truncated structured output "
+                f"(finish_reason=length, output_tokens={output_tokens})")
+            stream_guard_status = "truncated"
+        elif stream_expects_json and accumulated_content.strip():
+            try:
+                json.loads(accumulated_content)
+            except ValueError:
+                self.correction.record_structured_parse_failure(
+                    req, stream=True, output_tokens=output_tokens)
+                stream_guard_err = (
+                    f"backend {ep_cfg.role} returned invalid JSON for a "
+                    f"structured request (stream reassembly does not parse; "
+                    f"output_tokens={output_tokens})")
+                stream_guard_status = "error"
+
+        if stream_guard_err is not None:
+            await stream_q.put({"type": "error", "error": stream_guard_err})
+        else:
+            await stream_q.put({
+                "type": "done",
+                "queue_wait_ms": round(decision.queue_wait_ms, 1),
+                "backend_latency_ms": round(duration * 1000, 1),
+                "ttft_ms": round(ttft_ms or 0.0, 1),  # Phase 4.1
+                "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
+            })
+        # Phase 1.1: record truncation of a structured stream so the storm is
+        # visible in metrics (kept independent of the guard kill-switch — with
+        # the guard off the caller still got the legacy 'done', but the
+        # completion row + LLMPROXY_TRUNCATION log stay loud).
+        status = stream_guard_status
+        if (status == "ok" and last_finish_reason == "length"
+                and self.correction.request_is_structured(req)):
+            status = "truncated"
         self.record_completion(
             req, decision, duration, input_tokens, output_tokens, status,
             finish_reason=last_finish_reason, cached_tokens=cached_tokens,
@@ -1152,6 +1220,26 @@ class Lifecycle:
         cached_tokens: int | None = None,
     ) -> None:
         now = time.monotonic()
+
+        # Operator-mandated truncation visibility (2026-07-11): EVERY completion
+        # — both response modes, every caller — passes through here with its
+        # finish_reason, making this the single choke point where an output-cap
+        # hit can never pass silently. finish_reason == "length" is what BOTH
+        # llama-server and vLLM emit on the OpenAI-compat surface (sync body and
+        # the final stream chunk) when max_tokens cut the output; the tool-call
+        # stream sanitizer also relabels a truncated tool stream to "length".
+        # Structured truncation already fails the request upstream; free-text
+        # truncation still serves (may be a legitimate cap) — this is the loud
+        # ERROR + per-(model, caller) tally either way. Synchronous +
+        # allocation-light (one small dict row per (model, caller)); fail-open
+        # so observability can never break completion accounting.
+        if finish_reason == "length" and req.payload_type == "chat_completion":
+            try:
+                self.correction.record_truncation_event(
+                    req, structured=self.correction.request_is_structured(req),
+                    stream=req.stream, output_tokens=output_tokens, status=status)
+            except Exception:  # noqa: BLE001 — observability must not break accounting
+                logger.debug("truncation tally failed", exc_info=True)
 
         # On-demand: a request to this endpoint reached a terminal outcome
         # (ok/error/timeout/cancel) — release its in-flight hold so the idle

@@ -24,6 +24,7 @@ from .config import (
     schema_backstop_enabled,
     schema_backstop_shadow,
     shadow_egress_detect_enabled,
+    structured_validity_guard_enabled,
     thinking_enabled,
     thinking_reasoning_budget,
     uniform_correction_enabled,
@@ -539,11 +540,20 @@ class Correction:
         itself flag-gated (``COLLECTIVE_PROXY_SCHEMA_BACKSTOP``, default OFF ==
         byte-identical). Schema repair runs AFTER the finalizers (so it sees
         de-thought, degeneration-corrected content) and BEFORE the shadow detector
-        (detect-only, last)."""
+        (detect-only, last). ``enforce_structured_validity`` (operator mandate
+        2026-07-11) runs at the very END so every repair layer above gets its
+        chance first — it's the always-on parse-only floor that flips a still-
+        malformed structured 200 to the established 502 error shape.
+        ``enforce_toolcall_truncation`` must precede ``maybe_repair_schema``:
+        a vLLM tool_call argument cut mid-JSON (finish mislabeled
+        "tool_calls") is TRUNCATION, and json-repair would otherwise close it
+        into valid-but-fabricated JSON — a silent wrong command."""
         self.finalize_thinking(req, result)
         await self.maybe_correct_degenerate(req, result)
+        self.enforce_toolcall_truncation(req, result)
         await self.maybe_repair_schema(req, result)
         self.shadow_egress_detect(req, result)
+        self.enforce_structured_validity(req, result)
 
     def finalize_stream(
         self, req: "QueuedRequest", content: str, last_finish_reason: str | None,
@@ -1159,6 +1169,188 @@ class Correction:
         result["status"] = "error"
         result["error"] = f"thinking structured-output recovery failed: {why}"
         result.pop("response", None)
+    def request_expects_json(self, req: QueuedRequest) -> bool:
+        """True when the request's structured constraint implies the CONTENT
+        must be a parseable JSON value: ``response_format`` json_object/
+        json_schema, ``guided_json``, or a JSON-OBJECT-rooted GBNF grammar
+        (top-level / ``extra_body`` / ``structured_outputs``). Deliberately
+        NARROWER than :meth:`request_is_structured`: ``guided_choice`` and
+        bare-token grammars (``root ::= "yes" | "no"``) legitimately emit
+        non-JSON output and must never be parse-gated — only truncation-gated."""
+        if req.payload_type != "chat_completion":
+            return False
+        p = req.payload
+        if not isinstance(p, dict):
+            return False
+        containers = [p]
+        eb = p.get("extra_body")
+        if isinstance(eb, dict):
+            containers.append(eb)
+        for c in containers:
+            rf = c.get("response_format")
+            if isinstance(rf, dict) and rf.get("type") in ("json_object", "json_schema"):
+                return True
+            if isinstance(c.get("guided_json"), dict):
+                return True
+        grammar, _loc = self.extract_grammar(p)
+        if grammar is None:
+            so = p.get("structured_outputs")
+            if isinstance(so, dict) and isinstance(so.get("grammar"), str):
+                grammar = so["grammar"]
+        if isinstance(grammar, str) and grammar.strip():
+            try:
+                # Object-rooted grammar ⇒ the output is a JSON object. A grammar
+                # with no derivable root keys could still be JSON, but we can't
+                # know — fail SAFE (no parse gate) rather than 502 a legitimate
+                # bare-token reply.
+                return bool(root_object_keys(grammar))
+            except Exception:  # noqa: BLE001 — predicate must never raise
+                return False
+        return False
+
+    def record_truncation_event(
+        self, req: "QueuedRequest", *, structured: bool, stream: bool,
+        output_tokens: int, status: str,
+    ) -> None:
+        """Loud ERROR + per-(model, caller) tally for an output-cap hit
+        (operator mandate 2026-07-11 — truncation must never pass silently to
+        ANY caller). Called from the single completion choke point
+        (``Lifecycle.record_completion``, finish_reason=="length" for BOTH
+        response modes) and from the sync tool-call truncation rule (vLLM
+        mislabels that finish as "tool_calls"). The ``LLMPROXY_TRUNCATION``
+        marker is stable — log_scan / health-verifier grep for it. Synchronous +
+        allocation-light (one small dict row per (model, caller))."""
+        key = f"{req.endpoint}|{req.agent_id}"
+        tally = self.state.truncation_by_model_caller.setdefault(
+            key, {"count": 0, "structured": 0, "freetext": 0})
+        tally["count"] += 1
+        tally["structured" if structured else "freetext"] += 1
+        self.state.truncation_total += 1
+        p = req.payload if isinstance(req.payload, dict) else {}
+        logger.error(
+            "LLMPROXY_TRUNCATION model=%s agent=%s call_site=%s priority=%s "
+            "max_tokens=%s output_tokens=%d structured=%s stream=%s status=%s",
+            req.endpoint, req.agent_id, req.call_site, req.priority.name,
+            p.get("max_tokens", 0), output_tokens, structured, stream, status)
+
+    def enforce_toolcall_truncation(self, req: "QueuedRequest", result: dict) -> None:
+        """SYNC mirror of the stream sanitizer's finalize rule (operator mandate
+        2026-07-11). vLLM mislabels a max_tokens truncation mid-tool-call as
+        ``finish_reason="tool_calls"`` (see ``_ToolCallStreamSanitizer``, defect
+        THREE), so it bypasses the Phase-1.1 length check — and worse, the
+        schema backstop's json-repair can close the cut-off argument string into
+        VALID-but-FABRICATED JSON (a silent wrong command). A tool_call whose
+        ``function.arguments`` does not parse on a vLLM sync 200 is therefore
+        TRUNCATION, never a repair target: fail loud with the pinned deferrable
+        "truncated structured output" shape so the caller retries. Runs BEFORE
+        ``maybe_repair_schema`` in :meth:`apply` — order is load-bearing.
+        vLLM-only: llama.cpp labels truncation "length" correctly. FAIL-OPEN;
+        kill-switch ``COLLECTIVE_PROXY_STRUCTURED_VALIDITY``."""
+        try:
+            if not structured_validity_guard_enabled():
+                return
+            if result.get("status") != "ok" or req.payload_type != "chat_completion":
+                return
+            response = result.get("response")
+            if not isinstance(response, dict):
+                return
+            ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
+            if ep is None or ep.backend_engine != "vllm":
+                return
+            tool_calls = _response_tool_calls(response)
+            if not tool_calls or all(
+                _arg_str_valid(tc) for tc in tool_calls if isinstance(tc, dict)
+            ):
+                return
+            usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+            out_tok = int(usage.get("completion_tokens") or 0)
+            self.record_truncation_event(
+                req, structured=True, stream=False,
+                output_tokens=out_tok, status="truncated")
+            result["status"] = "error"
+            # Keep the pinned deferrable marker ("truncated structured output",
+            # framework/nexus_errors.py) so existing client retry/re-chunk
+            # classification engages unchanged.
+            result["error"] = (
+                f"backend {req.endpoint} truncated structured output "
+                f"(finish_reason=tool_calls mislabel — tool_call arguments cut "
+                f"mid-JSON, output_tokens={out_tok})")
+            result["code"] = "toolcall_truncated"
+            result.pop("response", None)
+        except Exception:  # noqa: BLE001 — the rule must never break a response
+            logger.debug("toolcall truncation rule failed", exc_info=True)
+
+    def record_structured_parse_failure(
+        self, req: "QueuedRequest", *, stream: bool, output_tokens: int,
+    ) -> None:
+        """Tally + loud ERROR for a structured response whose content failed
+        ``json.loads`` (operator mandate 2026-07-11). Shared by the sync guard
+        (:meth:`enforce_structured_validity`) and the streaming end-of-stream
+        guard in ``Lifecycle.execute_streaming`` so both doors count + log
+        identically. The ``LLMPROXY_STRUCTURED_INVALID`` marker is stable —
+        log_scan / health-verifier grep for it."""
+        key = f"{req.endpoint}|{req.agent_id}"
+        st = self.state
+        st.structured_parse_failure_total += 1
+        st.structured_parse_failures_by_model_caller[key] = (
+            st.structured_parse_failures_by_model_caller.get(key, 0) + 1)
+        p = req.payload if isinstance(req.payload, dict) else {}
+        logger.error(
+            "LLMPROXY_STRUCTURED_INVALID model=%s agent=%s call_site=%s "
+            "priority=%s max_tokens=%s output_tokens=%d stream=%s — structured "
+            "response content is not valid JSON",
+            req.endpoint, req.agent_id, req.call_site, req.priority.name,
+            p.get("max_tokens", 0), output_tokens, stream)
+
+    def enforce_structured_validity(self, req: "QueuedRequest", result: dict) -> None:
+        """Operator-mandated ALWAYS-ON floor (2026-07-11): a JSON-implying
+        structured request must never return status=ok with content that fails
+        ``json.loads``. Runs LAST in :meth:`apply`, after every repair layer
+        (thinking-finalize / degeneration / schema-backstop) had its chance, so
+        it only fires on what nothing recovered. Parse-only — schema conformance
+        is NOT checked (backends enforce grammar; the backstop owns schemas);
+        this catches truncation/malformation. On failure it flips the result to
+        the SAME status=error shape every other egress guard uses, so
+        ``handle_sync_submit`` returns the established 502 and existing client
+        deferral handling engages unchanged.
+
+        Hot-path notes: synchronous, no awaits; ``json.loads`` runs on content
+        bounded by the request's ``max_tokens`` cap, and only for structured
+        requests whose content survived every prior guard — an acceptable,
+        rare, bounded cost on the single event loop. FAIL-OPEN on internal
+        errors. Kill-switch ``COLLECTIVE_PROXY_STRUCTURED_VALIDITY``."""
+        try:
+            if not structured_validity_guard_enabled():
+                return
+            if result.get("status") != "ok" or req.payload_type != "chat_completion":
+                return
+            if not self.request_expects_json(req):
+                return
+            response = result.get("response")
+            if not isinstance(response, dict):
+                return
+            content = _chat_completion_text(response)
+            if not isinstance(content, str) or not content.strip():
+                # Empty content = tool-calls-only response or the backend
+                # empty-completion gate's domain — nothing to parse-gate here.
+                return
+            try:
+                json.loads(content)
+                return
+            except ValueError:
+                pass
+            usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+            out_tok = int(usage.get("completion_tokens") or 0)
+            self.record_structured_parse_failure(req, stream=False, output_tokens=out_tok)
+            result["status"] = "error"
+            result["error"] = (
+                f"backend {req.endpoint} returned invalid JSON for a structured "
+                f"request (content does not parse; output_tokens={out_tok})")
+            result["code"] = "structured_invalid_json"
+            result.pop("response", None)
+        except Exception:  # noqa: BLE001 — the floor must never break a response
+            logger.debug("structured validity guard failed", exc_info=True)
+
     def request_is_structured(self, req: QueuedRequest) -> bool:
         """True when the request constrained its output (grammar / JSON schema /
         structured outputs), so a finish_reason=length truncation almost

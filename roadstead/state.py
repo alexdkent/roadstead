@@ -154,6 +154,17 @@ class ProxyState:
         # min_tokens; recovered = those that produced a real response.
         self.empty_rescue_attempts = 0
         self.empty_rescue_recovered = 0
+        # Truncation / structured-validity guard tallies (operator mandate
+        # 2026-07-11 — truncation must never pass silently; structured responses
+        # must be valid JSON or an explicit error). Keyed "endpoint|agent_id" so
+        # /v1/status shows WHO is hitting output caps on WHICH model. truncation
+        # rows split structured vs freetext (freetext truncation still serves —
+        # log + count only). parse failures = structured content that failed
+        # json.loads after every repair layer ran (sync 502 / stream error frame).
+        self.truncation_total = 0
+        self.truncation_by_model_caller: dict[str, dict] = {}
+        self.structured_parse_failure_total = 0
+        self.structured_parse_failures_by_model_caller: dict[str, int] = {}
         # Dedupe set so a single request that races across two timeout
         # layers (e.g. admission expiry + client-wait) is logged once.
         self.timed_out_ids: set[str] = set()

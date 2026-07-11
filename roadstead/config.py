@@ -438,6 +438,31 @@ def endpoint_cooldown_enabled() -> bool:
     )
 
 
+def structured_validity_guard_enabled() -> bool:
+    """Operator-mandated ALWAYS-ON floor (2026-07-11): a structured request must
+    never see a clean success whose content is not parseable JSON. Two caller-
+    visible enforcement points, both under this one kill-switch:
+
+      * sync: a 200 whose content fails ``json.loads`` on a JSON-implying
+        structured request (``request_expects_json``) flips to the established
+        status=error → 502 (code ``structured_invalid_json``);
+      * streaming: a structured stream that TRUNCATED (finish_reason=length) or
+        whose reassembled content fails ``json.loads`` terminates with the
+        established error frame instead of a clean ``done``.
+
+    Runs AFTER the flag-gated repair layers (thinking-finalize / degeneration /
+    schema-backstop), so anything they recover passes; this is the last-resort
+    parse-only floor when they're off or exhausted. Schema CONFORMANCE is
+    deliberately NOT checked here (the backends enforce grammar; the backstop
+    owns schema validation) — this catches truncation/malformation only. The
+    LLMPROXY_TRUNCATION / LLMPROXY_STRUCTURED_INVALID observability (ERROR log
+    + per-(model, caller) tallies) is NOT gated by this switch — it's read-only.
+    Default ON. Env kill-switch ``COLLECTIVE_PROXY_STRUCTURED_VALIDITY``."""
+    return os.environ.get("COLLECTIVE_PROXY_STRUCTURED_VALIDITY", "1").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
 def schema_backstop_enabled() -> bool:
     """Phase 3 (2026-07-01): the structured-output/tool-call reliability backstop.
     On a structured/tool SYNC response, run
