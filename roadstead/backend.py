@@ -72,42 +72,34 @@ def _translate_anthropic_image_blocks(messages: Any) -> list:
     return out
 
 
-def _has_consecutive_system_messages(messages: Any) -> bool:
-    """True if ``messages`` contains two or more ADJACENT ``role: system``
-    entries — the shape that trips some chat templates."""
-    prev_system = False
+def _has_consecutive_role(messages: Any, role: str) -> bool:
+    """True if ``messages`` contains two or more ADJACENT entries of ``role`` —
+    the shape that trips strict chat templates (Qwen rejects >1 system; Mistral
+    rejects consecutive user, requiring strict user/assistant alternation)."""
+    prev = False
     for msg in messages or []:
-        is_system = isinstance(msg, dict) and msg.get("role") == "system"
-        if is_system and prev_system:
+        is_role = isinstance(msg, dict) and msg.get("role") == role
+        if is_role and prev:
             return True
-        prev_system = is_system
+        prev = is_role
     return False
 
 
-def _coalesce_system_messages(messages: Any) -> list:
-    """Collapse each run of ADJACENT ``role: system`` messages into one,
-    joining their ``content`` with ``"\\n\\n"``.
-
-    The Qwen3.5-122B (composer) chat template raises a Jinja exception
-    (``System message must be at the beginning``) on more than one system
-    message, 400ing the whole request ("Unable to generate parser for this
-    template"). Callers that legitimately split a stable leading system block
-    from a dynamic one (dj crew, and any future caller) send two consecutive
-    system messages — semantically one system prompt. Merging adjacent system
-    messages is content-preserving (order kept, byte-stable prefix retained for
-    the prefix cache) and only affects the llama.cpp path (see the ``not vllm``
-    gate at the call site). Builds new dicts — never mutates the caller's
-    objects (corpus capture stores ``req.payload``). Only string ``content`` is
-    joined; a non-string (e.g. a multimodal block list) starts a new run so
-    vision system blocks are never mangled.
+def _coalesce_role(messages: Any, role: str) -> list:
+    """Collapse each run of ADJACENT ``role`` messages into one, joining their
+    string ``content`` with ``"\\n\\n"``. Content-preserving (order kept), and
+    since coalescing happens in the message body it never disturbs a byte-stable
+    leading system prefix used for prefix-cache reuse. Builds new dicts — never
+    mutates the caller's objects. Non-string content (e.g. a multimodal block
+    list) starts a new run so vision blocks are never mangled.
     """
     out: list = []
     for msg in messages or []:
-        is_system = isinstance(msg, dict) and msg.get("role") == "system"
+        is_role = isinstance(msg, dict) and msg.get("role") == role
         if (
-            is_system
+            is_role
             and out
-            and out[-1].get("role") == "system"
+            and out[-1].get("role") == role
             and isinstance(out[-1].get("content"), str)
             and isinstance(msg.get("content"), str)
         ):
@@ -116,6 +108,21 @@ def _coalesce_system_messages(messages: Any) -> list:
         else:
             out.append(msg)
     return out
+
+
+def _has_consecutive_system_messages(messages: Any) -> bool:
+    """True if ``messages`` has adjacent ``role: system`` entries.
+
+    The Qwen3.5-122B (composer) template raises ``System message must be at the
+    beginning`` on >1 system message; the dj crew and the inner-loop split a
+    stable leading system block from a dynamic one. Back-compat wrapper.
+    """
+    return _has_consecutive_role(messages, "system")
+
+
+def _coalesce_system_messages(messages: Any) -> list:
+    """Collapse adjacent ``role: system`` runs into one (back-compat wrapper)."""
+    return _coalesce_role(messages, "system")
 
 
 def _normalize_chat_payload(
@@ -162,6 +169,13 @@ def _normalize_chat_payload(
     # llama.cpp only: >1 adjacent system message 400s the composer 122B template.
     needs_system_coalesce = (not vllm) and _has_consecutive_system_messages(
         payload.get("messages"))
+    # llama.cpp only: consecutive user messages 500 strict templates (Mistral/
+    # Ministral require strict user/assistant alternation after one optional
+    # system). The inner loop emits [system, user, user] when a history turn has
+    # an empty assistant response — fine for Qwen, fatal for Mistral. Coalescing
+    # is content-preserving and cache-safe (happens after the leading prefix).
+    needs_user_coalesce = (not vllm) and _has_consecutive_role(
+        payload.get("messages"), "user")
     if (
         "system" not in payload
         and "extra_body" not in payload
@@ -170,6 +184,7 @@ def _normalize_chat_payload(
         and not needs_thinking_default
         and not needs_vision_xlate
         and not needs_system_coalesce
+        and not needs_user_coalesce
     ):
         return payload
     p = dict(payload)
@@ -190,6 +205,11 @@ def _normalize_chat_payload(
     # message is collapsed too. No-op when there is no adjacency.
     if not vllm and _has_consecutive_system_messages(p.get("messages")):
         p["messages"] = _coalesce_system_messages(p.get("messages"))
+    # llama.cpp only: merge consecutive user messages so strict alternation
+    # templates (Mistral/Ministral) don't 500 on the loop's [system, user, user]
+    # shape. Runs after the system coalesce; no-op when users aren't adjacent.
+    if not vllm and _has_consecutive_role(p.get("messages"), "user"):
+        p["messages"] = _coalesce_role(p.get("messages"), "user")
     extra_body = p.pop("extra_body", None)
     if isinstance(extra_body, dict):
         p.update(extra_body)
