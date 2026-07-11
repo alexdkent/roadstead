@@ -110,6 +110,75 @@ def _coalesce_role(messages: Any, role: str) -> list:
     return out
 
 
+def _first_nonsystem_is_assistant(messages: Any) -> bool:
+    """True if the first non-system message is an assistant. Strict-alternation
+    templates (Mistral/Ministral) require a USER turn to follow the optional
+    leading system — an assistant there 500s ('After the optional system…')."""
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        r = msg.get("role")
+        if r == "system":
+            continue
+        return r == "assistant"
+    return False
+
+
+def _needs_alternation_fix(messages: Any) -> bool:
+    """Any shape a strict-alternation template rejects: consecutive same-role
+    (system/user/assistant) or a leading assistant after the optional system."""
+    return (
+        _has_consecutive_role(messages, "system")
+        or _has_consecutive_role(messages, "user")
+        or _has_consecutive_role(messages, "assistant")
+        or _first_nonsystem_is_assistant(messages)
+    )
+
+
+def _normalize_strict_alternation(messages: Any) -> list:
+    """Make ``messages`` valid for strict user/assistant alternation templates
+    (Mistral/Ministral): at most one leading system, then user/assistant/user…
+    starting with user. Qwen tolerates loose shapes; Mistral 500s on ALL of:
+    consecutive system, consecutive user, consecutive assistant, and an
+    assistant right after the system.
+
+    Two steps:
+      1. Coalesce consecutive same-role runs (any role), joining string content
+         with ``"\\n\\n"`` (non-string content starts a new run — vision blocks
+         are never mangled). After this the sequence strictly alternates.
+      2. Drop assistant messages that precede the first user turn (orphan history
+         fragments with no preceding user), keeping a leading system.
+
+    Cache-safe: the leading system's bytes are never modified and it stays at
+    index 0, so the warm prefix-cache prefix is preserved. Content-preserving
+    except the deliberate drop of orphan leading assistants (a broken history
+    fragment; better dropped than a 500). Builds new dicts — never mutates
+    the caller's objects.
+    """
+    out: list = []
+    for msg in messages or []:
+        role = msg.get("role") if isinstance(msg, dict) else None
+        if (
+            out
+            and role is not None
+            and out[-1].get("role") == role
+            and isinstance(out[-1].get("content"), str)
+            and isinstance(msg.get("content"), str)
+        ):
+            prev = out[-1]
+            out[-1] = {**prev, "content": f"{prev['content']}\n\n{msg['content']}"}
+        else:
+            out.append(msg)
+    lead: list = []
+    rest = out
+    if rest and isinstance(rest[0], dict) and rest[0].get("role") == "system":
+        lead = [rest[0]]
+        rest = rest[1:]
+    while rest and isinstance(rest[0], dict) and rest[0].get("role") == "assistant":
+        rest = rest[1:]
+    return lead + rest
+
+
 def _has_consecutive_system_messages(messages: Any) -> bool:
     """True if ``messages`` has adjacent ``role: system`` entries.
 
@@ -166,16 +235,15 @@ def _normalize_chat_payload(
     needs_model_set = bool(vllm and model_id and payload.get("model") != model_id)
     needs_thinking_default = bool(vllm and not _has_enable_thinking(payload))
     needs_vision_xlate = _has_anthropic_image_block(payload.get("messages"))
-    # llama.cpp only: >1 adjacent system message 400s the composer 122B template.
-    needs_system_coalesce = (not vllm) and _has_consecutive_system_messages(
+    # llama.cpp only: strict-alternation templates (Mistral/Ministral) 500 on
+    # consecutive system/user/assistant AND on an assistant right after the
+    # system. The inner loop emits these from empty-assistant history turns and
+    # tool-observation injections — fine for Qwen's loose template, fatal for
+    # Mistral. Normalize to valid alternation (content-preserving + cache-safe:
+    # the leading system prefix is never touched). Subsumes the old system-only
+    # coalesce (the composer 122B's >1-adjacent-system case is one instance).
+    needs_alternation = (not vllm) and _needs_alternation_fix(
         payload.get("messages"))
-    # llama.cpp only: consecutive user messages 500 strict templates (Mistral/
-    # Ministral require strict user/assistant alternation after one optional
-    # system). The inner loop emits [system, user, user] when a history turn has
-    # an empty assistant response — fine for Qwen, fatal for Mistral. Coalescing
-    # is content-preserving and cache-safe (happens after the leading prefix).
-    needs_user_coalesce = (not vllm) and _has_consecutive_role(
-        payload.get("messages"), "user")
     if (
         "system" not in payload
         and "extra_body" not in payload
@@ -183,8 +251,7 @@ def _normalize_chat_payload(
         and not needs_model_set
         and not needs_thinking_default
         and not needs_vision_xlate
-        and not needs_system_coalesce
-        and not needs_user_coalesce
+        and not needs_alternation
     ):
         return payload
     p = dict(payload)
@@ -199,17 +266,13 @@ def _normalize_chat_payload(
     # inline so the prepended system message is walked too (it's a no-op there).
     if needs_vision_xlate:
         p["messages"] = _translate_anthropic_image_blocks(p.get("messages"))
-    # llama.cpp only: merge adjacent system messages (the composer 122B template
-    # rejects >1). Runs AFTER the system-inline above so a top-level `system`
-    # prepended in front of a messages list that already starts with a system
-    # message is collapsed too. No-op when there is no adjacency.
-    if not vllm and _has_consecutive_system_messages(p.get("messages")):
-        p["messages"] = _coalesce_system_messages(p.get("messages"))
-    # llama.cpp only: merge consecutive user messages so strict alternation
-    # templates (Mistral/Ministral) don't 500 on the loop's [system, user, user]
-    # shape. Runs after the system coalesce; no-op when users aren't adjacent.
-    if not vllm and _has_consecutive_role(p.get("messages"), "user"):
-        p["messages"] = _coalesce_role(p.get("messages"), "user")
+    # llama.cpp only: normalize to strict user/assistant alternation (Mistral/
+    # Ministral). Runs AFTER the system-inline above so a top-level `system`
+    # prepended in front of a messages list is folded in too. No-op when the
+    # sequence is already valid (the common case). Also collapses the composer
+    # 122B's >1-adjacent-system shape (a consecutive-system run).
+    if not vllm and _needs_alternation_fix(p.get("messages")):
+        p["messages"] = _normalize_strict_alternation(p.get("messages"))
     extra_body = p.pop("extra_body", None)
     if isinstance(extra_body, dict):
         p.update(extra_body)
