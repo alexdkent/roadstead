@@ -338,7 +338,7 @@ models:
 
   creative:
     kind: chat
-    status: active                  # PINNED always-resident on the boxa (now CO-TENANT with `mellum` on :9197 — the card serves two models). Standalone docker container `llamacpp-creative-boxa` (--restart always) — no dispatcher/systemd; proxy dispatches directly. Swapped 2026-07-08: Gemma-4-31B vLLM-XPU -> Trinity-Mini llama.cpp-SYCL.
+    status: active                  # PINNED always-resident on the boxa (now CO-TENANT with `companion-lite` on :9197 — the card serves two models). Standalone docker container `llamacpp-creative-boxa` (--restart always) — no dispatcher/systemd; proxy dispatches directly. Swapped 2026-07-08: Gemma-4-31B vLLM-XPU -> Trinity-Mini llama.cpp-SYCL.
     proxy_endpoint: true
     endpoint_class: creative
     role: creative
@@ -376,12 +376,12 @@ models:
       DEPLOYED MODEL (2026-07-08 swap): `arcee-ai/Trinity-Mini` (base released 2026-01) — a diverse
       NON-Qwen/NON-Gemma MoE (26B total / ~3B active), Q5_K_M GGUF from `arcee-ai/Trinity-Mini-GGUF`
       (/models/trinity-mini-gguf/ on the box). Served on the Intel Arc Pro boxa
-      (10.0.0.10:9196, now CO-TENANT with `mellum` on :9197) by a standalone always-on docker container `llamacpp-creative-boxa`
+      (10.0.0.10:9196, now CO-TENANT with `companion-lite` on :9197) by a standalone always-on docker container `llamacpp-creative-boxa`
       (`ghcr.io/ggml-org/llama.cpp:server-intel`, SYCL/level_zero:0, --restart always;
       `-ngl 99 -c 131072 --parallel 2 -fa on -ctk f16 -ctv f16 -b 4096 -ub 2048 --jinja`). NO dispatcher,
       NO systemd — docker owns lifecycle. Depends on the /mnt/cache/llm NVMe mount. CANONICAL LAUNCH +
       per-flag perf rationale: `infra/nasbox-vllm-xpu/serve_creative_llamacpp.sh` (re-run to recreate/retune).
-      PERF TUNING 2026-07-08 (A/B-benchmarked when the card served creative + nothing else; the boxa now also co-hosts `mellum` on :9197):
+      PERF TUNING 2026-07-08 (A/B-benchmarked when the card served creative + nothing else; the boxa now also co-hosts `companion-lite` on :9197):
       f16 KV (q8_0 dequant-on-read was the main decode cap here) + np2/separate-KV (np4 taxed single-stream) +
       -ub 2048 (prefill) + 64K/slot (uses the free VRAM) => single-stream decode +79%, conc-2 agg +64%, prefill +28%.
       WHY THE SWAP: the prior Gemma-4-31B-it-abliterated AWQ W4A16 on custom vLLM 0.23 XPU (config-C)
@@ -399,64 +399,71 @@ models:
       the Gemma values) to restore the incumbent. The `deckard` aliases + serve_deckard.sh anvil
       rollback are untouched.
 
-  mellum:
+  companion-lite:
     kind: chat
-    status: active                  # standalone docker container `llamacpp-mellum-boxa` (--restart always) on the boxa (CO-TENANT with `creative` — the boxa now serves TWO models) — no dispatcher/systemd; proxy dispatches directly, capacity self-discovered via /props. Promoted 2026-07-08.
+    status: active                  # standalone docker container `llamacpp-companion-lite-boxa` (--restart always) on the boxa (CO-TENANT with `creative` — the boxa now serves TWO models) — no dispatcher/systemd; proxy dispatches directly, capacity self-discovered via /props. Landed 2026-07-11 (replaces the retired `mellum` focal slot).
     proxy_endpoint: true
-    endpoint_class: mellum
-    role: mellum
-    aliases: [mellum2, focal]         # `focal` = the JOB (fast RAG-compression/synthesis + classify/route); `mellum2` = version-forward shorthand
+    endpoint_class: companion-lite
+    role: companion-lite
+    aliases: []                       # DEDICATED single-purpose role — NO aliases. The prior `mellum`/`mellum2`/`focal` aliases are RETIRED with the Mellum2 model. Do NOT reintroduce a `focal` alias here: this slot is the chat loop ONLY, not a focal/offload tier.
     host: nasbox
     port: 9197                        # host port -> container :8080 (docker -p 9197:8080)
     backend_engine: llama.cpp
     probe_kind: llama
-    served_model_names: [mellum]      # llama.cpp `-a mellum`; declared so the naming-doctrine test covers it
-    model_family: JetBrains Mellum2-12B-A2.5B (2026, attention MoE ~2.5B active), Q4_K_M GGUF
+    served_model_names: [companion-lite]  # llama.cpp `-a companion-lite` (the serve script sets it); declared so the naming-doctrine test covers it
+    model_family: Mistral Ministral-3-8B-Instruct-2512 (abliterated, DENSE 8B), Q4_K_M GGUF
     quant: Q4_K_M
-    params: {active: 2.5B, total: 12B}
-    context_per_slot: 32768          # llama.cpp -c 32768 --parallel 1 = 32768/slot (SEED — live /props self-corrects). See slots note re: any future --parallel 2.
-    context_window: 32768            # fleet chunkers size against 32K (policy, not slot size)
-    slots: 1                         # llama.cpp --parallel 1 — matches the VALIDATED pilot + in-lane eval. NOT bumped to 2: a 2nd 32K f16-KV slot would grow KV ~1-2GB and risk OOM against creative's ~21.3GB on the 32GB boxa (headroom ~3.3GB). Bump only after a VRAM-verified relaunch + benchmark.
-    timeout_floor_s: 60             # fast focal model (~98 t/s decode, quick prefill); short RAG-compress/classify calls. Min-budget floor.
+    params: {total: 8B}              # DENSE 8B — no MoE active/total split (unlike the retired Mellum2 MoE)
+    context_per_slot: 16384          # llama.cpp -c 16384 --parallel 1 = 16384/slot (SEED — live /props self-corrects). Single slot => id_slot is ALWAYS 0.
+    context_window: 16384            # chat-loop turns size against 16K (persona+catalog prefix ~9k + dynamic delta)
+    slots: 1                         # llama.cpp --parallel 1 — DEDICATED single slot. This is a hard design property, not a tuning knob: the one warm slot holds the ~9k-token static persona+catalog prefix so only the dynamic delta prefills (validated: prompt-eval ~13k -> 680-3700/call, cold 4.1s -> warm 0.82s). Bumping to 2 would split/cold the prefix and defeat the whole point — do NOT.
+    slot_affinity: single            # single slot => id_slot always 0; chat-loop requests pass cache_prompt + id_slot:0 to keep the prefix permanently warm
+    timeout_floor_s: 60             # fast chat model (dense 8B Q4, quick prefill on the warm prefix); a Sidekick chat turn. Min-budget floor.
     timeout_ceiling_s: 600
     policy:
       background_floor_pct: 0.0
-      fast_path_reserve_slots: 0     # single-slot endpoint (slots:1) — cannot reserve a fast-path slot out of 1 (would starve background); the one slot serves all bands FIFO via the proxy DRR. (creative reserves 1 because it has 2 slots.)
+      fast_path_reserve_slots: 0     # single-slot endpoint (slots:1) — cannot reserve a fast-path slot out of 1; the one slot serves the chat loop. (creative reserves 1 because it has 2 slots.)
       # llama.cpp --parallel. Keep EQUAL to `slots: 1` above; the shadow reconciler warns on drift.
       documented_max_num_seqs: 1
     capabilities:
-      vision: false                 # text-only (JetBrains positions Mellum2 as text/code focal, not multimodal)
+      vision: false                 # text-only chat model
       streaming: true
-      reasoning: false              # NOT a forced-reasoning model (unlike creative/Trinity) — plain response_format json_schema works, no forced-reasoning budget, no GBNF deadlock class
-      tool_calling: false           # auto-tool-choice OFF — used for compress/classify/route, not agentic tool loops
-      structured_output: grammar    # llama.cpp GBNF + response_format json_schema (json_schema VERIFIED in the 2026-07-08 in-lane eval); documentary field only (no code branches on it)
-    token_speed: {decode_tok_s_at_1: 98, note: "~98 t/s single-stream decode on the boxa (SYCL); Q4_K_M ~8.2GB resident at -c 32768/--parallel 1"}
-    purpose: Fast FOCAL model — RAG-compression/synthesis + cheap classification/routing; an offload target for composer-122B (RAG synth) and gemma-router-4B (classify/route).
+      reasoning: false              # NOT a forced-reasoning model — a fast chat-turn model; escalation to composer-122B (ORIGINFLEET_LOOP_ESCALATION_ROLE) handles the hard-turn case per-turn
+      tool_calling: grammar         # inner-loop tool-calling via GBNF grammar (the orchestrator's tool catalog is grammar-constrained)
+      structured_output: grammar    # llama.cpp GBNF + response_format json_schema
+    token_speed: {note: "dense 8B Ministral Q4_K_M ~5GB weights resident on the boxa (SYCL); warm-prefix chat turns prefill only the dynamic delta (cold 4.1s -> warm 0.82s on a mechanic test)"}
+    purpose: |
+      RESERVED EXCLUSIVELY for the orchestrator inner chat loop (Sidekick's chat turn). This is a
+      DEDICATED, 1-SLOT model — NOT a shared / focal / general / reasoning tier, and NOT an
+      offload target for any other role. It exists solely to run chat turns fast off a permanently
+      warm persona+catalog prefix, with composer-122B as the per-turn escalation target. Nothing
+      else may route here.
     when_used:
-      - RAG-compression / synthesis offload from composer (competitive quality, much faster)
-      - triage classification / routing offload from gemma-router (~parity)
-      - (consumer wire-in is a SEPARATE later build — no live callers at first-class landing)
+      - orchestrator inner chat loop ONLY (ORIGINFLEET_LOOP_CHAT_ROLE=companion-lite)
+      - (per-turn escalation of a malformed/low-confidence turn bumps to composer-122B via ORIGINFLEET_LOOP_ESCALATION_ROLE=qwen-composer)
     fallback: composer
     notes: |
-      PROMOTED 2026-07-08: JetBrains `Mellum2-12B-A2.5B-Instruct` (Apache-2.0, Q4_K_M GGUF,
-      /models/mellum2-gguf/ on the box) — an attention-MoE 12B-total / ~2.5B-active, a diverse
-      NON-Qwen / NON-Gemma family (fleet diversity; the two heavy incumbents composer+reasoner
-      are both Qwen). Served on the Intel Arc Pro boxa (10.0.0.10:9197) by a standalone always-on
-      docker container `llamacpp-mellum-boxa` (`ghcr.io/ggml-org/llama.cpp:server-intel`,
-      SYCL/level_zero:0, --restart always; `-a mellum -ngl 99 -c 32768 --parallel 1 -fa on`),
-      CO-TENANT with `creative` (:9196) on the SAME boxa (the card now serves two models). NO
-      dispatcher, NO systemd — docker owns lifecycle. Depends on the /mnt/cache/llm NVMe mount.
-      CANONICAL LAUNCH: `infra/nasbox-vllm-xpu/serve_mellum_llamacpp.sh` (re-run to recreate/retune).
-      Capacity self-discovered from /props (llama.cpp), so slots/context above are seeds.
-      JetBrains positions it as a 'FOCAL' model, NOT a primary reasoner. IN-LANE EVAL 2026-07-08
-      (vs the actual incumbent each): ~parity with gemma-router on triage classification (80 vs 87%
-      domain, much faster); COMPETITIVE with composer-122B on RAG synth/compression (full coverage +
-      clean faithfulness incl. a recency/superseded probe, ~9-19x faster); WEAKER on multi-object
-      structured extraction (under-decomposes) and multi-speaker summarization (mis-attributed the
-      speaker + hallucinated a name) — those STAY on classify-35B / composer-122B / reasoner-27B.
-      LANE = fast focal 'compress/label' offload, NOT a general reasoning tier. reasoning:false =>
-      plain response_format json_schema works (no forced-reasoning budget, no GBNF deadlock). Slots
-      pinned at 1 (VRAM-safe on the shared 32GB card next to creative's ~21.3GB) — see the slots note.
+      LANDED 2026-07-11: Mistral `Ministral-3-8B-Instruct-2512` (abliterated), Q4_K_M GGUF at
+      /models/ministral3-8b-gguf/ministral3-8b-abliterated-Q4_K_M.gguf on the box — a DENSE 8B,
+      a diverse NON-Qwen / NON-Gemma family (the two heavy incumbents composer+reasoner are both
+      Qwen). Served on the Intel Arc Pro boxa (10.0.0.10:9197) by a standalone always-on docker
+      container `llamacpp-companion-lite-boxa` (`ghcr.io/ggml-org/llama.cpp:server-intel`,
+      SYCL/level_zero:0, --restart always; `-a companion-lite -ngl 99 -c 16384 --parallel 1
+      -fa on -ctk f16 -ctv f16 -b 4096 -ub 2048 --cache-reuse 256 --jinja`), CO-TENANT with
+      `creative` (:9196) on the SAME boxa — Ministral Q4 ~5GB weights leave ample headroom next
+      to creative's ~21.3GB on the 32GB card. NO dispatcher, NO systemd — docker owns lifecycle.
+      Depends on the /mnt/cache/llm NVMe mount.
+      CANONICAL LAUNCH: `infra/nasbox-vllm-xpu/serve_companion-lite_llamacpp.sh` (re-run to recreate/retune).
+      RESERVED EXCLUSIVELY FOR THE CHAT LOOP: this is a single dedicated slot for the orchestrator
+      inner chat loop (Sidekick's chat turn), pinned via ORIGINFLEET_LOOP_CHAT_ROLE=companion-lite. It is
+      NOT a shared/focal/general/reasoning tier and NOT an offload target for any other role — do not
+      wire other callers to it. The `--parallel 1` single slot plus cache_prompt/id_slot:0 requests
+      keep the ~9k-token static persona+catalog prefix permanently warm, so only the dynamic delta
+      prefills (VALIDATED: prompt-eval dropped from ~13k tokens to 680-3700/call; cold 4.1s -> warm
+      0.82s on a mechanic test). Ministral was chosen for best Sidekick-voice in a bake-off; a proxy fix
+      (coalesce consecutive user messages for llama.cpp) unblocked its strict Mistral chat template.
+      The prior Mellum2 'focal' / RAG-compression capability is RETIRED from the boxa — if focal /
+      RAG-compression is ever needed again it re-homes to `qwen-classify`, NOT here.
 
   # ---------------------------------------------------------------- retrieval
   embed:
