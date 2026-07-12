@@ -28,17 +28,19 @@ class IPIdentityMap:
             ipaddress.ip_network("172.16.0.0/12"),
             ipaddress.ip_network("::1/128"),
         ]
-        # Admin surfaces (drain/pause, maintenance, flags) accept the internal
-        # nets PLUS an explicit allow-list — deliberately SEPARATE from
+        # Admin surfaces (drain/pause, maintenance, flags, calls-log ingest) accept
+        # the internal nets PLUS an explicit allow-list — deliberately SEPARATE from
         # _internal_nets so granting admin never changes a host's inference
         # PRIORITY (identify() matches _internal_nets first, before subnet
-        # entries — see is_admin). 2026-07-09 anvil (10.0.0.3) was added here so
-        # the anvil-dispatcher could pause/resume the `classify` endpoint during
-        # eviction; REMOVED 2026-07-11 — classify re-homed off anvil onto the boxa
-        # `creative` endpoint and the eviction coordinator is now inert, so anvil
-        # no longer needs proxy admin. Back to loopback-only (the 2026-06-10 posture).
-        # ROLLBACK (if classify is re-stood-up on anvil): re-add 10.0.0.3/32 below.
-        self._admin_nets = list(self._internal_nets)
+        # entries — see is_admin). anvil (10.0.0.3) is granted admin: originally
+        # (2026-07-09) for the classify-evict pause/resume, but anvil also depends
+        # on it for its HEALTH TELEMETRY path — a brief 2026-07-11 removal (after
+        # classify re-homed off anvil) broke anvil health telemetry on the
+        # Systems page, so it is KEPT. DO NOT remove even though classify eviction is
+        # now inert: anvil has other admin-gated proxy dependencies.
+        self._admin_nets = list(self._internal_nets) + [
+            ipaddress.ip_network("10.0.0.3/32"),
+        ]
 
     def register(
         self,
@@ -93,9 +95,9 @@ class IPIdentityMap:
         internal (port not published) and every legitimate admin caller goes
         through ``docker exec curl localhost`` (restart_llm.sh) or the gateway
         on loopback — verified by the admin-audit IP log before tightening
-        (2026-06-10: 127.0.0.1 only). 2026-07-09: anvil (10.0.0.3) was added to
-        _admin_nets for the classify-evict pause/resume; REMOVED 2026-07-11 when
-        classify re-homed off anvil (eviction now inert) — back to loopback-only
+        (2026-06-10: 127.0.0.1 only). 2026-07-09: anvil (10.0.0.3) added to
+        _admin_nets — needed for classify-evict AND the anvil health-telemetry
+        path (removing it broke anvil telemetry on the Systems page); KEEP it
         (see __init__)."""
         try:
             addr = ipaddress.ip_address(remote_ip)
