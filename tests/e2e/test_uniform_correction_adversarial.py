@@ -51,8 +51,15 @@ def _pin_schema_backstop_off(monkeypatch):
     request; pin OFF so these tests are hermetic w.r.t. the ambient container
     env. Fixes the container-only 502 in test_sync_door_shadow_egress_wired_
     through_apply after the "chat"→classify (grammar-capable) cutover.
+
+    The always-on structured-validity floor (COLLECTIVE_PROXY_STRUCTURED_VALIDITY,
+    2026-07-11) is pinned OFF for the same reason: the fake's non-JSON echo on the
+    grammar cases (sync 200 assertion + the grammar-stream 'done' flow) would trip
+    the parse-only floor — an artifact of the fake, not the uniform-correction
+    seams this file tests. The floor has its own suite (test_truncation_guard.py).
     """
     monkeypatch.setenv("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", "0")
+    monkeypatch.setenv("COLLECTIVE_PROXY_STRUCTURED_VALIDITY", "0")
 
 
 # --------------------------------------------------------------------------- #

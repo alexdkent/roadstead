@@ -93,8 +93,16 @@ def _pin_schema_backstop_off(monkeypatch):
     captured with the flag OFF (its default), so pin it OFF to keep this file
     hermetic w.r.t. the ambient container env (it reads os.environ live). Fixes
     the container-only 502 in the chat_sync_grammar case after "chat"→classify.
+
+    The always-on structured-validity floor (COLLECTIVE_PROXY_STRUCTURED_VALIDITY,
+    2026-07-11) is pinned OFF for the same reason: the fake's non-JSON echo on the
+    grammar case would 502 under the parse-only floor — an artifact of the fake
+    backend, not the transform this corpus pins. The guard has its own suite
+    (test_truncation_guard.py). Env is read live per request, so fixture ordering
+    vs proxy construction doesn't matter.
     """
     monkeypatch.setenv("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", "0")
+    monkeypatch.setenv("COLLECTIVE_PROXY_STRUCTURED_VALIDITY", "0")
 
 _OPENAI_ENVELOPE_OBJECTS = ("chat.completion", "chat.completion.chunk", "list")
 
