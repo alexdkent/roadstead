@@ -36,6 +36,26 @@ _PROBLEM_STATUSES = frozenset({"error", "timeout", "truncated"})
 _ENDPOINT_STALL_MIN_TIMEOUTS = 8
 _ENDPOINT_STALL_WARN_ENDPOINTS = frozenset({"gemma"})
 
+# callsite_timeout_too_tight tuning (2026-07-12). The complement of the stall
+# alert: it counts PREMATURE timeouts — a caller giving up BELOW the model's
+# recommended deadline — in the BACKGROUND band (P3/P4), grouped by call_site.
+# That is the "timeout set below the call's real latency, so it never completes
+# and re-attempts" signature (orchestrator.summarize stormed all day 2026-07-12,
+# 10.5s applied vs 360s recommended, undetected because premature timeouts are
+# excluded from the backend-stall alert — correctly, they're the CALLER's fault,
+# not the backend's). Interactive/foreground bands (P0-P2) give up early BY
+# DESIGN and degrade gracefully (force_synth), so they're excluded — only
+# deferred work that re-attempts is dangerous here.
+_BACKGROUND_PRIORITY_NAMES = frozenset({"P3_INGESTION", "P4_HYGIENE"})
+# Background call-sites whose short deadline is DELIBERATE (fire-and-forget; the
+# result is droppable, no retry / dirty state). Empty today — every current
+# best-effort miner (greeter advisory, sidekick.extract_*) runs in the P1/P2
+# interactive bands, already excluded above. The default is "alarm", so a new
+# too-tight must-complete background site self-reports instead of storming
+# silently; add a site here only when a background give-up is genuinely intended.
+_PREMATURE_TIMEOUT_ALLOWLIST: frozenset[str] = frozenset()
+_PREMATURE_CALLSITE_MIN_TIMEOUTS = 6
+
 
 # ---------------------------------------------------------------------------
 # Request log record
@@ -156,6 +176,10 @@ class MetricsSample:
     # in a feedback loop (2026-07-04 gemma stall bursts). Excluded from the
     # stall heuristic so only timeouts that gave the backend FAIR time count.
     best_effort: bool = False
+    # Call-site identifier (e.g. "orchestrator.summarize"), for the per-call-site
+    # premature-timeout alarm. Appended LAST to keep positional construction of
+    # the older fields stable. Empty on paths that don't carry it.
+    call_site: str = ""
 
 
 class RollingMetrics:
@@ -225,6 +249,28 @@ class RollingMetrics:
                 continue
             n += 1
         return n
+
+    def premature_background_by_call_site(
+        self, *, now: float | None = None,
+    ) -> dict[str, int]:
+        """Count PREMATURE background-band timeouts, grouped by call_site.
+
+        A ``status="timeout"`` sample with ``premature=True`` in the P3/P4
+        (BACKGROUND) band is a deferred call-site giving up below the model's
+        recommended deadline — the "too-tight timeout, never completes,
+        re-attempts" signature. Feeds the ``callsite_timeout_too_tight`` alert.
+        """
+        if now:
+            self._prune(now)
+        tally: dict[str, int] = {}
+        for s in self._samples:
+            if s.status != "timeout" or not s.premature:
+                continue
+            if s.priority not in _BACKGROUND_PRIORITY_NAMES:
+                continue
+            cs = s.call_site or "unknown"
+            tally[cs] = tally.get(cs, 0) + 1
+        return tally
 
     def throughput_rps(
         self, endpoint: str | None = None, now: float | None = None,
@@ -346,6 +392,28 @@ def check_alerts(
                 f"(in_flight={snap.get('in_flight', 0)}/"
                 f"{max_slots or '?'}, queued=0) — backend likely stalling, "
                 f"not saturated",
+            ))
+
+    # Too-tight background timeout (2026-07-12). The complement of endpoint_stalled:
+    # a BACKGROUND-band call-site giving up below the model's recommended deadline
+    # (premature) in bulk is abandoning work it will re-attempt on the next trigger
+    # — a silent retry storm that also cools the endpoint (orchestrator.summarize:
+    # 10.5s applied vs 360s recommended, ~10-27 calls/burst all day, undetected).
+    # Self-reports the "timeout set below the call's real latency" class for ANY
+    # call-site (budgets.py OR inline asyncio.wait_for), which endpoint_stalled
+    # deliberately excludes (premature = caller's fault, not the backend's).
+    for cs, n in metrics.premature_background_by_call_site(now=now).items():
+        if cs in _PREMATURE_TIMEOUT_ALLOWLIST:
+            continue
+        if n >= _PREMATURE_CALLSITE_MIN_TIMEOUTS:
+            alerts.append(AlertCondition(
+                "callsite_timeout_too_tight", "WARNING", True,
+                f"call_site {cs}: {n} premature background timeouts in "
+                f"{int(metrics._window_s)}s — its applied timeout is below the "
+                f"model's recommended deadline, so the call never completes and "
+                f"re-attempts (retry storm). Raise the call-site's timeout_s "
+                f"(compare /v1/timeouts recommended_ms) or, if the give-up is "
+                f"deliberate, add it to _PREMATURE_TIMEOUT_ALLOWLIST.",
             ))
 
     # Agent starvation — REMOVED. The DRR fix (pick_agent on head-of-queue wait)

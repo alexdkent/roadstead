@@ -1344,6 +1344,7 @@ class Lifecycle:
             backend_latency_ms=duration_s * 1000,
             status=status,
             slot_seconds=duration_s,
+            call_site=req.call_site,
             best_effort=_best_effort,
         ))
 
@@ -1561,6 +1562,7 @@ class Lifecycle:
                     backend_latency_ms=0.0,
                     status="timeout",
                     slot_seconds=0.0,
+                    call_site=req.call_site,
                     # `under` = fired below the proxy's recommended deadline; a
                     # client-side give-up, excluded from the endpoint_stalled
                     # backend-stall heuristic (best-effort sub-floor callers).

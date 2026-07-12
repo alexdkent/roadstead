@@ -131,6 +131,103 @@ def test_gemma_stall_is_warning_not_error():
     assert _severity(alerts, "endpoint_stalled") == "WARNING"
 
 
+# --- callsite_timeout_too_tight: the complement of endpoint_stalled ----------
+# endpoint_stalled deliberately EXCLUDES premature timeouts (caller's fault, not
+# the backend's). That left the "timeout set below the call's real latency, so
+# it never completes and re-attempts" class silent — the orchestrator.summarize
+# storm (10.5s applied vs 360s recommended, all day). This alarm catches it in
+# the BACKGROUND band (P3/P4), grouped by call_site.
+
+def _premature_bg_timeouts(
+    endpoint: str, call_site: str, n: int, now: float, *,
+    priority: str = "P4_HYGIENE",
+) -> RollingMetrics:
+    m = RollingMetrics(window_s=300.0)
+    for _ in range(n):
+        m.record(MetricsSample(
+            timestamp=now, endpoint=endpoint, agent_id="a", priority=priority,
+            queue_wait_ms=0.0, backend_latency_ms=0.0, status="timeout",
+            slot_seconds=0.0, premature=True, best_effort=False,
+            call_site=call_site))
+    return m
+
+
+def test_callsite_timeout_too_tight_fires_on_premature_background_burst():
+    now = time.monotonic()
+    m = _premature_bg_timeouts("companion", "orchestrator.summarize", 6, now)
+    snaps = {"companion": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
+    alerts = check_alerts(
+        endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
+        cost_model_samples={}, queue_wal_size=0, now=now)
+    assert "callsite_timeout_too_tight" in _names(alerts)
+    assert _severity(alerts, "callsite_timeout_too_tight") == "WARNING"
+    # The offending call_site is named so the operator can find + fix it.
+    detail = next(a.detail for a in alerts if a.name == "callsite_timeout_too_tight")
+    assert "orchestrator.summarize" in detail
+
+
+def test_callsite_too_tight_below_threshold_silent():
+    # 5 premature background timeouts (< 6) — not yet a storm.
+    now = time.monotonic()
+    m = _premature_bg_timeouts("companion", "orchestrator.summarize", 5, now)
+    snaps = {"companion": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
+    alerts = check_alerts(
+        endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
+        cost_model_samples={}, queue_wal_size=0, now=now)
+    assert "callsite_timeout_too_tight" not in _names(alerts)
+
+
+def test_callsite_too_tight_ignores_interactive_band():
+    # Interactive/foreground bands (P0-P2) give up early BY DESIGN and degrade
+    # gracefully (force_synth) — a premature burst there is not a retry storm and
+    # must NOT fire, even well above the count threshold.
+    now = time.monotonic()
+    m = _premature_bg_timeouts(
+        "gemma", "orchestrator.route", 12, now, priority="P1_TURN_SUPPORT")
+    snaps = {"gemma": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
+    alerts = check_alerts(
+        endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
+        cost_model_samples={}, queue_wal_size=0, now=now)
+    assert "callsite_timeout_too_tight" not in _names(alerts)
+
+
+def test_callsite_too_tight_ignores_genuine_background_timeouts():
+    # Genuine background timeouts (premature=False → waited PAST the recommended
+    # deadline) are a BACKEND problem (endpoint_stalled), not a too-tight caller.
+    # They must NOT fire this caller-side alarm.
+    now = time.monotonic()
+    m = RollingMetrics(window_s=300.0)
+    for _ in range(10):
+        m.record(MetricsSample(
+            timestamp=now, endpoint="thinker", agent_id="a", priority="P3_INGESTION",
+            queue_wait_ms=0.0, backend_latency_ms=0.0, status="timeout",
+            slot_seconds=0.0, premature=False, best_effort=False,
+            call_site="knowledge_store.judge"))
+    snaps = {"thinker": {"in_flight": 0, "max_slots": 8, "queued": 0, "paused": False}}
+    alerts = check_alerts(
+        endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
+        cost_model_samples={}, queue_wal_size=0, now=now)
+    assert "callsite_timeout_too_tight" not in _names(alerts)
+
+
+def test_callsite_too_tight_groups_by_call_site():
+    # Two call_sites, each below threshold on its own (4 + 4), must NOT be pooled
+    # into one firing — the alarm names ONE offending site, so it groups per site.
+    now = time.monotonic()
+    m = _premature_bg_timeouts("companion", "orchestrator.summarize", 4, now)
+    for _ in range(4):
+        m.record(MetricsSample(
+            timestamp=now, endpoint="companion", agent_id="a", priority="P4_HYGIENE",
+            queue_wait_ms=0.0, backend_latency_ms=0.0, status="timeout",
+            slot_seconds=0.0, premature=True, best_effort=False,
+            call_site="orchestrator.consolidate"))
+    snaps = {"companion": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
+    alerts = check_alerts(
+        endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
+        cost_model_samples={}, queue_wal_size=0, now=now)
+    assert "callsite_timeout_too_tight" not in _names(alerts)
+
+
 def test_timeout_below_recommended_ratio():
     # The best_effort tag: an applied deadline under half the recommended time is
     # a sub-floor give-up; anything else (incl. missing/zero inputs) is genuine.
