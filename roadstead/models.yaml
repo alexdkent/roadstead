@@ -79,85 +79,15 @@ models:
 
   # ---------------------------------------------------------------- chat / reasoning
 
-  classify:
-    kind: chat
-    status: active
-    proxy_endpoint: true
-    endpoint_class: classify
-    role: qwen-classify
-    aliases: [qwen-classify, classify, chat, nexus-chat, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]
-    host: anvil   # 2026-07-09: MIGRATED nexus->anvil (CUDA) — nexus is now composer-only. See notes.
-    port: 9092
-    backend_engine: llama.cpp
-    systemd_unit: llama-classify
-    probe_kind: llama
-    model_family: Qwen3.6-35B-A3B + mmproj (chat + vision)
-    quant: UD-Q4_K_M
-    context_per_slot: 131072   # 2026-07-04: --kv-unified shared pool (live /props confirms); was 32768/slot
-    context_window: 32768      # fleet chunkers size against 32K on purpose (policy, not slot size)
-    slots: 4
-    timeout_floor_s: 180       # 2026-07-04: raised 45->180 — kv-unified allows big single requests; a cold ~37K prefill was hitting the old 45s floor
-    evictable: true            # 2026-07-09: yielding co-tenant of the anvil imagegen/videogen dispatcher — stopped+proxy-paused when a diffusion/video job can't fit residual VRAM, restored on idle-unload. See anvil_imagegen/classify_evict.py.
-    capabilities:
-      vision: true
-      streaming: false
-      reasoning: false
-      tool_calling: true
-      structured_output: grammar
-    token_speed: {note: "~56 t/s decode text (anvil CUDA, >= nexus 55); prefill ~4x nexus (2210/2640 t/s pp); vision extract ~15-30s/image incl. encode"}
-    purpose: Consolidated text-classify + vision tier — replaces both analyst's TEXT-classify half and the separate analyst-vision (8B) service. As of 2026-07-09 runs on anvil (CUDA); nexus is now composer-only.
-    when_used:
-      - Tier-1.5 / Tier-2 text classification (sidekick.extract_pad fallback, temporal.daily_summary, mail-agent.email_recent_overview, orchestrator.autonomous_chat-agent.reflect, forum-agent.peer_playbook)
-      - attachments stage-2 full-resolution image extraction
-      - knowledge_v3 ground-truth PII/document intake
-      - browser_broker vision-routed capabilities (perceive./vision./insurance./portal.)
-    fallback: composer   # analyst (30B) fully decommissioned 2026-07-03; classify itself migrated to anvil 2026-07-09, nexus is composer-only
-    notes: |
-      **MIGRATED nexus->anvil 2026-07-09** (docs plan
-      this-session-is-going-dapper-horizon): moved off the nexus Vulkan iGPU to
-      the anvil GB10 (CUDA), where vision (mmproj) is better-supported and
-      prefill is ~4x faster. Config is behavior-identical (kv-unified 131072
-      shared pool, --reasoning off, q8_0 KV, 4 slots) on a fresh CUDA llama.cpp
-      build (HEAD c15c5c77, sm_121a) at /opt/llama.cpp-build-src/build/bin; unit
-      infra/anvil/systemd/llama-classify.service. Decode ~56 t/s (>= nexus's
-      55), prefill ~4x. **nexus is now composer-only** — the old
-      llama-chat.service there is stopped+disabled. classify is an EVICTABLE
-      co-tenant of the anvil imagegen/videogen dispatcher (see `evictable:
-      true` above). Rationale + usage data: the swap that motivated this
-      (classify<->creative) was invalidated — creative is used 6.4x more than
-      classify, so classify is the light model that yields the GB10 to imagegen.
-
-      Stood up 2026-07-03 as the classify leg of the nexus model swap-out
-      (docs/nexus_qwen35_loadout_plan.md); resurrects the pre-2026-05-30
-      `llama-chat.service` model (this IS the model that ran as "chat" before
-      being replaced by the dedicated Qwen3-VL-30B) — same weights
-      (`/srv/models/qwen3.6-35b-a3b-ud-q4_k_m.gguf` + its native mmproj),
-      now on a fresh port (8091) with `--reasoning off` baked in (this model
-      defaults to thinking-mode via its chat template — left on, that's a
-      40-100x slowdown, confirmed in the 2026-07-02 3-way classify bake-off:
-      originfleet/infra/nexus/bench_results/classify_bakeoff_3way_2026-07-02.md).
-
-      **Vision consolidation decision (2026-07-03):** benched this model's
-      native mmproj against the dedicated 8B `analyst-vision`
-      (originfleet/infra/nexus/bench_results/vision_consolidation_qwen36_35b_20260703.md)
-      — tied or slightly ahead across all 7 categories, no substantial 8B
-      edge found. Per the operator's consolidation-biased decision rule,
-      `analyst-vision`/`llama-vision-8b.service` was decommissioned and its
-      3 vision callers (attachments, knowledge_v3 ground-truth,
-      browser_broker) migrated here via the `analyst-vision`/`qwen-vision-8b`
-      aliases (no caller code changes needed — see the decommissioned block
-      below). This also frees ~11 GiB of GTT, which matters: nexus's real
-      usable ceiling is ~109 GiB (not the naive 124 GiB GTT-quota sum — see
-      infra/nexus/runbooks/amdgpu_vm_memory_leak_2026-07-03.md for the full
-      memory-accounting story from this same swap).
-
-      The `chat`/`nexus-chat` aliases moved here from `analyst` (zero live
-      internal callers used the bare "chat" string; the external gateway
-      facade routes via an explicit service id, unaffected). `analyst`
-      itself is FULLY DECOMMISSIONED (not kept as an on-demand fallback —
-      nexus runs exactly two models, `classify` and `composer`), so
-      `qwen-analyst`/`analyst` are now legacy aliases resolving here too —
-      see the `decommissioned:` block below.
+  # classify / analyst / vision: RE-HOMED onto the boxa `creative` endpoint 2026-07-11 (three-role
+  # consolidation) — the anvil `llama-classify.service` (Qwen3.6-35B-A3B+mmproj on the GB10 :9092)
+  # is STOPPED + disabled, and role names `classify`/`qwen-classify`/`chat`/`nexus-chat`/`analyst`/
+  # `qwen-analyst`/`analyst-vision`/`qwen-vision-8b`/`qwen-vision-9b`/`vision-8b` are now ALIASES of
+  # the single boxa `creative` endpoint (see the creative stanza above + the `decommissioned:` block).
+  # Keeping ONE stanza at ONE URL keeps 6-slot capacity accounting correct. This frees the anvil
+  # GB10 for imagegen/videogen (classify no longer evicts them) and fixes classify's ~36s p95
+  # queue-wait. Same weights/mmproj as before, same 32K chunking policy (creative.context_window),
+  # reasoning-off, grammar tool-calling — behavior-preserving for classify callers.
 
   composer:
     kind: chat
@@ -338,151 +268,82 @@ models:
 
   creative:
     kind: chat
-    status: active                  # PINNED always-resident on the boxa (now CO-TENANT with `companion-lite` on :9197 — the card serves two models). Standalone docker container `llamacpp-creative-boxa` (--restart always) — no dispatcher/systemd; proxy dispatches directly. Swapped 2026-07-08: Gemma-4-31B vLLM-XPU -> Trinity-Mini llama.cpp-SYCL.
+    status: active                  # PINNED always-resident on the boxa. Standalone docker container `llamacpp-creative-boxa` (--restart always) on :9196 — no dispatcher/systemd; proxy dispatches directly, capacity self-discovered via /props. CONSOLIDATED 2026-07-11: ONE Qwen3.6-35B-A3B-abliterated container (+mmproj) now backs THREE roles — `creative`, `companion-lite`(alias, chat loop), AND the `classify`/`analyst`/vision family(alias, re-homed off anvil :9092). Superseded the Trinity-Mini(creative)/Gemma-4-26B(companion-lite) split AND the anvil llama-classify.service (stopped). Not evictable (dedicated card) — the anvil eviction dance is gone.
     proxy_endpoint: true
     endpoint_class: creative
     role: creative
-    aliases: [deckard, deckard-31b]   # HISTORICAL — from the prior anvil NVFP4 DECKARD model; kept as compat role aliases only (the deployed model is NOT a DECKARD finetune)
+    aliases: [deckard, deckard-31b, companion-lite, qwen-classify, classify, chat, nexus-chat, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]   # THREE roles now resolve to this ONE boxa endpoint (2026-07-11 consolidation): (1) creative, (2) companion-lite = the orchestrator inner chat loop, (3) the whole classify/analyst/vision family (re-homed off anvil :9092). All pure ALIASES of the single endpoint so no caller changes AND slots aren't double-counted (two stanzas at one URL would double-count the 6 slots). deckard/deckard-31b are HISTORICAL anvil NVFP4 rollback aliases (the deployed model is NOT a DECKARD finetune).
     host: nasbox
     port: 9196
     backend_engine: llama.cpp
     probe_kind: llama
-    served_model_names: [creative, deckard-31b, deckard]   # `creative` = the LIVE boxa llama.cpp server (-a creative); `deckard`/`deckard-31b` = the DORMANT anvil rollback (serve_deckard.sh, on anvil — untouched by the .10 cleanup) — declared so the naming-doctrine test covers both. (The .10 serve_prod.sh vLLM creative model was REMOVED 2026-07-11 — re-provision from HF to use that rollback.)
-    model_family: Arcee Trinity-Mini (2026-01, MoE 26B-A3B), Q4_K_M GGUF
-    quant: Q4_K_M                    # squeezed from Q5_K_M 2026-07-11 (commit 42138723) to free co-tenant VRAM for companion-lite; +11% decode (~91->~101 t/s), MoE experts quant-robust, craft A/B'd top-tier
-    params: {active: 3B, total: 26B}
-    context_per_slot: 65536          # llama.cpp -c 131072 --parallel 2 SEPARATE KV -> 64K PER SLOT (2x the 32K chunk policy), f16 KV cache; ~17.3GB resident on the 32GB boxa (post Q4_K_M squeeze 2026-07-11; was ~21.3GB at Q5_K_M)
-    context_window: 32768            # fleet chunkers size against 32K on purpose (policy, not slot size)
-    slots: 2                         # llama.cpp --parallel 2 (2026-07-08 tuning: np4 imposed a standing single-stream decode tax; np2 matches the np1 ceiling AND keeps 2-way concurrency so a real-time crew turn isn't head-of-line blocked behind a song-compose)
-    timeout_floor_s: 900            # generous floor for long song-compose + forced reasoning (llama.cpp load is now ~30s, but the floor is a min-budget, not a target; kept at 900 to stay synced with the FLOOR_S mirror + the client sub-floor-honor path)
-    timeout_ceiling_s: 1800         # 2026-07-05: inherently long-running (cold load + long-form gen); a role override so the generous background band applies on EVERY tier (song-compose runs at P1). Adaptive surge×size widens up to here.
+    served_model_names: [creative, deckard-31b, deckard]   # `creative` = the LIVE boxa llama.cpp server (-a creative); `deckard`/`deckard-31b` = the DORMANT anvil rollback (serve_deckard.sh, on anvil) — declared so the naming-doctrine test covers them. `companion-lite` is a ROUTING alias, NOT a served -a name — the container runs `-a creative`.
+    model_family: Qwen3.6-35B-A3B (abliterated, Heretic) — MoE 35B total / ~3B active, Q4_K_M GGUF
+    quant: Q4_K_M
+    params: {active: 3B, total: 35B}
+    context_per_slot: 65536          # llama.cpp -c 393216 --parallel 6 = 65536/slot, f16 KV cache. Trimmed 76800->65536 (2026-07-11) to make room for the mmproj (861 MB) + vision-encoder compute buffer now that classify/vision re-homed here; ~30.5 GiB resident of the 32GB boxa, no GTT spill.
+    context_window: 32768            # fleet chunkers size against 32K on purpose (policy, not slot size) — same policy classify used, so re-homing classify here changes no chunk sizing
+    slots: 6                         # llama.cpp --parallel 6 — the shadow reconciler warns if this drifts from actual --parallel (6)
+    timeout_floor_s: 120            # compromise: this endpoint now serves BOTH long creative song-compose AND latency-sensitive chat (companion-lite alias). 120s min-budget; adaptive surge×size widens to the ceiling for big song-compose, and a stuck chat turn fails in ~120s instead of 900s. (mirrors timeout_model FLOOR_S["creative"] — bump BOTH in lockstep.)
+    timeout_ceiling_s: 1800         # inherently long-running (long-form gen); a role override so the generous background band applies on EVERY tier (song-compose runs at an interactive tier). Adaptive surge×size widens up to here.
     policy:
       background_floor_pct: 0.0
-      fast_path_reserve_slots: 1
-      # llama.cpp --parallel. Keep EQUAL to `slots: 2` above; the shadow reconciler warns on drift.
-      documented_max_num_seqs: 2
+      fast_path_reserve_slots: 2     # reserve 2 of 6 slots for interactive chat turns (companion-lite alias) so a real-time chat turn isn't head-of-line blocked behind a background song-compose.
+      # llama.cpp --parallel. Keep EQUAL to `slots: 6` above; the shadow reconciler warns on drift.
+      documented_max_num_seqs: 6
     capabilities:
-      vision: false                 # Trinity-Mini is TEXT-ONLY. The prior Gemma-4 served image+video; that capability is DROPPED in this swap (speed + family-diversity prioritized; classify(qwen3vl) remains the fleet's primary vision path — no creative-role caller sends images, verified 2026-07-08).
+      vision: true                  # mmproj loaded (mmproj-bf16.gguf, 861 MB) — classify's vision callers (attachments stage-2, knowledge_store intake, browser_broker perceive./vision.) route here now. Verified 2026-07-11: perfect OCR + shape/number extraction on the boxa/SYCL, ~79 t/s vision decode.
       streaming: true
-      reasoning: true               # Trinity ALWAYS thinks (cannot disable). llama.cpp --jinja routes CoT to the reasoning_content channel; VERIFIED 2026-07-08 NO <think> bleed into content (streaming + non-streaming). ~4-5s/call reasoning tax, absorbed by 88 t/s decode.
-      tool_calling: false           # auto-tool-choice OFF
-      structured_output: grammar    # llama.cpp GBNF / json_schema grammar. NOTE: give structured calls a generous max_tokens — forced reasoning consumes budget BEFORE the JSON (too-tight budget -> empty content).
-    token_speed: {decode_tok_s_at_1: 91, aggregate_tok_s_full: 57}   # measured 2026-07-08 (f16 KV, np2): ~91 t/s single-stream decode, ~2000 t/s prefill@4K, ~57 t/s conc-2 aggregate. NOTE: this card's decode is ~FLAT vs concurrency (GPU saturates on one stream) — more slots spread it thinner, they don't add aggregate.
-    purpose: Creative / counterpoint voice — a different-family (Arcee) generative model.
+      reasoning: false              # Qwen3.6 reasoning is DISABLED via `--jinja --chat-template-kwargs '{"enable_thinking":false}'` (VERIFIED 0 reasoning_content).
+      tool_calling: grammar         # now backs the inner-loop chat tool-calling (companion-lite alias): the orchestrator's tool catalog is GBNF grammar-constrained.
+      structured_output: grammar    # llama.cpp GBNF / response_format json_schema. NOTE: give structured calls a generous max_tokens.
+    token_speed: {note: "Qwen3.6-35B-A3B MoE (~3B active) Q4_K_M on the boxa (SYCL), --parallel 6 / 76800 ctx-per-slot; consolidated creative+companion-lite endpoint. Per-model decode/prefill numbers not yet re-benchmarked on this loadout — the prior Trinity-Mini/Gemma-4-26B figures are retired."}
+    purpose: |
+      The consolidated boxa core model — ONE abliterated Qwen3.6-35B-A3B (+mmproj) serving THREE roles:
+      (1) creative / counterpoint generative voice, (2) the orchestrator inner chat-loop backend
+      (companion-lite alias), and (3) the fleet text-classify + vision tier (classify/analyst family,
+      re-homed off the anvil GB10 — which is now free for imagegen/videogen).
     when_used:
       - sidekick song authoring (theme/hook/expand), dj crew speaker voice
+      - orchestrator inner chat loop (Sidekick's chat turn) via the companion-lite alias
+      - Tier-1.5/Tier-2 text classification (sidekick.extract_pad fallback, temporal.daily_summary, mail-agent.email_recent_overview, orchestrator.autonomous_chat-agent.reflect, forum-agent.peer_playbook) via the classify alias
+      - attachments stage-2 full-resolution image extraction; knowledge_store ground-truth PII/document intake; browser_broker vision-routed capabilities (perceive./vision./insurance./portal.) via the vision aliases
     fallback: composer
     notes: |
-      DEPLOYED MODEL (2026-07-08 swap): `arcee-ai/Trinity-Mini` (base released 2026-01) — a diverse
-      NON-Qwen/NON-Gemma MoE (26B total / ~3B active), Q4_K_M GGUF from `arcee-ai/Trinity-Mini-GGUF`
-      (/models/trinity-mini-gguf/Trinity-Mini-Q4_K_M.gguf on the box; squeezed from Q5_K_M 2026-07-11,
-      commit 42138723, to free co-tenant VRAM for companion-lite — +11% decode, MoE quant-robust).
-      Served on the Intel Arc Pro boxa
-      (10.0.0.10:9196, now CO-TENANT with `companion-lite` on :9197) by a standalone always-on docker container `llamacpp-creative-boxa`
-      (`ghcr.io/ggml-org/llama.cpp:server-intel`, SYCL/level_zero:0, --restart always;
-      `-ngl 99 -c 131072 --parallel 2 -fa on -ctk f16 -ctv f16 -b 4096 -ub 2048 --jinja`). NO dispatcher,
-      NO systemd — docker owns lifecycle. Depends on the /mnt/cache/llm NVMe mount. CANONICAL LAUNCH +
-      per-flag perf rationale: `infra/nasbox-vllm-xpu/serve_creative_llamacpp.sh` (re-run to recreate/retune).
-      PERF TUNING 2026-07-08 (A/B-benchmarked when the card served creative + nothing else; the boxa now also co-hosts `companion-lite` on :9197):
-      f16 KV (q8_0 dequant-on-read was the main decode cap here) + np2/separate-KV (np4 taxed single-stream) +
-      -ub 2048 (prefill) + 64K/slot (uses the free VRAM) => single-stream decode +79%, conc-2 agg +64%, prefill +28%.
-      WHY THE SWAP: the prior Gemma-4-31B-it-abliterated AWQ W4A16 on custom vLLM 0.23 XPU (config-C)
-      was DENSE -> bandwidth-bound on the 608 GB/s card -> pathological cold PREFILL (~30 t/s; a 16K
-      request took ~10 min). Trinity measured 2026-07-08 bake-off: prefill 1697 t/s @3K / 842 @16K,
-      decode 88 t/s single-stream at Q5 (see docs/creative_model_bakeoff_results_2026-07-07.md; ~101 t/s post Q4_K_M squeeze).
-      Uncensored-native — 0/8 refusals on the edgy creative battery, NO abliteration needed.
-      REASONING: Trinity ALWAYS thinks and it CANNOT be disabled; llama.cpp --jinja separates CoT into
-      the reasoning_content channel (VERIFIED no <think> bleed into content, streaming + non-streaming),
-      costing ~4-5s/call absorbed by the fast decode. STRUCTURED: give grammar/JSON calls a generous
-      max_tokens (reasoning consumes budget before the JSON). VISION DROPPED (Trinity is text-only; no
-      creative-role caller sends images). ROLLBACK: the prior Gemma-4-31B vLLM-XPU creative model files
-      (alonsoko-ct-w4a16 W4A16 + the gemma-4-31b-deckard bf16 source) were REMOVED in the 2026-07-11
-      cleanup, so the `vllm-creative-boxa` rollback is no longer a one-command `docker start` — to revert
-      to the vLLM creative you must first re-provision the W4A16 model from HF (serve_prod.sh + quantize.sh
-      show the source), then revert this entry (backend_engine: vllm, drop probe_kind, model_family/quant/
-      params/context/caps back to the Gemma values). The `deckard` aliases remain declared for the
-      naming-doctrine; serve_deckard.sh (anvil) is unaffected by the .10 cleanup.
+      CONSOLIDATED 2026-07-11 (three roles → one model): ONE standalone always-on docker container
+      `llamacpp-creative-boxa` (`ghcr.io/ggml-org/llama.cpp:server-intel`, SYCL/level_zero:0,
+      --restart always) on the Intel Arc Pro boxa (10.0.0.10:9196) now backs the `creative` role, the
+      `companion-lite` role (orchestrator chat loop), AND the `classify`/`analyst`/vision family
+      (re-homed off anvil). ALL non-creative roles are ALIASES of this one endpoint — no caller
+      changes, and keeping ONE stanza at ONE URL keeps 6-slot capacity accounting correct (two stanzas
+      at one URL would double-count the slots).
+      DEPLOYED MODEL: an abliterated (Heretic) `Qwen3.6-35B-A3B` MoE (35B total / ~3B active), Q4_K_M
+      GGUF + its native mmproj (mmproj-bf16.gguf, 861 MB) on the /mnt/cache/llm NVMe. Tool-calling +
+      VISION both live (vision verified 2026-07-11: perfect OCR/shape/number extraction, ~79 t/s).
+      Reasoning is DISABLED via `--jinja --chat-template-kwargs '{"enable_thinking":false}'` (verified
+      0 reasoning_content). NOTE: llama.cpp disables `--cache-reuse` when an mmproj is loaded (logged
+      at boot); cross-turn token reuse is off, but `--slot-prompt-similarity 0.5` still routes each
+      request to its warm slot.
+      Launch: `-ngl 99 -c 393216 --parallel 6 -fa on -ctk f16 -ctv f16 --mmproj …` => 65536 ctx/slot,
+      ~30.5 GiB resident of the 32GB card (trimmed from 76800 to make room for the mmproj + vision
+      compute). NO dispatcher, NO systemd — docker owns lifecycle; depends on the /mnt/cache/llm mount.
+      CANONICAL LAUNCH + per-flag rationale: `infra/nasbox-vllm-xpu/serve_creative_llamacpp.sh`.
+      This SUPERSEDED (a) the prior two-model creative/chat split (Trinity-Mini :9196 + Gemma-4-26B-A4B
+      :9197 — old `llamacpp-companion-lite-boxa` container STOPPED), AND (b) the anvil
+      `llama-classify.service` (Qwen3.6-35B-A3B+mmproj on the GB10 :9092 — STOPPED + disabled; the
+      GB10 is now free for imagegen/videogen, and classify no longer has to evict them). Moving the
+      light classify model OFF the contended anvil card also fixes classify's ~36s p95 queue-wait.
+      ROLLBACK: git-revert `serve_creative_llamacpp.sh` + re-run `serve_companion-lite_llamacpp.sh` +
+      re-enable `llama-classify.service` on anvil + revert these stanzas (all prior GGUFs remain
+      staged). The `deckard`/`deckard-31b` aliases remain declared for the naming-doctrine;
+      serve_deckard.sh (anvil) is unaffected.
 
-  companion-lite:
-    kind: chat
-    status: active                  # standalone docker container `llamacpp-companion-lite-boxa` (--restart always) on the boxa (CO-TENANT with `creative` — the boxa now serves TWO models) — no dispatcher/systemd; proxy dispatches directly, capacity self-discovered via /props. Landed 2026-07-11 (replaces the retired `mellum` focal slot).
-    proxy_endpoint: true
-    endpoint_class: companion-lite
-    role: companion-lite
-    reserved: true                    # RESERVED EXCLUSIVELY for the orchestrator chat loop. Active + shown on the Inference page, but the Model Playground filters it out (`_enrich` -> chat_roles.reserved) so it can't be manually driven — it must stay dedicated to the loop's warm single-slot prefix.
-    aliases: []                       # DEDICATED single-purpose role — NO aliases. The prior `mellum`/`mellum2`/`focal` aliases are RETIRED with the Mellum2 model. Do NOT reintroduce a `focal` alias here: this slot is the chat loop ONLY, not a focal/offload tier.
-    host: nasbox
-    port: 9197                        # host port -> container :8080 (docker -p 9197:8080)
-    backend_engine: llama.cpp
-    probe_kind: llama
-    served_model_names: [companion-lite]  # llama.cpp `-a companion-lite` (the serve script sets it); declared so the naming-doctrine test covers it
-    model_family: Gemma-4-26B-A4B-it (abliterated, MoE 26B total / ~4B active), imatrix Q4_K_M GGUF
-    quant: Q4_K_M
-    params: {active: 4B, total: 26B}  # MoE — only ~4B activate/token (fast decode) of 26B total. Cutover 2026-07-11 from the DENSE Ministral-3-8B.
-    context_per_slot: 16384          # llama.cpp -c 16384 --parallel 1 = 16384/slot (SEED — live /props self-corrects). Single slot => id_slot is ALWAYS 0.
-    context_window: 16384            # chat-loop turns size against 16K (persona+catalog prefix ~9k + dynamic delta)
-    slots: 1                         # llama.cpp --parallel 1 — DEDICATED single slot. This is a hard design property, not a tuning knob: the one warm slot holds the ~9k-token static persona+catalog prefix so only the dynamic delta prefills (validated: prompt-eval ~13k -> 680-3700/call, cold 4.1s -> warm 0.82s). Bumping to 2 would split/cold the prefix and defeat the whole point — do NOT.
-    slot_affinity: single            # single slot => id_slot always 0; chat-loop requests pass cache_prompt + id_slot:0 to keep the prefix permanently warm
-    timeout_floor_s: 60             # fast chat model (26B-A4B MoE, ~4B active @64.7 t/s, quick prefill on the warm prefix); a Sidekick chat turn. Min-budget floor. (mirrors timeout_model FLOOR_S["companion-lite"])
-    timeout_ceiling_s: 600
-    policy:
-      background_floor_pct: 0.0
-      fast_path_reserve_slots: 0     # single-slot endpoint (slots:1) — cannot reserve a fast-path slot out of 1; the one slot serves the chat loop. (creative reserves 1 because it has 2 slots.)
-      # llama.cpp --parallel. Keep EQUAL to `slots: 1` above; the shadow reconciler warns on drift.
-      documented_max_num_seqs: 1
-    capabilities:
-      vision: false                 # text-only chat model
-      streaming: true
-      reasoning: false              # Gemma-4-26B-A4B IS a reasoning model but CoT is DISABLED via `--chat-template-kwargs '{"enable_thinking":false}'` (MANDATORY — thinking-on triggers a <unused49> flood that never answers). Emits ZERO reasoning_content. Hard-turn case handled by per-turn escalation to composer-122B (ORIGINFLEET_LOOP_ESCALATION_ROLE).
-      tool_calling: grammar         # inner-loop tool-calling via GBNF grammar (the orchestrator's tool catalog is grammar-constrained)
-      structured_output: grammar    # llama.cpp GBNF + response_format json_schema
-    token_speed: {note: "Gemma-4-26B-A4B MoE (~4B active) imatrix Q4_K_M ~16.8GB weights resident on the boxa (SYCL); 64.7 t/s solo / 66 t/s co-tenant with creative, prefill ~320 t/s; warm-prefix chat turns prefill only the dynamic delta. WIRED-LOOP: /chat-perf 16/16 completed, ~2-3x faster than the 122B baseline; streaming TTFT ~4.3s direct / p50 6.7s w/ tools; wall p50 ~10s"}
-    purpose: |
-      RESERVED EXCLUSIVELY for the orchestrator inner chat loop (Sidekick's chat turn). This is a
-      DEDICATED, 1-SLOT model — NOT a shared / focal / general / reasoning tier, and NOT an
-      offload target for any other role. It exists solely to run chat turns fast off a permanently
-      warm persona+catalog prefix, with composer-122B as the per-turn escalation target. Nothing
-      else may route here.
-    when_used:
-      - orchestrator inner chat loop ONLY (ORIGINFLEET_LOOP_CHAT_ROLE=companion-lite)
-      - (per-turn escalation of a malformed/low-confidence turn bumps to composer-122B via ORIGINFLEET_LOOP_ESCALATION_ROLE=qwen-composer)
-    fallback: composer
-    notes: |
-      CUTOVER 2026-07-11: Gemma-4-26B-A4B-it (abliterated), imatrix Q4_K_M GGUF at
-      /models/gemma4-26b-ablit-gguf/gemma4-26b-a4b-ablit-i1-Q4_K_M.gguf on the box
-      (`mradermacher/gemma-4-26B-A4B-it-abliterated-i1-GGUF`) — a Gemma-4 MoE, 26B total / ~4B
-      active. SUPERSEDED the dense Ministral-3-8B: same warm-single-slot chat role, but a
-      26B-smart, best-voice model that still decodes fast (only ~4B activate/token). Served on the
-      Intel Arc Pro boxa (10.0.0.10:9197) by a standalone always-on docker container
-      `llamacpp-companion-lite-boxa` (`ghcr.io/ggml-org/llama.cpp:server-intel`, SYCL/level_zero:0,
-      --restart always; `-a companion-lite -ngl 99 -c 16384 --parallel 1 -fa on -ctk f16 -ctv f16
-      -b 4096 -ub 2048 --cache-reuse 256 --jinja --chat-template-kwargs '{"enable_thinking":false}'`),
-      CO-TENANT with `creative` (:9196) on the SAME boxa — Q4_K_M ~16.8GB weights + a 16K f16-KV slot
-      fit alongside creative's ~17.3GB (post-squeeze) on the 32GB card, VALIDATED co-resident +
-      healthy at 66 t/s. NO dispatcher, NO systemd — docker owns lifecycle. Depends on the
-      /mnt/cache/llm NVMe mount.
-      CANONICAL LAUNCH: `infra/nasbox-vllm-xpu/serve_companion-lite_llamacpp.sh` (re-run to recreate/retune).
-      REASONING OFF IS MANDATORY: Gemma-4-26B-A4B is a reasoning model; left thinking-on it triggers a
-      `<unused49>` token flood that fills context with NO answer. The ONLY reliable disable is
-      `--jinja --chat-template-kwargs '{"enable_thinking":false}'` (NOT `--reasoning-budget 0` /
-      `--reasoning-format none` — no-effect on this model). Verified: zero reasoning_content, clean even
-      on flood-trigger prompts.
-      WHY Q4_K_M (not Q4_0/IQ4_XS): on SYCL a MoE's expert tensors go through `mul_mat_id`, whose fast
-      reorder kernel covers Q4_K/Q5_K/Q6_K ONLY — Q4_0 and i-quants hit the slow path. So for THIS MoE
-      Q4_K_M is the FAST format (64.7 t/s) > Q4_0 (59.6) > IQ4_XS (49.1), the INVERSE of the dense
-      "Q4_0 fastest" rule. imatrix-calibrated Q4_K_M keeps quality above plain Q4_0.
-      RESERVED EXCLUSIVELY FOR THE CHAT LOOP: a single dedicated slot for the orchestrator inner chat
-      loop (Sidekick's chat turn), pinned via ORIGINFLEET_LOOP_CHAT_ROLE=companion-lite. NOT a
-      shared/focal/general tier and NOT an offload target for any other role — do not wire other callers
-      to it. The `--parallel 1` single slot plus cache_prompt/id_slot:0 requests keep the ~9k-token
-      static persona+catalog prefix permanently warm, so only the dynamic delta prefills. WIRED-LOOP
-      VALIDATED (/chat-perf): 16/16 completed, ~2-3x faster than the 122B baseline; streaming TTFT ~4.3s
-      direct / p50 6.7s w/ tools; wall p50 ~10s. ROLLBACK to Ministral-3-8B (GGUF was removed in the
-      2026-07-11 cleanup — re-pull an abliterated Ministral-3-8B Q4_K_M from HF into
-      /models/ministral3-8b-gguf/): set the serve script MODEL back + drop the --chat-template-kwargs
-      line, re-run, revert this stanza.
-      The prior Mellum2 'focal' / RAG-compression capability is RETIRED from the boxa — if focal /
-      RAG-compression is ever needed again it re-homes to `qwen-classify`, NOT here.
+  # companion-lite + classify/analyst/vision: RETIRED as distinct stanzas 2026-07-11 — MERGED into
+  # `creative` above as ALIASES (one Qwen3.6-35B-A3B-abliterated boxa container +mmproj backs all three
+  # roles; keeping ONE stanza at ONE URL keeps 6-slot capacity accounting correct). The orchestrator
+  # inner chat loop targets role `companion-lite`; classify/analyst/vision callers target their usual
+  # role names — all now resolve to the creative endpoint (:9196). The anvil llama-classify.service
+  # is stopped+disabled. See the creative stanza's `aliases:` + notes, and the `decommissioned:` block.
 
   # ---------------------------------------------------------------- retrieval
   embed:
@@ -809,6 +670,26 @@ models:
 # `inferctl models --all` and audits surface these with their retirement note.
 # ---------------------------------------------------------------------------
 decommissioned:
+  classify-anvil:
+    aliases: [qwen-classify, classify, chat, nexus-chat]
+    host: anvil
+    port: 9092
+    retired: 2026-07-11
+    notes: |
+      The anvil `llama-classify.service` (Qwen3.6-35B-A3B UD-Q4_K_M + native mmproj on the GB10
+      CUDA, :9092, kv-unified 131072/4 slots, evictable co-tenant of the imagegen/videogen
+      dispatcher). RE-HOMED onto the always-resident boxa `creative` endpoint (:9196) in the
+      2026-07-11 three-role consolidation (creative + companion-lite + classify on one abliterated
+      Qwen3.6-35B-A3B). Its role names — `classify`/`qwen-classify`/`chat`/`nexus-chat` plus the
+      analyst/vision aliases below — are now ALIASES of `creative`. Motivation: creative is used
+      ~6.4x more than classify, so classify was the light model; moving it to its own card fixes its
+      ~36s p95 queue-wait AND frees the anvil GB10 for imagegen/videogen (no more eviction dance).
+      The anvil unit is stopped+disabled (unit file + GGUF kept for rollback); the classify eviction
+      coupling in anvil_dispatcher/classify_evict.py is disabled and imagegen's idle-unload timeout
+      was relaxed since nothing competes for the card now. Behavior-preserving: same weights/mmproj,
+      same 32K chunking policy, reasoning-off, grammar tool-calling. Prior history (nexus->anvil
+      migration 2026-07-09, the 2026-07-02 3-way classify bake-off, the 2026-07-03 vision
+      consolidation) is in git + the bench_results/ docs referenced by the old analyst entries below.
   analyst:
     aliases: [qwen-analyst]
     host: nexus
@@ -825,8 +706,10 @@ decommissioned:
       of GTT, which — combined with the analyst-vision consolidation — is
       what makes the composer 122B swap's memory budget viable; see
       infra/nexus/runbooks/amdgpu_vm_memory_leak_2026-07-03.md for the full
-      memory-accounting story. `qwen-analyst`'s aliases now resolve to
-      `classify`; no caller code changes needed.
+      memory-accounting story. `qwen-analyst`'s aliases resolved to `classify`,
+      which itself re-homed to the boxa `creative` endpoint 2026-07-11 (see
+      `classify-anvil` above) — so they now resolve to `creative`; no caller
+      code changes needed.
   analyst-vision:
     aliases: [qwen-vision-8b, qwen-vision-9b, vision-8b]
     host: nexus
@@ -837,7 +720,9 @@ decommissioned:
       Consolidated into `classify` (Qwen3.6-35B-A3B's native mmproj) after a
       vision A/B found no substantial quality edge — see
       infra/nexus/bench_results/vision_consolidation_qwen36_35b_20260703.md.
-      Its aliases now resolve to `classify`; no caller code changes needed.
+      Its aliases resolved to `classify`, which re-homed to the boxa `creative`
+      endpoint 2026-07-11 (see `classify-anvil` above) — so they now resolve
+      to `creative`; no caller code changes needed.
   gemma-hot:
     aliases: [llama-gemma-hot]
     host: anvil

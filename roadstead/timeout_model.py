@@ -50,28 +50,26 @@ from .config import normalize_endpoint
 # disagrees with the yaml makes the client's sub-floor-honor decision drift from
 # what the server enforces. Keep them equal; test_timeout_floor_yaml_sync pins it.
 FLOOR_S: dict[str, float] = {
-    # classify (Qwen3.6-35B + vision): raised 45→180 in the 2026-07-04 nexus
-    # loadout (commit 35df6545). kv-unified allows big single requests; a cold
-    # ~37K prefill was hitting the old 45s floor. The vision half (image encode +
-    # extraction) also runs 15-30s/call. Mirrors models.yaml classify.timeout_floor_s.
-    "classify": 180.0,
+    # (The former "classify" FLOOR_S entry is removed 2026-07-11 — classify/analyst/vision re-homed
+    # onto the boxa `creative` endpoint as ALIASES, so normalize_endpoint() resolves "classify" to
+    # "creative" before this lookup and the "creative" floor below applies. On the dedicated boxa the
+    # cold prefill that motivated the old 180s floor is ~20s at 1807 t/s pp, and vision extract
+    # 15-30s — all well inside the 120s creative floor, with adaptive surge×size widening for big docs.)
     # companion = the `composer` role, now Qwen3.5-122B (2026-07-03 cutover from
     # the 80B). Raised 180→360 (commit 35df6545): the 122B is materially slower,
     # and the old 180s floor was truncating turns + streams under load. Mirrors
     # models.yaml composer.timeout_floor_s.
     "companion": 360.0,
     "thinker": 180.0,
-    # creative (Gemma-4-31B abliterated) is dense (~25 tok/s single-stream, 16 slots on the Arc Pro boxa);
-    # long-form creative generation needs a high floor so cold-start (no history) doesn't
-    # cap requests at the 60s default. recommended = max(p99*margin, floor) once warm.
-    # 900s (15min) so an ON-DEMAND cold model LOAD (several minutes) + generation can WAIT
-    # in-queue rather than time out — the song-compose author stages tolerate the wait.
-    "creative": 900.0,
-    # companion-lite (Gemma-4-26B-A4B abliterated MoE ~4B-active, boxa co-tenant, cutover 2026-07-11):
-    # the DEDICATED chat-loop model (Sidekick's chat turn) — 26B-smart but fast (~4B active @64.7 t/s)
-    # off a warm persona+catalog prefix. 60s floor mirrors models.yaml companion-lite.timeout_floor_s
-    # (bump BOTH in lockstep). Superseded the dense Ministral-3-8B; replaces the retired `mellum` slot.
-    "companion-lite": 60.0,
+    # creative (Qwen3.6-35B-A3B abliterated MoE, ~3B active, 6 slots on the Arc Pro boxa). CONSOLIDATED
+    # 2026-07-11: this ONE endpoint now backs THREE roles — `creative`, `companion-lite` (chat loop),
+    # AND the `classify`/`analyst`/vision family (re-homed off anvil) — all pure ALIASES that
+    # normalize to "creative". 120s is a compromise floor across long song-compose, latency-sensitive
+    # chat, and classify text/vision extraction: a stuck turn fails in ~120s instead of 900s while
+    # adaptive surge×size still widens up to the 1800s ceiling for a big song-compose or a big document
+    # vision extract. Mirrors models.yaml creative.timeout_floor_s (bump BOTH in lockstep). (The former
+    # companion-lite AND classify FLOOR_S entries are removed — both resolve via the alias.)
+    "creative": 120.0,
     "gemma": 60.0,
     # 2026-06-08: the "gemma-hot" endpoint class was removed from DEFAULT_ENDPOINTS
     # (E2B :9090 decommissioned; gemma-greeter consolidated onto the "gemma"/E4B
