@@ -85,31 +85,6 @@ def _has_consecutive_role(messages: Any, role: str) -> bool:
     return False
 
 
-def _coalesce_role(messages: Any, role: str) -> list:
-    """Collapse each run of ADJACENT ``role`` messages into one, joining their
-    string ``content`` with ``"\\n\\n"``. Content-preserving (order kept), and
-    since coalescing happens in the message body it never disturbs a byte-stable
-    leading system prefix used for prefix-cache reuse. Builds new dicts — never
-    mutates the caller's objects. Non-string content (e.g. a multimodal block
-    list) starts a new run so vision blocks are never mangled.
-    """
-    out: list = []
-    for msg in messages or []:
-        is_role = isinstance(msg, dict) and msg.get("role") == role
-        if (
-            is_role
-            and out
-            and out[-1].get("role") == role
-            and isinstance(out[-1].get("content"), str)
-            and isinstance(msg.get("content"), str)
-        ):
-            prev = out[-1]
-            out[-1] = {**prev, "content": f"{prev['content']}\n\n{msg['content']}"}
-        else:
-            out.append(msg)
-    return out
-
-
 def _first_nonsystem_is_assistant(messages: Any) -> bool:
     """True if the first non-system message is an assistant. Strict-alternation
     templates (Mistral/Ministral) require a USER turn to follow the optional
@@ -161,6 +136,14 @@ def _normalize_strict_alternation(messages: Any) -> list:
         if (
             out
             and role is not None
+            # Never merge consecutive tool messages: each carries its own
+            # ``tool_call_id`` that pairs it to a specific assistant tool_call,
+            # and ``{**prev, "content": ...}`` would keep only the FIRST id —
+            # silently dropping the second tool result's linkage (audit
+            # 2026-07-12, D-3a). Strict-alternation templates want user/assistant
+            # alternation anyway; tool turns are the backend's concern, not ours
+            # to coalesce.
+            and role != "tool"
             and out[-1].get("role") == role
             and isinstance(out[-1].get("content"), str)
             and isinstance(msg.get("content"), str)
@@ -177,21 +160,6 @@ def _normalize_strict_alternation(messages: Any) -> list:
     while rest and isinstance(rest[0], dict) and rest[0].get("role") == "assistant":
         rest = rest[1:]
     return lead + rest
-
-
-def _has_consecutive_system_messages(messages: Any) -> bool:
-    """True if ``messages`` has adjacent ``role: system`` entries.
-
-    The Qwen3.5-122B (composer) template raises ``System message must be at the
-    beginning`` on >1 system message; the dj crew and the inner-loop split a
-    stable leading system block from a dynamic one. Back-compat wrapper.
-    """
-    return _has_consecutive_role(messages, "system")
-
-
-def _coalesce_system_messages(messages: Any) -> list:
-    """Collapse adjacent ``role: system`` runs into one (back-compat wrapper)."""
-    return _coalesce_role(messages, "system")
 
 
 def _normalize_chat_payload(
@@ -739,8 +707,11 @@ class BackendClientPool:
                 status_code=resp.status_code,
                 body=body,
                 duration_s=duration,
-                input_tokens=usage.get("prompt_tokens", 0),
-                output_tokens=usage.get("completion_tokens", 0),
+                # Same defensive coercion as call() — a null/NaN/bool shadow
+                # usage count must never reach the INTEGER telemetry columns
+                # (audit 2026-07-12, D-4; parity with the primary path).
+                input_tokens=coerce_token_count(usage.get("prompt_tokens", 0)),
+                output_tokens=coerce_token_count(usage.get("completion_tokens", 0)),
                 cached_tokens=extract_cached_tokens(usage),
             )
         except Exception:

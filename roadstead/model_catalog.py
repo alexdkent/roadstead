@@ -125,10 +125,17 @@ def _coerce_entry(name: str, raw: dict[str, Any]) -> ModelEntry:
         v = raw.get(key) or []
         return tuple(v)
 
+    # A stanza that carries a `retired:` key (a retirement date) is retired,
+    # even if it lacks an explicit `status:` — otherwise a model left in the
+    # `models:` block with only `retired:` set silently defaults to "active"
+    # and reads as live (audit 2026-07-12, F-2). An explicit `status:` still
+    # wins (lets a re-activation override without deleting the audit trail).
+    status = raw.get("status") or ("retired" if raw.get("retired") else "active")
+
     return ModelEntry(
         name=name,
         kind=raw.get("kind", ""),
-        status=raw.get("status", "active"),
+        status=status,
         role=raw.get("role", name),
         aliases=_t("aliases"),
         proxy_endpoint=bool(raw.get("proxy_endpoint", False)),

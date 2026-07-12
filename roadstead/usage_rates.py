@@ -10,7 +10,7 @@ Two cost regimes:
 
   1. TOKEN-NATIVE LLM classes (chat / embed / rerank) — (in, out) USD per 1M
      tokens. Keyed by the proxy endpoint-CLASS (creative / companion / thinker /
-     gemma / mellum / embed / rerank); every legacy role/alias resolves to one of
+     gemma / embed / rerank); every legacy role/alias resolves to one of
      those via `_ENDPOINT_CLASS`.
 
   2. PER-UNIT capabilities (speech / audio) — the producer packs its NATIVE
@@ -45,7 +45,6 @@ _RATES_BY_CLASS: dict[str, tuple[float, float]] = {
     "companion": (0.15, 0.60),   # Qwen3.5-122B-A10B   → Qwen3-235B-A22B-Instruct-2507
     "creative":  (0.15, 0.55),   # Qwen3.6-35B-A3B+vis → Qwen3-VL-30B-A3B-Instruct (vision billed as input tokens, no premium)
     "gemma":     (0.04, 0.08),   # Gemma-4-E4B         → Gemma-3-4B-it (DeepInfra)
-    "mellum":    (0.15, 0.20),   # Mellum2-12B-A2.5B   → Qwen2.5-Coder-14B
     "embed":     (0.01, 0.0),    # BGE-M3 (EXACT model on DeepInfra) — market floor
     "rerank":    (0.02, 0.02),   # BGE-Reranker-v2-m3  → Voyage/Jina lite (per-token)
 }
@@ -92,7 +91,6 @@ _ENDPOINT_CLASS: dict[str, str | None] = {
     "gemma": "gemma", "gemma-router": "gemma", "nexus-gemma": "gemma",
     "router": "gemma", "classifier": "gemma",
     "gemma-hot": "gemma", "gemma-greeter": "gemma", "nexus-gemma-hot": "gemma",
-    "mellum": "mellum",
     "embed": "embed", "bge-m3-embed": "embed",
     "rerank": "rerank", "bge-reranker": "rerank", "nexus-rerank": "rerank",
     # --- per-unit: speech / audio (input_tokens = audio_seconds*100) ---

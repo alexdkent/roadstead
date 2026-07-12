@@ -38,8 +38,9 @@ def _make_scheduler(
 
 def _req(
     agent_id: str = "agent_a",
-    # qwen-analyst (30B) fully decommissioned 2026-07-03 — it's now a legacy
-    # alias resolving to "classify", so default to that class name directly.
+    # qwen-analyst (30B) fully decommissioned 2026-07-03; after the 2026-07-11
+    # boxa consolidation `classify` is itself an alias normalizing to the
+    # `creative` endpoint class — the default endpoint here resolves there.
     endpoint: str = "classify",
     priority: str = "P1_TURN_SUPPORT",
     call_site: str = "test",
@@ -257,7 +258,9 @@ class TestPickAgentDRR:
 
 class TestBackgroundFloor:
     def test_background_gets_floor_during_interactive_flood(self):
-        sched, config, _, bm = _make_scheduler(endpoints={"chat": 4})
+        # `chat` aliases to the `creative` endpoint class post-2026-07-11 boxa
+        # consolidation; the max_slots override keys on the class name.
+        sched, config, _, bm = _make_scheduler(endpoints={"creative": 4})
         now = time.monotonic()
 
         # 4 interactive requests
@@ -276,7 +279,7 @@ class TestBackgroundFloor:
         endpoints_used = [d.request.agent_id for d in decisions]
         priorities = [d.request.priority for d in decisions]
 
-        # bg floor for chat is 20% of 4 = 1 slot reserved for background
+        # bg floor for creative is 20% of 4 = 1 slot reserved for background
         # so interactive should get at most 3 slots, bg gets 1
         interactive_count = sum(1 for p in priorities if p <= LLMPriority.P1_TURN_SUPPORT)
         bg_count = sum(1 for p in priorities if p >= LLMPriority.P3_INGESTION)
@@ -287,7 +290,9 @@ class TestBackgroundFloor:
 
 class TestConcurrencyAwareAdmission:
     def test_respects_max_slots(self):
-        sched, *_ = _make_scheduler(endpoints={"classify": 2})
+        # classify aliases to the `creative` endpoint class (2026-07-11 boxa
+        # consolidation); the max_slots override keys on the class name.
+        sched, *_ = _make_scheduler(endpoints={"creative": 2})
         now = time.monotonic()
 
         # Submit 5 requests
@@ -297,7 +302,7 @@ class TestConcurrencyAwareAdmission:
         decisions = sched.tick(now + 0.01)
         # Should dispatch at most 2 (max_slots)
         assert len(decisions) <= 2
-        assert sched.active_count("classify") == len(decisions)
+        assert sched.active_count("creative") == len(decisions)
 
 
 class TestTimeout:
@@ -359,9 +364,10 @@ class TestInflightSnapshot:
         assert len(reqs) == 1
         row = reqs[0]
         assert row["request_id"] == req.request_id
-        # qwen-analyst (30B) fully decommissioned 2026-07-03 — it's now a
-        # legacy alias normalizing to the classify class, not "chat".
-        assert row["endpoint"] == "classify"
+        # qwen-analyst (30B) fully decommissioned 2026-07-03; after the
+        # 2026-07-11 boxa consolidation its legacy alias normalizes to the
+        # `creative` endpoint class.
+        assert row["endpoint"] == "creative"
         # `backend` = the actual host:port doing the processing (UI "Endpoint");
         # `served_model` = the model the backend answers to. Both derived from
         # the endpoint config so the In-Flight view can show model + endpoint.
@@ -370,7 +376,7 @@ class TestInflightSnapshot:
         assert row["agent"] == "agent_a"
         assert row["input_tokens"] > 0          # context size flowing through
         assert 0.9 <= row["elapsed_s"] <= 1.2   # ~1s since dispatch
-        assert snap["per_endpoint"]["classify"]["in_flight"] == 1
+        assert snap["per_endpoint"]["creative"]["in_flight"] == 1
 
     def test_inflight_snapshot_drops_completed(self):
         sched, *_ = _make_scheduler()
@@ -388,7 +394,7 @@ class TestInflightSnapshot:
             now + 0.5,
         )
         assert sched.inflight_snapshot(now + 0.6)["requests"] == []
-        assert sched.inflight_snapshot(now + 0.6)["per_endpoint"]["classify"]["in_flight"] == 0
+        assert sched.inflight_snapshot(now + 0.6)["per_endpoint"]["creative"]["in_flight"] == 0
 
 
 class TestQueuedRequestsAccessor:

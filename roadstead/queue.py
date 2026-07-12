@@ -21,6 +21,16 @@ from .scheduler import QueuedRequest
 
 logger = logging.getLogger(__name__)
 
+# Only the last 48h of durable context-overflow aggregates are seeded into the
+# in-memory /v1/status shadow on boot (audit 2026-07-12, E-4). The table keeps
+# a rolling per-(endpoint, caller) aggregate whose `last_at` is refreshed on
+# every new overflow; without a window an endpoint that overflowed 8 days ago
+# but never since presents on /v1/status.reliability.context_overflows_shadow
+# as if it were live, misleading the flip-gate review. The durable rows are
+# retained (the daily retention sweep governs deletion) — this only bounds what
+# is treated as CURRENT at seed time.
+_CONTEXT_OVERFLOW_SEED_WINDOW_S = 48 * 3600.0
+
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS proxy_queue (
     request_id     TEXT PRIMARY KEY,
@@ -829,12 +839,19 @@ class PersistentQueue:
 
     def load_context_overflows(self) -> dict[str, dict]:
         """Rebuild the /v1/status ``context_overflows_shadow`` shape from the
-        durable aggregates (startup seed)."""
+        durable aggregates (startup seed).
+
+        Windowed to the last ``_CONTEXT_OVERFLOW_SEED_WINDOW_S`` (48h) by
+        ``last_at`` (audit 2026-07-12, E-4): a stale aggregate that hasn't
+        overflowed since must NOT read as a live signal on /v1/status. The
+        durable rows persist regardless — this only bounds the seed."""
         if not self._conn:
             return {}
+        cutoff = time.time() - _CONTEXT_OVERFLOW_SEED_WINDOW_S
         rows = self._reader().execute(
             "SELECT endpoint, caller, count, max_est_in "
-            "FROM proxy_context_overflows").fetchall()
+            "FROM proxy_context_overflows WHERE last_at >= ?",
+            (cutoff,)).fetchall()
         out: dict[str, dict] = {}
         for ep, caller, count, max_in in rows:
             tally = out.setdefault(ep, {"count": 0, "callers": {}, "max_est_in": 0})

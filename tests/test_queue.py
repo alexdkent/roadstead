@@ -157,6 +157,26 @@ def test_open_sets_incremental_auto_vacuum(tmp_path):
     pq.close()
 
 
+def test_load_context_overflows_windows_out_stale_rows(tmp_path):
+    # E-4 (audit 2026-07-12): the boot seed must NOT present an 8-day-old
+    # overflow aggregate as a live /v1/status signal — only rows whose last_at
+    # is within the 48h window load into the shadow.
+    import time
+    from originfleet.llmproxy.queue import _CONTEXT_OVERFLOW_SEED_WINDOW_S
+    pq = PersistentQueue(str(tmp_path / "q.db"))
+    pq.record_context_overflow("creative", "callerOld", 8000)
+    pq.record_context_overflow("thinker", "callerFresh", 16000)
+    # Backdate the "creative" aggregate past the seed window.
+    pq._conn.execute(
+        "UPDATE proxy_context_overflows SET last_at=? WHERE endpoint=?",
+        (time.time() - (_CONTEXT_OVERFLOW_SEED_WINDOW_S + 3600), "creative"))
+    loaded = pq.load_context_overflows()
+    assert "thinker" in loaded, "fresh overflow row must seed the shadow"
+    assert "creative" not in loaded, "stale (>48h) overflow row must be windowed out"
+    assert loaded["thinker"]["max_est_in"] == 16000
+    pq.close()
+
+
 def test_checkpoint_truncate_shrinks_wal(tmp_path):
     pq = PersistentQueue(str(tmp_path / "q.db"))
     for i in range(500):

@@ -51,11 +51,13 @@ async def test_max_slots_drift_reconciler(proxy, monkeypatch):
 
     # 4) A llama.cpp endpoint (documented_max_num_seqs == 0) is NEVER reconciled,
     #    even if its max_slots is odd — the guard is vLLM-only.
-    # qwen-analyst (30B) fully decommissioned 2026-07-03 — "chat" is a legacy
-    # alias resolving to "classify" now, use that endpoint class directly.
+    # After the 2026-07-11 boxa consolidation the old classify/chat class is an
+    # alias of the `creative` endpoint, which DOES carry documented_max_num_seqs;
+    # `companion` (nexus llama.cpp, documented == 0) is the current example of a
+    # never-reconciled endpoint.
     thinker.max_slots = admitted_before  # restore the drift
-    chat = eps["classify"]
-    assert chat.documented_max_num_seqs == 0
-    chat.max_slots = 999
+    llamacpp_ep = eps["companion"]
+    assert llamacpp_ep.documented_max_num_seqs == 0
+    llamacpp_ep.max_slots = 999
     health.evaluate_alerts(time.monotonic())
     assert _drift_alerts(state) == [], "llama.cpp endpoint should never drift-alert"

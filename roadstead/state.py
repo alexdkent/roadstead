@@ -154,6 +154,13 @@ class ProxyState:
         # min_tokens; recovered = those that produced a real response.
         self.empty_rescue_attempts = 0
         self.empty_rescue_recovered = 0
+        # Per-endpoint empty-completion events (audit 2026-07-12, C-3): a 2xx
+        # backend response with no content/tool_calls (position-0-EOS), counted
+        # each time the fail-loud gate in backend.call() trips — the
+        # post-boxa-consolidation reliability signature for "empty completion on
+        # creative". Loop-thread-only writes (single-writer invariant), emitted
+        # on /metrics as ``llmproxy_empty_completion_total{endpoint}``.
+        self.empty_completion_by_endpoint: dict[str, int] = {}
         # Truncation / structured-validity guard tallies (operator mandate
         # 2026-07-11 — truncation must never pass silently; structured responses
         # must be valid JSON or an explicit error). Keyed "endpoint|agent_id" so

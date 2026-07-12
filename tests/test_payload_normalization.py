@@ -12,9 +12,9 @@ This is the test that would have caught the original bug.
 from __future__ import annotations
 
 from originfleet.llmproxy.backend import (
-    _coalesce_system_messages,
-    _has_consecutive_system_messages,
+    _needs_alternation_fix,
     _normalize_chat_payload,
+    _normalize_strict_alternation,
     _translate_anthropic_image_blocks,
 )
 from originfleet.llmproxy.coalesce import DeterministicCache
@@ -192,19 +192,127 @@ def test_coalesce_preserves_non_string_system_block():
     block = {"role": "system", "content": [{"type": "text", "text": "x"}]}
     msgs = [block, {"role": "system", "content": "after"},
             {"role": "user", "content": "u"}]
-    out = _coalesce_system_messages(msgs)
+    out = _normalize_strict_alternation(msgs)
     # The list-content system starts a fresh run; only compatible string runs merge.
     assert out[0]["content"] == [{"type": "text", "text": "x"}]
     assert [m["role"] for m in out] == ["system", "system", "user"]
 
 
-def test_has_consecutive_system_detector():
-    assert _has_consecutive_system_messages([
+# --- strict-alternation normalizer (Mistral/Ministral) regression suite ---
+# _normalize_strict_alternation + _needs_alternation_fix are the LIVE path
+# (the old _coalesce_*/_has_consecutive_system_messages wrappers were deleted
+# 2026-07-12, D-1). These lock every shape a strict-alternation template
+# rejects so the normalizer can't silently regress (D-2).
+
+def test_needs_alternation_fix_detects_each_bad_shape():
+    assert _needs_alternation_fix([
         {"role": "system"}, {"role": "system"}, {"role": "user"}])
-    assert not _has_consecutive_system_messages([
-        {"role": "system"}, {"role": "user"}, {"role": "system"}])
-    assert not _has_consecutive_system_messages([{"role": "user"}])
-    assert not _has_consecutive_system_messages(None)
+    assert _needs_alternation_fix([
+        {"role": "user"}, {"role": "user"}])
+    assert _needs_alternation_fix([
+        {"role": "user"}, {"role": "assistant"}, {"role": "assistant"}])
+    # leading assistant (after the optional system) is invalid
+    assert _needs_alternation_fix([
+        {"role": "system"}, {"role": "assistant"}, {"role": "user"}])
+    # already-valid alternation is not flagged
+    assert not _needs_alternation_fix([
+        {"role": "system"}, {"role": "user"}, {"role": "assistant"},
+        {"role": "user"}])
+    assert not _needs_alternation_fix([{"role": "user"}])
+    assert not _needs_alternation_fix(None)
+
+
+def test_normalize_coalesces_consecutive_user():
+    msgs = [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "second"},
+    ]
+    out = _normalize_strict_alternation(msgs)
+    assert [m["role"] for m in out] == ["user"]
+    assert out[0]["content"] == "first\n\nsecond"
+
+
+def test_normalize_coalesces_consecutive_assistant():
+    msgs = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    out = _normalize_strict_alternation(msgs)
+    assert [m["role"] for m in out] == ["user", "assistant"]
+    assert out[1]["content"] == "a1\n\na2"
+
+
+def test_normalize_drops_leading_assistant():
+    # An assistant before the first user turn (orphan history fragment) is
+    # dropped; a leading system is kept.
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "assistant", "content": "orphan"},
+        {"role": "user", "content": "u"},
+    ]
+    out = _normalize_strict_alternation(msgs)
+    assert [m["role"] for m in out] == ["system", "user"]
+    assert out[0]["content"] == "sys"
+    assert out[1]["content"] == "u"
+
+
+def test_normalize_tool_role_preserves_both_tool_call_ids():
+    # Two consecutive tool messages must NOT be merged — each carries its own
+    # tool_call_id, and a merge would drop the second (D-3a). BOTH survive.
+    msgs = [
+        {"role": "user", "content": "call two tools"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_a", "type": "function",
+             "function": {"name": "f", "arguments": "{}"}},
+            {"id": "call_b", "type": "function",
+             "function": {"name": "g", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "result A"},
+        {"role": "tool", "tool_call_id": "call_b", "content": "result B"},
+    ]
+    out = _normalize_strict_alternation(msgs)
+    tool_msgs = [m for m in out if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2, "consecutive tool messages must not be coalesced"
+    assert [m["tool_call_id"] for m in tool_msgs] == ["call_a", "call_b"]
+    assert [m["content"] for m in tool_msgs] == ["result A", "result B"]
+
+
+def test_normalize_empty_list():
+    assert _normalize_strict_alternation([]) == []
+    assert _normalize_strict_alternation(None) == []
+
+
+def test_normalize_single_message():
+    msgs = [{"role": "user", "content": "solo"}]
+    out = _normalize_strict_alternation(msgs)
+    assert out == [{"role": "user", "content": "solo"}]
+
+
+def test_normalize_all_same_role():
+    msgs = [
+        {"role": "user", "content": "a"},
+        {"role": "user", "content": "b"},
+        {"role": "user", "content": "c"},
+    ]
+    out = _normalize_strict_alternation(msgs)
+    assert [m["role"] for m in out] == ["user"]
+    assert out[0]["content"] == "a\n\nb\n\nc"
+
+
+def test_normalize_consecutive_user_via_full_payload_llamacpp():
+    # End-to-end through _normalize_chat_payload (llama.cpp path): consecutive
+    # user turns are coalesced so a Mistral/Ministral template doesn't 500.
+    payload = {
+        "model": "llama-thinker",
+        "messages": [
+            {"role": "user", "content": "one"},
+            {"role": "user", "content": "two"},
+        ],
+    }
+    out = _normalize_chat_payload(payload)  # vllm=False
+    assert [m["role"] for m in out["messages"]] == ["user"]
+    assert out["messages"][0]["content"] == "one\n\ntwo"
 
 
 # --- vLLM thinking-leak fix: default chat_template_kwargs.enable_thinking off ---

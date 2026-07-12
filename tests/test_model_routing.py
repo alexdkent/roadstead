@@ -32,9 +32,10 @@ def test_requested_model_wins_when_known_and_different():
         "payload_type": "chat_completion",
         "payload": {"model": "qwen-analyst"},  # but asks for qwen-analyst
     })
-    # qwen-analyst (30B) fully decommissioned 2026-07-03 — it's now a legacy
-    # alias resolving to classify, not a distinct "chat" endpoint.
-    assert ep == "classify"  # routed to classify, not thinker
+    # qwen-analyst (30B) fully decommissioned 2026-07-03; after the 2026-07-11
+    # boxa one-model consolidation its legacy alias (like classify/analyst/vision)
+    # resolves to the `creative` endpoint (boxa :9196), not a distinct endpoint.
+    assert ep == "creative"  # routed to creative, not thinker
 
 
 def test_no_override_when_model_matches_submit_endpoint():
@@ -42,9 +43,11 @@ def test_no_override_when_model_matches_submit_endpoint():
     ep = svc._resolve_endpoint({
         "endpoint": "classify",
         "payload_type": "chat_completion",
-        "payload": {"model": "qwen-analyst"},  # normalizes to classify == submit
+        # both `classify` (submit endpoint) and `qwen-analyst` (model) alias to
+        # `creative` post-2026-07-11 consolidation → they match, no override.
+        "payload": {"model": "qwen-analyst"},
     })
-    assert ep == "classify"
+    assert ep == "creative"
 
 
 def test_falls_back_when_model_absent():
@@ -107,7 +110,7 @@ def test_resolved_endpoint_flows_into_queued_request():
         priority="P4_HYGIENE", call_site="orchestrator.autonomous_chat-agent.reflect",
         payload_type="chat_completion", payload=body["payload"],
     )
-    assert req.endpoint == "classify"
+    assert req.endpoint == "creative"
 
 
 # ----- effective_model_id -----

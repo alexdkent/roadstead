@@ -820,6 +820,17 @@ class Lifecycle:
                 return
             except (BackendUnavailable, BackendError) as exc:
                 duration = time.monotonic() - t0
+                # Per-endpoint empty-completion tally (audit 2026-07-12, C-3):
+                # count EVERY empty-completion event (each attempt), before the
+                # retry decision, so the signal is complete whether or not the
+                # rescue path engages. Loop-thread-only increment (single-writer).
+                if (
+                    req.payload_type == "chat_completion"
+                    and "empty completion" in (exc.detail or "")
+                ):
+                    ep_key = normalize_endpoint(req.endpoint)
+                    self.state.empty_completion_by_endpoint[ep_key] = (
+                        self.state.empty_completion_by_endpoint.get(ep_key, 0) + 1)
                 # Phase 1.3 defer-don't-drop: a transient infra failure (backend
                 # unreachable/503, or an empty completion — a backend hiccup, not
                 # a content error) RETRIES within the remaining deadline rather

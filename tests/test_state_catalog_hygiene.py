@@ -50,6 +50,20 @@ def test_catalog_resolution_canonical_alias_unknown():
         assert cat.host_ip(e.name), f"{e.name} has no resolvable host ip"
 
 
+def test_coerce_entry_retired_key_sets_status():
+    # F-2 (audit 2026-07-12): a stanza carrying a `retired:` key is retired even
+    # without an explicit `status:` — it must NOT silently default to "active".
+    e = mc._coerce_entry("old-model", {"kind": "chat", "retired": "2026-07-11"})
+    assert e.status == "retired"
+    # No retired key → the historic "active" default is unchanged.
+    e2 = mc._coerce_entry("live-model", {"kind": "chat"})
+    assert e2.status == "active"
+    # An explicit status still wins over the retired-key inference.
+    e3 = mc._coerce_entry("odd", {"kind": "chat", "retired": "2026-01-01",
+                                  "status": "on_demand"})
+    assert e3.status == "on_demand"
+
+
 def test_endpoint_kwargs_derive_from_catalog():
     kwargs = mc.build_endpoint_kwargs()
     assert kwargs, "derived endpoint kwargs must not be empty"

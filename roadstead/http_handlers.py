@@ -258,6 +258,34 @@ class ProxyHttpHandlers:
                 out.append(Metric("llmproxy_alerts_active",
                                   by_sev.get(sev, 0), {"severity": sev}, "gauge",
                                   help="standing alert conditions by severity"))
+
+            # Per-caller truncation gauge (audit 2026-07-12, L-2): surfaces WHO
+            # is hitting output caps on WHICH model, split structured vs
+            # freetext, from the in-memory tally keyed "endpoint|agent_id". A
+            # climbing structured series is a caller max_tokens-too-low signal
+            # (e.g. the kv4 grader). Emitted as two series per caller so a TSDB
+            # rule can alert on structured truncations alone.
+            for key, t in (self.state.truncation_by_model_caller or {}).items():
+                endpoint, _, caller = str(key).partition("|")
+                for structured_flag, field in (("true", "structured"),
+                                                ("false", "freetext")):
+                    out.append(Metric(
+                        "llmproxy_truncations_total",
+                        int(t.get(field, 0) or 0),
+                        {"endpoint": endpoint, "caller": caller,
+                         "structured": structured_flag},
+                        "gauge",
+                        help="output-cap (finish_reason=length) hits by caller"))
+
+            # Per-endpoint empty-completion gauge (audit 2026-07-12, C-3): the
+            # post-boxa-consolidation "empty completion on creative" reliability
+            # signature. A 2xx with no content/tool_calls, counted each time the
+            # backend.call() fail-loud gate trips. Watch it — investigate if it
+            # climbs.
+            for endpoint, n in (self.state.empty_completion_by_endpoint or {}).items():
+                out.append(Metric("llmproxy_empty_completion_total", int(n or 0),
+                                  {"endpoint": str(endpoint)}, "gauge",
+                                  help="empty (position-0-EOS) completions by endpoint"))
         except Exception:
             logger.exception("llmproxy /metrics render failed")
             out = []

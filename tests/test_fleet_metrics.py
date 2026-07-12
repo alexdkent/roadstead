@@ -251,6 +251,33 @@ class _LoopReq:
 
 
 @_pt.mark.asyncio
+async def test_metrics_renders_truncation_gauge():
+    """L-2 (audit 2026-07-12): the per-caller truncation tally must surface on
+    /metrics so a TSDB rule can alert on structured truncations by caller."""
+    svc = ProxyService(ProxyConfig())
+    svc._state.truncation_by_model_caller["creative|kv4_grader"] = {
+        "count": 3, "structured": 2, "freetext": 1}
+    resp = await svc.handle_prometheus_metrics(_LoopReq({}))
+    text = resp.body.decode()
+    assert "llmproxy_truncations_total" in text
+    assert ('llmproxy_truncations_total{endpoint="creative",caller="kv4_grader",'
+            'structured="true"} 2') in text
+    assert ('llmproxy_truncations_total{endpoint="creative",caller="kv4_grader",'
+            'structured="false"} 1') in text
+
+
+@_pt.mark.asyncio
+async def test_metrics_renders_empty_completion_gauge():
+    """C-3 (audit 2026-07-12): the per-endpoint empty-completion counter must
+    surface on /metrics so the post-boxa reliability signature is trendable."""
+    svc = ProxyService(ProxyConfig())
+    svc._state.empty_completion_by_endpoint["creative"] = 5
+    resp = await svc.handle_prometheus_metrics(_LoopReq({}))
+    text = resp.body.decode()
+    assert 'llmproxy_empty_completion_total{endpoint="creative"} 5' in text
+
+
+@_pt.mark.asyncio
 async def test_calls_log_409_for_llm_class_endpoints():
     """A pushed call whose endpoint normalizes to a proxy-native LLM class
     duplicates a natively-recorded row (the 2026-06-11 rerank double-count
