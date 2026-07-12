@@ -203,6 +203,36 @@ async def test_sync_freetext_truncation_served_but_loud(caplog):
 
 
 @pytest.mark.asyncio
+async def test_sync_freetext_warmer_probe_exempt_from_marker(caplog):
+    """A prefix-cache warmer deliberately asks for a 1-token (gemma: 16) freetext
+    completion to keep the composer prefix hot; finish_reason=length on such a
+    probe is EXPECTED, not a caller-visible cut-off. It must NOT log a marker or
+    tally — else the warmers (fired every ~90s) bury the real truncation signal.
+    Regression guard for the 2026-07-12 warmer exemption."""
+    svc = _svc_sync("x", "length", output_tokens=1)
+    with caplog.at_level(logging.ERROR):
+        resp, result = await _drive_sync(svc, _payload(max_tokens=1))
+    # Response still delivered (freetext truncation is never a hard failure)…
+    assert resp.status_code == 200 and result["status"] == "ok"
+    # …but the marker + tally are suppressed for the tiny probe.
+    markers = [r for r in caplog.records if "LLMPROXY_TRUNCATION" in r.getMessage()]
+    assert markers == []
+    assert _tally(svc) is None
+    assert svc._correction.state.truncation_total == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_freetext_16token_probe_exempt(caplog):
+    """The gemma warmer uses max_tokens=16 — the exemption ceiling is inclusive."""
+    svc = _svc_sync("x", "length", output_tokens=16)
+    with caplog.at_level(logging.ERROR):
+        resp, result = await _drive_sync(svc, _payload(max_tokens=16))
+    assert resp.status_code == 200 and result["status"] == "ok"
+    assert [r for r in caplog.records if "LLMPROXY_TRUNCATION" in r.getMessage()] == []
+    assert svc._correction.state.truncation_total == 0
+
+
+@pytest.mark.asyncio
 async def test_sync_freetext_truncation_never_cached():
     """A temperature=0 free-text truncation is served but must NOT enter the
     deterministic cache — otherwise one capped call re-serves the cut-off text

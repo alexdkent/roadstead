@@ -1220,18 +1220,28 @@ class Correction:
         mislabels that finish as "tool_calls"). The ``LLMPROXY_TRUNCATION``
         marker is stable — log_scan / health-verifier grep for it. Synchronous +
         allocation-light (one small dict row per (model, caller))."""
+        p = req.payload if isinstance(req.payload, dict) else {}
+        max_tokens = int(p.get("max_tokens") or 0)
+        # Prefix-cache warmers deliberately request a 1-token (gemma: 16) freetext
+        # completion to keep the composer prefix hot (orchestrator warm_prefix,
+        # dj crew warm probe). finish_reason=length on such a probe is EXPECTED —
+        # the caller never wanted more than a token — so it's not a caller-visible
+        # cut-off. Tallying/logging these buries the real signal (513:67 over the
+        # 7-day log) and fires a benign ERROR every ~90s. A real structured call
+        # never asks for ≤16 tokens, so scope the exemption to tiny freetext.
+        if not structured and 0 < max_tokens <= 16:
+            return
         key = f"{req.endpoint}|{req.agent_id}"
         tally = self.state.truncation_by_model_caller.setdefault(
             key, {"count": 0, "structured": 0, "freetext": 0})
         tally["count"] += 1
         tally["structured" if structured else "freetext"] += 1
         self.state.truncation_total += 1
-        p = req.payload if isinstance(req.payload, dict) else {}
         logger.error(
             "LLMPROXY_TRUNCATION model=%s agent=%s call_site=%s priority=%s "
             "max_tokens=%s output_tokens=%d structured=%s stream=%s status=%s",
             req.endpoint, req.agent_id, req.call_site, req.priority.name,
-            p.get("max_tokens", 0), output_tokens, structured, stream, status)
+            max_tokens, output_tokens, structured, stream, status)
 
     def enforce_toolcall_truncation(self, req: "QueuedRequest", result: dict) -> None:
         """SYNC mirror of the stream sanitizer's finalize rule (operator mandate
