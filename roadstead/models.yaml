@@ -158,7 +158,7 @@ models:
     quant: Q4_K_XL
     context_per_slot: 16384
     context_window: 16384
-    slots: 2
+    slots: 4                          # 2026-07-12: 2->4 (--parallel 4, --ctx-size 65536 on anvil:9091). 2 slots couldn't absorb bursts from the many cheap gemma callers (greeter advisory every turn + sidekick.extract_pad/obs + tool routers + classify), spiking tail latency into their aggressive per-call timeouts. E4B is tiny (~4.3GB) with ample anvil headroom; live value still comes from /props.
     timeout_floor_s: 60
     capabilities:
       vision: false
