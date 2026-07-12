@@ -32,14 +32,13 @@ class IPIdentityMap:
         # nets PLUS an explicit allow-list — deliberately SEPARATE from
         # _internal_nets so granting admin never changes a host's inference
         # PRIORITY (identify() matches _internal_nets first, before subnet
-        # entries — see is_admin). 2026-07-09: anvil (10.0.0.3) added so the
-        # anvil-dispatcher can pause/resume the `classify` endpoint when it
-        # evicts classify to free GPU memory for an image/video job. This is the
-        # one deliberate widening of the 2026-06-10 loopback-only tightening;
-        # the admin-audit IP log still records every admin call.
-        self._admin_nets = list(self._internal_nets) + [
-            ipaddress.ip_network("10.0.0.3/32"),
-        ]
+        # entries — see is_admin). 2026-07-09 anvil (10.0.0.3) was added here so
+        # the anvil-dispatcher could pause/resume the `classify` endpoint during
+        # eviction; REMOVED 2026-07-11 — classify re-homed off anvil onto the boxa
+        # `creative` endpoint and the eviction coordinator is now inert, so anvil
+        # no longer needs proxy admin. Back to loopback-only (the 2026-06-10 posture).
+        # ROLLBACK (if classify is re-stood-up on anvil): re-add 10.0.0.3/32 below.
+        self._admin_nets = list(self._internal_nets)
 
     def register(
         self,
@@ -94,8 +93,10 @@ class IPIdentityMap:
         internal (port not published) and every legitimate admin caller goes
         through ``docker exec curl localhost`` (restart_llm.sh) or the gateway
         on loopback — verified by the admin-audit IP log before tightening
-        (2026-06-10: 127.0.0.1 only). 2026-07-09: anvil (10.0.0.3) added to
-        _admin_nets for the classify-evict pause/resume (see __init__)."""
+        (2026-06-10: 127.0.0.1 only). 2026-07-09: anvil (10.0.0.3) was added to
+        _admin_nets for the classify-evict pause/resume; REMOVED 2026-07-11 when
+        classify re-homed off anvil (eviction now inert) — back to loopback-only
+        (see __init__)."""
         try:
             addr = ipaddress.ip_address(remote_ip)
         except ValueError:

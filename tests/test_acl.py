@@ -21,15 +21,17 @@ def test_lan_generic_subnet():
     assert r == ("lan-generic", LLMPriority.P3_INGESTION)
 
 
-def test_anvil_is_admin_but_priority_unchanged():
-    # 2026-07-09: anvil (10.0.0.3) was granted admin (via _admin_nets, NOT
-    # _internal_nets) so the anvil-dispatcher can pause/resume the `classify`
-    # endpoint when it evicts classify for image/video work. Pin BOTH facts:
-    #   (1) anvil IS admin now,
-    #   (2) the grant did NOT upgrade anvil's inference priority — identify()
-    #       must still resolve it via its subnet entry, not the P1 internal path.
+def test_anvil_not_admin_but_priority_unchanged():
+    # 2026-07-09: anvil (10.0.0.3) was granted admin (via _admin_nets) for the
+    # classify-evict pause/resume. 2026-07-11: REVOKED — classify re-homed off
+    # anvil onto the boxa `creative` endpoint and the eviction coordinator is
+    # inert, so anvil no longer needs proxy admin (back to loopback-only). Pin:
+    #   (1) anvil is NO LONGER admin,
+    #   (2) revoking admin did NOT change anvil's inference priority — identify()
+    #       still resolves it via its own registration (anvil-local / P3), not the
+    #       P1 internal path.
     acl = IPIdentityMap.from_env()
-    assert acl.is_admin("10.0.0.3") is True
+    assert acl.is_admin("10.0.0.3") is False
     assert acl.identify("10.0.0.3") != ("internal", LLMPriority.P1_TURN_SUPPORT)
     # A different LAN host is neither admin nor internal.
     assert acl.is_admin("10.0.0.50") is False
