@@ -1391,7 +1391,7 @@ class PersistentQueue:
         if not self._conn:
             return []
         from .timeout_model import percentile
-        from .usage_rates import cloud_rate
+        from .usage_rates import cloud_cost_usd
         col = {
             "agent": "agent_id", "call_site": "call_site",
             "endpoint": "endpoint", "provider": "endpoint",
@@ -1413,13 +1413,12 @@ class PersistentQueue:
                 "key": key, "requests": 0, "ok": 0, "errors": 0,
                 "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "_lats": [],
             })
-            in_rate, out_rate = cloud_rate(endpoint or "")
             a["requests"] += int(n)
             a["ok"] += int(ok or 0)
             a["errors"] += int(n) - int(ok or 0)
             a["tokens_in"] += int(tin or 0)
             a["tokens_out"] += int(tout or 0)
-            a["cost_usd"] += (int(tin or 0) / 1e6) * in_rate + (int(tout or 0) / 1e6) * out_rate
+            a["cost_usd"] += cloud_cost_usd(endpoint or "", tin, tout)
             a["_lats"].extend(int(x) for x in (lats or "").split(",") if x)
         out: list[dict] = []
         for a in agg.values():
@@ -1438,7 +1437,7 @@ class PersistentQueue:
         host daemon's ``fleet_savings`` (now proxy-authoritative)."""
         if not self._conn:
             return {"today_usd": 0.0, "total_usd": 0.0, "by_endpoint": []}
-        from .usage_rates import cloud_rate
+        from .usage_rates import cloud_cost_usd
         if today_start is None:
             lt = time.localtime()
             today_start = time.mktime((
@@ -1460,9 +1459,8 @@ class PersistentQueue:
             in_total, out_total = int(in_total or 0), int(out_total or 0)
             today_in += in_today; today_out += out_today
             total_in += in_total; total_out += out_total
-            in_rate, out_rate = cloud_rate(ep or "")
-            t_today = (in_today / 1e6) * in_rate + (out_today / 1e6) * out_rate
-            t_total = (in_total / 1e6) * in_rate + (out_total / 1e6) * out_rate
+            t_today = cloud_cost_usd(ep or "", in_today, out_today)
+            t_total = cloud_cost_usd(ep or "", in_total, out_total)
             today_usd += t_today; total_usd += t_total
             by_endpoint.append({
                 "endpoint": ep, "today_usd": round(t_today, 4),

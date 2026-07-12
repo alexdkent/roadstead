@@ -15,7 +15,7 @@ from originfleet.llmproxy.config import ProxyConfig
 from originfleet.llmproxy.queue import PersistentQueue
 from originfleet.llmproxy.service import ProxyService
 from originfleet.llmproxy.sse_hub import DROP_SENTINEL, SSEHub
-from originfleet.llmproxy.usage_rates import cloud_rate
+from originfleet.llmproxy.usage_rates import cloud_cost_usd, cloud_rate
 
 
 # ----- queue: non-LLM ingest + rollups -----
@@ -63,25 +63,26 @@ def test_fleet_activity_aggregates(tmp_path):
 
 def test_usage_rollup_by_agent_with_cost(tmp_path):
     pq = PersistentQueue(str(tmp_path / "q.db"))
-    # thinker tokens cost the most (Opus-equivalent rate)
+    # Realistic open-model rental rates (2026-07-12): thinker = Qwen3-32B tier.
     _llm(pq, "l1", endpoint="thinker", in_tok=1_000_000, out_tok=1_000_000, agent="knowledge")
     _ext(pq, "e1", "whisper-1", kind="audio", in_tok=1_000_000, agent="tideway")
     rows = pq.usage_rollup("agent", hours=1)
     by_agent = {r["key"]: r for r in rows}
-    # thinker: 15/M in + 75/M out = 90.0
-    assert by_agent["knowledge"]["cost_usd"] == pytest.approx(90.0, abs=0.01)
-    # whisper: 0.36/M in, 0 out = 0.36
-    assert by_agent["tideway"]["cost_usd"] == pytest.approx(0.36, abs=0.01)
+    # thinker: 0.15/M in + 0.50/M out = 0.65
+    assert by_agent["knowledge"]["cost_usd"] == pytest.approx(0.65, abs=0.01)
+    # whisper (stt): input_tokens = audio_seconds*100 → 1M = 10_000s = 2.778 hr
+    #                × $0.111/hr = $0.308
+    assert by_agent["tideway"]["cost_usd"] == pytest.approx(0.308, abs=0.01)
     assert by_agent["knowledge"]["requests"] == 1
     pq.close()
 
 
 def test_savings_summary(tmp_path):
     pq = PersistentQueue(str(tmp_path / "q.db"))
-    _llm(pq, "l1", endpoint="gemma", in_tok=1_000_000, out_tok=0)  # 1.0/M = $1
+    _llm(pq, "l1", endpoint="gemma", in_tok=1_000_000, out_tok=0)  # 0.04/M in = $0.04
     s = pq.savings_summary(today_start=0.0)  # everything counts as "today"
-    assert s["total_usd"] == pytest.approx(1.0, abs=0.01)
-    assert s["today_usd"] == pytest.approx(1.0, abs=0.01)
+    assert s["total_usd"] == pytest.approx(0.04, abs=0.001)
+    assert s["today_usd"] == pytest.approx(0.04, abs=0.001)
     assert s["total_tokens_in"] == 1_000_000
     pq.close()
 
@@ -99,12 +100,12 @@ def test_top_callers_groups_by_endpoint(tmp_path):
 
 def test_endpoint_series(tmp_path):
     pq = PersistentQueue(str(tmp_path / "q.db"))
-    _llm(pq, "l1", endpoint="classify", dur=1.0, status="ok")
-    _llm(pq, "l2", endpoint="classify", dur=2.0, status="error")
-    # qwen-analyst (30B) fully decommissioned 2026-07-03 — now a legacy alias
-    # resolving to classify, not a distinct "chat" endpoint class.
+    _llm(pq, "l1", endpoint="creative", dur=1.0, status="ok")
+    _llm(pq, "l2", endpoint="creative", dur=2.0, status="error")
+    # classify/analyst RE-HOMED onto the boxa `creative` endpoint 2026-07-11 (three-role
+    # consolidation) — qwen-analyst is now a legacy alias resolving to `creative`.
     out = pq.endpoint_series("qwen-analyst", window_s=3600, bin_s=60)  # role → class
-    assert out["endpoint"] == "classify"
+    assert out["endpoint"] == "creative"
     total = sum(b["n"] for b in out["calls_series"])
     assert total == 2
     pq.close()
@@ -113,11 +114,32 @@ def test_endpoint_series(tmp_path):
 # ----- usage rate table -----
 
 def test_cloud_rate_resolves_class_unit_and_role():
-    assert cloud_rate("thinker") == (15.0, 75.0)
-    assert cloud_rate("llama-thinker") == (15.0, 75.0)   # role alias
-    assert cloud_rate("whisper-1") == (0.36, 0.0)        # non-LLM unit
+    # Token-native LLM classes: realistic open-model rental rates (2026-07-12).
+    assert cloud_rate("thinker") == (0.15, 0.50)
+    assert cloud_rate("llama-thinker") == (0.15, 0.50)   # role alias -> thinker
+    assert cloud_rate("classify") == (0.15, 0.55)        # legacy alias -> creative
+    assert cloud_rate("gemma") == (0.04, 0.08)
+    # Per-unit / no-analog endpoints carry NO token rate (cost via cloud_cost_usd).
+    assert cloud_rate("orpheus-tts") == (0.0, 0.0)       # per-char, not per-token
+    assert cloud_rate("nasbox-whisper") == (0.0, 0.0)    # per-audio-hour
     assert cloud_rate("got-ocr") == (0.0, 0.0)           # no analog
     assert cloud_rate("nonsense") == (0.0, 0.0)
+
+
+def test_cloud_cost_usd_token_and_per_unit():
+    # 1. Token-native: rate x tokens.
+    assert cloud_cost_usd("thinker", 1_000_000, 1_000_000) == pytest.approx(0.65)  # 0.15 + 0.50
+    assert cloud_cost_usd("classify", 1_000_000, 0) == pytest.approx(0.15)         # alias -> creative
+    assert cloud_cost_usd("companion-lite", 1_000_000, 0) == pytest.approx(0.15)   # alias -> creative
+    # 2. Per-audio-hour: input_tokens = audio_seconds * 100, so 360_000 = 1 hour.
+    assert cloud_cost_usd("nasbox-whisper", 360_000, 0) == pytest.approx(0.111)     # stt
+    assert cloud_cost_usd("nasbox-diarize", 360_000, 0) == pytest.approx(0.12)      # diarize
+    # 3. Per-character TTS: input_tokens = characters.
+    assert cloud_cost_usd("orpheus-tts", 1_000_000, 5_000_000) == pytest.approx(15.0)  # 1M chars; out ignored
+    # 4. No-analog / not-yet-metered -> $0 (stream avoids double-counting stt).
+    assert cloud_cost_usd("stream", 10_000_000, 0) == 0.0
+    assert cloud_cost_usd("imagegen", 999, 999) == 0.0
+    assert cloud_cost_usd("nonsense", 1_000_000, 1_000_000) == 0.0
 
 
 # ----- SSE hub -----
