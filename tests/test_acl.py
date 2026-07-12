@@ -45,6 +45,15 @@ def test_exact_registration_beats_subnet():
     assert acl.identify("10.0.0.9") == ("tideway", LLMPriority.P3_INGESTION)
 
 
+def test_recipe_runner_labeled_not_lan_generic():
+    # recipe-runner (Kestrel CTnnn, static 10.0.0.14) hits the OpenAI-compat door as a
+    # plain OpenAI client with no identity header; the exact registration must label
+    # it `recipe-runner` instead of letting it fall through to the lan-generic catch-all
+    # (2026-07-12). P3 tier is preserved — this is identity-only, not a QoS change.
+    acl = IPIdentityMap.from_env()
+    assert acl.identify("10.0.0.14") == ("recipe-runner", LLMPriority.P3_INGESTION)
+
+
 def test_unknown_ip_denied():
     acl = IPIdentityMap.from_env()
     assert acl.identify("8.8.8.8") is None

@@ -132,6 +132,14 @@ class IPIdentityMap:
         acl.register("10.0.0.9", "tideway", LLMPriority.P3_INGESTION)
         acl.register("10.0.0.6", "nexus-local", LLMPriority.P3_INGESTION)
         acl.register("10.0.0.3", "anvil-local", LLMPriority.P3_INGESTION)
+        # recipe-runner (Kestrel CTnnn, static 10.0.0.14). The Goose CLI's own LLM
+        # provider hits the OpenAI-compat door (NEXUS_URL=…:42161/v1,
+        # GOOSE_MODEL=llama-thinker) as a plain OpenAI client — no identity
+        # header — so without this it fell through to `lan-generic`, hiding the
+        # fleet's single highest-volume OpenAI-door caller (~9k calls, mostly
+        # thinker) behind the catch-all. Identity-only fix: same P3 tier it
+        # already got via the subnet default, so QoS is unchanged. (2026-07-12)
+        acl.register("10.0.0.14", "recipe-runner", LLMPriority.P3_INGESTION)
         acl.register("10.0.0.0/24", "lan-generic", LLMPriority.P3_INGESTION)
 
         return acl
