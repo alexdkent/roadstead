@@ -187,12 +187,13 @@ class EndpointConfig:
 
     # Hard ceiling on CONCURRENT dispatch to this endpoint, independent of the
     # discovered physical slot count. 0 -> use max_slots (no extra cap). Set
-    # BELOW max_slots for a concurrency-fragile backend to leave crash-headroom:
-    # the companion 80B (Strix Halo Vulkan, patched-cache) aborted under full
-    # 4-slot pressure with a llama.cpp KV-seq-removal assertion (2026-06-01, G1),
-    # so it runs at 3 to keep one slot of headroom and lower the peak
-    # seq-management concurrency. Caps DISPATCH only; capacity discovery and
-    # reporting still use max_slots.
+    # BELOW max_slots for a concurrency-fragile backend to leave crash-headroom.
+    # Historical example: the FORMER companion, Qwen3-Next-80B (Strix Halo Vulkan,
+    # patched-cache), aborted under full 4-slot pressure with a llama.cpp
+    # KV-seq-removal assertion (2026-06-01, G1), so it ran at 3 for headroom. That
+    # 80B was retired 2026-07-03 — companion is now Qwen3.5-122B-A10B on nexus,
+    # which re-validated safe at cap 4 (see models.yaml composer.policy). Caps
+    # DISPATCH only; capacity discovery and reporting still use max_slots.
     dispatch_concurrency_cap: int = 0
 
     # --- backend connection ---

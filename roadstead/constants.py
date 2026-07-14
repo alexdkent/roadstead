@@ -23,8 +23,10 @@ _DEFAULT_TIMEOUT_S = 180.0
 _SMART_DEFAULT_CAP_S = 1800.0
 
 # Phase 5C — time-to-first-token watchdog for streaming. Data (2026-05-31): the
-# companion 80B sometimes produces ZERO tokens on a large-context synth and burns
-# the FULL deadline (180s), uselessly holding a scarce slot. If no first token
+# then-companion Qwen3-Next-80B (retired 2026-07-03; companion is now the
+# Qwen3.5-122B-A10B on nexus) sometimes produced ZERO tokens on a large-context
+# synth and burned the FULL deadline (180s), uselessly holding a scarce slot. The
+# watchdog still applies to the 122B. If no first token
 # arrives within this bound, abort + free the slot + return a deferrable error so
 # the caller defers instead of the slot being dead for minutes. Capped to the
 # caller's own deadline so a legitimately short request isn't over-waited.
