@@ -112,7 +112,12 @@ models:
       dispatch_concurrency_cap: 4   # re-validated for the 122B via llama-batched-bench (1/2/4/8 parallel,
                                     # no instability found through 8) — the old cap:3 was specific to the
                                     # 80B's own G1 crash history, doesn't carry over to a different model.
-      fast_path_reserve_slots: 1
+      fast_path_reserve_slots: 1    # background_cap = 4-1 = 3, the doctrine-MAX. Do NOT set reserve:0 to
+                                    # give extraction all 4 slots (tried 2026-07-17): reserve:0 alone
+                                    # backfires (cap→0.20 floor=1); reserve:0+background_floor_pct:1.0 breaks
+                                    # the anti-starvation invariant (test_background_cap.py — floor must leave
+                                    # >=1 for interactive). Reclaiming the idle 4th slot needs a SCHEDULER
+                                    # change, not config. Real throughput lever = smoothing the kv3/kv4 feed.
       slot_affinity: true           # pin a conversation to one slot (KV reuse via --slot-prompt-similarity)
     capabilities:
       vision: false
