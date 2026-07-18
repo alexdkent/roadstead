@@ -483,15 +483,18 @@ models:
     port: 8086
     slots: 1                          # single-worker ThreadPoolExecutor(max_workers=1) — sequential
     backend_engine: shim
-    model_family: Whisper Large v3 (int8, OpenVINO)
-    purpose: Speech-to-text transcription.
+    model_family: parakeet-tdt-0.6b-v3 (onnx-asr, CPU)
+    purpose: Speech-to-text transcription (speech unit).
     when_used:
       - Tideway transcription, voice intake, Wyoming ASR for HA
     fallback: null
     notes: |
-      Runs on the Nasbox Intel Xe/NPU box (10.0.0.10) since 2026-06-12; relocated
-      to Kestrel CTnnn "audio" (10.0.0.13, same image/port, Iris Xe iGPU) 2026-07-03.
-      Nasbox's copy left running as rollback during soak.
+      Speech STT migrated off whisper to NVIDIA parakeet-tdt-0.6b-v3 (onnx-asr,
+      CPU EP) 2026-07-18 (STT_BACKEND=parakeet) — off the contended iGPU; instant
+      rollback STT_BACKEND=whisper. The DJ song-lyrics transcribe unit (/transcribe)
+      STAYS on whisper-large-v3-turbo-int8 (LYRICS_BACKEND=whisper) — see the
+      lyrics-transcribe block below. Runs on Kestrel CTnnn "audio" (10.0.0.13),
+      relocated nexus→Nasbox 2026-06-12 → Kestrel 2026-07-03.
 
   diarize:
     kind: diarize
