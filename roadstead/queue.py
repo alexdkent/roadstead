@@ -1634,11 +1634,24 @@ class PersistentQueue:
         total = 0
         premature = 0
         planned_total = 0
+        # `premature` and `planned` are INDEPENDENT event flags and OVERLAP: an
+        # event inside a maintenance drain can also fire below its recommended
+        # deadline, landing in both counts. Consumers that want "is the fleet
+        # actually under inference pressure?" need premature timeouts that are
+        # NOT maintenance collateral (`premature_unplanned`), and — since P3/P4
+        # background work defers+retries silently by design — ideally only the
+        # foreground (P0-P2, user-facing) subset (`premature_foreground_unplanned`).
+        premature_unplanned = 0
+        premature_foreground_unplanned = 0
         for ep, pri, layer, elapsed, in_flight, queued, under, rec_ms, caller, ctx_pct, occurred in rows:
             total += 1
             premature += int(under or 0)
             is_planned = _planned(ep, occurred or 0.0)
             planned_total += int(is_planned)
+            if under and not is_planned:
+                premature_unplanned += 1
+                if (pri if pri is not None else 3) <= 2:
+                    premature_foreground_unplanned += 1
             g = groups.setdefault((ep, pri, layer), {
                 "elapsed": [], "in_flight": [], "queued": [],
                 "premature": 0, "planned": 0, "recommended": [],
@@ -1684,6 +1697,8 @@ class PersistentQueue:
         return {
             "total": total,
             "premature": premature,
+            "premature_unplanned": premature_unplanned,
+            "premature_foreground_unplanned": premature_foreground_unplanned,
             "planned": planned_total,
             "rows": out,
             "maintenance_windows": windows,

@@ -296,6 +296,47 @@ def test_report_tags_event_inside_window_as_planned(tmp_path):
     assert rep["maintenance_windows"][0]["reason"] == "thinker restart: 128K bump"
 
 
+def test_premature_unplanned_excludes_maintenance_and_background(tmp_path):
+    """Regression (2026-07-18): `premature` and `planned` are INDEPENDENT event
+    flags that OVERLAP — a call that queues during a backend drain and gives up
+    below its recommended deadline is BOTH. The health-relevant numbers exclude
+    that overlap (`premature_unplanned`) and further exclude background P3/P4
+    work that defers+retries silently (`premature_foreground_unplanned`).
+    Counting raw `premature` surfaced planned prefill-drain bursts as a false
+    "inference pressure" condition in the daily briefing."""
+    svc = _svc(tmp_path)
+    now = time.time()
+
+    def _ev(rid, endpoint, priority, under):
+        svc._queue_db.persist_timeout_event(
+            request_id=rid, endpoint=endpoint, priority=priority, agent_id="a",
+            call_site="c", layer="client_wait", elapsed_s=100.0,
+            applied_timeout_s=300.0, queue_wait_ms=0.0, in_flight=0, queued=2,
+            max_slots=8, est_in=1000, est_out=256, recommended_ms=360000.0,
+            under_recommended=under,
+        )
+
+    # Foreground (P1) premature, NOT in a window → the one genuine health event.
+    _ev("fg", "gemma", 1, True)
+    # Foreground (P1) premature, but INSIDE a drain window → maintenance collateral.
+    _ev("fg_planned", "companion", 1, True)
+    # Background (P3) premature on a DIFFERENT endpoint (not drained) → unplanned,
+    # but still background so it defers+retries, not a foreground health signal.
+    _ev("bg", "thinker", 3, True)
+    # Background (P3) premature AND planned (the dominant real-world case).
+    _ev("bg_planned", "companion", 3, True)
+
+    svc._queue_db.maintenance_record(
+        endpoint="companion", started_at=now - 60, ended_at=now + 60,
+        reason="composer prefill drain", operator="op")
+
+    rep = svc._queue_db.timeouts_report(24)
+    assert rep["premature"] == 4                     # raw, overlaps planned (the old buggy number)
+    assert rep["planned"] == 2                        # 2 companion events fell in the window
+    assert rep["premature_unplanned"] == 2            # excludes the 2 planned premature (fg + bg survive)
+    assert rep["premature_foreground_unplanned"] == 1  # + excludes the unplanned background (only fg)
+
+
 def test_report_does_not_tag_event_outside_window(tmp_path):
     svc = _svc(tmp_path)
     _to_event(svc)
