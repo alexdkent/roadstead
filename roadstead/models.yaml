@@ -145,6 +145,13 @@ models:
       validated batch/ubatch sweet spot. A research pass found nothing in the
       gap between b9849 and the (then-)current HEAD (b9870) worth chasing for
       this hardware/backend — see the same bench doc.
+      2026-07-17/18 prefill campaign (same binary, env uplift + slots 4->8):
+      infra/nexus/bench_results/composer_prefill_campaign_20260717.md.
+      Nexus host state it depends on: CPU governor=performance
+      (nexus-perfgov.service), amd_iommu=off grub default, mesa-vulkan-drivers
+      26.1.4 kisak PPA under apt-mark hold (mesa version materially moves
+      composer throughput — never upgrade without a drained re-bench), unit
+      `--cache-ram 16384` (host prompt cache; KV f16 A/B rejected, q8_0 kept).
 
   router:
     kind: chat
