@@ -71,14 +71,18 @@ def test_companion_dispatch_concurrency_cap():
     llama.cpp build (b9849). Re-validated via llama-batched-bench at 1/2/4/8
     parallel with no instability found through 8 — see
     infra/nexus/bench_results/composer_122b_optimization_20260703.md.
-    Physical slot count is now 4, cap == max_slots (no G1-style ceiling
-    needed for this model). effective_max_slots == 4; the interactive
-    reserve is preserved (background cap = 4 - 1 = 3)."""
+
+    2026-07-17 prefill campaign: --parallel raised 4->8 (llama-batched-bench on
+    the new env: aggregate decode 28.5->62.8 t/s at 1->8-way, monotonic, no
+    cliff; prefill holds ~430-460 t/s aggregate through 8-way) — see
+    infra/nexus/bench_results/composer_prefill_campaign_20260717.md.
+    cap == max_slots == 8; the interactive reserve is preserved
+    (background cap = 8 - 1 = 7)."""
     comp = DEFAULT_ENDPOINTS["companion"]
-    assert comp.max_slots == 4               # physical (122B swap, 2026-07-03)
-    assert comp.dispatch_concurrency_cap == 4
-    assert comp.effective_max_slots == 4     # dispatch ceiling (== physical now)
-    assert comp.background_cap_slots == 3    # leaves 1 for interactive
+    assert comp.max_slots == 8               # physical (prefill campaign, 2026-07-17)
+    assert comp.dispatch_concurrency_cap == 8
+    assert comp.effective_max_slots == 8     # dispatch ceiling (== physical now)
+    assert comp.background_cap_slots == 7    # leaves 1 for interactive
     # An uncapped endpoint is unaffected: effective == physical.
     thinker = DEFAULT_ENDPOINTS["thinker"]
     assert thinker.dispatch_concurrency_cap == 0
