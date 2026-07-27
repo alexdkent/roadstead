@@ -18,6 +18,8 @@ import asyncio
 
 import pytest
 
+from originfleet.llmproxy.timeout_model import normalize_endpoint
+
 # Exhaustive ProxyService-spinning adversarial matrix — deselected from the
 # per-ship in_container_tollgate via `-m 'not heavy'` (see pyproject `heavy`).
 pytestmark = pytest.mark.heavy
@@ -41,21 +43,37 @@ def _all_off(mp):
         mp.delenv(k, raising=False)
 
 
-# Endpoint under test. "chat" is a pure alias of the "classify" class (2026-07-03
-# analyst decommission); the proxy normalizes it everywhere, so cooldown/health
-# STATE and the /v1/status "endpoints" map are keyed by "classify", not "chat".
-# Look-ups that hit those dicts directly must use the resolved class name.
-async def _status_ep(proxy, ep="classify") -> dict:
+# Endpoint under test. "chat" is a pure ALIAS; the proxy normalizes it
+# everywhere, so cooldown/health STATE and the /v1/status "endpoints" map are
+# keyed by the RESOLVED CLASS, not by "chat". Look-ups that hit those dicts
+# directly must use the resolved name.
+#
+# Resolved at import from normalize_endpoint rather than hardcoded: the target
+# has moved twice already (→ "classify" on the 2026-07-03 analyst decommission,
+# → "creative" on the 2026-07-11 boxa consolidation, which re-homed the
+# classify/analyst/vision family onto the boxa endpoint). Each move left this
+# file asserting on a class the proxy no longer keys, and the KeyError went
+# unseen because `local_tollgate` never actually ran a test until 2026-07-27
+# (ledger `local-tollgate-never-ran`). Deriving it means the next re-homing
+# cannot rot these guards — the same "assert against the live object, not a
+# copy of the fact" rule the discord decomposition landed on.
+EP_ALIAS = "chat"
+EP_CLASS = normalize_endpoint(EP_ALIAS)
+
+
+async def _status_ep(proxy, ep=None) -> dict:
+    ep = ep or EP_CLASS
     resp = await proxy.client.get("/v1/status")
     assert resp.status_code == 200
     return resp.json()["endpoints"][ep]
 
 
-async def _wait_trips(proxy, ep="classify", want=1, timeout_s=4.0) -> int:
+async def _wait_trips(proxy, ep=None, want=1, timeout_s=4.0) -> int:
     """Poll for the cooldown trip to land. Some fault paths (sync-timeout) count
     in the BACKGROUND dispatch task, which completes AFTER the caller's shorter
     client-wait deadline returns — so the trip is not synchronous with the HTTP
     response and must be awaited."""
+    ep = ep or EP_CLASS
     st = proxy.svc._correction.state
     deadline = asyncio.get_event_loop().time() + timeout_s
     while asyncio.get_event_loop().time() < deadline:
@@ -85,7 +103,7 @@ async def test_enforce_cools_defers_recovers_no_reroute(proxy, monkeypatch):
         assert r.status_code >= 400, f"call {i} should surface the injected 500"
     # Tripped after exactly allowed_fails backend-faults.
     st = proxy.svc._correction.state
-    assert st.endpoint_cooldown_trips.get("classify") == 1, "did not cool after 3 faults"
+    assert st.endpoint_cooldown_trips.get(EP_CLASS) == 1, "did not cool after 3 faults"
     assert proxy.svc._health.endpoint_healthy("chat") is False, "cooled ep still healthy"
     assert proxy.total_in_flight() == base, "slot leaked after the flap"
 
@@ -136,7 +154,7 @@ async def test_4xx_storm_never_cools_e2e(proxy, monkeypatch):
         assert r.status_code >= 400
     st = proxy.svc._correction.state
     assert st.endpoint_cooldown_trips == {}, "4xx must never trip a cooldown"
-    assert "classify" not in st.endpoint_cooldown_until
+    assert EP_CLASS not in st.endpoint_cooldown_until
     assert proxy.svc._health.endpoint_healthy("chat") is True
     snap = await _status_ep(proxy)
     assert "cooldown_trips" not in snap and "cooling" not in snap
@@ -156,8 +174,8 @@ async def test_shadow_counts_but_never_pulls_e2e(proxy, monkeypatch):
     for _ in range(2):
         await proxy.chat("hi")
     st = proxy.svc._correction.state
-    assert st.endpoint_cooldown_trips.get("classify") == 1, "shadow must still count a trip"
-    assert "classify" not in st.endpoint_cooldown_until, "shadow must NOT set a cooldown"
+    assert st.endpoint_cooldown_trips.get(EP_CLASS) == 1, "shadow must still count a trip"
+    assert EP_CLASS not in st.endpoint_cooldown_until, "shadow must NOT set a cooldown"
     assert proxy.svc._health.endpoint_healthy("chat") is True, "shadow must NOT pull"
     snap = await _status_ep(proxy)
     assert snap.get("cooldown_trips") == 1  # surfaced even in shadow
@@ -211,7 +229,7 @@ async def test_stream_reset_counts_and_no_slot_leak_while_cooling(proxy, monkeyp
         assert any("error" in f for f in frames), "reset should surface a stream error"
         assert proxy.total_in_flight() == base, "slot leaked on stream reset"
     st = proxy.svc._correction.state
-    assert st.endpoint_cooldown_trips.get("classify") == 1, \
+    assert st.endpoint_cooldown_trips.get(EP_CLASS) == 1, \
         "streaming-error call site did not feed the cooldown"
     assert proxy.svc._health.endpoint_healthy("chat") is False
     # Another reset attempt lands while already cooling — still no leak.

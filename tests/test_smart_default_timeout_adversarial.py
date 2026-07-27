@@ -37,6 +37,7 @@ from originfleet.llmproxy.backend import BackendResponse
 from originfleet.llmproxy.config import EndpointConfig, ProxyConfig
 from originfleet.llmproxy.constants import _DEFAULT_TIMEOUT_S, _SMART_DEFAULT_CAP_S
 from originfleet.llmproxy.service import ProxyService
+from originfleet.llmproxy.timeout_model import normalize_endpoint, resolve_ceiling_s
 
 from tests.llmproxy.fake_backend import (
     FAULT_EMPTY_COMPLETION,
@@ -50,11 +51,18 @@ from tests.llmproxy.fake_backend import (
 )
 
 _INTERNAL_CLIENT = ("127.0.0.1", 41999)
-# "chat" resolves to the "classify" class (2026-07-03 analyst decommission);
-# its floor was raised 45→180 in the 2026-07-04 nexus loadout. (Pre-decommission
-# this said 30.0 — stale on both counts, undetected while in-container llmproxy
-# tests were blocked by the ship restart-poll bug.)
-_CLASS_FLOORS = {"chat": 180.0, "bge-m3-embed": 15.0, "gemma-router": 60.0}
+# "chat" is an ALIAS; the shadow tally, the floors table and the /v1/status
+# endpoints map are all keyed by the RESOLVED CLASS.
+#
+# Derived from normalize_endpoint rather than hardcoded, because the target has
+# moved twice: → "classify" (2026-07-03 analyst decommission), → "creative"
+# (2026-07-11 boxa consolidation, which re-homed classify/analyst/vision onto the
+# boxa endpoint as aliases). Each move left this file raising KeyError on a class
+# the proxy no longer keys; nothing caught it because `local_tollgate` never
+# actually ran a test until 2026-07-27 (ledger `local-tollgate-never-ran`).
+_CHAT_CLASS = normalize_endpoint("chat")
+# (The former _CLASS_FLOORS table is gone — every floor is now read from the
+# live timeout model at assert time, which is what stopped it going stale.)
 
 
 # --------------------------------------------------------------------------- #
@@ -156,7 +164,12 @@ def test_resolve_never_raises_and_is_sane(flag_on):
                     assert d == _DEFAULT_TIMEOUT_S
                 else:
                     # C: flag-ON smart deadline never dips below the class floor.
-                    exp_floor = _CLASS_FLOORS.get(ep, 60.0)  # unknown → _DEFAULT_FLOOR_S
+                    # Derived from the LIVE model, not a hardcoded table: the
+                    # floor moves whenever a role is re-homed (chat's went
+                    # 180→120 when the boxa consolidation aliased it onto
+                    # "creative"). The invariant under test is "never dips below
+                    # the class floor" — not any particular number.
+                    exp_floor = svc._timeout_model.floor_ms(ep) / 1000.0
                     assert d >= exp_floor, f"{ep}: {d} < floor {exp_floor}"
 
 
@@ -172,16 +185,29 @@ def test_resolve_off_is_flat_even_when_model_is_hot():
 def test_resolve_on_caps_pathological_tail_and_stays_finite():
     """C: a heavy-tailed cell (recommended = p99*margin) is clamped, never
     leaking a multi-hour or non-finite deadline. Since the 2026-07-05 adaptive
-    uplift the per-class CEILING governs first: chat/classify is interactive so
-    the pathological tail is bounded by the interactive ceiling (600s), reached
-    before the flat _SMART_DEFAULT_CAP_S (1800s) fallback."""
+    uplift the per-class CEILING governs first, so the pathological tail is
+    bounded by the ceiling that actually applies to chat's resolved class —
+    derived here, not hardcoded. NB since the 2026-07-11 boxa consolidation that
+    class is "creative", which carries an explicit `timeout_ceiling_s: 1800`
+    role override in models.yaml ("a role override so the generous background
+    band applies on EVERY tier", because song-compose runs at an interactive
+    tier). So chat no longer lands on the 600s interactive band — a real
+    consequence of the re-homing, not a test detail. What the test still proves
+    is that SOMETHING finite governs before the flat cap."""
     svc = ProxyService(ProxyConfig())
     svc._flags.set_many({"smart_default_timeout": True})
     tm = svc._timeout_model
     for i in range(80):
         tm.record("chat", 1, 8, 8, 9_999_999_999.0, "ok", 1000.0 + i)
     d = svc._lifecycle.resolve_default_timeout("chat", _body())
-    assert d == svc._config.timeout_ceiling_interactive_s  # 600s class ceiling
+    expected = resolve_ceiling_s(
+        "chat", interactive=True,
+        role_ceilings=svc._state.timeout_ceilings,
+        floor_s=svc._timeout_model.floor_ms("chat") / 1000.0,
+        interactive_s=svc._config.timeout_ceiling_interactive_s,
+        background_s=svc._config.timeout_ceiling_background_s,
+    )
+    assert d == expected
     assert d <= _SMART_DEFAULT_CAP_S
     assert math.isfinite(d)
 
@@ -193,14 +219,17 @@ def test_tally_written_both_modes_and_never_corrupts():
     N = 500
     for _ in range(N):
         svc._lifecycle.resolve_default_timeout("chat", _body())
-    # "chat" tallies under its resolved class "classify"; floor 180 (2026-07-04).
-    t = svc._smart_default_shadow["classify"]
+    t = svc._smart_default_shadow[_CHAT_CLASS]
+    # The smart value here IS chat's resolved-class floor — derived, because that
+    # number moved 180→120 with the 2026-07-11 boxa re-homing. What this pins is
+    # that every one of the N resolves produced the SAME value with no drift.
+    _floor = svc._timeout_model.floor_ms("chat") / 1000.0
     assert t["count"] == N
     assert t["flat_s"] == _DEFAULT_TIMEOUT_S
-    assert t["smart_s_min"] == t["smart_s_max"] == 180.0
-    assert t["smart_s_sum"] == 180.0 * N  # exact — no float drift at this scale
+    assert t["smart_s_min"] == t["smart_s_max"] == _floor
+    assert t["smart_s_sum"] == _floor * N  # exact — no float drift at this scale
     # mean is recoverable
-    assert t["smart_s_sum"] / t["count"] == 180.0
+    assert t["smart_s_sum"] / t["count"] == _floor
 
 
 # ========================================================================== #
@@ -321,9 +350,12 @@ async def test_wire_omitted_uses_default_and_tallies(okproxy, flag_on):
     with _capture_applied() as created:
         resp = await asyncio.wait_for(svc.handle_submit(_body(), _Req()), timeout=8.0)
     assert resp.status_code == 200
-    # chat→classify, floor 180 (2026-07-04) — coincides with the flat default here.
-    assert created[-1].timeout_s == (180.0 if flag_on else _DEFAULT_TIMEOUT_S)
-    assert svc._smart_default_shadow["classify"]["count"] == 1
+    # Flag ON floors at chat's resolved-class floor (derived — it is 120.0 since
+    # the 2026-07-11 boxa re-homing, was 180.0 as "classify"). Flag OFF is the
+    # byte-identical flat default.
+    _floor = svc._timeout_model.floor_ms("chat") / 1000.0
+    assert created[-1].timeout_s == (_floor if flag_on else _DEFAULT_TIMEOUT_S)
+    assert svc._smart_default_shadow[_CHAT_CLASS]["count"] == 1
     await _drain(svc)
 
 
@@ -450,10 +482,10 @@ async def fakeproxy():
         # Flag ON + a TINY classify floor so the SMART DEFAULT (which floors at
         # the class floor) becomes a sub-second, fast-to-fire deadline — this is
         # the "tighter default" the mandate wants exercised, without a 30s wait.
-        # Override "classify" (the resolved class for "chat"), NOT "chat" — the
+        # Override the RESOLVED CLASS for "chat", NOT "chat" itself — the
         # latter normalizes away and the override would be a no-op.
         svc._flags.set_many({"smart_default_timeout": True})
-        svc._timeout_model._floors["classify"] = 0.5  # → smart default ~1s (ceil)
+        svc._timeout_model._floors[_CHAT_CLASS] = 0.5  # → smart default ~1s (ceil)
 
         await svc.startup()
         transport = httpx.ASGITransport(
@@ -544,4 +576,4 @@ async def test_smartdefault_duplicate_storm_no_leak(fakeproxy):
         assert not isinstance(r, Exception), f"raised: {r!r}"
         assert not (r.status_code == 500 and "internal proxy error" in r.text)
     await _drain_client(svc)
-    assert svc._smart_default_shadow["classify"]["count"] == N
+    assert svc._smart_default_shadow[_CHAT_CLASS]["count"] == N

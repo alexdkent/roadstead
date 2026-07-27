@@ -37,6 +37,7 @@ pytestmark = pytest.mark.heavy
 
 from originfleet.llmproxy.backend import extract_cached_tokens
 from originfleet.llmproxy.queue import PersistentQueue
+from originfleet.llmproxy.timeout_model import normalize_endpoint
 
 from tests.llmproxy.fake_backend import _OMIT_USAGE, _UNSET  # noqa: F401  (imported for parity/clarity)
 
@@ -326,9 +327,19 @@ async def test_north_face_hostile_caller_cannot_corrupt_attribution(proxy):
     assert r.status_code == 200
     proxy.svc._queue_db.flush(timeout=5.0)
     attr = proxy.svc._queue_db.cache_attribution(window_s=3600)
-    # The proxy normalizes model="chat" to its class "classify" (2026-07-03
-    # analyst decommission), so attribution rows land under "classify".
-    chat_ep = next(e for e in attr["by_endpoint"] if e["endpoint"] == "classify")
+    # The proxy normalizes model="chat" to its endpoint CLASS, so attribution
+    # rows land under the resolved name — derived, not hardcoded: that target has
+    # moved twice (→ "classify" 2026-07-03, → "creative" 2026-07-11 boxa
+    # consolidation). A bare `next()` on the stale name raised StopIteration
+    # INSIDE an async test, which asyncio re-reports as an opaque
+    # "coroutine raised StopIteration" — so the default below keeps a missing row
+    # failing legibly.
+    chat_class = normalize_endpoint("chat")
+    chat_ep = next((e for e in attr["by_endpoint"]
+                    if e["endpoint"] == chat_class), None)
+    assert chat_ep is not None, (
+        f"no attribution row for {chat_class!r}; "
+        f"got {[e['endpoint'] for e in attr['by_endpoint']]}")
     assert chat_ep["cached_tokens"] == 6           # backend value, not 999999/123456
     assert chat_ep["attributable_input_tokens"] == 12
     assert chat_ep["hit_rate"] == 0.5
