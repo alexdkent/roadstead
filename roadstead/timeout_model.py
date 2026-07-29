@@ -335,6 +335,68 @@ class TimeoutModel:
         out_b = _bucket(est_out, _OUT_EDGES)
         floor_ms = self.floor_ms(ep)
 
+        mn, med, p95, recommended, n, source = self._advise_at(ep, pri, in_b, out_b, floor_ms)
+
+        # ── MONOTONICITY GUARD (regression ledger `llm-output-budget-starvation`) ──
+        # The advice MUST NOT shrink as the caller asks for more output. It could,
+        # and it did: the fallback ladder picks the FIRST level with >= min_samples,
+        # so a well-populated `tier_out` bucket answers for a mid-sized request
+        # while a sparse HIGH out-bucket falls through to `tier` — which aggregates
+        # over every out-bucket and is therefore dominated by small, fast calls.
+        #
+        # Measured live 2026-07-29 on `thinker` @ P3_INGESTION:
+        #     est_out 8192 -> 459s   (source=tier_out, n=107)
+        #     est_out 9000 -> 227s   (source=tier,     n=8682)   <-- HALVED
+        #
+        # That inversion is what made kv4's truncation-retry actively destructive.
+        # `resilient_json_call` correctly re-derives its deadline when it bumps
+        # max_tokens (6000 -> 9000), and the re-derived deadline came back SMALLER
+        # than the one the 6000-token attempt already needed 276s of. Result: 95%
+        # of those retries (136/143) were killed at the deadline having produced
+        # ZERO output tokens, burning ~12.5 hours of thinker time in three days for
+        # nothing at all.
+        #
+        # And it was self-perpetuating: `record()` only admits status=="ok"
+        # samples, so a bucket whose calls always time out can never accumulate the
+        # samples that would give it an honest recommendation. The sparse bucket
+        # stays sparse forever. A guard is the only way out of that loop.
+        #
+        # The guard: a request can never be advised LESS than a request for FEWER
+        # output tokens on the same endpoint/priority. Cheap (<= 4 extra lookups
+        # over in-memory reservoirs, and `_OUT_EDGES` yields only 5 buckets), and
+        # strictly safe — it can only ever RAISE a deadline, and the caller-side
+        # `cap_s` ceiling still bounds the result.
+        lifted_from = None
+        for lower_b in range(out_b):
+            _mn, _med, _p95, cand, _n, _src = self._advise_at(
+                ep, pri, in_b, lower_b, floor_ms)
+            if cand > recommended:
+                recommended = cand
+                lifted_from = lower_b
+
+        out = {
+            "min_ms": round(mn, 1),
+            "median_ms": round(med, 1),
+            "p95_ms": round(p95, 1),
+            "recommended_ms": round(recommended, 1),
+            "recommended_timeout_s": math.ceil(recommended / 1000.0),
+            "sample_count": n,
+            "source": source,
+        }
+        if lifted_from is not None:
+            # Observable, so a dashboard/shadow report can see that this endpoint's
+            # high out-buckets are starved of samples rather than genuinely fast.
+            out["monotonic_lift_from_out_bucket"] = lifted_from
+        return out
+
+    def _advise_at(
+        self, ep: str, pri: int, in_b: int, out_b: int, floor_ms: float,
+    ) -> tuple[float, float, float, float, int, str]:
+        """The raw fallback-ladder lookup for one (in_bucket, out_bucket) cell.
+
+        Returns ``(min, median, p95, recommended, n, source)`` in ms. Split out of
+        ``advise`` so the monotonicity guard can re-query lower out-buckets without
+        duplicating the ladder."""
         levels = (
             ("cell", dict(priority=pri, in_b=in_b, out_b=out_b)),
             ("tier_out", dict(priority=pri, out_b=out_b)),
@@ -352,26 +414,10 @@ class TimeoutModel:
 
         if samples:
             samples.sort()
-            mn = samples[0]
-            med = percentile(samples, 50)
-            p95 = percentile(samples, 95)
-            p99 = percentile(samples, 99)
-            recommended = max(p99 * self._margin, floor_ms)
-            n = len(samples)
-        else:
-            mn = med = p95 = floor_ms
-            recommended = floor_ms
-            n = 0
-
-        return {
-            "min_ms": round(mn, 1),
-            "median_ms": round(med, 1),
-            "p95_ms": round(p95, 1),
-            "recommended_ms": round(recommended, 1),
-            "recommended_timeout_s": math.ceil(recommended / 1000.0),
-            "sample_count": n,
-            "source": source,
-        }
+            return (samples[0], percentile(samples, 50), percentile(samples, 95),
+                    max(percentile(samples, 99) * self._margin, floor_ms),
+                    len(samples), source)
+        return (floor_ms, floor_ms, floor_ms, floor_ms, 0, source)
 
     def snapshot(self) -> dict:
         """Debug view: sample count per endpoint class."""
