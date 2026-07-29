@@ -171,6 +171,29 @@ models:
     context_window: 16384
     slots: 4                          # 2026-07-12: 2->4 (--parallel 4, --ctx-size 65536 on anvil:9091). 2 slots couldn't absorb bursts from the many cheap gemma callers (greeter advisory every turn + sidekick.extract_pad/obs + tool routers + classify), spiking tail latency into their aggressive per-call timeouts. E4B is tiny (~4.3GB) with ample anvil headroom; live value still comes from /props.
     timeout_floor_s: 60
+    policy:
+      fast_path_reserve_slots: 1    # 2026-07-29: 0(default)->1. THE lever for this endpoint's
+                                    # bursty tail. With reserve 0, background_cap_slots collapses
+                                    # to background_floor_slots = max(1, int(slots*0.20)) — which is
+                                    # 1 at 4 slots AND STILL 1 at 8 (config.py:261-277). So the
+                                    # background band (this endpoint's dominant traffic: kv4
+                                    # audit/dedup ~138k reqs + temporal ~52k, both P3_INGESTION)
+                                    # ran ONE-AT-A-TIME no matter how many slots the backend had.
+                                    # reserve:1 -> background_cap = slots-1 = 3 now, 7 if/when the
+                                    # unit goes --parallel 8. Raising --parallel WITHOUT this is a
+                                    # no-op for those callers. Do NOT set reserve:0 with
+                                    # background_floor_pct:1.0 to "free" the last slot — that breaks
+                                    # the anti-starvation invariant (test_background_cap.py); see
+                                    # the composer policy block above for the same lesson.
+      documented_max_num_seqs: 4    # llama.cpp --parallel in llama-gemma.service. Keep EQUAL to
+                                    # `slots` above — health.py:242 raises a standing max_slots_drift
+                                    # WARNING (into /v1/status.alerts + the health-verifier chip) on mismatch.
+                                    # Bump BOTH to 8 in the same change that edits the unit.
+      # NOTE: `min_expected_slots` is deliberately NOT set here — it is absent from the
+      # policy key mapping in model_catalog.py:245-255, so a models.yaml value is silently
+      # DROPPED. EndpointConfig defaults it to 1 (config.py), which makes the CRITICAL guard
+      # at health.py:549 ("discovered N slots, expected >= M") unreachable fleet-wide: no
+      # entry can raise it above 1. Arming it is a code change, not config.
     capabilities:
       vision: false
       streaming: false
