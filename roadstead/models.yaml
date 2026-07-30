@@ -95,7 +95,7 @@ models:
     proxy_endpoint: true
     endpoint_class: companion
     role: qwen-composer
-    aliases: [qwen-composer, companion, nexus-companion]
+    aliases: [tier3, qwen-composer, companion, nexus-companion]   # tier3 = canonical (2026-07-30 tier migration)
     host: nexus
     port: 8081
     backend_engine: llama.cpp
@@ -159,11 +159,11 @@ models:
     proxy_endpoint: true
     endpoint_class: gemma
     role: gemma-router
-    aliases: [gemma-router, gemma, nexus-gemma]
-    host: anvil
+    aliases: [tier1, gemma-router, gemma, nexus-gemma]   # tier1 = canonical (2026-07-30 tier migration)
+    host: kestrel-perception
     port: 9091
     backend_engine: llama.cpp
-    systemd_unit: llama-gemma
+    systemd_unit: ""              # 2026-07-30: MOVED to Kestrel A2000 as docker container `gemma-tier1` (not a systemd unit)
     probe_kind: llama
     model_family: Gemma-4-E4B-it
     quant: Q4_K_XL
@@ -217,7 +217,7 @@ models:
     endpoint_class: gemma
     role: gemma-greeter
     aliases: [gemma-greeter, gemma-hot, nexus-gemma-hot]
-    host: anvil
+    host: kestrel-perception
     port: 9091
     backend_engine: llama.cpp
     model_family: Gemma-4-E4B-it
@@ -306,7 +306,7 @@ models:
     proxy_endpoint: true
     endpoint_class: creative
     role: creative
-    aliases: [deckard, deckard-31b, companion-lite, qwen-classify, classify, chat, nexus-chat, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]   # THREE roles now resolve to this ONE boxa endpoint (2026-07-11 consolidation): (1) creative, (2) companion-lite = the orchestrator inner chat loop, (3) the whole classify/analyst/vision family (re-homed off anvil :9092). All pure ALIASES of the single endpoint so no caller changes AND slots aren't double-counted (two stanzas at one URL would double-count the 6 slots). deckard/deckard-31b are HISTORICAL anvil NVFP4 rollback aliases (the deployed model is NOT a DECKARD finetune).
+    aliases: [tier2, deckard, deckard-31b, companion-lite, qwen-classify, classify, chat, nexus-chat, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]   # THREE roles now resolve to this ONE boxa endpoint (2026-07-11 consolidation): (1) creative, (2) companion-lite = the orchestrator inner chat loop, (3) the whole classify/analyst/vision family (re-homed off anvil :9092). All pure ALIASES of the single endpoint so no caller changes AND slots aren't double-counted (two stanzas at one URL would double-count the 6 slots). deckard/deckard-31b are HISTORICAL anvil NVFP4 rollback aliases (the deployed model is NOT a DECKARD finetune).
     host: nasbox
     port: 9196
     backend_engine: llama.cpp
