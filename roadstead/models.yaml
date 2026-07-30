@@ -387,7 +387,7 @@ models:
     endpoint_class: embed
     role: bge-m3-embed
     aliases: [bge-m3-embed]
-    host: anvil
+    host: nexus             # 2026-07-30: MOVED anvil -> nexus (ROCm/gfx1151) for hardware diversity
     port: 9087
     backend_engine: shim
     systemd_unit: bge-m3-embed
@@ -410,7 +410,13 @@ models:
     fallback: null
     notes: |
       NOT OpenAI-compatible — POST /embed returning dense+sparse+colbert. The
-      nexus CPU copy (:8091) was removed 2026-06-05.
+      nexus CPU copy (:8091) was removed 2026-06-05; this is the nexus GPU
+      copy (ROCm/gfx1151), which is a different thing — do not confuse them.
+      Moved off anvil 2026-07-30 for hardware/vendor diversity: retrieval now
+      fails independently of CUDA-stack generation. Measured cost, accepted:
+      query (12 tok) 17.3 -> 31.0 ms, chunk 1.20x, long chunk ~parity,
+      batch x16 marginally faster on nexus. ROCm loses on small latency-bound
+      calls and catches up when batched.
 
   rerank:
     kind: rerank
@@ -419,7 +425,7 @@ models:
     endpoint_class: rerank
     role: bge-reranker
     aliases: [bge-reranker, rerank, nexus-rerank]
-    host: anvil
+    host: nexus             # 2026-07-30: MOVED anvil -> nexus (ROCm/gfx1151) for hardware diversity
     port: 9084
     backend_engine: shim
     systemd_unit: bge-reranker-shim
@@ -444,10 +450,27 @@ models:
     notes: |
       Cohere-style POST /rerank (not OpenAI). Upstream `infinity-bge-reranker`
       (:9085) is the INTERNAL backend behind this shim — not a public role.
+      Moved off anvil 2026-07-30 for hardware/vendor diversity (see `embed`).
+      Measured cost, accepted — ROCm's penalty is WORST on small candidate
+      lists, which is the common kv4-recall shape:
+        5 cand 45.9 -> 133.8 ms | 10 cand 38.5 -> 141.1 ms (3.66x)
+        25 cand 99.9 -> 181.7 ms | 50 cand 159.1 -> 335.7 ms
+      ⚠️ The nexus venvs are NOT rebuildable from anvil's pip freeze, and the
+      two services need CONFLICTING versions — rerank wants transformers 4.57.6
+      + numpy 1.26.4, embed wants transformers 5.8.1 + numpy 2.4.5. They live in
+      SEPARATE venvs (/opt/rerankenv, /opt/rocmtest/venv) for that reason; do not
+      merge them. infinity_emb 0.0.77 also needs a stale `optimum/bettertransformer/`
+      tree that PyPI optimum 2.1.0 no longer ships.
 
   # ---------------------------------------------------------------- vision / OCR
   ocr:
     kind: ocr
+    # ⚠️ 2026-07-30: the SERVICE IS STOPPED (`ocr-unit` inactive on the A2000). It was
+    # switched off to free VRAM for tier1/gemma — gemma needs 3817 MiB and only 1404 MiB was free
+    # with OCR resident. `status: active` is kept deliberately: OCR is temporarily DOWN, not
+    # retired, and the catalog only understands active|on_demand (retirement is the `retired:`
+    # flag). It comes back on nexus in Phase E, which is gated behind Phase B freeing nexus.
+    # Attachment/document verticals have no OCR until then.
     status: active
     proxy_endpoint: false           # facade-only (gateway), not a proxy LLM role
     role: got-ocr
