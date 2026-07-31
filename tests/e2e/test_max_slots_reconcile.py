@@ -30,12 +30,14 @@ async def test_max_slots_drift_reconciler(proxy, monkeypatch):
     #    max_slots diverges from documented --max-num-seqs → WARNING fires, naming
     #    both numbers. Admission is NOT touched (shadow).
     thinker = eps["thinker"]
-    # 16 = the Tier-3 backend's real --max-num-seqs (serve_tier3_prod.sh). Was 20 under the
-    # retired dense Qwen3.6-27B; changed 2026-07-30 when tier3 became Laguna S 2.1 INT4.
+    # 20 = the Tier-3 backend's real --max-num-seqs (serve_tier3_prod.sh). History: 20 under the
+    # retired dense Qwen3.6-27B -> 16 on 2026-07-30 when tier3 became Laguna S 2.1 INT4 -> back to
+    # 20 on 2026-07-31 (operator request; the 26 GiB KV pool is sized by --kv-cache-memory and is
+    # unchanged, so this only widens the scheduler's concurrency cap).
     # Pinned deliberately rather than read from config: this seed is the ONLY source of the
     # proxy's admission ceiling (vLLM does not expose --max-num-seqs over its API), so a silent
     # edit to models.yaml should break a test, not drift unnoticed into over-admission.
-    assert thinker.documented_max_num_seqs == 16
+    assert thinker.documented_max_num_seqs == 20
     admitted_before = thinker.max_slots
     thinker.max_slots = 32
     health.evaluate_alerts(time.monotonic())
@@ -43,7 +45,7 @@ async def test_max_slots_drift_reconciler(proxy, monkeypatch):
     assert len(drift) == 1, f"drift not detected: {state.alerts}"
     assert drift[0]["severity"] == "WARNING"
     assert "thinker" in drift[0]["detail"] and "32" in drift[0]["detail"] \
-        and "16" in drift[0]["detail"]
+        and "20" in drift[0]["detail"]
     # shadow: the reconciler never rewrote admission
     assert thinker.max_slots == 32
 

@@ -346,13 +346,21 @@ models:
     # tokens, so a 578K prompt gets the SAME stretch as an 82K one. That constant was tuned when
     # the ceiling was 128K and is now ~10x too early. Revisit before relying on near-max calls.
     context_window: 32768            # fleet chunkers size against 32K on purpose
-    # 16 = the backend's HARD cap (`--max-num-seqs 16` in serve_tier3_prod.sh; was 20 on the
-    # retired 27B). vLLM does NOT expose --max-num-seqs over its API, so this seed is the ONLY
-    # source of the proxy's admission ceiling; a stale value over-admits (the surplus just
-    # queues at the backend, bypassing the proxy's DRR fairness — a stale 32 once over-admitted
-    # the thinker by 12). NOTE: llama.cpp roles self-correct via /props; vLLM ones like this do
-    # NOT — the shadow reconciler warns on drift. Keep EQUAL to serve_tier3_prod.sh.
-    slots: 16
+    # 20 = the backend's HARD cap (`--max-num-seqs 20` in serve_tier3_prod.sh). vLLM does NOT
+    # expose --max-num-seqs over its API, so this seed is the ONLY source of the proxy's
+    # admission ceiling; a stale value over-admits (the surplus just queues at the backend,
+    # bypassing the proxy's DRR fairness — a stale 32 once over-admitted the thinker by 12).
+    # NOTE: llama.cpp roles self-correct via /props; vLLM ones like this do NOT — the shadow
+    # reconciler warns on drift. Keep EQUAL to serve_tier3_prod.sh.
+    #
+    # 2026-07-31: raised 16 -> 20 (operator request). max_num_seqs is a SCHEDULER concurrency
+    # cap, not a KV allocation — the 26 GiB pool (722,390 tokens) is sized by
+    # --kv-cache-memory and is unchanged, and per-step activation is bounded by
+    # --max-num-batched-tokens 8192, not by this number. The real risk it carries is the
+    # DFlash drafter, which allocates OUTSIDE --gpu-memory-utilization (the mechanism that
+    # hard-hung this box twice, both needing a power cycle), so headroom was re-measured
+    # after the restart rather than assumed.
+    slots: 20
     timeout_floor_s: 180
     policy:
       background_floor_pct: 0.0
@@ -360,7 +368,7 @@ models:
       # Step 4c: the backend's real --max-num-seqs (serve_tier3_prod.sh). Keep
       # EQUAL to `slots` above; the shadow reconciler warns if they drift (the
       # 32-vs-20 class). Update BOTH whenever serve_tier3_prod.sh changes.
-      documented_max_num_seqs: 16
+      documented_max_num_seqs: 20
     capabilities:
       vision: false
       streaming: true
@@ -397,18 +405,42 @@ models:
       activation and cudagraphs", which is exactly what makes it easy to get wrong when a
       drafter is also allocating outside the budget. vLLM prints the suggested value at startup.
 
-      🚨 TWO LOAD-BEARING FLAGS. Neither is cosmetic; both are gated by tier3_gates.py:
-      1. `--default-chat-template-kwargs '{"enable_thinking": true}'`. Laguna's chat
-         template defaults enable_thinking=true, but vLLM's DeepSeekV3-derived
-         `poolside_v1` reasoning parser defaults it FALSE, and when false it installs an
-         IdentityReasoningParser that separates NOTHING. Without the flag, any request
-         that sends no chat_template_kwargs — which is EVERY fleet caller today — gets
-         raw chain-of-thought plus a stray `</think>` inside `content`. It reads as
-         model output, so nothing errors; it just quietly poisons kv4 extraction and
-         every judgment. Caught by gate G4 (asserts no leak in all three modes).
-      2. `--gpu-memory-utilization 0.72` is a HARD CEILING while a drafter is loaded —
-         spec-decode drafters allocate OUTSIDE that budget. 0.78 + a drafter hard-hung
-         anvil twice on 2026-07-30, each needing an operator power cycle.
+      🚨 TWO LOAD-BEARING FLAGS. Neither is cosmetic; both are gated by tier3_gates.py.
+      ⚠️ Both entries below were WRONG until 2026-07-31 and each would have sent a reader
+      to "correct" the live config into a broken state. Verify against
+      serve_tier3_prod.sh, which is the truth.
+
+      1. `--default-chat-template-kwargs '{"enable_thinking": false}'` — FALSE, not true.
+         The mechanism is real: Laguna's chat template defaults enable_thinking=true,
+         while vLLM's DeepSeekV3-derived `poolside_v1` reasoning parser defaults it
+         FALSE and then installs an IdentityReasoningParser that separates NOTHING, so
+         any caller sending no chat_template_kwargs — EVERY fleet caller — got raw
+         chain-of-thought plus a stray `</think>` inside `content`.
+         But setting it TRUE (the first fix, which this comment used to prescribe) is
+         WORSE: the model then spends the whole budget reasoning and returns NOTHING.
+         Measured: max_tokens=120 thinking=true -> out=120, finish=length, content_len=0,
+         status=ok — no error, no alert, callers just got empty strings.
+         FALSE fixes both: no thinking is generated, so there is nothing to leak.
+         The reason the leak "fix" looked verified was an ABSENCE assertion
+         (`"</think>" not in content`), which an empty string also satisfies. Gate G4
+         must assert a POSITIVE property (non-empty, finish_reason=stop) too.
+      2. `--gpu-memory-utilization 0.81` is the live value; the old "0.72 is a HARD
+         CEILING" line described a DIFFERENT configuration and no longer applies.
+         When util sized the KV pool, 0.72 was the ceiling and 0.78 + a drafter
+         hard-hung anvil twice on 2026-07-30, each needing an operator power cycle.
+         We now pass `--kv-cache-memory 27917287424` (26 GiB), which sizes the pool
+         DIRECTLY, so util is a bound rather than the allocator and 0.81 is stable
+         (re-measured 2026-07-31 at 20 slots: 11 GiB free after load).
+         ⚠️ The underlying HAZARD is unchanged and is about the MECHANISM, not the
+         number: a spec-decode drafter allocates OUTSIDE the util budget. Re-measure
+         headroom after any change that adds concurrency or a drafter.
+
+      Structured outputs use `--structured-outputs-config '{"backend":"guidance"}'`
+      (see `structured_output: guidance` below) — NOT llama.cpp GBNF, which is the
+      `creative`/tier2 stanza's backend. Verified 2026-07-31 with a real json_schema
+      call: 29 tokens, finish_reason=stop, valid parseable JSON. Truncation of
+      structured calls runs ~0.1% (28 in 26,993 requests/24h) and is a budget tail,
+      not a grammar fault.
 
       Tool calling and reasoning both use `poolside_v1` (Laguna's template is
       GLM-derived: `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>`).
