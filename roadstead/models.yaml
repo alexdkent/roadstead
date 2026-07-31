@@ -717,14 +717,17 @@ models:
     status: on_demand
     proxy_endpoint: false
     role: flux1-imagegen
-    aliases: [flux1-imagegen, anvil-imagegen]
-    host: anvil
+    aliases: [flux1-imagegen, anvil-imagegen, nexus-imagegen]
+    # 2026-07-31 Phase E: MOVED anvil -> nexus (ROCm/gfx1151), unit `nexus-imagegen`.
+    # The `anvil-imagegen` alias and anvil's unit are kept: that service is still running
+    # as the ROLLBACK until every checkpoint is verified on nexus.
+    host: nexus
     port: 9210
     backend_engine: shim
     dispatcher_capability: image_diffusers
     dispatcher_capability_aliases: [image_fast, image_hq]
-    dispatcher_unit_key: anvil-imagegen
-    unit: anvil-imagegen.service
+    dispatcher_unit_key: nexus-imagegen
+    unit: nexus-imagegen.service
     manage_process: false            # self-managing; dispatcher brokers the slot only
     health_path: /healthz
     warmup_sec: 15
@@ -736,7 +739,28 @@ models:
     notes: |
       Hosts ~150 swappable checkpoints behind one FastAPI — the per-checkpoint
       sub-registry lives in infra/anvil/anvil_imagegen/models.yaml (a finer
-      granularity; NOT folded into this authority).
+      granularity; NOT folded into this authority). On nexus that sub-registry is
+      /opt/imagegen/registry.yaml (25 rows, 16 with weights present) plus
+      /opt/imagegen/loras.yaml (103 LoRAs).
+
+      🚨 REQUIRES A GPU-SLOT DISPATCHER. imagegen leases a slot from `nexus-dispatcher`
+      (:9201) before committing VRAM; without it EVERY generate fails immediately with
+      "dispatcher /ensure unreachable". That dispatcher was ported from anvil with the
+      service — it is not optional infrastructure.
+
+      ⚠️ COLD LOAD IS EXPENSIVE ON gfx1151 AND IT IS NOT THE DISK. Measured 2026-07-31: disk
+      reads 4.1 GB/s and from_pretrained takes 0.5 s, but `to("cuda")` on a large checkpoint
+      runs 10-25 MINUTES (status shows phase=moving_to_cuda). Tested HSA_ENABLE_SDMA at 0 AND
+      1 with no material difference, so this is the unified-memory copy path, not the SDMA
+      workaround. anvil saw the same on big checkpoints (17-24 GB cold loads timing out
+      >600 s), so it is NOT a regression from the move. Same-family swaps are cheap
+      (SDXL variants 15-20 s). Mitigated in the unit: IMAGEGEN_IDLE_UNLOAD_S=5400 and
+      IMAGEGEN_GENERATION_TIMEOUT_S=3600 — the service counts model LOAD inside the
+      generation deadline, so the default 960 s failed healthy loads.
+
+      Also on nexus: HSA_ENABLE_SDMA=0 (gfx1151 libhsa segfault), diffusers needs
+      variant="fp16", and a /models -> /srv/models/imagegen symlink covers aux paths that are
+      hardcoded absolute with no env override (e.g. hand_detect).
 
   video:
     kind: media
