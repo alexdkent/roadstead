@@ -328,7 +328,14 @@ models:
 
       KV sizing is EXPLICIT: `--kv-cache-memory 27917287424` (26 GiB) rather than letting the
       util number decide what is left over. Measured 2026-07-30: 670,750 KV tokens
-      (~41.6 KiB/token), 2.56x concurrency at a full 256K request, ~12 GiB host headroom.
+      (~41.6 KiB/token), 2.56x concurrency at a full 256K request.
+
+      ⚠️ Host headroom is **~8 GiB under load, NOT the ~12 GiB you see just after startup** —
+      the idle figure is measured before KV blocks are actually touched, and it drops once real
+      traffic populates the pool. Budget against 8. That is the number to use before deciding
+      anything else can move onto this box: the two hard-hangs happened at ~0 GiB free, and on
+      a unified-memory box the reserve IS the recovery path (no shell ⇒ no `docker rm` ⇒
+      operator power cycle). Do NOT take another 6 GiB on the strength of the idle number.
       Prefer this lever over --gpu-memory-utilization: util is "whatever remains after weights,
       activation and cudagraphs", which is exactly what makes it easy to get wrong when a
       drafter is also allocating outside the budget. vLLM prints the suggested value at startup.
