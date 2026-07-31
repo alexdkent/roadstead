@@ -405,7 +405,44 @@ models:
       activation and cudagraphs", which is exactly what makes it easy to get wrong when a
       drafter is also allocating outside the budget. vLLM prints the suggested value at startup.
 
-      🚨 TWO LOAD-BEARING FLAGS. Neither is cosmetic; both are gated by tier3_gates.py.
+      🚨 `disable_any_whitespace: true` IS LOAD-BEARING — do not drop it (fixed 2026-07-31).
+      Without it, structured output RUNS AWAY on whitespace. A real durability-gate pass
+      produced, 10 times out of 10:
+          completion_tokens = 1540 (the entire budget)
+          real content      = 54 chars: `{"notes": [{"n": 1, "holds": true`
+          trailing          = 3032 chars of pure whitespace (2274 spaces, 758 \n)
+      The model reaches a STRUCTURAL position — where a `,` must precede the next
+      required key — and the grammar also permits whitespace there, so greedy decoding
+      emits whitespace until the budget dies. `disable_any_whitespace` removes that
+      freedom. After: 0/10 runaway, median 7.6 s (was 29 s), no measured cost to plain
+      chat (2.17 s / ~25 tok/s, unchanged).
+
+      `maxLength` IS and always WAS enforced — at 20/40/60/80/100/120 the longest emitted
+      string equals the bound EXACTLY, before and after the fix. Anyone reporting
+      "tier3 ignores maxLength" has met THIS bug, not a bound failure.
+
+      What it is NOT, all measured, so nobody re-runs these:
+        * NOT the backend — `xgrammar` reproduced it 10/10 too (and is otherwise worse).
+        * NOT speculative decoding — 10/10 with DFlash disabled (and disabling it costs
+          ~26 -> ~19 tok/s, so it stays ON).
+        * NOT temperature (2/3 at 0.7), NOT item count (3/3 at maxItems=6+minItems=6),
+          NOT `additionalProperties`.
+        * A synthetic schema reproduced only ~2/50 — DO NOT conclude "fine" from a toy.
+      Proxy-side fallback if the flag is ever unavailable: `frequency_penalty=0.2` gave
+      4/4 clean (0.5 over-corrects). Do NOT use `stop` on runs of whitespace — it fires
+      on pretty-printed JSON indentation and truncates at ~14 tokens.
+
+      ⚠️ Why this hid for so long: the proxy turns the truncation into a 502 and callers
+      turn a 502 into "", so a silently-dead gate looks exactly like "the model had
+      nothing to say". Each occurrence also burned 30-60 s of a tier3 slot.
+      The backend/flags are server-level; they CANNOT be overridden per request —
+      verified, all three override shapes were ignored or rejected.
+
+      🚨 TWO LOAD-BEARING FLAGS. Neither is cosmetic. ⚠️ They are gated by
+      `tier3_gates.py`, which lives ONLY on anvil (`/opt/anvil-bench/`) and is NOT in
+      this repo — so neither CI nor ship.sh can run it, and nothing here will catch a
+      regression in these two flags. Treat the text below as the authority and verify
+      against serve_tier3_prod.sh on the box.
       ⚠️ Both entries below were WRONG until 2026-07-31 and each would have sent a reader
       to "correct" the live config into a broken state. Verify against
       serve_tier3_prod.sh, which is the truth.
