@@ -63,13 +63,15 @@ def test_fleet_activity_aggregates(tmp_path):
 
 def test_usage_rollup_by_agent_with_cost(tmp_path):
     pq = PersistentQueue(str(tmp_path / "q.db"))
-    # Realistic open-model rental rates (2026-07-12): thinker = Qwen3-32B tier.
+    # 2026-07-31: thinker class re-anchored 0.50 -> 0.60 out. It now serves tier3 = Laguna
+    # S 2.1 INT4 (~120B sparse MoE, 700K ctx) after composer/companion were repointed onto it;
+    # the old Qwen3-32B anchor understated every heavy-tier call.
     _llm(pq, "l1", endpoint="thinker", in_tok=1_000_000, out_tok=1_000_000, agent="knowledge")
     _ext(pq, "e1", "whisper-1", kind="audio", in_tok=1_000_000, agent="tideway")
     rows = pq.usage_rollup("agent", hours=1)
     by_agent = {r["key"]: r for r in rows}
-    # thinker: 0.15/M in + 0.50/M out = 0.65
-    assert by_agent["knowledge"]["cost_usd"] == pytest.approx(0.65, abs=0.01)
+    # thinker: 0.15/M in + 0.60/M out = 0.75
+    assert by_agent["knowledge"]["cost_usd"] == pytest.approx(0.75, abs=0.01)
     # whisper (stt): input_tokens = audio_seconds*100 → 1M = 10_000s = 2.778 hr
     #                × $0.111/hr = $0.308
     assert by_agent["tideway"]["cost_usd"] == pytest.approx(0.308, abs=0.01)
@@ -114,9 +116,12 @@ def test_endpoint_series(tmp_path):
 # ----- usage rate table -----
 
 def test_cloud_rate_resolves_class_unit_and_role():
-    # Token-native LLM classes: realistic open-model rental rates (2026-07-12).
-    assert cloud_rate("thinker") == (0.15, 0.50)
-    assert cloud_rate("llama-thinker") == (0.15, 0.50)   # role alias -> thinker
+    # Token-native LLM classes: realistic open-model rental rates.
+    # thinker re-anchored 2026-07-31 (Laguna S 2.1 INT4, ~120B MoE) — see usage_rates.py.
+    assert cloud_rate("thinker") == (0.15, 0.60)
+    assert cloud_rate("llama-thinker") == (0.15, 0.60)   # role alias -> thinker
+    assert cloud_rate("composer") == (0.15, 0.60)        # 2026-07-31: composer -> tier3/thinker
+    assert cloud_rate("companion") == (0.15, 0.60)       # 2026-07-31: companion -> tier3/thinker
     assert cloud_rate("classify") == (0.15, 0.55)        # legacy alias -> creative
     assert cloud_rate("gemma") == (0.04, 0.08)
     # Per-unit / no-analog endpoints carry NO token rate (cost via cloud_cost_usd).
@@ -128,7 +133,9 @@ def test_cloud_rate_resolves_class_unit_and_role():
 
 def test_cloud_cost_usd_token_and_per_unit():
     # 1. Token-native: rate x tokens.
-    assert cloud_cost_usd("thinker", 1_000_000, 1_000_000) == pytest.approx(0.65)  # 0.15 + 0.50
+    # 0.15 in + 0.60 out. Re-anchored 2026-07-31: the thinker class now serves tier3 =
+    # Laguna S 2.1 INT4 (~120B sparse MoE), not the dense Qwen3-32B this was priced against.
+    assert cloud_cost_usd("thinker", 1_000_000, 1_000_000) == pytest.approx(0.75)
     assert cloud_cost_usd("classify", 1_000_000, 0) == pytest.approx(0.15)         # alias -> creative
     assert cloud_cost_usd("companion-lite", 1_000_000, 0) == pytest.approx(0.15)   # alias -> creative
     # 2. Per-audio-hour: input_tokens = audio_seconds * 100, so 360_000 = 1 hour.

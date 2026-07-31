@@ -743,7 +743,12 @@ models:
     status: on_demand                # LIVE 2026-06-21 — Phase 0 validated on the GB10
     proxy_endpoint: false
     role: ltx2-videogen
-    aliases: [ltx2-videogen, anvil-videogen, anvil-ltx]
+    # `videogen` included so Catalog.entry("videogen") RESOLVES: the gateway facade looks the
+    # video service up by that literal string (external_facade.inference_models), and the
+    # stanza key is `video` while the role is `ltx2-videogen` — so entry() returned None and
+    # the payload shipped with no canonical/status/healthy/model. The Inference page then
+    # rendered a card with every stat as "—" and no real health signal. Found 2026-07-31.
+    aliases: [videogen, ltx2-videogen, anvil-videogen, anvil-ltx]
     host: anvil
     port: 9211                       # anvil-videogen FastAPI service (adjacent to imagegen :9210)
     backend_engine: shim

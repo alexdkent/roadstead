@@ -41,8 +41,16 @@ from __future__ import annotations
 #    / Together / Groq / Fireworks). See docs/fleet_cost_model.md for the table.
 # ---------------------------------------------------------------------------
 _RATES_BY_CLASS: dict[str, tuple[float, float]] = {
-    "thinker":   (0.15, 0.50),   # Qwen3-32B reasoner  → Qwen3-32B (DeepInfra/OR/Groq)
-    "companion": (0.15, 0.60),   # Qwen3.5-122B-A10B   → Qwen3-235B-A22B-Instruct-2507
+    # 2026-07-31 tier migration: `composer`/`companion`/`thinker`/`reasoner`/`tier3` ALL resolve
+    # to the tier3 endpoint now (class `thinker`), which runs **Laguna S 2.1 INT4** — a ~120B
+    # sparse MoE (256 experts, top-10) with a 700K window, NOT the dense Qwen3.6-27B this row was
+    # anchored to. Re-anchored to the heavier analog that the moved traffic was ALREADY priced
+    # against as `companion`, because it is the same workload on a bigger model; keeping the
+    # 32B anchor made the "$ saved" figure understate every heavy-tier call.
+    "thinker":   (0.15, 0.60),   # Laguna S 2.1 INT4 (~120B MoE) → Qwen3-235B-A22B-Instruct-2507
+    # `companion` is now ONLY the stopped tier3-backup (nexus 122B, status on_demand). Kept so
+    # historical rows still price, but it should bill ~nothing while the backup is down.
+    "companion": (0.15, 0.60),   # tier3-backup Qwen3.5-122B-A10B → Qwen3-235B-A22B-Instruct-2507
     "creative":  (0.15, 0.55),   # Qwen3.6-35B-A3B+vis → Qwen3-VL-30B-A3B-Instruct (vision billed as input tokens, no premium)
     "gemma":     (0.04, 0.08),   # Gemma-4-E4B         → Gemma-3-4B-it (DeepInfra)
     "embed":     (0.01, 0.0),    # BGE-M3 (EXACT model on DeepInfra) — market floor
