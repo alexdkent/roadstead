@@ -191,9 +191,9 @@ def test_timeout_event_records_identity_and_context(tmp_path):
     # thinker context_per_slot (vLLM --max-model-len). 262144 since 2026-07-30, when tier3
     # became Laguna S 2.1 and the window was raised to the model's native
     # max_position_embeddings; was 131072 on the retired Qwen3.6-27B.
-    assert row[3] == 262144
-    # est_in = 4000 chars / 4 = 1000 tokens; 1000 / 262144 * 100 ≈ 0.4%
-    assert row[4] == 0.4
+    assert row[3] == 700000
+    # est_in = 4000 chars / 4 = 1000 tokens; 1000 / 700000 * 100 ≈ 0.1%
+    assert row[4] == 0.1
 
 
 def test_completion_persists_identity(tmp_path):

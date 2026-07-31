@@ -295,7 +295,25 @@ models:
     # --max-model-len does NOT reserve memory; it only permits longer requests. Paged
     # attention allocates what a request actually uses, so typical ~8k traffic is unaffected
     # and only several CONCURRENT full-length requests contend for the pool.
-    context_per_slot: 262144
+    #
+    # Raised to 700000 on 2026-07-30 via `--hf-overrides`, using the BASE repo's rope_parameters
+    # VERBATIM (attention_factor is YaRN-factor-dependent — 1.4852 at factor 128 vs 1.3466 at 32
+    # — so it must be copied, never hand-computed).
+    context_per_slot: 700000
+    # ⚠️ 700000 is a MEMORY bound, not a model bound. vLLM: "estimated maximum model length is
+    # 723472" at our 26 GiB KV. The MODEL reaches 1,048,576, but that needs 37.16 GiB of KV and
+    # the only ~11 GiB spare is the DFlash drafter — so 1M costs ~half the decode speed
+    # (28-30 t/s -> ~15). Deliberately not taken.
+    #
+    # ⚠️ ULTRA-LONG IS BACKGROUND-ONLY. A 578,400-token request measured 794 s end-to-end
+    # (prefill 729 tok/s — HALF the 1,426 tok/s seen at 213K; it degrades with length).
+    # timeout_model caps interactive (P0-P2) at _INTERACTIVE_CEILING_S = 600 s, so an
+    # interactive caller is killed around ~430K tokens. P3/P4 get 1800 s and fit. Anything
+    # sending >400K MUST be background priority or it will time out.
+    #
+    # ⚠️ timeout_model.size_stretch SATURATES at size_max=4.0 x the 16384 top edge = 65,536
+    # tokens, so a 578K prompt gets the SAME stretch as an 82K one. That constant was tuned when
+    # the ceiling was 128K and is now ~10x too early. Revisit before relying on near-max calls.
     context_window: 32768            # fleet chunkers size against 32K on purpose
     # 16 = the backend's HARD cap (`--max-num-seqs 16` in serve_tier3_prod.sh; was 20 on the
     # retired 27B). vLLM does NOT expose --max-num-seqs over its API, so this seed is the ONLY
