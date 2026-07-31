@@ -249,14 +249,59 @@ def _normalize_chat_payload(
         so = dict(so) if isinstance(so, dict) else {}
         so.setdefault("grammar", p.pop("grammar"))
         p["structured_outputs"] = so
-    # Default thinking off for vLLM (checked AFTER the extra_body merge so a
+    # Default thinking OFF for vLLM (checked AFTER the extra_body merge so a
     # caller's chat_template_kwargs nested in extra_body still wins).
+    #
+    # ⚠️ WHY IT IS OFF, correctly stated. It is NOT that thinking is broken —
+    # that was the 2026-07-31 misdiagnosis (999308832, "silently returning
+    # EMPTY content"). Re-measured the same day: reasoning works and lands in
+    # the response's `reasoning` field; at max_tokens=500 the model spends the
+    # whole budget reasoning and never reaches `content` (finish_reason=length),
+    # and at 1500 it answers cleanly in ~922 tokens.
+    #
+    # The default stays OFF because reasoning tokens are ADDITIVE to the answer
+    # and essentially every caller sizes max_tokens for the answer alone —
+    # flipping this globally would empty-complete the fleet. Thinking is
+    # opt-in per call site, and a call site that opts in MUST raise its budget.
+    # The empty-completion gate below now names this case explicitly so the
+    # next person does not re-derive "thinking is broken" from a bare "empty".
     if vllm and not _has_enable_thinking(p):
         ck = p.get("chat_template_kwargs")
         ck = dict(ck) if isinstance(ck, dict) else {}
         ck["enable_thinking"] = False
         p["chat_template_kwargs"] = ck
     return p
+
+
+
+def empty_completion_error(role: str, msg: dict, finish_reason: str | None,
+                           output_tokens: int) -> "BackendError | None":
+    """The empty-completion decision, as a pure function so it can be TESTED.
+
+    Extracted 2026-07-31 rather than left inline: a test that re-implements this
+    logic is a copy that drifts, and the whole point of the change is that the
+    message must stay precise. See
+    `tests/llmproxy/test_empty_completion_names_its_cause.py`.
+
+    Returns the error to raise, or None when the response is fine.
+    """
+    if (msg.get("content") or "").strip() or msg.get("tool_calls"):
+        return None
+    reasoning = (msg.get("reasoning") or msg.get("reasoning_content") or "")
+    if reasoning.strip() and finish_reason == "length":
+        return BackendError(
+            502,
+            f"backend {role} spent its ENTIRE {output_tokens}-token budget on "
+            f"REASONING and never reached content ({len(reasoning)} chars of "
+            f"reasoning, finish_reason=length). This is a token-budget problem, "
+            f"NOT a broken model: raise max_tokens (reasoning is additive to the "
+            f"answer), or use the proxy's `thinking: true` opt-in which adds a "
+            f"reasoning budget for you, or send enable_thinking=false.")
+    return BackendError(
+        502,
+        f"backend {role} returned empty completion "
+        f"(no content, output_tokens={output_tokens}, "
+        f"finish_reason={finish_reason!r})")
 
 
 def _has_enable_thinking(payload: dict) -> bool:
@@ -498,12 +543,10 @@ class BackendClientPool:
             choice0 = (body.get("choices") or [{}])[0] or {}
             finish_reason = choice0.get("finish_reason")
             msg = choice0.get("message") or {}
-            if not (msg.get("content") or "").strip() and not msg.get("tool_calls"):
-                raise BackendError(
-                    502,
-                    f"backend {ep_cfg.role} returned empty completion "
-                    f"(no content, output_tokens={output_tokens})",
-                )
+            err = empty_completion_error(
+                ep_cfg.role, msg, finish_reason, output_tokens)
+            if err is not None:
+                raise err
 
         return BackendResponse(
             status_code=resp.status_code,
