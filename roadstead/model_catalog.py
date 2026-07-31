@@ -231,6 +231,13 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
             "host": cat.hosts.get(e.host, e.host),
             "port": e.port,
         }
+        if e.status == "on_demand":
+            # An on_demand endpoint is NOT always-resident, so health must not page when it is
+            # simply not loaded (health.Health skips probing when on_demand and not loaded).
+            # Without this the catalog's `status: on_demand` never reached EndpointConfig and a
+            # deliberately-stopped backend logged CRITICAL "UNHEALTHY — 3 consecutive probe
+            # failures" every cycle. Found 2026-07-31 after tier3-backup was stopped per §2b.
+            kw["on_demand"] = True
         if e.backend_engine == "vllm":
             kw["backend_engine"] = "vllm"
         if e.capabilities.get("reasoning") and e.backend_engine != "vllm":

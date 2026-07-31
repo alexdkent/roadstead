@@ -103,6 +103,18 @@ models:
     #
     # Do NOT re-add `tier3` here — an alias maps to exactly ONE endpoint and load_catalog()
     # raises `name collision` AT IMPORT, taking the proxy down on start (it did, ~4 min).
+    # 🚨 RECOVERY IS MANUAL TODAY — do not read `fallback: tier3_backup` as automatic failover.
+    # Two things are true and easy to conflate:
+    #   * `fallback:` is PARSED into the catalog but never consumed for routing. It is advisory
+    #     metadata. Nothing re-routes to this endpoint when tier3 fails.
+    #   * `status: on_demand` here is NOT the same field as EndpointConfig.on_demand. That flag
+    #     drives the ANVIL GPU-slot dispatcher lease (dispatcher_capability) and is anvil-
+    #     only; nexus has no dispatcher, so no existing machinery can load this model. Building
+    #     that is §4b.2 of the tier migration (the nexus memory arbiter) — NEW SOFTWARE.
+    # Until the arbiter lands, bringing the abliterated 122B back is an OPERATOR action:
+    #     ssh root@10.0.0.6 'systemctl start llama-companion'     # ~minutes, 70.6 GiB GGUF
+    # The unit is stopped AND disabled on purpose (§2b: steady state STOPPED so imagegen gets
+    # the run of the box). Starting it will contend with imagegen for nexus memory.
     kind: chat
     status: on_demand
     proxy_endpoint: true
