@@ -370,3 +370,61 @@ if __name__ == "__main__":  # plain-script runner
         passed += 1
         print(f"ok  {fn.__name__}")
     print(f"\n{passed}/{len(fns)} passed")
+
+
+def _req_bare_grammar():
+    """A raw GBNF grammar whose language is NOT JSON — the exact example named
+    in `request_expects_json`'s docstring."""
+    r = _req()
+    r.payload = {
+        "messages": [{"role": "user", "content": "Is the sky blue?"}],
+        "grammar": 'root ::= ("yes" | "no")',
+    }
+    r.call_site = "agent.bare_grammar"
+    return r
+
+
+def test_bare_token_grammar_is_not_parse_gated():
+    """REGRESSION: a bare-token GBNF grammar legitimately emits non-JSON, and
+    the schema-backstop must not demand JSON of it.
+
+    The backstop passed `request_is_structured()` as `expect_json_content`,
+    but that predicate is true for ANY constrained output. A grammar
+    constrains output to an arbitrary language, so `yes` is CORRECT — yet it
+    was repair-failed, retry-failed and turned into a 502
+    ("produced schema-invalid structured output"). Measured live 2026-07-31:
+    GBNF worked direct to llama.cpp and 502'd through the proxy on all three
+    tiers. `request_expects_json()` is the narrower predicate that already
+    documents this exact case; the backstop must use it.
+    """
+    _enforce()
+    try:
+        backend = _backend_returning()
+        st = _mock_state(backend)
+        res = _result("yes")
+        _run(st, _req_bare_grammar(), res)
+    finally:
+        _clear_flags()
+    assert res["status"] == "ok", f"bare grammar was rejected: {res.get('error')}"
+    assert res["response"]["choices"][0]["message"]["content"] == "yes"
+    assert st.schema_detected == 0, "backstop must not even flag a non-JSON grammar"
+    assert backend.calls == [], "must not burn a retry re-dispatching a valid answer"
+
+
+def test_json_object_rooted_grammar_is_still_parse_gated():
+    """The narrowing must NOT go too far: a grammar rooted at a JSON OBJECT
+    still implies JSON content, so malformed output there must still be caught."""
+    _enforce()
+    try:
+        backend = _backend_returning()
+        st = _mock_state(backend)
+        r = _req()
+        r.payload = {
+            "messages": [{"role": "user", "content": "give me a"}],
+            "grammar": 'root ::= "{" ws "\\"a\\"" ws ":" ws number ws "}"\nws ::= [ \\t\\n]*\nnumber ::= [0-9]+',
+        }
+        res = _result("not json at all")
+        _run(st, r, res)
+    finally:
+        _clear_flags()
+    assert st.schema_detected == 1, "JSON-rooted grammar must still be parse-gated"

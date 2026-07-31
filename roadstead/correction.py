@@ -882,7 +882,18 @@ class Correction:
                 return
 
             schema = _extract_declared_schema(payload)
-            status, conformed = _conform_body(response, schema, expect_json_content=is_struct)
+            # ⚠️ expect_json_content must be the NARROW predicate, not `is_struct`.
+            # `request_is_structured()` is true for ANY constrained output, but a
+            # GBNF grammar constrains to an ARBITRARY language — `root ::= "yes" |
+            # "no"` legitimately emits `yes`, which is not JSON. Passing is_struct
+            # here made the backstop demand JSON of it, fail repair, burn a retry,
+            # and then either 502 ("produced schema-invalid structured output") or
+            # substitute the retry's `{}` for the correct answer. Measured live
+            # 2026-07-31: raw GBNF worked direct to llama.cpp and failed through
+            # the proxy on all three tiers. `request_expects_json()` already
+            # documents exactly this case (JSON-object-rooted grammars still gate).
+            status, conformed = _conform_body(
+                response, schema, expect_json_content=self.request_expects_json(req))
             if status == "ok":
                 return  # fast path — already valid, no-op
 
