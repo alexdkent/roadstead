@@ -275,10 +275,18 @@ models:
     # parameter count; these are DERIVED from config.json and are approximate — treat as
     # indicative, not authoritative.
     params: {active: ~6B, total: ~120B}
-    # 262144 = the SERVED window (--max-model-len), and Laguna's NATIVE
-    # max_position_embeddings — no rope scaling, so no long-context quality cliff by design.
-    # Raised 131072 -> 262144 on 2026-07-30 together with an explicit --kv-cache-memory of
-    # 26 GiB (up from the 15.94 GiB the 0.72 util happened to leave over).
+    # 262144 = the SERVED window (--max-model-len) = THIS CHECKPOINT's ceiling. Raised
+    # 131072 -> 262144 on 2026-07-30 with an explicit --kv-cache-memory of 26 GiB.
+    #
+    # ⚠️ CORRECTION: 262144 is NOT "Laguna's native context, unscaled" — an earlier version of
+    # this comment said that and it was wrong twice over.
+    #   * It IS rope-scaled: `rope_parameters.full_attention` is YaRN with factor 32.0 over an
+    #     original_max_position_embeddings of 8192 (8192 x 32 = 262144).
+    #   * The BASE repo `poolside/Laguna-S-2.1` ships YaRN factor **128.0 = 1,048,576 (1M)**.
+    #     The INT4 and NVFP4 quants ship factor 32.0 instead. Weights are identical and YaRN is
+    #     an inference-time RoPE transform, so 1M is a CONFIG cap here, not a weights limit —
+    #     see the `laguna-1m-context` note about raising it (KV, not config, is the real bound:
+    #     the pool holds 670,750 tokens, so ~670K is the practical ceiling regardless).
     #
     # Never go BELOW the retired 27B's 131072 without saying so out loud: the context gate
     # starts 422-ing requests that used to succeed, which is a silent capability regression
