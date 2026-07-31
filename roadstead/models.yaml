@@ -95,7 +95,12 @@ models:
     proxy_endpoint: true
     endpoint_class: companion
     role: qwen-composer
-    aliases: [tier3, qwen-composer, companion, nexus-companion]   # tier3 = canonical (2026-07-30 tier migration)
+    # `tier3` MOVED OFF this stanza 2026-07-30 (Phase B): tier3 is now Laguna on anvil
+    # (the `reasoner` stanza). This nexus 122B GGUF stays as the `composer` FALLBACK, which
+    # keeps the abliterated capability reachable. Do NOT re-add tier3 here — an alias may map
+    # to exactly ONE endpoint and load_catalog() raises `name collision` at import, which takes
+    # the whole proxy down on start (it did, for ~4 min, on the Phase B cutover).
+    aliases: [qwen-composer, companion, nexus-companion]
     host: nexus
     port: 8081
     backend_engine: llama.cpp
@@ -253,52 +258,83 @@ models:
     # (build_role_to_class registers role + aliases, never the key), so callers
     # passing model="reasoner" 404'd with unknown_endpoint. Registered as an alias
     # so the semantic role name resolves to the live anvil thinker backend.
-    aliases: [reasoner, llama-thinker, thinker]
+    aliases: [tier3, reasoner, llama-thinker, thinker]   # tier3 = canonical (2026-07-30 tier migration)
     host: anvil
     port: 9083
     backend_engine: vllm
-    systemd_unit: vllm-thinker
+    # 2026-07-30: NOT a systemd unit any more. Tier 3 runs as docker container `vllm-tier3`
+    # (--restart unless-stopped); launcher + the load-bearing flags are documented in
+    # /opt/anvil-bench/serve_tier3_prod.sh on anvil. The old `vllm-thinker` unit AND
+    # `vllm-thinker-watchdog` are stopped + DISABLED — do not send restart tooling at them.
+    systemd_unit: ""
     probe_kind: vllm
-    served_model_names: [llama-thinker, thinker, claude-sonnet-4-5, llama]
-    model_family: Qwen3.6-27B-Text-NVFP4-MTP
-    quant: NVFP4
-    params: {active: 27B, total: 27B}
+    served_model_names: [llama-thinker, thinker, tier3, reasoner, claude-sonnet-4-5, llama]
+    model_family: Laguna-S-2.1-INT4 (+ Laguna-S-2.1-DFlash-INT4 drafter)
+    quant: INT4 (compressed-tensors pack-quantized, W4A16, group 32)
+    # Sparse MoE: 256 experts, top-10, 48 layers, hidden 3072. poolside do not publish a
+    # parameter count; these are DERIVED from config.json and are approximate — treat as
+    # indicative, not authoritative.
+    params: {active: ~6B, total: ~120B}
+    # 131072 = the SERVED window (--max-model-len). Held at parity with the retired 27B on
+    # purpose: dropping it to 32768 is a silent capability regression — the context gate starts
+    # 422-ing requests between 32K and 128K that used to succeed. Affordable here: the KV pool
+    # is 217k tokens, and paged attention allocates only what a request uses, so typical (~8k)
+    # traffic is unaffected; only several CONCURRENT full-length requests contend.
     context_per_slot: 131072
     context_window: 32768            # fleet chunkers size against 32K on purpose
-    # 20 = the backend's HARD cap (vllm-thinker `--max-num-seqs 20`, lowered
-    # 32->20 on 2026-06-11 for DECKARD co-residency — see serve_thinker_prod.sh).
-    # vLLM does NOT expose --max-num-seqs over its API, so this seed is the ONLY
-    # source of the proxy's admission ceiling; a stale 32 here over-admitted the
-    # thinker by 12 (the extra 12 just queued at the backend, bypassing the
-    # proxy's DRR fairness). Reconciled to the documented launch value 2026-07-01
-    # (Phase-0 discovery). NOTE: llama.cpp roles self-correct via /props; vLLM
-    # ones like this do NOT — a Phase-1 shadow reconciler will warn on future
-    # drift. Keep this equal to serve_thinker_prod.sh's --max-num-seqs.
-    slots: 20
+    # 16 = the backend's HARD cap (`--max-num-seqs 16` in serve_tier3_prod.sh; was 20 on the
+    # retired 27B). vLLM does NOT expose --max-num-seqs over its API, so this seed is the ONLY
+    # source of the proxy's admission ceiling; a stale value over-admits (the surplus just
+    # queues at the backend, bypassing the proxy's DRR fairness — a stale 32 once over-admitted
+    # the thinker by 12). NOTE: llama.cpp roles self-correct via /props; vLLM ones like this do
+    # NOT — the shadow reconciler warns on drift. Keep EQUAL to serve_tier3_prod.sh.
+    slots: 16
     timeout_floor_s: 180
     policy:
       background_floor_pct: 0.0
       fast_path_reserve_slots: 1
-      # Step 4c: the backend's real --max-num-seqs (serve_thinker_prod.sh). Keep
+      # Step 4c: the backend's real --max-num-seqs (serve_tier3_prod.sh). Keep
       # EQUAL to `slots` above; the shadow reconciler warns if they drift (the
-      # 32-vs-20 class). Update BOTH whenever serve_thinker_prod.sh changes.
-      documented_max_num_seqs: 20
+      # 32-vs-20 class). Update BOTH whenever serve_tier3_prod.sh changes.
+      documented_max_num_seqs: 16
     capabilities:
       vision: false
       streaming: true
       reasoning: true               # MTP speculative + per-request thinking
       tool_calling: true
       structured_output: guidance
-    token_speed: {decode_tok_s_at_1: 40, aggregate_tok_s_full: 120}
-    purpose: Dense agentic reasoning tier (the fleet's heavy reasoner).
+    token_speed: {decode_tok_s_at_1: 30, aggregate_tok_s_full: 120}   # 29.9 t/s measured 2026-07-30
+    purpose: Heavy MoE reasoning/synthesis tier (tier3 — the fleet's deepest model).
     when_used:
       - knowledge extraction, news synthesis, thread/device enrichment
       - browser-broker default, forum-agent thread summary
     fallback: composer
     notes: |
-      Function-named: actually a Qwen3.6 dense model on vLLM with qwen3_5_mtp
-      n=3 speculative decoding. served window is 128K (opencode); fleet chunkers
-      deliberately use 32K (context_window) to keep extraction chunks small.
+      TIER 3 — Laguna S 2.1 INT4 on vLLM (anvil/GB10, sm_121a image
+      ghcr.io/timothystewart6/vllm-gb10), with the MATCHED Laguna-S-2.1-DFlash-INT4
+      drafter at num_speculative_tokens=3. Replaced the dense Qwen3.6-27B NVFP4 on
+      2026-07-30. Weights live on the NVMe-backed `llmmodels` share (67 GB + 2.1 GB).
+
+      Measured at cutover: decode 29.9 t/s, DFlash acceptance 43.1% (2.29 tok/forward),
+      prefix-cache hit 64-70%. Prefix caching WORKS here — it was structurally 0% on
+      Qwen3.5's DeltaNet hybrid — which matters a lot on a prefill-dominated load.
+
+      🚨 TWO LOAD-BEARING FLAGS. Neither is cosmetic; both are gated by tier3_gates.py:
+      1. `--default-chat-template-kwargs '{"enable_thinking": true}'`. Laguna's chat
+         template defaults enable_thinking=true, but vLLM's DeepSeekV3-derived
+         `poolside_v1` reasoning parser defaults it FALSE, and when false it installs an
+         IdentityReasoningParser that separates NOTHING. Without the flag, any request
+         that sends no chat_template_kwargs — which is EVERY fleet caller today — gets
+         raw chain-of-thought plus a stray `</think>` inside `content`. It reads as
+         model output, so nothing errors; it just quietly poisons kv4 extraction and
+         every judgment. Caught by gate G4 (asserts no leak in all three modes).
+      2. `--gpu-memory-utilization 0.72` is a HARD CEILING while a drafter is loaded —
+         spec-decode drafters allocate OUTSIDE that budget. 0.78 + a drafter hard-hung
+         anvil twice on 2026-07-30, each needing an operator power cycle.
+
+      Tool calling and reasoning both use `poolside_v1` (Laguna's template is
+      GLM-derived: `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>`).
+      Served window is 32K (down from the 27B's 128K), matching the fleet chunkers.
 
   creative:
     kind: chat
