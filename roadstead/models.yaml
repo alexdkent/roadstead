@@ -748,13 +748,26 @@ models:
       "dispatcher /ensure unreachable". That dispatcher was ported from anvil with the
       service — it is not optional infrastructure.
 
-      ⚠️ COLD LOAD IS EXPENSIVE ON gfx1151 AND IT IS NOT THE DISK. Measured 2026-07-31: disk
-      reads 4.1 GB/s and from_pretrained takes 0.5 s, but `to("cuda")` on a large checkpoint
-      runs 10-25 MINUTES (status shows phase=moving_to_cuda). Tested HSA_ENABLE_SDMA at 0 AND
-      1 with no material difference, so this is the unified-memory copy path, not the SDMA
-      workaround. anvil saw the same on big checkpoints (17-24 GB cold loads timing out
-      >600 s), so it is NOT a regression from the move. Same-family swaps are cheap
-      (SDXL variants 15-20 s). Mitigated in the unit: IMAGEGEN_IDLE_UNLOAD_S=5400 and
+      ⚠️ BULK `to("cuda")` IS PATHOLOGICALLY SLOW ON gfx1151 — OPEN ISSUE, NOT YET ROOT-CAUSED.
+      Measured 2026-07-31 on a 7 GiB SDXL checkpoint: disk 4.1 GB/s, `from_pretrained` 0.4 s,
+      then `to("cuda")` runs >400 s ALONE on an idle box (97 GiB free) and 10-25 min under
+      load. That is ~4-17 MB/s for a copy that on a UNIFIED-memory part should barely copy at
+      all. Ruled OUT by measurement, each disproved in turn:
+        * HSA_ENABLE_SDMA — same slowness at 0 and 1.
+        * the venv — /opt/rocmtest/venv (no torchvision) is equally slow.
+        * GPU contention — still slow with the box quiet and nothing else loaded.
+      🔑 STRONG LEAD: the earlier "SDXL is fine on nexus, 18 s" result was per-IMAGE
+      GENERATION, not load, and it used `enable_model_cpu_offload()` — which streams layers on
+      demand and therefore NEVER performs a bulk to("cuda"). Generation itself is healthy
+      (~20 s/image). So the cost is specifically the fully-resident bulk transfer the service
+      does, and offload may sidestep it entirely. Worth testing before accepting the timeouts
+      below as permanent.
+      ⚠️ Do NOT claim parity with anvil: anvil can no longer load these checkpoints at all
+      (tier3 leaves ~8 GiB against a ~22 GiB need), so no same-model baseline exists. An earlier
+      revision of this note asserted "not a regression from the move" on the strength of
+      anvil's registry comment about 17-24 GB DiT models — a different, much larger class.
+      That claim was not supported and has been withdrawn.
+      Same-checkpoint reuse IS cheap (SDXL variants 15-20 s once resident). Mitigated in the unit: IMAGEGEN_IDLE_UNLOAD_S=5400 and
       IMAGEGEN_GENERATION_TIMEOUT_S=3600 — the service counts model LOAD inside the
       generation deadline, so the default 960 s failed healthy loads.
 
