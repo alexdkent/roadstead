@@ -275,12 +275,19 @@ models:
     # parameter count; these are DERIVED from config.json and are approximate — treat as
     # indicative, not authoritative.
     params: {active: ~6B, total: ~120B}
-    # 131072 = the SERVED window (--max-model-len). Held at parity with the retired 27B on
-    # purpose: dropping it to 32768 is a silent capability regression — the context gate starts
-    # 422-ing requests between 32K and 128K that used to succeed. Affordable here: the KV pool
-    # is 217k tokens, and paged attention allocates only what a request uses, so typical (~8k)
-    # traffic is unaffected; only several CONCURRENT full-length requests contend.
-    context_per_slot: 131072
+    # 262144 = the SERVED window (--max-model-len), and Laguna's NATIVE
+    # max_position_embeddings — no rope scaling, so no long-context quality cliff by design.
+    # Raised 131072 -> 262144 on 2026-07-30 together with an explicit --kv-cache-memory of
+    # 26 GiB (up from the 15.94 GiB the 0.72 util happened to leave over).
+    #
+    # Never go BELOW the retired 27B's 131072 without saying so out loud: the context gate
+    # starts 422-ing requests that used to succeed, which is a silent capability regression
+    # (caught 2026-07-30 by test_context_gate + test_timeout_events as `assert 422 == 200`).
+    #
+    # --max-model-len does NOT reserve memory; it only permits longer requests. Paged
+    # attention allocates what a request actually uses, so typical ~8k traffic is unaffected
+    # and only several CONCURRENT full-length requests contend for the pool.
+    context_per_slot: 262144
     context_window: 32768            # fleet chunkers size against 32K on purpose
     # 16 = the backend's HARD cap (`--max-num-seqs 16` in serve_tier3_prod.sh; was 20 on the
     # retired 27B). vLLM does NOT expose --max-num-seqs over its API, so this seed is the ONLY
@@ -318,6 +325,13 @@ models:
       Measured at cutover: decode 29.9 t/s, DFlash acceptance 43.1% (2.29 tok/forward),
       prefix-cache hit 64-70%. Prefix caching WORKS here — it was structurally 0% on
       Qwen3.5's DeltaNet hybrid — which matters a lot on a prefill-dominated load.
+
+      KV sizing is EXPLICIT: `--kv-cache-memory 27917287424` (26 GiB) rather than letting the
+      util number decide what is left over. Measured 2026-07-30: 670,750 KV tokens
+      (~41.6 KiB/token), 2.56x concurrency at a full 256K request, ~12 GiB host headroom.
+      Prefer this lever over --gpu-memory-utilization: util is "whatever remains after weights,
+      activation and cudagraphs", which is exactly what makes it easy to get wrong when a
+      drafter is also allocating outside the budget. vLLM prints the suggested value at startup.
 
       🚨 TWO LOAD-BEARING FLAGS. Neither is cosmetic; both are gated by tier3_gates.py:
       1. `--default-chat-template-kwargs '{"enable_thinking": true}'`. Laguna's chat
