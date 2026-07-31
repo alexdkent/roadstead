@@ -89,18 +89,26 @@ models:
   # queue-wait. Same weights/mmproj as before, same 32K chunking policy (creative.context_window),
   # reasoning-off, grammar tool-calling — behavior-preserving for classify callers.
 
-  composer:
+  tier3_backup:
+    # 🔻 TIER-3 BACKUP ONLY as of 2026-07-30 (Phase B step 4 + §2b priority ladder).
+    # Every live role that used to land here — `composer`, `companion`, `nexus-companion`,
+    # `qwen-composer` — now resolves to the anvil `reasoner`/tier3 Laguna endpoint. This
+    # stanza exists to keep the ABLITERATED 122B reachable as tier3's declared fallback.
+    #
+    # `status: on_demand` because §2b makes its STEADY STATE **STOPPED** (priority 1: loaded
+    # only when tier3 is unhealthy). Leaving it running is not free — measured 2026-07-31, with
+    # the 122B resident nexus has ~8 GiB spare and moving SDXL to GPU took **701 s instead of
+    # seconds**, a ~40x penalty. imagegen and this model cannot usefully co-reside, which is the
+    # whole reason §2b specifies non-concurrency rather than sharing.
+    #
+    # Do NOT re-add `tier3` here — an alias maps to exactly ONE endpoint and load_catalog()
+    # raises `name collision` AT IMPORT, taking the proxy down on start (it did, ~4 min).
     kind: chat
-    status: active
+    status: on_demand
     proxy_endpoint: true
     endpoint_class: companion
-    role: qwen-composer
-    # `tier3` MOVED OFF this stanza 2026-07-30 (Phase B): tier3 is now Laguna on anvil
-    # (the `reasoner` stanza). This nexus 122B GGUF stays as the `composer` FALLBACK, which
-    # keeps the abliterated capability reachable. Do NOT re-add tier3 here — an alias may map
-    # to exactly ONE endpoint and load_catalog() raises `name collision` at import, which takes
-    # the whole proxy down on start (it did, for ~4 min, on the Phase B cutover).
-    aliases: [qwen-composer, companion, nexus-companion]
+    role: tier3-backup
+    aliases: [tier3-backup, llama-companion-122b]
     host: nexus
     port: 8081
     backend_engine: llama.cpp
@@ -258,15 +266,26 @@ models:
     # (build_role_to_class registers role + aliases, never the key), so callers
     # passing model="reasoner" 404'd with unknown_endpoint. Registered as an alias
     # so the semantic role name resolves to the live anvil thinker backend.
-    aliases: [tier3, reasoner, llama-thinker, thinker]   # tier3 = canonical (2026-07-30 tier migration)
+    # tier3 = canonical (2026-07-30 tier migration). `composer`/`companion`/`qwen-composer`/
+    # `nexus-companion` were MOVED here from the nexus 122B stanza on 2026-07-30 — Phase B
+    # step 4, "point composer/companion/reasoner/thinker aliases at tier3". Laguna is now the
+    # single heavy tier; the 122B remains reachable as `tier3-backup` (on_demand) for its
+    # abliterated capability, per the §2b priority ladder.
+    aliases: [tier3, reasoner, llama-thinker, thinker, composer, companion, qwen-composer, nexus-companion]
     host: anvil
     port: 9083
     backend_engine: vllm
-    # 2026-07-30: NOT a systemd unit any more. Tier 3 runs as docker container `vllm-tier3`
-    # (--restart unless-stopped); launcher + the load-bearing flags are documented in
-    # /opt/anvil-bench/serve_tier3_prod.sh on anvil. The old `vllm-thinker` unit AND
-    # `vllm-thinker-watchdog` are stopped + DISABLED — do not send restart tooling at them.
-    systemd_unit: ""
+    # `vllm-tier3.service` WRAPS the docker container (same pattern the retired
+    # vllm-thinker.service used): ExecStart=/opt/anvil-bench/serve_tier3_prod.sh,
+    # ExecStop=docker stop vllm-tier3.
+    # ⚠️ This field must be a REAL systemd unit — the anvil telemetry collector probes it with
+    # `systemctl is-active`, and build_telemetry_units() DROPS any probed role with an empty
+    # systemd_unit, which means NO health probe, NO metrics and NO health-verifier monitoring. It was ""
+    # from the Phase B cutover until 2026-07-31, so tier3 ran unmonitored for that window;
+    # test_model_naming_doctrine::test_telemetry_derive_is_complete is the guard.
+    # The old `vllm-thinker` unit AND `vllm-thinker-watchdog` are stopped + DISABLED (there is
+    # deliberately no watchdog on tier3) — do not send restart tooling at them.
+    systemd_unit: vllm-tier3
     probe_kind: vllm
     served_model_names: [llama-thinker, thinker, tier3, reasoner, claude-sonnet-4-5, llama]
     model_family: Laguna-S-2.1-INT4 (+ Laguna-S-2.1-DFlash-INT4 drafter)
@@ -341,7 +360,7 @@ models:
     when_used:
       - knowledge extraction, news synthesis, thread/device enrichment
       - browser-broker default, forum-agent thread summary
-    fallback: composer
+    fallback: tier3_backup
     notes: |
       TIER 3 — Laguna S 2.1 INT4 on vLLM (anvil/GB10, sm_121a image
       ghcr.io/timothystewart6/vllm-gb10), with the MATCHED Laguna-S-2.1-DFlash-INT4
@@ -425,7 +444,7 @@ models:
       - orchestrator inner chat loop (Sidekick's chat turn) via the companion-lite alias
       - Tier-1.5/Tier-2 text classification (sidekick.extract_pad fallback, temporal.daily_summary, mail-agent.email_recent_overview, orchestrator.autonomous_chat-agent.reflect, forum-agent.peer_playbook) via the classify alias
       - attachments stage-2 full-resolution image extraction; knowledge_store ground-truth PII/document intake; browser_broker vision-routed capabilities (perceive./vision./insurance./portal.) via the vision aliases
-    fallback: composer
+    fallback: tier3_backup
     notes: |
       CONSOLIDATED 2026-07-11 (three roles → one model): ONE standalone always-on docker container
       `llamacpp-creative-boxa` (`ghcr.io/ggml-org/llama.cpp:server-intel`, SYCL/level_zero:0,

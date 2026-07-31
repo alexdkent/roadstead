@@ -69,13 +69,17 @@ async def test_sync_capture_rollup_deblend_and_surfaces(proxy):
     test_endpoint_rate_uses_real_backend_metric_not_null.)
 
     Traffic: 2 attributed chats emitting cached_tokens=6/12 + 4 NULL
-    (llama.cpp shape) chats — driven on the 'chat'/'companion' endpoints."""
+    (llama.cpp shape) chats — driven on the 'chat'/'thinker' endpoints."""
     proxy.controller.cached_tokens = 6
     for _ in range(2):
         assert (await proxy.chat("hi", model="chat")).status_code == 200
     proxy.controller.cached_tokens = None  # llama.cpp: no counter
     for _ in range(4):
-        assert (await proxy.chat("hi", model="companion")).status_code == 200
+        # 2026-07-30: was model="companion". That role was repointed to tier3, and
+        # normalize_endpoint("companion") now resolves to "thinker" — the ROLE shadows the
+        # identically-named CLASS. Addressing "thinker" directly keeps this test comparing TWO
+        # DISTINCT endpoints (one attributed, one NULL-cached), which is the whole point.
+        assert (await proxy.chat("hi", model="thinker")).status_code == 200
 
     attr = _attr(proxy)
     # "chat" model= input normalizes to the "creative" endpoint class (the boxa
@@ -88,7 +92,7 @@ async def test_sync_capture_rollup_deblend_and_surfaces(proxy):
     assert chat_ep["attributable_input_tokens"] == 24  # 2 × 12
     assert chat_ep["hit_rate"] == 0.5
     # NULL (llama.cpp) rows: n/a, NOT a 0% hit — counted as unattributed.
-    comp = next(e for e in attr["by_endpoint"] if e["endpoint"] == "companion")
+    comp = next(e for e in attr["by_endpoint"] if e["endpoint"] == "thinker")
     assert comp["attributed_calls"] == 0
     assert comp["unattributed_calls"] == 4
     assert comp["hit_rate"] is None

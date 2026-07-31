@@ -9,6 +9,14 @@ track owns the hostile fault-injection E2E matrix.
 
 Self-binds the real Health methods to a stub state (the Mac 3.9 conftest blocks
 pytest, so it also runs as a plain script).
+
+
+2026-07-30: these drive the endpoint identifier formerly called "companion".
+That role now resolves to the anvil tier3 (Laguna) endpoint whose class is
+"thinker", so failures recorded under it land in the thinker bucket. Switched to
+"tier3-backup" — the nexus 122B, which still OWNS the `companion` endpoint class —
+so these keep exercising cooldown mechanics on that class rather than silently
+re-testing thinker. The mechanics under test are unchanged.
 """
 from __future__ import annotations
 
@@ -67,10 +75,10 @@ def test_both_flags_off_is_noop(monkeypatch):
     _all_off(monkeypatch)
     h = _health()
     for _ in range(10):
-        h.record_dispatch_failure("companion", _fail())
+        h.record_dispatch_failure("tier3-backup", _fail())
     assert h.state.endpoint_failure_times == {}
     assert h.state.endpoint_cooldown_trips == {}
-    assert h.endpoint_healthy("companion") is True
+    assert h.endpoint_healthy("tier3-backup") is True
 
 
 # --- backend-fault classification ------------------------------------------
@@ -80,7 +88,7 @@ def test_4xx_does_not_count(monkeypatch):
     monkeypatch.delenv(ENFORCE, raising=False)
     h = _health()
     for _ in range(10):
-        h.record_dispatch_failure("companion", BackendError(400, "bad request"))
+        h.record_dispatch_failure("tier3-backup", BackendError(400, "bad request"))
     assert h.state.endpoint_cooldown_trips == {}  # never trips on client errors
     assert "companion" not in h.state.endpoint_failure_times or \
         h.state.endpoint_failure_times.get("companion") == []
@@ -103,9 +111,9 @@ def test_below_threshold_no_trip(monkeypatch):
     monkeypatch.setenv(ALLOWED, "4")
     h = _health()
     for _ in range(3):
-        h.record_dispatch_failure("companion", _fail())
+        h.record_dispatch_failure("tier3-backup", _fail())
     assert h.state.endpoint_cooldown_trips == {}
-    h.record_dispatch_failure("companion", _fail())  # the 4th trips
+    h.record_dispatch_failure("tier3-backup", _fail())  # the 4th trips
     assert h.state.endpoint_cooldown_trips.get("companion") == 1
 
 
@@ -116,7 +124,7 @@ def test_stale_failures_pruned_from_window(monkeypatch):
     h = _health()
     # 3 old failures (well outside the 1s window) + 1 fresh → prune leaves 1.
     h.state.endpoint_failure_times["companion"] = [time.monotonic() - 100] * 3
-    h.record_dispatch_failure("companion", _fail())
+    h.record_dispatch_failure("tier3-backup", _fail())
     assert h.state.endpoint_cooldown_trips == {}  # stale ones don't count
 
 
@@ -128,10 +136,10 @@ def test_shadow_counts_but_does_not_pull(monkeypatch):
     monkeypatch.setenv(ALLOWED, "3")
     h = _health()
     for _ in range(3):
-        h.record_dispatch_failure("companion", _fail())
+        h.record_dispatch_failure("tier3-backup", _fail())
     assert h.state.endpoint_cooldown_trips.get("companion") == 1
     assert "companion" not in h.state.endpoint_cooldown_until  # NOT cooled
-    assert h.endpoint_healthy("companion") is True             # NOT pulled
+    assert h.endpoint_healthy("tier3-backup") is True             # NOT pulled
 
 
 # --- enforce: pull + auto-recover ------------------------------------------
@@ -142,13 +150,13 @@ def test_enforce_pulls_then_auto_recovers(monkeypatch):
     monkeypatch.setenv(DURATION, "30")
     h = _health()
     for _ in range(3):
-        h.record_dispatch_failure("companion", _fail())
+        h.record_dispatch_failure("tier3-backup", _fail())
     assert h.state.endpoint_cooldown_trips.get("companion") == 1
     assert "companion" in h.state.endpoint_cooldown_until
-    assert h.endpoint_healthy("companion") is False  # cooled → deferred
+    assert h.endpoint_healthy("tier3-backup") is False  # cooled → deferred
     # Simulate the cooldown expiring → auto-recovery (next dispatch tick).
     h.state.endpoint_cooldown_until["companion"] = time.monotonic() - 1
-    assert h.endpoint_healthy("companion") is True
+    assert h.endpoint_healthy("tier3-backup") is True
 
 
 def test_enforce_resets_window_after_trip(monkeypatch):
@@ -158,7 +166,7 @@ def test_enforce_resets_window_after_trip(monkeypatch):
     monkeypatch.setenv(ALLOWED, "3")
     h = _health()
     for _ in range(3):
-        h.record_dispatch_failure("companion", _fail())
+        h.record_dispatch_failure("tier3-backup", _fail())
     assert h.state.endpoint_failure_times.get("companion") == []  # window reset
 
 
@@ -174,7 +182,7 @@ def test_guard_bite_enforce_off_never_pulls(monkeypatch):
     h = _health()
     # Force a would-be-active cooldown window directly, then confirm OFF ignores it.
     h.state.endpoint_cooldown_until["companion"] = time.monotonic() + 999
-    assert h.endpoint_healthy("companion") is True  # enforce off → gate skipped
+    assert h.endpoint_healthy("tier3-backup") is True  # enforce off → gate skipped
 
 
 if __name__ == "__main__":  # plain-script mode (Mac 3.9)

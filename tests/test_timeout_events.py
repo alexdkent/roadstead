@@ -188,9 +188,10 @@ def test_timeout_event_records_identity_and_context(tmp_path):
     assert row[0] == "sess9"
     assert row[1] == "turn1"
     assert row[2] == "sidekick/sidekick.test/sess9"
-    # thinker context_per_slot (vLLM --max-model-len). 262144 since 2026-07-30, when tier3
-    # became Laguna S 2.1 and the window was raised to the model's native
-    # max_position_embeddings; was 131072 on the retired Qwen3.6-27B.
+    # thinker context_per_slot (vLLM --max-model-len). 700000 since 2026-07-30: tier3 became
+    # Laguna S 2.1 and the window was raised by overriding the QUANT's YaRN factor 32 up to the
+    # base repo's 128. Was 131072 on the retired Qwen3.6-27B. MEMORY-bound, not model-bound —
+    # the model reaches 1,048,576 but that needs 37.16 GiB of KV against our 26.
     assert row[3] == 700000
     # est_in = 4000 chars / 4 = 1000 tokens; 1000 / 700000 * 100 ≈ 0.1%
     assert row[4] == 0.1
@@ -322,20 +323,24 @@ def test_premature_unplanned_excludes_maintenance_and_background(tmp_path):
     # Foreground (P1) premature, NOT in a window → the one genuine health event.
     _ev("fg", "gemma", 1, True)
     # Foreground (P1) premature, but INSIDE a drain window → maintenance collateral.
-    _ev("fg_planned", "companion", 1, True)
+    _ev("fg_planned", "creative", 1, True)
     # Background (P3) premature on a DIFFERENT endpoint (not drained) → unplanned,
     # but still background so it defers+retries, not a foreground health signal.
     _ev("bg", "thinker", 3, True)
     # Background (P3) premature AND planned (the dominant real-world case).
-    _ev("bg_planned", "companion", 3, True)
+    _ev("bg_planned", "creative", 3, True)
 
     svc._queue_db.maintenance_record(
-        endpoint="companion", started_at=now - 60, ended_at=now + 60,
-        reason="composer prefill drain", operator="op")
+        endpoint="creative", started_at=now - 60, ended_at=now + 60,
+        reason="creative prefill drain", operator="op")
 
     rep = svc._queue_db.timeouts_report(24)
     assert rep["premature"] == 4                     # raw, overlaps planned (the old buggy number)
-    assert rep["planned"] == 2                        # 2 companion events fell in the window
+    # 2026-07-30: was "companion". normalize_endpoint("companion") now returns "thinker" — the
+    # ROLE shadows the identically-named CLASS, since composer/companion were repointed to tier3.
+    # That collapsed these events onto the same endpoint as the "bg" event and destroyed the
+    # two-distinct-endpoints structure this test needs. `creative` restores it.
+    assert rep["planned"] == 2                        # 2 creative events fell in the window
     assert rep["premature_unplanned"] == 2            # excludes the 2 planned premature (fg + bg survive)
     assert rep["premature_foreground_unplanned"] == 1  # + excludes the unplanned background (only fg)
 

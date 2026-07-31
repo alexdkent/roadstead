@@ -380,7 +380,13 @@ async def test_operator_pause_alerts_drained_not_outage():
         svc._evaluate_alerts(time.monotonic())
         names = {(a["name"], a["severity"]) for a in svc._alerts}
         assert ("endpoint_drained", "WARNING") in names
-        assert not any(a["name"] == "endpoint_paused" for a in svc._alerts)
+        # Scoped to the endpoint UNDER TEST. 2026-07-30: `tier3-backup` (the nexus 122B) is
+        # `status: on_demand`, and an on-demand endpoint that is not currently loaded raises its
+        # own legitimate endpoint_paused — unrelated to this drain. A blanket "no endpoint_paused
+        # anywhere" made this test sensitive to every other endpoint on the box; asserting about
+        # `thinker` specifically is what it actually meant to check.
+        assert not any(a["name"] == "endpoint_paused" and "thinker" in str(a.get("detail", ""))
+                       for a in svc._alerts)
     finally:
         svc._paused_endpoints.discard("thinker")
         await svc.shutdown()

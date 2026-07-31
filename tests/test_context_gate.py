@@ -100,7 +100,7 @@ async def test_enforce_max_tokens_counts_toward_limit():
 
 
 @pytest.mark.asyncio
-async def test_boundaries_thinker_vs_companion():
+async def test_boundaries_thinker_vs_creative():
     svc = ProxyService(ProxyConfig())
     svc._flags.set_many({"context_gate_enforce": True})
     _ok_backend(svc)
@@ -111,11 +111,23 @@ async def test_boundaries_thinker_vs_companion():
         # (131072→262144 on 2026-07-09 when classify freed composer memory)
         # can't strand this test on a stale constant again: an over-limit
         # prompt to companion 422s; a comfortably-under prompt to thinker admits.
-        composer_slot = next(ep.context_per_slot for ep in svc._config.endpoints.values()
-                             if ep.role == "qwen-composer")
-        over = composer_slot * 4 + 200_000   # chars ≈ 4/token → safely past the slot limit
+        # 2026-07-30: `qwen-composer` no longer names an endpoint ROLE — composer/companion
+        # moved to tier3 (role `llama-thinker`). The SMALLER-window endpoint is now the nexus
+        # 122B under `tier3-backup` (262144) vs tier3's 700000, which keeps this test doing what
+        # it was written to do: prove the gate is applied PER-ENDPOINT against each one's own
+        # limit rather than one global constant.
+        # 2026-07-30: `qwen-composer` no longer names an endpoint ROLE — composer/companion
+        # moved to tier3 (role `llama-thinker`, 700K). Deliberately NOT using `tier3-backup`
+        # as the small side: its stanza is `status: on_demand`, which routes admission through
+        # OnDemandManager.ensure_loaded BEFORE this gate, so it is a bad fixture here. `creative`
+        # is an ACTIVE chat endpoint with a genuinely smaller window, which keeps this test doing
+        # what it was written to do: prove the gate applies PER-ENDPOINT against each one's own
+        # limit rather than one global constant.
+        small_slot = next(ep.context_per_slot for ep in svc._config.endpoints.values()
+                          if ep.role == "creative")
+        over = small_slot * 4 + 200_000      # chars ≈ 4/token → safely past the slot limit
         under = 200_000                      # ~50K tokens, inside any live thinker limit
-        resp = await svc.handle_submit(_body("qwen-composer", over), _Req())
+        resp = await svc.handle_submit(_body("creative", over), _Req())
         assert resp.status_code == 422
         resp = await asyncio.wait_for(
             svc.handle_submit(_body("llama-thinker", under, timeout_s=10.0), _Req()),
