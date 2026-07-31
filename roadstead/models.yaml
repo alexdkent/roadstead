@@ -579,20 +579,28 @@ models:
   # ---------------------------------------------------------------- vision / OCR
   ocr:
     kind: ocr
-    # ⚠️ 2026-07-30: the SERVICE IS STOPPED (`ocr-unit` inactive on the A2000). It was
-    # switched off to free VRAM for tier1/gemma — gemma needs 3817 MiB and only 1404 MiB was free
-    # with OCR resident. `status: active` is kept deliberately: OCR is temporarily DOWN, not
-    # retired, and the catalog only understands active|on_demand (retirement is the `retired:`
-    # flag). It comes back on nexus in Phase E, which is gated behind Phase B freeing nexus.
-    # Attachment/document verticals have no OCR until then.
+    # ✅ 2026-07-31: BACK UP, on nexus (Phase E). It had been stopped since 2026-07-30 — switched
+    # off on the A2000 to free VRAM for tier1/gemma (gemma needs 3817 MiB; only 1404 MiB was free
+    # with OCR resident). Phase B stopping the nexus 122B freed ~100 GiB, which is what let it
+    # come back here. Verified end-to-end on ROCm: a probe image containing "INVOICE AX-4471 /
+    # 842.10 GBP / 31 March 2026" round-tripped correctly in 5.4 s.
     status: active
     proxy_endpoint: false           # facade-only (gateway), not a proxy LLM role
     role: got-ocr
     aliases: [got-ocr, got_ocr]
-    host: kestrel-perception             # RELOCATED off nexus 2026-07-02 (Kestrel OCR VM, CUDA)
+    # nexus (Strix Halo, ROCm/gfx1151) as of 2026-07-31 — unit `nexus-got-ocr`, isolated venv
+    # at /opt/got-ocr/.venv. Was kestrel-perception (A2000/CUDA) 2026-07-02..2026-07-30.
+    # ⚠️ transformers is PINNED 4.45.2 there: GOT-OCR2_0's trust_remote_code modeling breaks on
+    # newer. That conflicts with nexus's embed (5.8.1), rerank (4.57.6) and imagegen (5.14.1)
+    # venvs — four services, four venvs, do not consolidate.
+    host: nexus
     port: 8087
     backend_engine: shim
-    systemd_unit: ocr-unit
+    # `nexus-got-ocr` on nexus since 2026-07-31 (was `ocr-unit` on the A2000).
+    # Telemetry probes this with `systemctl is-active` — a stale unit name silently drops
+    # the role from derived UNITS (no health probe / metrics / health-verifier), the same way an empty
+    # systemd_unit did for tier3.
+    systemd_unit: nexus-got-ocr
     probe_kind: health
     model_family: GOT-OCR-2.0
     quant: fp16
