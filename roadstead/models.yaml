@@ -438,6 +438,35 @@ models:
       The backend/flags are server-level; they CANNOT be overridden per request —
       verified, all three override shapes were ignored or rejected.
 
+      🚨 `--long-prefill-token-threshold 1024` IS SLOT FAIRNESS (2026-07-31).
+      It caps how many prefill tokens ONE request may take per scheduler step, BEFORE
+      the shared `--max-num-batched-tokens 8192` budget is applied
+      (vllm/v1/core/sched/scheduler.py:507). Without it a single giant prefill owns the
+      whole budget for ~25 consecutive steps and nothing else prefills at all.
+
+      Measured with one 100K-token request in flight alongside short interactive ones.
+      Read the WORST short request, not the median — the median hides it completely,
+      because only the FIRST short request is starved and the rest run free:
+
+          threshold   worst short   long request
+          none(8192)     45.26 s       49.2 s     <- one caller stalled 100x
+          4096            9.76 s       49.1 s
+          2048            4.16 s       50.0 s
+          1024            1.86 s       51.5 s     <- CHOSEN
+
+      1024 buys a 24x better interactive tail for 4.7% on the giant. That is the right
+      direction because this stanza ALREADY declares ultra-long traffic background-only,
+      and a 45 s stall reads to a caller as a hang and blows _INTERACTIVE_CEILING_S.
+      Idle short latency was 0.30 s at every setting — normal traffic pays nothing.
+      Our real distribution (1157 reqs) is 96% <=10k tokens, 0.7% >50k, so the giants
+      this protects against are rare but severe.
+
+      ⚠️ `--max-num-partial-prefills` / `--max-long-partial-prefills` are NOT usable:
+      vLLM's V1 engine raises `NotImplementedError: Concurrent Partial Prefill is not
+      supported` at startup (engine/arg_utils.py `_check_feature_supported`) and
+      crash-loops. The fields exist on the legacy SchedulerConfig, which makes them look
+      available — they are not. Only the threshold is honoured. Don't re-try them.
+
       🚨 TWO LOAD-BEARING FLAGS. Neither is cosmetic. ⚠️ They are gated by
       `tier3_gates.py`, which lives ONLY on anvil (`/opt/anvil-bench/`) and is NOT in
       this repo — so neither CI nor ship.sh can run it, and nothing here will catch a
