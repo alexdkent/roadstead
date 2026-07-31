@@ -501,12 +501,30 @@ models:
          number: a spec-decode drafter allocates OUTSIDE the util budget. Re-measure
          headroom after any change that adds concurrency or a drafter.
 
-      Structured outputs use `--structured-outputs-config '{"backend":"guidance"}'`
-      (see `structured_output: guidance` below) — NOT llama.cpp GBNF, which is the
-      `creative`/tier2 stanza's backend. Verified 2026-07-31 with a real json_schema
-      call: 29 tokens, finish_reason=stop, valid parseable JSON. Truncation of
-      structured calls runs ~0.1% (28 in 26,993 requests/24h) and is a budget tail,
-      not a grammar fault.
+      Structured outputs use the `guidance` backend (see `structured_output: guidance`
+      below) — NOT llama.cpp GBNF, which is the `creative`/tier2 stanza's backend.
+      Verified 2026-07-31 with a real json_schema call: 29 tokens, finish_reason=stop,
+      valid parseable JSON.
+
+      TRUNCATION, re-measured after the disable_any_whitespace fix (2026-07-31):
+        pre-fix : 0.104% overall (28 / 26,993 per 24h), dominated by the runaway
+        post-fix: 0.155% overall (11 / 7,095 per 4h) — but the COMPOSITION inverted
+                  and that is the number that matters:
+                    * structured truncation is now 1 in 7,095 = 0.014%
+                    * 8 of the 11 are `structured=False` — plain generations hitting
+                      a small cap, i.e. CALLER under-budgeting, not a tier3 defect
+                    * 6 of those 8 were one burst from `lan-generic.openai_compat`
+                      at max_tokens=512 inside 5 seconds
+        The single structured case was `forum-agent.thread_summary`, which uses
+        `response_format: {"type":"json_object"}` (no schema, 800-token cap) — a long
+        summary hitting its budget, not a structural-position runaway.
+      ⚠️ Do NOT read the overall rate going 0.104% -> 0.155% as a regression. The
+      runaway class it was measuring is gone (the real gate went 10/10 -> 0/10); what
+      is left is a different, caller-side phenomenon that the earlier number was
+      never isolating.
+      Known log noise: `discord.schema_smoke` truncates repeatedly at max_tokens=96,
+      which is a smoke test with a deliberately tiny budget — it is not a fault, but
+      it does dilute this signal.
 
       Tool calling and reasoning both use `poolside_v1` (Laguna's template is
       GLM-derived: `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>`).
