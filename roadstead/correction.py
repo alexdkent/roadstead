@@ -1094,7 +1094,9 @@ class Correction:
         against the cap; operator directive is to prefer slowness over cutoffs).
         Records the request for response-side structured-output recovery. Strips
         the ``thinking`` control field (not a backend param) regardless. Fully
-        transparent when not requested, feature-disabled, streaming, or non-vLLM."""
+        transparent when not requested, feature-disabled, streaming, or non-vLLM.
+        Also folds any system message(s) into the first user turn — see
+        :meth:`fold_system_for_thinking` for why."""
         p = req.payload
         if not isinstance(p, dict):
             return
@@ -1119,8 +1121,80 @@ class Correction:
         budget = thinking_reasoning_budget()
         cur = p.get("max_tokens")
         p["max_tokens"] = (cur if isinstance(cur, int) and cur > 0 else 800) + budget
+        # Thinking IS being applied from here — the template quirk below only
+        # matters on this path, so the fold stays scoped to the opt-in.
+        folded = self.fold_system_for_thinking(p.get("messages"))
+        if folded is not None:
+            p["messages"] = folded
         self.state.thinking_active[req.request_id] = {
             "allowed_keys": self.thinking_allowed_keys(p)}
+
+    @staticmethod
+    def fold_system_for_thinking(messages):
+        """Merge system message(s) into the first non-system turn, returning a NEW
+        list (or ``None`` when there is nothing to do / it can't be done losslessly).
+
+        WHY (measured 2026-07-31, laguna/tier3 = vLLM on anvil:9083):
+        ``chat_template_kwargs.enable_thinking=true`` is accepted with no error
+        and no warning, and the model still emits NO reasoning far more often
+        when a caller-supplied ``role: "system"`` message is present. Measured
+        against the live endpoint on a think-worthy prompt (n samples per cell,
+        `reasoning` field length):
+
+            system + user, no schema  →     0,     0 ch
+            same text, folded in      →  8200, 13565 ch
+            system + user, schema     →     0 x6, 11411 ch      (1/7 reasoned)
+            same text, folded, schema →  12416, 3935, 31300, 0 x5 (3/8 reasoned)
+
+        It tracks the PRESENCE of the caller's system role, not its content or
+        its length. NOTE — this is NOT the template dropping the prefix:
+        ``/tokenize`` shows the rendered prompt ends in ``<assistant><think>``
+        in BOTH shapes. When no system message is supplied the template injects
+        its OWN default one, so the fold is really "let the model see its
+        native system prompt". The suppression is learned behaviour, hence
+        probabilistic rather than absolute — folding raises the reasoning rate,
+        it does not guarantee it.
+
+        Because essentially every fleet caller sends a system prompt, production
+        thinking calls have been reasoning far less than the opt-in implies —
+        and the responses were still schema-conformant, so ``thinking_clean``
+        reported health the whole time (that hole is now covered by
+        ``thinking_noop``).
+
+        Do NOT "simplify" this away. Same class of fix as
+        ``backend._normalize_strict_alternation`` (Mistral's strict alternation):
+        reshape the messages to satisfy a template quirk the backend won't report.
+
+        Content- and order-preserving: system texts are joined in order and
+        prefixed to the first remaining turn; nothing is dropped or reordered.
+        """
+        if not isinstance(messages, list):
+            return None
+        sys_parts, rest = [], []
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") == "system":
+                c = m.get("content")
+                if not isinstance(c, str):
+                    return None  # non-text system block — can't fold losslessly
+                sys_parts.append(c)
+            else:
+                rest.append(m)
+        if not sys_parts or not rest:
+            return None  # no system, or system-only — nothing to fold into
+        head = rest[0]
+        if not isinstance(head, dict):
+            return None
+        prefix = "\n\n".join(sys_parts)
+        content = head.get("content")
+        out = list(rest)
+        if isinstance(content, str):
+            out[0] = {**head, "content": prefix + "\n\n" + content}
+        elif isinstance(content, list):
+            # vision/multipart turn — prepend the system text as its own text block
+            out[0] = {**head, "content": [{"type": "text", "text": prefix}, *content]}
+        else:
+            return None
+        return out
     def finalize_thinking(self, req: QueuedRequest, result: dict) -> None:
         """Response-side normalization for an opted-in thinking request (mutates
         ``result`` in place). vLLM already splits reasoning into
@@ -1146,6 +1220,23 @@ class Correction:
         if not isinstance(content, str):
             return
         self.state.thinking_requests += 1
+        # LOUD-ify the silent case: thinking was requested and applied, but the
+        # backend returned NO reasoning at all. That is exactly how the laguna
+        # system-message template bug hid for its whole life — the responses were
+        # schema-conformant, so `thinking_clean` ticked up and nothing looked
+        # wrong. A capability that silently does nothing is the failure mode here.
+        try:
+            msg = ch0.get("message") or {}
+            reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+        except Exception:  # noqa: BLE001
+            reasoning = ""
+        if not (isinstance(reasoning, str) and reasoning.strip()):
+            self.state.thinking_noop += 1
+            logger.warning(
+                "thinking NO-OP (call_site=%s, endpoint=%s): thinking was requested "
+                "and applied but the response carried NO reasoning — the backend "
+                "emitted none despite enable_thinking (the opt-in did nothing here)",
+                req.call_site, getattr(req, "endpoint", "?"))
         allowed = info.get("allowed_keys") or []
         if not allowed:
             return  # plain thinking (no object-root constraint) — content is the answer

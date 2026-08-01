@@ -158,6 +158,7 @@ class ProxyService:
     _thinking_recovered = _StateField("thinking_recovered")
     _thinking_truncated = _StateField("thinking_truncated")
     _thinking_fallback = _StateField("thinking_fallback")
+    _thinking_noop = _StateField("thinking_noop")
     _shadow_drop = _StateField("shadow_drop")
     _degeneration_detected = _StateField("degeneration_detected")
     _degeneration_recovered = _StateField("degeneration_recovered")

@@ -37,8 +37,9 @@ def _mock_self(engine="vllm"):
     state.config = types.SimpleNamespace(endpoints={"thinker": ep})
     state.thinking_active = {}
     state.thinking_requests = state.thinking_clean = state.thinking_recovered = 0
-    state.thinking_truncated = state.thinking_fallback = 0
+    state.thinking_truncated = state.thinking_fallback = state.thinking_noop = 0
     m = types.SimpleNamespace(state=state)
+    m.fold_system_for_thinking = C.fold_system_for_thinking
     # bind the real Correction methods to the mock under their public names (so
     # internal cross-calls like self.thinking_allowed_keys resolve) AND under the
     # old underscore-prefixed names the test bodies call.
@@ -84,6 +85,107 @@ def test_apply_thinking_noop_on_llamacpp():
     assert "thinking" not in p and m.state.thinking_active == {}  # still stripped, no-op
 
 
+SYS = "You are Sidekick. Be terse."
+SYS2 = "Second system block."
+USR = "What is 17*23?"
+
+
+def _msgs(*roles_contents):
+    return [{"role": r, "content": c} for r, c in roles_contents]
+
+
+def test_fold_system_when_thinking_applied():
+    """laguna/tier3's template silently drops <think> when a system role is
+    present (measured: 0 ch reasoning with system, 4928 ch without). On the
+    opt-in path the system text is folded into the first user turn, verbatim."""
+    m = _mock_self("vllm")
+    p = {"messages": _msgs(("system", SYS), ("user", USR)),
+         "max_tokens": 800, "thinking": True}
+    m._apply_thinking(_req(p))
+    assert [x["role"] for x in p["messages"]] == ["user"]
+    merged = p["messages"][0]["content"]
+    assert merged == SYS + "\n\n" + USR
+    assert SYS in merged and USR in merged  # both survive verbatim
+
+
+def test_fold_does_not_happen_without_optin():
+    m = _mock_self("vllm")
+    orig = _msgs(("system", SYS), ("user", USR))
+    p = {"messages": list(orig), "max_tokens": 800}
+    m._apply_thinking(_req(p))
+    assert p["messages"] == orig  # untouched — zero blast radius off the opt-in
+
+
+def test_fold_does_not_happen_on_llamacpp():
+    m = _mock_self("llama.cpp")
+    orig = _msgs(("system", SYS), ("user", USR))
+    p = {"messages": list(orig), "max_tokens": 800, "thinking": True}
+    m._apply_thinking(_req(p))
+    assert p["messages"] == orig
+
+
+def test_fold_does_not_happen_when_feature_disabled():
+    m = _mock_self("vllm")
+    orig = _msgs(("system", SYS), ("user", USR))
+    p = {"messages": list(orig), "max_tokens": 800, "thinking": True}
+    os.environ["COLLECTIVE_PROXY_THINKING"] = "0"
+    try:
+        m._apply_thinking(_req(p))
+    finally:
+        os.environ.pop("COLLECTIVE_PROXY_THINKING")
+    assert p["messages"] == orig and p["max_tokens"] == 800
+
+
+def test_fold_noop_without_system():
+    m = _mock_self("vllm")
+    orig = _msgs(("user", USR), ("assistant", "391"), ("user", "again"))
+    p = {"messages": list(orig), "max_tokens": 800, "thinking": True}
+    m._apply_thinking(_req(p))
+    assert p["messages"] == orig
+
+
+def test_fold_noop_when_system_only():
+    """Nothing to fold INTO — leave it alone rather than invent a user turn."""
+    m = _mock_self("vllm")
+    orig = _msgs(("system", SYS))
+    p = {"messages": list(orig), "max_tokens": 800, "thinking": True}
+    m._apply_thinking(_req(p))
+    assert p["messages"] == orig
+
+
+def test_fold_preserves_multiple_systems_in_order():
+    m = _mock_self("vllm")
+    p = {"messages": _msgs(("system", SYS), ("user", USR), ("system", SYS2),
+                           ("assistant", "391")),
+         "max_tokens": 800, "thinking": True}
+    m._apply_thinking(_req(p))
+    assert [x["role"] for x in p["messages"]] == ["user", "assistant"]
+    assert p["messages"][0]["content"] == SYS + "\n\n" + SYS2 + "\n\n" + USR
+    assert p["messages"][1] == {"role": "assistant", "content": "391"}
+
+
+def test_fold_does_not_mutate_caller_message_dicts():
+    m = _mock_self("vllm")
+    user_msg = {"role": "user", "content": USR}
+    p = {"messages": [{"role": "system", "content": SYS}, user_msg],
+         "max_tokens": 800, "thinking": True}
+    m._apply_thinking(_req(p))
+    assert user_msg["content"] == USR  # new dicts built, caller's untouched
+
+
+def test_fold_handles_multipart_user_content():
+    m = _mock_self("vllm")
+    blocks = [{"type": "text", "text": USR},
+              {"type": "image_url", "image_url": {"url": "x"}}]
+    p = {"messages": [{"role": "system", "content": SYS},
+                      {"role": "user", "content": blocks}],
+         "max_tokens": 800, "thinking": True}
+    m._apply_thinking(_req(p))
+    out = p["messages"][0]["content"]
+    assert out[0] == {"type": "text", "text": SYS}
+    assert out[1:] == blocks
+
+
 def test_finalize_recovers_brace_dup():
     m = _mock_self("vllm")
     m.state.thinking_active["r1"] = {"allowed_keys": ["action", "params", "why"]}
@@ -121,6 +223,57 @@ def test_finalize_noop_without_optin():
     result = {"status": "ok", "response": {"choices": [{"message": {"content": "x"}}]}}
     m._finalize_thinking(_req({}, rid="rX"), result)
     assert result["status"] == "ok" and result["response"]["choices"][0]["message"]["content"] == "x"
+
+
+def test_finalize_counts_noop_when_no_reasoning():
+    """The guard that would have caught the laguna defect: schema-conformant
+    content but ZERO reasoning = the opt-in silently did nothing."""
+    m = _mock_self("vllm")
+    m.state.thinking_active["r1"] = {"allowed_keys": ["action", "params", "why"]}
+    good = '{"action": "upvote", "params": {}, "why": "y"}'
+    result = {"status": "ok", "response": {"choices": [
+        {"message": {"content": good, "reasoning": ""}, "finish_reason": "stop"}]}}
+    m._finalize_thinking(_req({}, rid="r1"), result)
+    assert m.state.thinking_noop == 1
+    assert m.state.thinking_clean == 1  # conformant AND a no-op — the whole point
+
+
+def test_finalize_counts_noop_when_reasoning_key_absent():
+    m = _mock_self("vllm")
+    m.state.thinking_active["r1"] = {"allowed_keys": []}
+    result = {"status": "ok", "response": {"choices": [
+        {"message": {"content": "hello"}, "finish_reason": "stop"}]}}
+    m._finalize_thinking(_req({}, rid="r1"), result)
+    assert m.state.thinking_noop == 1
+
+
+def test_finalize_no_noop_when_reasoning_present():
+    m = _mock_self("vllm")
+    m.state.thinking_active["r1"] = {"allowed_keys": ["action", "params", "why"]}
+    good = '{"action": "upvote", "params": {}, "why": "y"}'
+    result = {"status": "ok", "response": {"choices": [
+        {"message": {"content": good, "reasoning": "let me think..."},
+         "finish_reason": "stop"}]}}
+    m._finalize_thinking(_req({}, rid="r1"), result)
+    assert m.state.thinking_noop == 0 and m.state.thinking_clean == 1
+
+
+def test_finalize_no_noop_on_reasoning_content_alias():
+    """Some vLLM builds emit `reasoning_content` instead of `reasoning`."""
+    m = _mock_self("vllm")
+    m.state.thinking_active["r1"] = {"allowed_keys": []}
+    result = {"status": "ok", "response": {"choices": [
+        {"message": {"content": "x", "reasoning_content": "thought"},
+         "finish_reason": "stop"}]}}
+    m._finalize_thinking(_req({}, rid="r1"), result)
+    assert m.state.thinking_noop == 0
+
+
+def test_finalize_noop_not_counted_without_optin():
+    m = _mock_self("vllm")
+    result = {"status": "ok", "response": {"choices": [{"message": {"content": "x"}}]}}
+    m._finalize_thinking(_req({}, rid="rX"), result)
+    assert m.state.thinking_noop == 0 and m.state.thinking_requests == 0
 
 
 def test_budget_env_override():

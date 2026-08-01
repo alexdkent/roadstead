@@ -422,6 +422,10 @@ class ProxyHttpHandlers:
                 "thinking_recovered": self.state.thinking_recovered,
                 "thinking_truncated": self.state.thinking_truncated,
                 "thinking_fallback": self.state.thinking_fallback,
+                # Thinking applied but the response carried NO reasoning — the
+                # backend template ignored enable_thinking. Non-zero here means
+                # the opt-in is silently doing nothing on that endpoint.
+                "thinking_noop": self.state.thinking_noop,
                 # WS-4 shadow egress detector — silent grammar-drop over ALL
                 # grammar-bearing responses (read-only/zero-risk). Per-call_site
                 # rate + a flat fleet rate (health-verifier thresholds the scalar).

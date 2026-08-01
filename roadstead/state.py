@@ -119,6 +119,8 @@ class ProxyState:
         self.thinking_recovered = 0   # stray-brace artifact deterministically cleaned
         self.thinking_truncated = 0   # finish=length (raise budget) — failed safe
         self.thinking_fallback = 0    # unrecoverable structured output — failed safe
+        self.thinking_noop = 0        # thinking applied but response carried NO
+                                      # reasoning (backend ignored enable_thinking)
         # WS-4 shadow egress detector: per-call_site silent grammar-drop tally
         # over ALL grammar-bearing responses (read-only; NEVER mutates a
         # response). {call_site: {"checked": int, "dropped": int}}. Populated by
