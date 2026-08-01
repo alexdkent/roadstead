@@ -222,7 +222,26 @@ models:
     capabilities:
       vision: false
       streaming: false
-      reasoning: false
+      # 2026-08-01: false -> TRUE. This declares an OBSERVED property of the deployed
+      # backend, not a wish. Gemma-4's template emits a reasoning trace on constrained
+      # output and ignores BOTH documented off-switches — measured against the live
+      # backend, `--reasoning off` (already set on the container) and
+      # chat_template_kwargs {"enable_thinking": false} each still produced 482 chars.
+      # `--reasoning-budget 0` on the container helps a lot but is NOT sufficient: it
+      # clamps some prompts to 0 reasoning chars and leaves others at 285. So the
+      # container flag stays (it cuts the common case) and this flag is the SAFETY NET.
+      #
+      # reasoning:true + backend_engine llama.cpp => model_catalog sets
+      # forces_reasoning, and apply_forced_reasoning_budget reserves
+      # forced_reasoning_budget() tokens of answer headroom ON TOP of the caller's cap.
+      # That is robust where suppression is not: it does not need the model to stop
+      # reasoning, only to have room left afterwards. Callers budgeting 96-120 tokens
+      # (mail-agent.classify_triage, attachments.image_classify) were failing 73-100%
+      # of the time without it.
+      #
+      # The cap is a CEILING, not a target — a call that does not reason still stops on
+      # its own, so plain routing calls pay nothing.
+      reasoning: true
       tool_calling: true
       structured_output: grammar
     token_speed: {note: "cheap classify; first-token fast"}
