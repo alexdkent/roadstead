@@ -28,6 +28,53 @@ from .sse_hub import DROP_SENTINEL
 if TYPE_CHECKING:
     from .health import Health
     from .lifecycle import Lifecycle
+
+
+def _embedding_texts(raw) -> "tuple[list, str]":
+    """OpenAI ``input`` -> the shim's ``texts`` list. Returns ``(texts, error)``.
+
+    OpenAI also allows PRE-TOKENIZED input (``[int]`` or ``[[int]]``). The bge-m3 shim
+    takes text only and exposes no detokenizer, so that form is refused with a clear
+    message rather than silently embedding the string ``"[1, 2, 3]"`` — a wrong vector
+    is far worse here than an error, because nothing downstream can tell it apart from
+    a right one.
+    """
+    if isinstance(raw, str):
+        return ([raw], "") if raw else ([], "input must not be empty")
+    if isinstance(raw, list):
+        if not raw:
+            return [], "input must not be empty"
+        if all(isinstance(x, str) for x in raw):
+            if any(not x for x in raw):
+                return [], "input must not contain empty strings"
+            return raw, ""
+        if all(isinstance(x, int) for x in raw) or all(isinstance(x, list) for x in raw):
+            return [], ("pre-tokenized input is not supported by the bge-m3 backend; "
+                        "send text (a string or a list of strings)")
+        return [], "input must be a string or a list of strings"
+    if raw is None:
+        return [], "input is required"
+    return [], f"input must be a string or a list of strings, got {type(raw).__name__}"
+
+
+def _encode_embedding(vec: list, fmt: str):
+    """Float list, or OpenAI's base64 form (little-endian float32).
+
+    base64 is not exotic — the official OpenAI Python SDK REQUESTS it by default and
+    then decodes it itself, so a door that only ever returns float lists breaks the
+    most likely real client.
+    """
+    if fmt != "base64":
+        return vec
+    import base64
+    import struct
+    return base64.b64encode(
+        struct.pack(f"<{len(vec)}f", *(float(x) for x in vec))).decode("ascii")
+
+
+def _estimated_embed_tokens(texts: list) -> int:
+    """4 chars ~= 1 token, matching cost_model.estimate_input_tokens. An ESTIMATE."""
+    return max(1, sum(len(t) for t in texts) // 4)
     from .state import ProxyState
 
 logger = logging.getLogger(__name__)
@@ -129,6 +176,20 @@ class ProxyHttpHandlers:
             submit_body["timeout_s"] = client_timeout
         return await self.lifecycle.handle_submit(submit_body, request, openai=True)
     async def handle_openai_embeddings(self, body: dict, request: Request) -> Response:
+        """POST /v1/embeddings — the OpenAI-compatible embeddings door.
+
+        This is a TRANSLATOR in both directions, which it was not until 2026-08-01.
+        The bge-m3 shim speaks its own dialect on BOTH sides and the two never met:
+
+          request   OpenAI ``{"input": str | [str]}``   ->  shim ``{"texts": [str]}``
+          response  shim ``{"dense": [[float]], ...}``  ->  OpenAI ``{object, data, usage}``
+
+        Before, the raw OpenAI body was forwarded verbatim, so the shim rejected every
+        call for a missing ``texts`` field and the door returned 502 for its whole life.
+        The bug was invisible because no fleet caller uses it — agents embed through
+        ``/v1/submit``, which already speaks ``texts`` — so this path only ever served
+        external OpenAI clients, and nothing in-repo exercised it.
+        """
         remote_ip = request.client.host if request.client else "unknown"
         identity = self.state.acl.identify(remote_ip)
         if not identity:
@@ -137,19 +198,86 @@ class ProxyHttpHandlers:
                 code="access_denied")
         agent_id, default_priority = identity
 
+        texts, err = _embedding_texts(body.get("input"))
+        if err:
+            return _openai_error(err, "invalid_request_error", 400,
+                                 code="invalid_request_error")
+
+        fmt = body.get("encoding_format") or "float"
+        if fmt not in ("float", "base64"):
+            return _openai_error(
+                f"unsupported encoding_format {fmt!r} (expected 'float' or 'base64')",
+                "invalid_request_error", 400, code="invalid_request_error")
+
         submit_body = {
             "agent_id": agent_id,
             "endpoint": "bge-m3-embed",
             "priority": int(default_priority),
             "call_site": f"{agent_id}.openai_compat_embed",
             "payload_type": "embedding",
-            "payload": body,
+            # BOTH dialects, deliberately. The bge-m3 shim reads `texts` and ignores
+            # unknown keys (verified against the live shim); an OpenAI-shaped embeddings
+            # server reads `input` and sizes its reply from it. Sending only `texts`
+            # makes such a server return ONE vector for an N-input request — a silent
+            # under-count, which is worse than an error because the caller gets a
+            # well-formed list of the wrong length. `texts` is the normalized list, so
+            # the two never disagree about content.
+            "payload": {"texts": texts, "input": texts},
             "timeout_s": 60.0,
         }
-        # Phase 5D: openai=True so success returns the bare OpenAI embeddings
-        # object ({object:list,data:[...],usage}) and errors are OpenAI-shaped —
-        # was leaking the internal {status,response} envelope to OpenAI clients.
-        return await self.lifecycle.handle_submit(submit_body, request, openai=True)
+        # openai=True keeps ERRORS OpenAI-shaped (the internal {status,response}
+        # envelope used to leak). Success still returns the bare BACKEND body, so the
+        # OpenAI shape is applied here rather than in the shared sync path — embeddings
+        # are the only payload_type needing it, and the chat hot path stays untouched.
+        resp = await self.lifecycle.handle_submit(submit_body, request, openai=True)
+        if getattr(resp, "status_code", 500) != 200:
+            return resp
+        try:
+            backend = json.loads(resp.body)
+        except (ValueError, AttributeError, TypeError):
+            return _openai_error("embedding backend returned an unreadable body",
+                                 "backend_error", 502, code="backend_error")
+        # TWO backend dialects, and assuming one is how this broke a second time.
+        # The nexus bge-m3 shim answers `{"dense": [[float]]}`; a stock OpenAI-shaped
+        # embeddings server (and the e2e fake backend) answers with `data`/`object`
+        # already correct. Translate the former, pass the latter through — a backend
+        # that already speaks OpenAI must not be re-wrapped.
+        if isinstance(backend.get("data"), list) and backend.get("object") == "list":
+            if fmt == "base64":
+                # Only the ENCODING differs; leave index/usage/model as the backend set
+                # them, since those are its measurements and not ours to invent.
+                for row in backend["data"]:
+                    if isinstance(row, dict) and isinstance(row.get("embedding"), list):
+                        row["embedding"] = _encode_embedding(row["embedding"], "base64")
+            return JSONResponse(backend)
+
+        vectors = backend.get("dense")
+        if not isinstance(vectors, list) or not vectors:
+            # Assert PRESENCE: an embeddings reply with no vectors is a failure, not an
+            # empty success. Returning {"data": []} here would let a caller treat a dead
+            # backend as "nothing to embed".
+            return _openai_error(
+                "embedding backend returned no vectors "
+                f"(keys={sorted(backend)[:6]})", "backend_error", 502,
+                code="backend_error")
+        # Prefer the backend's own usage when it reports one; fall back to the estimate
+        # only because the bge-m3 shim reports no token counts at all. A measurement
+        # always beats our 4-chars-per-token guess.
+        est = _estimated_embed_tokens(texts)
+        usage = backend.get("usage")
+        if not isinstance(usage, dict) or "prompt_tokens" not in usage:
+            # Same estimator the proxy already records as estimated_input_tokens, so the
+            # door and telemetry agree rather than being two differently-wrong numbers.
+            # An ESTIMATE, not a measurement — do not bill from it.
+            usage = {"prompt_tokens": est, "total_tokens": est}
+        return JSONResponse({
+            "object": "list",
+            "data": [{"object": "embedding", "index": i,
+                      "embedding": _encode_embedding(v, fmt)}
+                     for i, v in enumerate(vectors)],
+            "model": body.get("model") or "bge-m3",
+            "usage": usage,
+        })
     async def handle_models(self, request: Request) -> Response:
         models = []
         for ep_name, ep_cfg in self.state.config.endpoints.items():
