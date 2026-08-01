@@ -388,6 +388,25 @@ models:
       # EQUAL to `slots` above; the shadow reconciler warns if they drift (the
       # 32-vs-20 class). Update BOTH whenever serve_tier3_prod.sh changes.
       documented_max_num_seqs: 20
+      # 2026-08-01: MIRRORS a host-side serve-script launch flag the proxy cannot
+      # introspect — exactly like `documented_max_num_seqs` above. The flag is
+      # `--structured-outputs-config '{"backend":"guidance","disable_any_whitespace":true}'`
+      # in the VENDORED script `infra/anvil/vllm/serve_tier3_prod.sh` (anvil runs
+      # its own copy at /opt/anvil-bench/serve_tier3_prod.sh — the two must change
+      # together). test_tier3_serve_script_doctrine.py pins script⟺catalog in BOTH
+      # directions, so removing the server flag forces removing this declaration.
+      #
+      # Why the proxy needs to KNOW: with whitespace banned, the two-character
+      # document `{}` is a legal, complete, zero-whitespace JSON object — so a BARE
+      # `response_format:{"type":"json_object"}` makes `{}` the greedy path and every
+      # such call returns it with finish_reason=stop. Measured live 2026-08-01 on this
+      # endpoint with sidekick's real critic prompt: no response_format -> 549 chars of valid
+      # JSON; bare json_object -> `{}` (2 chars); strict json_schema with `required` ->
+      # 241 chars of valid JSON. Correction.apply_json_object_guard reads this flag and
+      # STRIPS bare json_object (it does not substitute a permissive schema — `{}`
+      # satisfies `{"type":"object"}` with no `required`, so the bug would survive).
+      # Regression ledger: `tier3-json-object-empty-brace`.
+      disable_any_whitespace: true
     capabilities:
       vision: false
       streaming: true

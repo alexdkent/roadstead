@@ -60,6 +60,14 @@ class QueuedRequest:
     # give-up-time reporting must use the denominator the gate actually saw
     # (audit 2026-07-02).
     ctx_per_slot_at_admission: int = 0
+    # Correction.apply_json_object_guard removed a bare `response_format`
+    # json_object from ``payload`` (whitespace-banned backend — see that method).
+    # The payload no longer LOOKS structured, but the caller still expects JSON,
+    # so the response-side gates keyed off the payload (truncation integrity,
+    # the schema/JSON backstop, the structured-stream validity guard) must keep
+    # treating it as such. Without this the strip would silently drop those
+    # guarantees and hand a truncated half-object back to a caller that parses it.
+    json_object_stripped: bool = False
 
     @classmethod
     def create(

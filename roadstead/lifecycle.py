@@ -436,6 +436,15 @@ class Lifecycle:
         # streaming and sync paths (must precede the branch — apply_thinking is sync-only).
         self.correction.apply_forced_reasoning_budget(req)
 
+        # A backend launched with structured-output whitespace BANNED
+        # (disable_any_whitespace — tier3) turns a BARE response_format
+        # json_object into the literal `{}`: with no whitespace allowed, `{}` is a
+        # legal COMPLETE object and greedy decoding closes immediately. Strip it.
+        # Same placement rationale as the line above — this MUST precede the
+        # streaming/sync branch, because apply_thinking (below, in the sync branch)
+        # is sync-only and this guard has to cover both paths.
+        self.correction.apply_json_object_guard(req)
+
         # Streaming vs non-streaming
         if req.stream:
             return await self.handle_streaming_submit(req, openai=openai)

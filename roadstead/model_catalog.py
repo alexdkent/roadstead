@@ -259,6 +259,17 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
             # from the serve script (vLLM doesn't expose it) — drives the shadow
             # max_slots-drift reconciler.
             ("documented_max_num_seqs", "documented_max_num_seqs"),
+            # 2026-08-01: the backend's `--structured-outputs-config
+            # {"disable_any_whitespace":true}` launch flag, mirrored from the
+            # serve script (vLLM doesn't expose it either) — drives
+            # Correction.apply_json_object_guard, which strips a bare
+            # `response_format:{"type":"json_object"}` before it reaches a
+            # whitespace-banned grammar and greedily returns `{}`.
+            # ⚠️ A key that is NOT in this tuple list is SILENTLY DROPPED from
+            # models.yaml — see the `min_expected_slots` note in models.yaml.
+            # test_json_object_guard.py::test_models_yaml_flag_reaches_endpoint_config
+            # is the guard that this one is really wired.
+            ("disable_any_whitespace", "disable_any_whitespace"),
         ):
             if src in pol:
                 kw[dst] = pol[src]

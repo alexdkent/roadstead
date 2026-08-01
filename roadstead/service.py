@@ -321,6 +321,12 @@ class ProxyService:
                             req.endpoint, caller, est_in)
             except Exception:  # noqa: BLE001 — evidence must not break recovery
                 logger.debug("recovery overflow tally failed", exc_info=True)
+            # Same reason the overflow tally is repeated here: recovery bypasses
+            # handle_submit. A WAL-recovered request still carrying a bare
+            # response_format json_object would dispatch to a whitespace-banned
+            # backend and come back as literally `{}`. The guard is total and
+            # idempotent, so applying it again on this path is free.
+            self._correction.apply_json_object_guard(req)
             self._scheduler.enqueue(req)
 
         # Re-derive operator drains that were open when the process died.

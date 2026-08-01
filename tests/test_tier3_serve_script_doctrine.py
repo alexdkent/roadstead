@@ -91,6 +91,33 @@ def test_structured_outputs_disable_any_whitespace(script: str) -> None:
     )
 
 
+def test_disable_any_whitespace_is_declared_in_the_catalog(script: str, tier3: dict) -> None:
+    """BIDIRECTIONAL pin: script flag ⟺ ``policy.disable_any_whitespace``.
+
+    The proxy cannot introspect a backend LAUNCH flag, so models.yaml declares it
+    and ``Correction.apply_json_object_guard`` acts on the declaration — it strips
+    a bare ``response_format:{"type":"json_object"}``, which on a whitespace-banned
+    grammar makes the legal complete document ``{}`` the greedy path (measured
+    2026-08-01: bare json_object -> ``{}``, 2 chars, finish_reason=stop; the same
+    prompt with no response_format -> 549 chars of valid JSON).
+
+    Pinning only one direction leaves two silent failures. Script-without-catalog:
+    the guard never fires and callers get ``{}`` (3,100 forum-agent defers, executions
+    ~300/day -> 13). Catalog-without-script: the proxy strips a constraint the
+    backend would have honoured. So the two must move together — as must the
+    vendored script and anvil's own copy at /opt/anvil-bench/serve_tier3_prod.sh.
+    """
+    cfg = re.search(r"--structured-outputs-config\s+'([^']+)'", script)
+    in_script = bool(cfg) and '"disable_any_whitespace":true' in cfg.group(1).replace(" ", "")
+    declared = bool(tier3.get("policy", {}).get("disable_any_whitespace"))
+    assert in_script == declared, (
+        f"drift: serve script disable_any_whitespace={in_script} but models.yaml "
+        f"reasoner.policy.disable_any_whitespace={declared}. If you removed the "
+        "server flag, remove the catalog declaration too (the proxy must stop "
+        "stripping bare json_object); if you added it, declare it."
+    )
+
+
 def test_long_prefill_threshold_present_and_sane(script: str) -> None:
     """Slot fairness: caps per-request prefill tokens per scheduler step so one
     giant prefill cannot starve interactive traffic (45.26 s -> 1.86 s measured)."""

@@ -1087,6 +1087,122 @@ class Correction:
         # (ok=0). Padding it makes the warm-up SUCCEED and, as a bonus, exercises
         # decode (a fuller warm) — the ~200 discarded tokens are cheap + rare.
         p["max_tokens"] = cur + forced_reasoning_budget()
+    def apply_json_object_guard(self, req: QueuedRequest) -> None:
+        """Request-side: drop a BARE ``response_format:{"type":"json_object"}`` when
+        the target endpoint's backend was launched with structured-output whitespace
+        BANNED (``EndpointConfig.disable_any_whitespace``, mirrored from the serve
+        script — the proxy cannot introspect a launch flag).
+
+        WHY (measured live 2026-08-01, tier3 = vLLM on anvil:9083). tier3 restarted
+        2026-07-31 15:06:52 UTC with ``--structured-outputs-config
+        '{"backend":"guidance","disable_any_whitespace":true}'``. That flag is
+        load-bearing — without it structured output runs away emitting whitespace
+        until max_tokens — but with whitespace banned, the two-character document
+        ``{}`` is a legal, COMPLETE, zero-whitespace JSON object. A bare
+        ``json_object`` grammar therefore lets the model close immediately, and
+        greedy decoding takes it. Same prompt, same endpoint, three shapes::
+
+            no response_format                        -> 549 chars, valid JSON
+            response_format json_object (bare)        -> "{}"  (2 chars), finish=stop
+            response_format json_schema (strict, req) -> 241 chars, valid JSON
+
+        The backend even says so: ``LLMatcher error: Parser Error: token " me"
+        doesn't satisfy the grammar; forced bytes: got '{'; applying ' '``.
+
+        Downstream this is invisible: ``{}`` arrives with ``finish_reason=stop`` and
+        no error, so the caller sees a well-formed response missing every field. Sidekick's
+        forum-agent comment critic turned it into ``voice_match must be bool``, the
+        orchestrator read that ``.error`` as transient infra and DEFERRED, and forum-agent
+        re-drove the same proposal every tick — 3,100 defers, executions ~300/day -> 13.
+
+        STRIPPING is the only generic fix. Substituting a permissive
+        ``{"type":"object"}`` json_schema does NOT work: with no ``required`` keys,
+        ``{}`` still satisfies it and the grammar can still close immediately. And
+        the proxy cannot invent the caller's schema. Removing the constraint restores
+        the measured-good shape (repro 1 above); the model still emits JSON because
+        the caller's prompt asks for JSON. What the constraint was ALSO buying —
+        the truncation-integrity gate, the JSON backstop's repair+parse gate, the
+        structured-stream validity guard — is re-asserted via
+        ``QueuedRequest.json_object_stripped`` rather than lost with it. (There is
+        no declared schema to validate against either way: a bare json_object never
+        carried one.)
+
+        Deliberately NARROW — a request carrying a real constraint (``json_schema``,
+        ``guided_json``, a GBNF ``grammar``, ``structured_outputs``) is left completely
+        untouched, at top level and under ``extra_body``. Those shapes carry required
+        keys and do not degenerate.
+
+        This is a COMPENSATION for a caller bug, not a cure: the durable fix is each
+        call site declaring a real schema. The WARNING carries the greppable marker
+        ``json_object_stripped`` plus the caller identity so that migration stays
+        visible instead of quietly permanent.
+
+        Total / fail-open: never raises, never breaks a request.
+        """
+        try:
+            p = req.payload
+            if not isinstance(p, dict) or req.payload_type != "chat_completion":
+                return
+            ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
+            if ep is None or not getattr(ep, "disable_any_whitespace", False):
+                return
+
+            eb = p.get("extra_body")
+            eb = eb if isinstance(eb, dict) else None
+
+            # Any OTHER structured constraint anywhere in the payload -> hands off.
+            # The caller pinned a real grammar; json_object is not what is binding.
+            for container in (p, eb):
+                if not isinstance(container, dict):
+                    continue
+                for key in ("grammar", "guided_grammar", "guided_json",
+                            "guided_choice", "guided_regex", "structured_outputs"):
+                    if container.get(key):
+                        return
+
+            def _is_bare_json_object(rf: object) -> bool:
+                if not isinstance(rf, dict):
+                    return False
+                if str(rf.get("type") or "").strip() != "json_object":
+                    return False
+                # A json_object that somehow also carries a schema is not bare —
+                # leave it alone rather than guess which half the backend honors.
+                return not any(rf.get(k) for k in ("schema", "json_schema"))
+
+            targets = [c for c in (p, eb)
+                       if isinstance(c, dict) and _is_bare_json_object(c.get("response_format"))]
+            # A json_schema in EITHER position means the request is really schema-
+            # constrained; don't strip the redundant json_object sibling.
+            for container in (p, eb):
+                if isinstance(container, dict):
+                    rf = container.get("response_format")
+                    if isinstance(rf, dict) and str(rf.get("type") or "") == "json_schema":
+                        return
+            if not targets:
+                return
+            for container in targets:
+                container.pop("response_format", None)
+            # Re-assert what the constraint was also buying. The payload no longer
+            # looks structured, but the caller still parses JSON — so keep the
+            # truncation-integrity gate, the JSON backstop and the structured-
+            # stream validity guard armed via this flag. (CLAUDE.md: "replacing a
+            # component silently drops its guarantees" — enumerate and re-assert.)
+            try:
+                req.json_object_stripped = True
+            except Exception:  # noqa: BLE001 — a mock/namespace req must not break
+                pass
+            logger.warning(
+                "json_object_stripped: bare response_format json_object removed for "
+                "endpoint=%s agent=%s call_site=%s request_id=%s — this backend runs "
+                "disable_any_whitespace, where '{}' is a legal complete object and "
+                "becomes the greedy path (returns '{}' with finish_reason=stop). "
+                "MIGRATE THIS CALL SITE to response_format json_schema with required "
+                "fields; the strip is a proxy-side compensation, not a fix.",
+                req.endpoint, getattr(req, "agent_id", "?"),
+                getattr(req, "call_site", "?"), getattr(req, "request_id", "?"),
+            )
+        except Exception:  # noqa: BLE001 — a compensation must never break a request
+            logger.debug("json_object guard failed", exc_info=True)
     def apply_thinking(self, req: QueuedRequest) -> None:
         """Request-side: honor a per-request ``thinking: true`` opt-in. On a vLLM
         (reasoning-parser) backend, enable native <think> and add a GENEROUS
@@ -1284,6 +1400,10 @@ class Correction:
         p = req.payload
         if not isinstance(p, dict):
             return False
+        # Stripped bare json_object still implies JSON content (same reasoning as
+        # in request_is_structured) — keep the parse gate armed.
+        if getattr(req, "json_object_stripped", False):
+            return True
         containers = [p]
         eb = p.get("extra_body")
         if isinstance(eb, dict):
@@ -1472,6 +1592,11 @@ class Correction:
         p = req.payload
         if not isinstance(p, dict):
             return False
+        # The proxy itself removed the caller's bare json_object (see
+        # apply_json_object_guard) — the caller's EXPECTATION is unchanged, so
+        # the gate must not lapse just because the payload no longer shows it.
+        if getattr(req, "json_object_stripped", False):
+            return True
         if self.extract_grammar(p)[0]:
             return True
         if p.get("response_format") or p.get("structured_outputs"):

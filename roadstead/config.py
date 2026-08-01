@@ -176,6 +176,21 @@ class EndpointConfig:
     # reasoner 32-vs-20 class, reconciled in Step 2b). 0 = not tracked (llama.cpp /
     # shims). The Step-4c shadow reconciler warns when ``max_slots`` != this value.
     documented_max_num_seqs: int = 0
+    # The backend was launched with structured-output whitespace BANNED
+    # (vLLM ``--structured-outputs-config '{"disable_any_whitespace":true}'``),
+    # mirrored from the tracked serve script — the proxy cannot introspect a
+    # backend launch flag, so this is a DECLARATION, pinned against the vendored
+    # script by test_tier3_serve_script_doctrine.py.
+    #
+    # The flag is load-bearing (it stops the whitespace runaway; see the reasoner
+    # notes in models.yaml) but it has ONE toxic interaction: with whitespace
+    # banned, a BARE ``response_format:{"type":"json_object"}`` makes the literal
+    # two-character document ``{}`` a legal, complete, zero-whitespace object —
+    # and therefore the greedy path. Every such caller silently received ``{}``
+    # with finish_reason=stop from 2026-07-31 15:06 UTC. ``Correction
+    # .apply_json_object_guard`` uses this flag to strip bare json_object on
+    # these endpoints. False everywhere the launch flag is absent.
+    disable_any_whitespace: bool = False
     background_floor_pct: float = 0.20
     # Slots held back from the BACKGROUND band so an occasional interactive /
     # fast-path call always has an open slot (no preemption exists). When set,
