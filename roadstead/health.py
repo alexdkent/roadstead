@@ -27,7 +27,11 @@ from .config import (
     max_slots_reconcile_enabled,
     normalize_endpoint,
 )
-from .observability import AlertCondition, check_alerts
+from .observability import (
+    AlertCondition,
+    check_alerts,
+    structured_empty_alerts,
+)
 from originfleet.framework.prompt_security import record_security_event
 
 if TYPE_CHECKING:
@@ -247,6 +251,17 @@ class Health:
                                 f"but documented --max-num-seqs={doc} — reconcile "
                                 f"models.yaml `slots` with the serve script"),
                     ))
+        # Standing STRUCTURED-EMPTY rate alarm (2026-08-01, ledger
+        # `tier3-json-object-empty-brace`). The 31-hour silent outage produced
+        # NO other signal — `{}` is well-formed, so every existing emptiness /
+        # truncation / degeneration check passed it. A per-endpoint rate is the
+        # only thing that separates "one caller answered nothing" from "this
+        # endpoint stopped answering", and putting it on the alerts channel is
+        # what makes it reach /v1/status.alerts + the llmproxy_alerts_active
+        # gauge + the health-verifier chip instead of dying as a log line nobody greps.
+        # Window / threshold / sample-floor rationale: llmproxy/observability.py.
+        alerts.extend(structured_empty_alerts(
+            self.state.structured_empty_window, now))
         # Standing cache-drift conditions (audit 2026-07-02): mirror the current
         # drift set into the alerts channel so it reaches /v1/status.alerts +
         # the llmproxy_alerts_active gauge + the health-verifier chip — the CACHE_DRIFT

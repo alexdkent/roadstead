@@ -37,7 +37,7 @@ from .grammar import (
     root_object_keys,
     verify_conformance,
 )
-from .observability import MetricsSample
+from .observability import MetricsSample, record_structured_outcome
 
 # Phase 3 schema-repair backstop deps. json-repair recovers parseable-but-not-
 # valid JSON (fences / trailing prose / trailing commas / a missing brace) before
@@ -190,6 +190,67 @@ def _content_valid(text: str, schema: dict | None) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return _schema_valid(obj, schema)
+
+
+# --- Empty-structured-response detection ------------------------------------
+# Ledger `tier3-json-object-empty-brace` (2026-08-01). `{}` is a WELL-FORMED
+# JSON object, so it sails past `_is_degenerate_text` (needs ≥40 words), past
+# the truncation gate (finish_reason=stop), past the empty-completion gate
+# (content is non-empty), and past `enforce_structured_validity` (it parses).
+# The only thing wrong with it is that it carries no ANSWER — which is a
+# property of the caller's contract, not of the JSON. Hence a dedicated check.
+
+def _schema_required_keys(schema: dict | None) -> list[str]:
+    """The declared object-level ``required`` list (empty when absent/not a
+    list/not an object schema). Total."""
+    if not isinstance(schema, dict):
+        return []
+    req = schema.get("required")
+    if not isinstance(req, list):
+        return []
+    return [k for k in req if isinstance(k, str)]
+
+
+def _is_answerless_object(obj, schema: dict | None) -> bool:
+    """True iff ``obj`` is a JSON OBJECT that carries no answer.
+
+    Two shapes, in the order the incident produced them:
+
+    1. **Zero keys** — literally ``{}``. Unconditional: no caller ever declares
+       a structured contract in order to receive nothing at all. This is the
+       exact 2-character document a ``disable_any_whitespace`` backend emits
+       when the grammar is allowed to close immediately.
+    2. **Vacuously satisfying** — every key present maps to an empty value
+       (``null`` / ``""`` / ``[]`` / ``{}``), AND the caller declared NO
+       ``required`` keys. The ``required`` clause is what keeps this off the
+       legitimate case: an extractor that answers "I found nothing" with
+       ``{"facts": []}`` against a schema that REQUIRES ``facts`` has honoured
+       its contract — the field it was asked for is there, and its emptiness is
+       the answer. Nothing about that is a malfunction, and it must not alarm.
+
+    ⚠️ LIMITATION, stated plainly. When the caller declared no schema (or a
+    schema with no ``required``), shape 2 is INDISTINGUISHABLE from a genuine
+    "nothing found": both are an object with only empty values, produced by a
+    request that asked for nothing in particular. This detector will flag such
+    a response. That is not a tuning problem — it is a missing contract, and
+    it is precisely what `test_structured_output_doctrine`'s empty-``required``
+    clause exists to eliminate. Shape 1 has no such ambiguity.
+
+    Total: never raises."""
+    try:
+        if not isinstance(obj, dict):
+            return False
+        if not obj:
+            return True                       # shape 1: literally {}
+        if _schema_required_keys(schema):
+            return False                      # a real contract was met
+        for v in obj.values():                # shape 2: all values empty
+            if v is None or v == "" or v == [] or v == {}:
+                continue
+            return False
+        return True
+    except Exception:  # noqa: BLE001 — predicate must never raise
+        return False
 
 
 def _repair_json_text(text: str):
@@ -554,6 +615,11 @@ class Correction:
         await self.maybe_repair_schema(req, result)
         self.shadow_egress_detect(req, result)
         self.enforce_structured_validity(req, result)
+        # LAST, and after the validity floor on purpose: a response some guard
+        # already flipped to status=error is NOT a silent failure, so it is
+        # neither an empty event nor a healthy denominator sample. Detect-only,
+        # never mutates `result` — see detect_structured_empty.
+        self.detect_structured_empty(req, result)
 
     def finalize_stream(
         self, req: "QueuedRequest", content: str, last_finish_reason: str | None,
@@ -606,6 +672,10 @@ class Correction:
                     logger.warning(
                         "schema-invalid structured output DETECTED (stream) "
                         "call_site=%s endpoint=%s", cs, req.endpoint)
+            # Empty-structured DETECTION over the reassembled content. A stream
+            # can't un-send, and this is telemetry anyway — the point is that a
+            # streaming caller is not a blind spot for the RATE alarm.
+            self.detect_structured_empty(req, {}, content=content, stream=True)
         except Exception:  # noqa: BLE001 — detection must never break a stream
             logger.debug("finalize_stream failed", exc_info=True)
 
@@ -1582,6 +1652,124 @@ class Correction:
             result.pop("response", None)
         except Exception:  # noqa: BLE001 — the floor must never break a response
             logger.debug("structured validity guard failed", exc_info=True)
+
+    def detect_structured_empty(
+        self, req: "QueuedRequest", result: dict, *,
+        content: str | None = None, stream: bool = False,
+    ) -> None:
+        """DETECT (never fix) a structured response that carries no answer —
+        ledger ``tier3-json-object-empty-brace``, 2026-08-01.
+
+        On 2026-07-31 15:06 UTC tier3 restarted with ``disable_any_whitespace``
+        and every bare-``json_object`` request began returning the two
+        characters ``{}``: valid JSON, ``finish_reason=stop``, no error field,
+        no exception. The proxy held the evidence for 31 hours and said
+        nothing, because ``{}`` is WELL-FORMED — it passes the degeneration
+        check, the truncation check, the empty-completion check and the
+        structured-validity floor. Sidekick's forum-agent critic parsed it, found no
+        ``voice_match``, returned an error; the auto-approve orchestrator read
+        that error as transient infra and deferred; forum-agent re-drove the same
+        proposal every tick. 3,100 defers, forum output ~300/day → 13, found by
+        a human saying "forum-agent seems quiet".
+
+        This is TELEMETRY, NOT A GATE. It never raises, never mutates
+        ``result``, never rewrites content and — deliberately — never retries.
+        A retry here would turn a silent failure into an expensive silent
+        failure: the condition is a backend launch flag, so every retry
+        re-earns the same ``{}`` at full cost. The operator surfaces are:
+
+          * the greppable WARNING marker ``LLMPROXY_STRUCTURED_EMPTY``;
+          * ``framework.observability.degradation`` (component=``llmproxy``,
+            reason=``structured_empty``) — the same seam the comment critic
+            uses, so it also lands on the fleet-wide counter;
+          * per-endpoint RATE in the sliding window, which becomes the standing
+            ``structured_empty_rate`` alert on ``/v1/status.alerts``. A log line
+            nobody greps is not detection; the rate is the actual alarm.
+
+        Covers BOTH response modes: ``apply`` passes the sync body, and
+        ``finalize_stream`` passes the reassembled stream content."""
+        try:
+            if req.payload_type != "chat_completion":
+                return
+            if not stream and result.get("status") != "ok":
+                # A response some earlier guard already failed loud is not a
+                # SILENT failure — it has an error the caller can see.
+                return
+            if not self.request_is_structured(req):
+                return
+            if content is None:
+                response = result.get("response")
+                if not isinstance(response, dict):
+                    return
+                content = _chat_completion_text(response)
+            if not isinstance(content, str) or not content.strip():
+                # Genuinely empty content is the empty-completion gate's
+                # domain (it already fails loud) — not this detector's.
+                return
+            try:
+                obj = json.loads(content)
+            except ValueError:
+                return  # not parseable → enforce_structured_validity's domain
+            payload = req.payload if isinstance(req.payload, dict) else {}
+            schema = _extract_declared_schema(payload)
+            st = self.state
+            answerless = _is_answerless_object(obj, schema)
+            if answerless and schema is not None and not _schema_valid(obj, schema):
+                # It fails the declared schema outright — the schema backstop
+                # owns that, and double-counting it here would let a genuine
+                # schema miss inflate the empty RATE. Not a denominator sample
+                # either: it is not a healthy response.
+                return
+            if not answerless:
+                # The DENOMINATOR. Without healthy samples the rate is a bare
+                # count and cannot tell "one odd call" from "this endpoint
+                # returns nothing any more".
+                record_structured_outcome(
+                    st.structured_empty_window, req.endpoint,
+                    empty=False, call_site=req.call_site or "?",
+                    now=time.monotonic())
+                return
+
+            cs = req.call_site or "?"
+            st.structured_empty_total += 1
+            st.structured_empty_by_call_site[cs] = (
+                st.structured_empty_by_call_site.get(cs, 0) + 1)
+            record_structured_outcome(
+                st.structured_empty_window, req.endpoint,
+                empty=True, call_site=cs, now=time.monotonic())
+            n_keys = len(obj) if isinstance(obj, dict) else 0
+            logger.warning(
+                "LLMPROXY_STRUCTURED_EMPTY model=%s agent=%s call_site=%s "
+                "request_id=%s stream=%s declared_schema=%s required=%s "
+                "keys=%d content=%r — a STRUCTURED request returned a "
+                "well-formed JSON object with no answer in it. This is what a "
+                "backend running disable_any_whitespace emits when the grammar "
+                "is allowed to close immediately; it arrives with "
+                "finish_reason=stop and no error, so every caller-side health "
+                "signal reads it as success.",
+                req.endpoint, getattr(req, "agent_id", "?"), cs,
+                getattr(req, "request_id", "?"), stream,
+                schema is not None, _schema_required_keys(schema),
+                n_keys, content[:120],
+            )
+            try:
+                from originfleet.framework.observability import degradation
+                degradation(
+                    component="llmproxy", reason="structured_empty",
+                    impact="caller received a well-formed response with no "
+                           "fields; it cannot tell this from a real answer",
+                    model=req.endpoint,
+                    agent=getattr(req, "agent_id", "?"),
+                    call_site=cs,
+                    stream=stream,
+                    declared_schema=schema is not None,
+                    required_keys=len(_schema_required_keys(schema)),
+                )
+            except Exception:  # noqa: BLE001 — the seam must never break a response
+                logger.debug("structured_empty degradation emit failed",
+                             exc_info=True)
+        except Exception:  # noqa: BLE001 — telemetry must never break a response
+            logger.debug("detect_structured_empty failed", exc_info=True)
 
     def request_is_structured(self, req: QueuedRequest) -> bool:
         """True when the request constrained its output (grammar / JSON schema /

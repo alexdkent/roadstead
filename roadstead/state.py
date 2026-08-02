@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections import deque
 from typing import TYPE_CHECKING
 
 from .acl import IPIdentityMap
@@ -174,6 +175,20 @@ class ProxyState:
         self.truncation_by_model_caller: dict[str, dict] = {}
         self.structured_parse_failure_total = 0
         self.structured_parse_failures_by_model_caller: dict[str, int] = {}
+        # Empty-structured-response detection (2026-08-01, ledger
+        # `tier3-json-object-empty-brace`). A structured request whose content
+        # is a WELL-FORMED JSON object carrying no answer ("{}") defeats every
+        # emptiness / truncation / degeneration check the proxy has — that is
+        # how one endpoint returned nothing for 31 hours with no error, no
+        # exception and finish_reason=stop. Detection is telemetry only (the
+        # response is never altered); the operator surface is the per-endpoint
+        # RATE alarm on /v1/status.alerts, computed off `structured_empty_window`
+        # (endpoint -> deque[(monotonic_ts, was_empty, call_site)], pruned to
+        # observability.STRUCTURED_EMPTY_WINDOW_S). Loop-thread-only writes,
+        # so no lock (single event loop invariant).
+        self.structured_empty_total = 0
+        self.structured_empty_by_call_site: dict[str, int] = {}
+        self.structured_empty_window: dict[str, deque] = {}
         # Dedupe set so a single request that races across two timeout
         # layers (e.g. admission expiry + client-wait) is logged once.
         self.timed_out_ids: set[str] = set()

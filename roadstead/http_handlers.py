@@ -23,6 +23,7 @@ from . import cache_stats
 from .config import LLMPriority, normalize_endpoint
 from .constants import _PAYLOAD_KIND
 from .lifecycle import _openai_error
+from .observability import structured_empty_rates
 from .sse_hub import DROP_SENTINEL
 
 if TYPE_CHECKING:
@@ -302,6 +303,7 @@ class ProxyHttpHandlers:
         now = time.monotonic()
         out: list[Metric] = []
         _Q = {50: "0.5", 95: "0.95"}
+        _se_rates = structured_empty_rates(self.state.structured_empty_window, now)
         try:
             for ep_name in self.state.config.endpoints:
                 lbl = {"endpoint": ep_name}
@@ -357,6 +359,21 @@ class ProxyHttpHandlers:
                 out.append(Metric("llmproxy_endpoint_healthy",
                                   1 if h.get("healthy", True) else 0, lbl, "gauge",
                                   help="1 if the endpoint is healthy (not paused)"))
+                # Empty-structured rate (ledger tier3-json-object-empty-brace):
+                # the fraction of this endpoint's structured responses that came
+                # back a well-formed JSON object with no answer in it. VM builds
+                # the history; the standing alert is the page. Only emitted when
+                # the endpoint cleared the sample floor — an unevaluated
+                # endpoint must not publish a 0/0 that reads as "healthy".
+                se = _se_rates.get(ep_name)
+                if se and se.get("evaluated"):
+                    out.append(Metric("llmproxy_structured_empty_rate",
+                                      se["rate"], lbl, "gauge",
+                                      help="fraction of structured responses "
+                                           "carrying no answer (30m window)"))
+                    out.append(Metric("llmproxy_structured_samples_30m",
+                                      se["n"], lbl, "gauge",
+                                      help="structured responses in the window"))
 
             stats = self.state.scheduler.stats()
             for key, name in (("total_dispatched", "llmproxy_dispatched_total"),
@@ -602,6 +619,18 @@ class ProxyHttpHandlers:
                     cs: t for cs, t in self.state.schema_by_call_site.items()
                     if t.get("detected")
                 },
+                # Empty-structured responses (2026-08-01, ledger
+                # `tier3-json-object-empty-brace`): a STRUCTURED request that
+                # came back a well-formed JSON object with no answer in it.
+                # `{}` passes every other guard here, so this is the only place
+                # the 31-hour silent outage would have shown up. Grep marker:
+                # LLMPROXY_STRUCTURED_EMPTY. `structured_empty_rate` is the
+                # live per-endpoint sliding window the standing alert reads.
+                "structured_empty_total": self.state.structured_empty_total,
+                "structured_empty_by_call_site":
+                    self.state.structured_empty_by_call_site,
+                "structured_empty_rate": structured_empty_rates(
+                    self.state.structured_empty_window, time.monotonic()),
             },
             # Phase 5F — endpoints an operator has drained for maintenance.
             "paused_endpoints": sorted(self.state.paused_endpoints),
