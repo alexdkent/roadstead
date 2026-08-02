@@ -142,6 +142,16 @@ class IPIdentityMap:
         # thinker) behind the catch-all. Identity-only fix: same P3 tier it
         # already got via the subnet default, so QoS is unchanged. (2026-07-12)
         acl.register("10.0.0.14", "recipe-runner", LLMPriority.P3_INGESTION)
+        # pool-observer (Kestrel CTnnn, static 10.0.0.17). Identical situation to
+        # goose above: the `pool` CLI is a plain OpenAI-compat client with no
+        # identity header, so without this it lands in `lan-generic` and its
+        # traffic is invisible in `proxy_completions`. Registered in CODE, not
+        # via LLM_PROXY_ACL — container env is baked at `docker run`, so an env
+        # change would force a permission-gated full-fleet re-run for what is a
+        # one-line identity fix. Same P3 tier the subnet default already gave
+        # it, so QoS is unchanged; the point is attribution. tier3 peaks at
+        # 11/20 slots, so pool must stay deprioritizable. (2026-08-02)
+        acl.register("10.0.0.17", "pool-observer", LLMPriority.P3_INGESTION)
         acl.register("10.0.0.0/24", "lan-generic", LLMPriority.P3_INGESTION)
 
         return acl
