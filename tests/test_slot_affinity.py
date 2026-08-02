@@ -62,17 +62,28 @@ def test_slot_affinity_defaults_false():
     assert cfg.slot_affinity is False
 
 
-def test_companion_slot_affinity_true():
-    from originfleet.llmproxy.config import DEFAULT_ENDPOINTS
-    companion = DEFAULT_ENDPOINTS["companion"]
-    assert companion.slot_affinity is True
+def test_no_live_endpoint_uses_slot_affinity():
+    """As of 2026-08-02 NOTHING live sets slot_affinity — and that is expected.
 
+    It was only ever set on the nexus 122B (`companion`), whose `--slot-prompt-
+    similarity` KV reuse it existed for. That stanza stopped being a proxy
+    endpoint when its class name was found to collide with the `companion` ALIAS
+    of tier3 (ledger `endpoint-class-alias-collision`), so the flag now has no
+    live consumer.
 
-def test_non_companion_slot_affinity_false():
+    The MECHANISM is deliberately kept — `EndpointConfig.slot_affinity` and the
+    id_slot injection in `_execute_dispatch` are still exercised by the
+    integration test below against a synthetic config, so re-enabling it for a
+    future llama.cpp endpoint stays a one-line yaml change. This test asserts the
+    live state so that turning it on somewhere is a DELIBERATE, visible edit.
+    """
     from originfleet.llmproxy.config import DEFAULT_ENDPOINTS
-    for name, ep in DEFAULT_ENDPOINTS.items():
-        if name != "companion":
-            assert ep.slot_affinity is False, f"{name}.slot_affinity should be False"
+    enabled = [n for n, ep in DEFAULT_ENDPOINTS.items() if ep.slot_affinity]
+    assert enabled == [], (
+        f"{enabled} now set slot_affinity. That is fine — but it is llama.cpp-only "
+        "(id_slot means nothing to vLLM), so confirm the backend engine and update "
+        "this test."
+    )
 
 
 # ---------------------------------------------------------------------------

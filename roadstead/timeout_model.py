@@ -59,6 +59,13 @@ FLOOR_S: dict[str, float] = {
     # the 80B). Raised 180→360 (commit 35df6545): the 122B is materially slower,
     # and the old 180s floor was truncating turns + streams under load. Mirrors
     # models.yaml composer.timeout_floor_s.
+    # HISTORICAL ONLY as of 2026-08-02 — `companion` is no longer an endpoint
+    # class (the 122B backup left the proxy; its class name collided with the
+    # `companion` alias, see models.yaml). normalize_endpoint() now resolves
+    # "companion" to "thinker" in ONE step, so this key is unreachable for new
+    # traffic and the thinker floor below applies. Kept as a tombstone: deleting
+    # it invites someone to re-add `companion` as a class and reintroduce the
+    # collision. Ledger: `endpoint-class-alias-collision`.
     "companion": 360.0,
     "thinker": 180.0,
     # creative (Qwen3.6-35B-A3B abliterated MoE, ~3B active, 6 slots on the Arc Pro boxa). CONSOLIDATED

@@ -117,8 +117,32 @@ models:
     # the run of the box). Starting it will contend with imagegen for nexus memory.
     kind: chat
     status: on_demand
-    proxy_endpoint: true
-    endpoint_class: companion
+    # 🚨 NOT A PROXY ENDPOINT (2026-08-02). It was `proxy_endpoint: true` with
+    # `endpoint_class: companion`, and that CLASS NAME COLLIDED with `companion`,
+    # which the 2026-07-30 tier migration made an ALIAS of the reasoner/tier3
+    # stanza below. The collision made normalize_endpoint() NON-IDEMPOTENT:
+    #     tier3-backup -> companion -> thinker
+    # and the submit path normalizes twice (resolve_endpoint() then
+    # QueuedRequest.create()), so EVERY request for the 122B backup was silently
+    # served by tier3 — verified live on the wire (backend 10.0.0.3:9083,
+    # served_model=llama-thinker). The declared backup was unreachable, and on the
+    # day tier3 is sick that returns a confident wrong-model answer instead of a
+    # clean failure. Ledger: `endpoint-class-alias-collision`.
+    #
+    # Dropping the class (rather than the `companion` alias) is deliberate: the
+    # alias is load-bearing — dj, the prompt budgets and framework/nexus_stream
+    # all pass `companion` MEANING tier3, and removing it would point them at a
+    # dead nexus:8081. Dropping the class also stops us ADVERTISING a backend
+    # that physically cannot serve: the unit is stopped+disabled, nexus has no
+    # dispatcher to load it, so the endpoint was decorative. `tier3-backup` now
+    # 404s honestly instead of lying.
+    #
+    # The entry stays (kind/status/aliases/systemd_unit) so `canonical()` still
+    # resolves the reasoner stanza's `fallback: tier3_backup` and the model-card /
+    # telemetry derivations keep their metadata. RE-ADDING it as a proxy endpoint
+    # is part of the manual recovery below — and MUST use a class name that is not
+    # also an alias, or this bug returns.
+    proxy_endpoint: false
     role: tier3-backup
     aliases: [tier3-backup, llama-companion-122b]
     host: nexus

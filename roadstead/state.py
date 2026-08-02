@@ -291,6 +291,12 @@ class ProxyState:
         self.poller_task: asyncio.Task | None = None
         self.inflight_task: asyncio.Task | None = None
         self.started_at = time.monotonic()
+        # Wall-clock twin of started_at. `started_at` is monotonic and therefore
+        # NOT a timestamp — /v1/models needs a real epoch for the OpenAI
+        # `created` field. Stamped once per boot so the listing is stable
+        # request-to-request (a per-request time.time() would make every poll
+        # look like a different model set to a caching client).
+        self.boot_time_epoch = int(time.time())
 
     # ----- shared response/report helpers -----
     # Small read/write helpers that span clusters (Lifecycle + Health both call

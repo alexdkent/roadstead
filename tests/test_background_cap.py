@@ -77,13 +77,21 @@ def test_companion_dispatch_concurrency_cap():
     cliff; prefill holds ~430-460 t/s aggregate through 8-way) — see
     infra/nexus/bench_results/composer_prefill_campaign_20260717.md.
     cap == max_slots == 8; the interactive reserve is preserved
-    (background cap = 8 - 1 = 7)."""
-    comp = DEFAULT_ENDPOINTS["companion"]
+    (background cap = 8 - 1 = 7).
+
+    2026-08-02: `companion` is no longer an endpoint class — the 122B stanza left
+    the proxy because its class name collided with the `companion` ALIAS of tier3
+    (ledger `endpoint-class-alias-collision`). The history above is kept because
+    it is the reasoning behind the cap MECHANISM, which is unchanged; the
+    assertions now run against a synthetic endpoint with the 122B's final shape
+    rather than a live class, plus the real uncapped endpoint.
+    """
+    comp = _ep(8, 1, cap=8)                  # the 122B's final shape (2026-07-17)
     assert comp.max_slots == 8               # physical (prefill campaign, 2026-07-17)
     assert comp.dispatch_concurrency_cap == 8
     assert comp.effective_max_slots == 8     # dispatch ceiling (== physical now)
     assert comp.background_cap_slots == 7    # leaves 1 for interactive
-    # An uncapped endpoint is unaffected: effective == physical.
+    # An uncapped LIVE endpoint is unaffected: effective == physical.
     thinker = DEFAULT_ENDPOINTS["thinker"]
     assert thinker.dispatch_concurrency_cap == 0
     assert thinker.effective_max_slots == thinker.max_slots

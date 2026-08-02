@@ -48,9 +48,12 @@ _RATES_BY_CLASS: dict[str, tuple[float, float]] = {
     # against as `companion`, because it is the same workload on a bigger model; keeping the
     # 32B anchor made the "$ saved" figure understate every heavy-tier call.
     "thinker":   (0.15, 0.60),   # Laguna S 2.1 INT4 (~120B MoE) → Qwen3-235B-A22B-Instruct-2507
-    # `companion` is now ONLY the stopped tier3-backup (nexus 122B, status on_demand). Kept so
-    # historical rows still price, but it should bill ~nothing while the backup is down.
-    "companion": (0.15, 0.60),   # tier3-backup Qwen3.5-122B-A10B → Qwen3-235B-A22B-Instruct-2507
+    # HISTORICAL ONLY as of 2026-08-02: `companion` is no longer an endpoint class at all (the
+    # 122B backup stopped being a proxy endpoint — its class name collided with the `companion`
+    # alias and silently rerouted the backup to tier3; see models.yaml + the
+    # `endpoint-class-alias-collision` ledger entry). No NEW row can carry this class. Kept only
+    # so pre-cutover rows in the usage tables still price instead of falling to a default.
+    "companion": (0.15, 0.60),   # historical: Qwen3.5-122B-A10B → Qwen3-235B-A22B-Instruct-2507
     "creative":  (0.15, 0.55),   # Qwen3.6-35B-A3B+vis → Qwen3-VL-30B-A3B-Instruct (vision billed as input tokens, no premium)
     "gemma":     (0.04, 0.08),   # Gemma-4-E4B         → Gemma-3-4B-it (DeepInfra)
     "embed":     (0.01, 0.0),    # BGE-M3 (EXACT model on DeepInfra) — market floor
@@ -87,8 +90,19 @@ _TTS_CHAR_RATE = 15.0  # $/1M chars — tts-1 / Deepgram Aura-1 tier (no hosted 
 _ENDPOINT_CLASS: dict[str, str | None] = {
     # --- token-native ---
     "thinker": "thinker", "reasoner": "thinker", "llama-thinker": "thinker",
-    "companion": "companion", "composer": "companion", "qwen-composer": "companion",
-    "nexus-companion": "companion", "llama-companion": "companion",
+    # 2026-08-02: these five pointed at a `companion` CLASS that no longer
+    # exists — and did not agree with the router even before it was removed.
+    # `normalize_endpoint` has resolved companion/composer/qwen-composer/
+    # nexus-companion to `thinker` since the 2026-07-30 tier migration, so this
+    # map was attributing tier3 traffic to a class nothing was routed to. The $
+    # figure happened to match (both rows were priced 0.15/0.60), which is
+    # exactly why it went unnoticed. Point them where the traffic actually goes.
+    "companion": "thinker", "composer": "thinker", "qwen-composer": "thinker",
+    "nexus-companion": "thinker",
+    # The 122B backup is no longer a proxy endpoint (see models.yaml) — it has
+    # no class to bill to. `llama-companion` is its systemd UNIT name, never a
+    # routable alias.
+    "llama-companion": None, "tier3-backup": None, "llama-companion-122b": None,
     "creative": "creative", "deckard": "creative", "deckard-31b": "creative",
     "companion-lite": "creative",
     "chat": "creative", "nexus-chat": "creative",

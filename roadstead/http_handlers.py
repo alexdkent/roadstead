@@ -280,17 +280,52 @@ class ProxyHttpHandlers:
             "usage": usage,
         })
     async def handle_models(self, request: Request) -> Response:
-        models = []
+        """GET /v1/models — OpenAI-compatible listing.
+
+        Two things here are load-bearing for third-party OpenAI clients, both
+        learned from wiring poolside's `pool` CLI 2026-08-02:
+
+        1. ORDER IS A DEFAULT. A client with no configured model takes
+           ``data[0]``. Ours used to be whatever ``config.endpoints`` happened to
+           iterate first, which was the (now removed) 122B backup class — so pool
+           defaulted onto a decorative endpoint. Chat roles sort first, biggest
+           context first, so ``data[0]`` is the fleet's deepest chat model.
+        2. ``max_model_len`` IS THE CONTEXT FIELD CLIENTS ACTUALLY READ. The
+           OpenAI model schema has no context field at all; vLLM's own
+           /v1/models emits ``max_model_len``, so that is what a client built
+           against vLLM looks for. We were emitting only the bespoke
+           ``context_per_slot``, which nothing outside the fleet understands, so
+           pool fell back to its built-in default (128K) and budgeted its context
+           against that instead of the 700K we actually serve.
+
+        ``context_per_slot``/``endpoint_class``/``max_slots`` are kept for the
+        fleet's own consumers (Inference page, tooling).
+        """
+        _EMBEDDINGS = {"embed", "rerank"}
+        rows = []
         for ep_name, ep_cfg in self.state.config.endpoints.items():
-            models.append({
+            ctx = ep_cfg.context_per_slot
+            rows.append({
                 "id": ep_cfg.role,
                 "object": "model",
+                # OpenAI clients expect `created`; vLLM emits it. Static per
+                # boot is fine — nothing consumes the value, only the key.
+                "created": self.state.boot_time_epoch,
                 "owned_by": "collective",
+                # The served context window, in the field vLLM uses (see above).
+                "max_model_len": ctx,
                 "endpoint_class": ep_name,
                 "max_slots": ep_cfg.max_slots,
-                "context_per_slot": ep_cfg.context_per_slot,
+                "context_per_slot": ctx,
             })
-        return JSONResponse({"object": "list", "data": models})
+        # Chat before embed/rerank; within each, largest context first. Ties
+        # break on id so the order is stable across boots.
+        rows.sort(key=lambda r: (
+            r["endpoint_class"] in _EMBEDDINGS,
+            -(r["max_model_len"] or 0),
+            r["id"],
+        ))
+        return JSONResponse({"object": "list", "data": rows})
     async def handle_prometheus_metrics(self, request: Request) -> Response:
         """GET /metrics — Prometheus text exposition of CURRENT QoS aggregates
         (timeseries_migration_plan Phase 3.1). In-memory reads only (scheduler +

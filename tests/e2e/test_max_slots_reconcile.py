@@ -59,11 +59,13 @@ async def test_max_slots_drift_reconciler(proxy, monkeypatch):
     # 4) A llama.cpp endpoint (documented_max_num_seqs == 0) is NEVER reconciled,
     #    even if its max_slots is odd — the guard is vLLM-only.
     # After the 2026-07-11 boxa consolidation the old classify/chat class is an
-    # alias of the `creative` endpoint, which DOES carry documented_max_num_seqs;
-    # `companion` (nexus llama.cpp, documented == 0) is the current example of a
-    # never-reconciled endpoint.
+    # alias of the `creative` endpoint, which DOES carry documented_max_num_seqs.
+    # `companion` (nexus llama.cpp, documented == 0) used to be the example here,
+    # but that class was removed 2026-08-02 — its name collided with the
+    # `companion` ALIAS of tier3 (ledger `endpoint-class-alias-collision`).
+    # `rerank` is now the live llama.cpp endpoint with documented == 0.
     thinker.max_slots = admitted_before  # restore the drift
-    llamacpp_ep = eps["companion"]
+    llamacpp_ep = eps["rerank"]
     assert llamacpp_ep.documented_max_num_seqs == 0
     llamacpp_ep.max_slots = 999
     health.evaluate_alerts(time.monotonic())
