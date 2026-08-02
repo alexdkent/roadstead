@@ -302,7 +302,13 @@ models:
     # step 4, "point composer/companion/reasoner/thinker aliases at tier3". Laguna is now the
     # single heavy tier; the 122B remains reachable as `tier3-backup` (on_demand) for its
     # abliterated capability, per the §2b priority ladder.
-    aliases: [tier3, reasoner, llama-thinker, thinker, composer, companion, qwen-composer, nexus-companion]
+    # `poolside/laguna-s-2.1` is the name POOLSIDE'S OWN CLIENTS send by default
+    # (measured 2026-08-01: the `pool` CLI v1.0.14 in standalone mode hardcodes it
+    # in every /v1/chat/completions body). It is the SAME model we serve here —
+    # tier3 IS Laguna S 2.1 — so this alias exists purely so a stock poolside
+    # client works against the proxy with no client-side model config. Without it
+    # the proxy correctly 404s `model_not_found` and pool retries 3x and dies.
+    aliases: [tier3, reasoner, llama-thinker, thinker, composer, companion, qwen-composer, nexus-companion, poolside/laguna-s-2.1]
     host: anvil
     port: 9083
     backend_engine: vllm
