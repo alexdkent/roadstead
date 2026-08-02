@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from typing import TYPE_CHECKING
@@ -29,6 +30,36 @@ from .sse_hub import DROP_SENTINEL
 if TYPE_CHECKING:
     from .health import Health
     from .lifecycle import Lifecycle
+
+
+_TIER_RE = re.compile(r"^tier\d+$")
+_ADVERTISED_ID: "dict[str, str] | None" = None
+
+
+def _advertised_model_id(ep_cfg) -> str:
+    """The name /v1/models advertises for an endpoint: its CANONICAL tier name.
+
+    The 2026-07-30 tier migration made ``tier1``/``tier2``/``tier3`` the
+    canonical names; the ``role:`` strings (``gemma-router``, ``creative``,
+    ``llama-thinker``) are legacy and only kept resolving for compat. /v1/models
+    is where third-party clients LEARN a model name and then pin it in their own
+    config, so advertising a legacy role there mints new callers on the old name
+    indefinitely — which is exactly the thing the migration was ending.
+
+    Falls back to ``role`` for endpoints with no tier (embed/rerank are not
+    tiers). Built once from the catalog; the catalog is the authority, so a
+    renamed tier follows automatically.
+    """
+    global _ADVERTISED_ID
+    if _ADVERTISED_ID is None:
+        from .model_catalog import load_catalog
+        mapping: dict[str, str] = {}
+        for e in load_catalog().proxy_endpoints():
+            tier = next((a for a in e.aliases if _TIER_RE.match(a)), None)
+            if tier:
+                mapping[e.role] = tier
+        _ADVERTISED_ID = mapping
+    return _ADVERTISED_ID.get(ep_cfg.role, ep_cfg.role)
 
 
 def _embedding_texts(raw) -> "tuple[list, str]":
@@ -306,7 +337,16 @@ class ProxyHttpHandlers:
         for ep_name, ep_cfg in self.state.config.endpoints.items():
             ctx = ep_cfg.context_per_slot
             rows.append({
-                "id": ep_cfg.role,
+                # The CANONICAL tier name (tier1/tier2/tier3), never the legacy
+                # `role`. `role` is still `gemma-router`/`creative`/
+                # `llama-thinker` for compat, but the 2026-07-30 tier migration
+                # made the tier names canonical and this is the surface every
+                # NEW external client copies its model name from — advertising
+                # `llama-thinker` here would mint fresh callers on a legacy name
+                # forever. Non-tier endpoints (embed/rerank) have no tier and
+                # keep their role. Guarded by
+                # test_v1_models_advertises_canonical_tier_names.
+                "id": _advertised_model_id(ep_cfg),
                 "object": "model",
                 # OpenAI clients expect `created`; vLLM emits it. Static per
                 # boot is fine — nothing consumes the value, only the key.
@@ -315,6 +355,9 @@ class ProxyHttpHandlers:
                 # The served context window, in the field vLLM uses (see above).
                 "max_model_len": ctx,
                 "endpoint_class": ep_name,
+                # The legacy role, kept so in-fleet consumers that still key off
+                # it don't break. External clients should use `id`.
+                "role": ep_cfg.role,
                 "max_slots": ep_cfg.max_slots,
                 "context_per_slot": ctx,
             })
