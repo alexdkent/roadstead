@@ -440,10 +440,18 @@ class Lifecycle:
         # (disable_any_whitespace — tier3) turns a BARE response_format
         # json_object into the literal `{}`: with no whitespace allowed, `{}` is a
         # legal COMPLETE object and greedy decoding closes immediately. Strip it.
-        # Same placement rationale as the line above — this MUST precede the
-        # streaming/sync branch, because apply_thinking (below, in the sync branch)
-        # is sync-only and this guard has to cover both paths.
+        # Same placement rationale as the line above — this guard has to cover
+        # both the streaming and the sync path.
         self.correction.apply_json_object_guard(req)
+
+        # Thinking option: honor a per-request `thinking:true` opt-in (enable
+        # native <think> on vLLM + generous budget bump + system fold). No-op
+        # otherwise. Sits HERE, above the branch, alongside the two guards above:
+        # it used to live inside handle_sync_submit and bail on req.stream, which
+        # made the opt-in a silent no-op for streaming callers. The response-side
+        # half (finalize_thinking) is still sync-only — apply_thinking skips the
+        # thinking_active registration when streaming.
+        self.correction.apply_thinking(req)
 
         # Streaming vs non-streaming
         if req.stream:
@@ -456,10 +464,6 @@ class Lifecycle:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self.state.pending_futures[req.request_id] = future
-
-        # Thinking option: honor a per-request `thinking:true` opt-in (enable
-        # native <think> on vLLM + generous budget bump). No-op otherwise.
-        self.correction.apply_thinking(req)
 
         self.state.scheduler.enqueue(req)
         self.state.queue_db.persist_enqueue(req)

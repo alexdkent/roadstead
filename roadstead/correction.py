@@ -1280,9 +1280,23 @@ class Correction:
         against the cap; operator directive is to prefer slowness over cutoffs).
         Records the request for response-side structured-output recovery. Strips
         the ``thinking`` control field (not a backend param) regardless. Fully
-        transparent when not requested, feature-disabled, streaming, or non-vLLM.
+        transparent when not requested, feature-disabled, or non-vLLM.
         Also folds any system message(s) into the first user turn — see
-        :meth:`fold_system_for_thinking` for why."""
+        :meth:`fold_system_for_thinking` for why.
+
+        STREAMING (2026-08-02): the request side applies to streamed requests too.
+        It used to bail on ``req.stream`` outright, which made ``thinking: true``
+        a SILENT no-op for any streaming caller — no error, just a non-thinking
+        answer, which is exactly the failure shape that reads as "the model didn't
+        reason today". The bail was only ever needed for the RESPONSE side:
+        :meth:`finalize_thinking` rewrites a complete result dict and cannot run
+        over an SSE stream. So a streamed request gets the enable + budget + fold
+        and is deliberately NOT registered in ``state.thinking_active`` — nothing
+        will finalize it, and an un-popped entry would leak. A streaming caller
+        that also wants structured output therefore gets vLLM's raw framing (the
+        bounded stray-brace artifact is not repaired); the Playground, the only
+        streaming consumer of the opt-in today, reads reasoning off the
+        ``delta.reasoning_content`` channel and does not parse JSON."""
         p = req.payload
         if not isinstance(p, dict):
             return
@@ -1292,7 +1306,7 @@ class Correction:
             want = want or bool(eb.get("thinking"))
             eb.pop("thinking", None)
         p.pop("thinking", None)  # control field — never forward to the backend
-        if not want or req.stream or req.payload_type != "chat_completion":
+        if not want or req.payload_type != "chat_completion":
             return
         if not thinking_enabled():
             return
@@ -1312,6 +1326,10 @@ class Correction:
         folded = self.fold_system_for_thinking(p.get("messages"))
         if folded is not None:
             p["messages"] = folded
+        if req.stream:
+            # No finalize_thinking runs over a stream — registering here would
+            # leak an entry in thinking_active that nothing ever pops.
+            return
         self.state.thinking_active[req.request_id] = {
             "allowed_keys": self.thinking_allowed_keys(p)}
 
@@ -1340,6 +1358,32 @@ class Correction:
         native system prompt". The suppression is learned behaviour, hence
         probabilistic rather than absolute — folding raises the reasoning rate,
         it does not guarantee it.
+
+        Re-measured 2026-08-02 on the STREAMING path (live tier3, n=4 per cell,
+        no schema — a cleaner control than the table above), `reasoning` chars:
+
+            no system message at all  →  2459, 1846, 3956, 2244   (4/4 reasoned)
+            system message, folded    →     0,    0,  955,    0   (1/4 reasoned)
+
+        So the fold does NOT close the gap: WITH a caller system prompt, thinking
+        still no-ops most of the time. Anything offering thinking as a user-facing
+        control has to say so rather than let it look like a dead switch — the
+        Playground warns at the toggle and again on a zero-reasoning turn.
+
+        🚨 CONVERSATION HISTORY suppresses it HARDER, and this is not documented
+        anywhere else. Same rig, unique nonce per request so nothing is served
+        from the proxy's identical-payload cache (the first cut of this
+        measurement WAS cache-confounded — three identical 102-char replies —
+        so re-check that before trusting any repeat of it):
+
+            [user]                     →  1321, 1625, 2557, 3339   (4/4 reasoned)
+            [user, assistant, user]    →     0,    0,    0,    0   (0/4 reasoned)
+
+        A single prior assistant turn is enough. Any multi-turn caller that opts
+        into thinking gets it on the first turn and silently never again, so
+        treat `thinking: true` as a FIRST-TURN capability on this backend until
+        the template is understood. Not fixed here: the fix is not obviously the
+        proxy's to make, and a wrong guess would corrupt replayed history.
 
         Because essentially every fleet caller sends a system prompt, production
         thinking calls have been reasoning far less than the opt-in implies —

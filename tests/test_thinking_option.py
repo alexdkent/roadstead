@@ -85,6 +85,63 @@ def test_apply_thinking_noop_on_llamacpp():
     assert "thinking" not in p and m.state.thinking_active == {}  # still stripped, no-op
 
 
+def test_apply_thinking_applies_on_streaming_requests():
+    """REGRESSION (2026-08-02): apply_thinking used to `return` on req.stream, so a
+    streaming caller's `thinking: true` was stripped and silently ignored — no error,
+    just a non-thinking answer. That is the shape the Playground's thinking toggle
+    would have shipped as a dead control. The request side is stream-agnostic now."""
+    m = _mock_self("vllm")
+    p = {"messages": [{"role": "user", "content": "why?"}], "max_tokens": 2048,
+         "thinking": True}
+    m._apply_thinking(_req(p, stream=True))
+    assert p["chat_template_kwargs"]["enable_thinking"] is True
+    assert p["max_tokens"] == 2048 + config.thinking_reasoning_budget()
+    assert "thinking" not in p  # control field still stripped
+
+
+def test_apply_thinking_streaming_does_not_register_for_finalize():
+    """finalize_thinking rewrites a COMPLETE result dict and never runs over an SSE
+    stream, so a streamed request must not be recorded in thinking_active — the
+    entry would never be popped and would leak per request."""
+    m = _mock_self("vllm")
+    p = {"messages": [{"role": "user", "content": "why?"}], "max_tokens": 800,
+         "thinking": True, "response_format": SCHEMA_RF}
+    m._apply_thinking(_req(p, stream=True))
+    assert p["chat_template_kwargs"]["enable_thinking"] is True   # applied...
+    assert m.state.thinking_active == {}                          # ...but not registered
+    # the sync twin of the same payload DOES register — proves the assertion above
+    # is about streaming, not about the opt-in silently failing.
+    m2 = _mock_self("vllm")
+    p2 = {"messages": [{"role": "user", "content": "why?"}], "max_tokens": 800,
+          "thinking": True, "response_format": SCHEMA_RF}
+    m2._apply_thinking(_req(p2, stream=False))
+    assert set(m2.state.thinking_active["r1"]["allowed_keys"]) == {"action", "params", "why"}
+
+
+def test_apply_thinking_streaming_folds_system():
+    """The template quirk that suppresses <think> when a system role is present is
+    not stream-specific — the fold has to happen on the streaming path too."""
+    m = _mock_self("vllm")
+    p = {"messages": [{"role": "system", "content": "You are Sidekick."},
+                      {"role": "user", "content": "why?"}],
+         "max_tokens": 800, "thinking": True}
+    m._apply_thinking(_req(p, stream=True))
+    assert [x["role"] for x in p["messages"]] == ["user"]
+    assert p["messages"][0]["content"] == "You are Sidekick.\n\nwhy?"
+
+
+def test_apply_thinking_streaming_transparent_without_optin():
+    """Zero blast radius for the streaming traffic that does NOT opt in — which is
+    all of it today."""
+    m = _mock_self("vllm")
+    orig = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
+    p = {"messages": list(orig), "max_tokens": 800}
+    m._apply_thinking(_req(p, stream=True))
+    assert "chat_template_kwargs" not in p
+    assert p["max_tokens"] == 800 and p["messages"] == orig
+    assert m.state.thinking_active == {}
+
+
 SYS = "You are Sidekick. Be terse."
 SYS2 = "Second system block."
 USR = "What is 17*23?"
@@ -359,3 +416,43 @@ if __name__ == "__main__":
             print(f"FAIL {fn.__name__}: {type(e).__name__}: {e}")
     print(f"\n{passed}/{len(fns)} passed")
     sys.exit(0 if passed == len(fns) else 1)
+
+
+# ---------------------------------------------------------------------------
+# Wiring: apply_thinking must be REACHED on the streaming path
+# ---------------------------------------------------------------------------
+# A correct apply_thinking that only the sync branch calls is exactly the defect
+# this change fixed — the unit tests above would have stayed green through it.
+# handle_submit is a long async method over live proxy state (scheduler, futures,
+# queue DB, health), so this asserts the CALL SITE structurally instead of
+# standing up a fake proxy. Keyed on FUNCTION NAMES, never line numbers.
+
+def _lifecycle_calls(fn_name):
+    """Names of `self.correction.<x>(...)` calls made directly inside the named
+    method of lifecycle.py (not nested defs)."""
+    import ast
+    src = (REPO / "originfleet" / "llmproxy" / "lifecycle.py").read_text()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == fn_name:
+            out = set()
+            for sub in ast.walk(node):
+                f = getattr(sub, "func", None)
+                if (isinstance(f, ast.Attribute)
+                        and isinstance(f.value, ast.Attribute)
+                        and f.value.attr == "correction"):
+                    out.add(f.attr)
+            return out
+    raise AssertionError(f"lifecycle.py has no method {fn_name!r} — rename? update this test")
+
+
+def test_apply_thinking_is_called_before_the_stream_branch():
+    """It must live in handle_submit (which owns the `if req.stream:` branch), so
+    both lanes get it — the same placement apply_forced_reasoning_budget and
+    apply_json_object_guard already use, and for the same reason."""
+    assert "apply_thinking" in _lifecycle_calls("handle_submit"), (
+        "correction.apply_thinking is not called in handle_submit — if it moved back "
+        "into handle_sync_submit, `thinking: true` is a SILENT no-op for every "
+        "streaming caller (the Playground's thinking toggle among them)")
+    assert "apply_thinking" not in _lifecycle_calls("handle_sync_submit"), (
+        "apply_thinking is called in BOTH handle_submit and handle_sync_submit — a "
+        "sync request would get the reasoning budget added twice")
