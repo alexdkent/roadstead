@@ -351,10 +351,13 @@ models:
     served_model_names: [llama-thinker, thinker, tier3, reasoner, claude-sonnet-4-5, llama]
     model_family: Laguna-S-2.1-INT4 (+ Laguna-S-2.1-DFlash-INT4 drafter)
     quant: INT4 (compressed-tensors pack-quantized, W4A16, group 32)
-    # Sparse MoE: 256 experts, top-10, 48 layers, hidden 3072. poolside do not publish a
-    # parameter count; these are DERIVED from config.json and are approximate — treat as
-    # indicative, not authoritative.
-    params: {active: ~6B, total: ~120B}
+    # Sparse MoE: 256 experts, top-10, 48 layers, hidden 3072.
+    # 2026-08-03: these were previously ~6B/~120B, DERIVED from config.json on the belief that
+    # poolside publish no parameter count. They DO — the launch material states 118B total /
+    # 8B active — so these are now the vendor's numbers, not ours. The derived figures were in
+    # the right neighbourhood but the active count was ~25% low, which matters when it is used
+    # to reason about decode cost.
+    params: {active: 8B, total: 118B}
     # 262144 = the SERVED window (--max-model-len) = THIS CHECKPOINT's ceiling. Raised
     # 131072 -> 262144 on 2026-07-30 with an explicit --kv-cache-memory of 26 GiB.
     #
