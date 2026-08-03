@@ -58,6 +58,7 @@ class ModelEntry:
     slots: int = 0
     timeout_floor_s: float = 0.0
     timeout_ceiling_s: float = 0.0
+    stream_hard_cap_s: float = 0.0
     policy: dict[str, Any] = field(default_factory=dict)
     capabilities: dict[str, Any] = field(default_factory=dict)
     dispatcher_capability: str = ""
@@ -156,6 +157,7 @@ def _coerce_entry(name: str, raw: dict[str, Any]) -> ModelEntry:
         slots=int(raw.get("slots", 0) or 0),
         timeout_floor_s=float(raw.get("timeout_floor_s", 0) or 0),
         timeout_ceiling_s=float(raw.get("timeout_ceiling_s", 0) or 0),
+        stream_hard_cap_s=float(raw.get("stream_hard_cap_s", 0) or 0),
         policy=dict(raw.get("policy") or {}),
         capabilities=dict(raw.get("capabilities") or {}),
         dispatcher_capability=raw.get("dispatcher_capability", ""),
@@ -339,6 +341,23 @@ def build_class_ceilings(cat: Catalog | None = None) -> dict[str, float]:
     for e in cat.proxy_endpoints():
         if e.endpoint_class and e.timeout_ceiling_s and e.timeout_ceiling_s > 0:
             out[e.endpoint_class] = float(e.timeout_ceiling_s)
+    return out
+
+
+def build_class_stream_hard_caps(cat: Catalog | None = None) -> dict[str, float]:
+    """endpoint class → absolute streaming hard cap (seconds), from
+    ``stream_hard_cap_s``.  The per-role override of the band default in
+    ``constants._STREAM_HARD_CAP_{BACKGROUND,INTERACTIVE}_S``, which bounds how
+    far a PROXY-CHOSEN streaming deadline may be extended while the stream is
+    still emitting tokens.  An explicit caller deadline never consults this.
+    Only proxy-endpoint owners with a positive cap are emitted; classes absent
+    here fall back to the band default.  Deterministic (proxy-endpoint owner per
+    class, like ``build_class_floors``)."""
+    cat = cat or load_catalog()
+    out: dict[str, float] = {}
+    for e in cat.proxy_endpoints():
+        if e.endpoint_class and e.stream_hard_cap_s and e.stream_hard_cap_s > 0:
+            out[e.endpoint_class] = float(e.stream_hard_cap_s)
     return out
 
 

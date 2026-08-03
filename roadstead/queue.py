@@ -133,7 +133,12 @@ CREATE TABLE IF NOT EXISTS proxy_timeouts (
     turn_id           TEXT,
     caller_id         TEXT,
     context_window    INTEGER,
-    context_used_pct  REAL
+    context_used_pct  REAL,
+    -- Which bound actually fired, for the `stream` layer: ttft | stall |
+    -- hard_cap | caller_deadline (NULL for other layers / pre-migration rows).
+    -- `layer` alone says only "the stream ended early"; these four mean very
+    -- different things and call for opposite responses.
+    abort_reason      TEXT
 );
 
 -- Operator maintenance windows: deliberate backend restarts/drains. Timeout
@@ -282,6 +287,7 @@ class PersistentQueue:
             "caller_id": "TEXT",
             "context_window": "INTEGER",
             "context_used_pct": "REAL",
+            "abort_reason": "TEXT",
         })
 
     @classmethod
@@ -704,6 +710,7 @@ class PersistentQueue:
         caller_id: str | None = None,
         context_window: int = 0,
         context_used_pct: float | None = None,
+        abort_reason: str | None = None,
     ) -> None:
         """Record a call that hit its timeout instead of finishing, with
         the load context at the moment it gave up. ``layer`` is one of
@@ -711,20 +718,24 @@ class PersistentQueue:
         caller's deadline fired — work may still be in flight),
         ``backend`` (the model exceeded the deadline after dispatch), or
         ``stream``. ``under_recommended`` flags a timeout that fired below
-        the data-driven recommended deadline (i.e. likely premature)."""
+        the data-driven recommended deadline (i.e. likely premature).
+        ``abort_reason`` names WHICH bound fired on the ``stream`` layer —
+        ``ttft`` | ``stall`` | ``hard_cap`` | ``caller_deadline``."""
         self._w(
             "INSERT INTO proxy_timeouts "
             "(request_id, occurred_at, endpoint, priority, agent_id, call_site, "
             " layer, elapsed_s, applied_timeout_s, queue_wait_ms, in_flight, "
             " queued, max_slots, est_in, est_out, recommended_ms, under_recommended, "
-            " session_id, turn_id, caller_id, context_window, context_used_pct) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " session_id, turn_id, caller_id, context_window, context_used_pct, "
+            " abort_reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 request_id, time.time(), endpoint, int(priority), agent_id, call_site,
                 layer, elapsed_s, applied_timeout_s, queue_wait_ms, in_flight,
                 queued, max_slots, est_in, est_out, recommended_ms,
                 1 if under_recommended else 0,
                 session_id, turn_id, caller_id, context_window, context_used_pct,
+                abort_reason,
             ),
         )
 
@@ -1611,7 +1622,7 @@ class PersistentQueue:
         rows = self._reader().execute(
             "SELECT endpoint, priority, layer, elapsed_s, in_flight, queued, "
             "       under_recommended, recommended_ms, caller_id, context_used_pct, "
-            "       occurred_at "
+            "       occurred_at, abort_reason "
             "FROM proxy_timeouts WHERE occurred_at >= ?",
             (cutoff,),
         ).fetchall()
@@ -1643,8 +1654,16 @@ class PersistentQueue:
         # foreground (P0-P2, user-facing) subset (`premature_foreground_unplanned`).
         premature_unplanned = 0
         premature_foreground_unplanned = 0
-        for ep, pri, layer, elapsed, in_flight, queued, under, rec_ms, caller, ctx_pct, occurred in rows:
+        # Which BOUND fired, fleet-wide and per group. A `stream` layer count on
+        # its own can't tell "backends are dying mid-answer" (stall) from "we cut
+        # off healthy work for capacity" (hard_cap) from "callers set tight
+        # deadlines" (caller_deadline) — and those want opposite fixes.
+        by_abort_reason: dict[str, int] = {}
+        for (ep, pri, layer, elapsed, in_flight, queued, under, rec_ms, caller,
+             ctx_pct, occurred, abort_reason) in rows:
             total += 1
+            if abort_reason:
+                by_abort_reason[abort_reason] = by_abort_reason.get(abort_reason, 0) + 1
             premature += int(under or 0)
             is_planned = _planned(ep, occurred or 0.0)
             planned_total += int(is_planned)
@@ -1655,8 +1674,11 @@ class PersistentQueue:
             g = groups.setdefault((ep, pri, layer), {
                 "elapsed": [], "in_flight": [], "queued": [],
                 "premature": 0, "planned": 0, "recommended": [],
-                "callers": {}, "ctx_pct": [],
+                "callers": {}, "ctx_pct": [], "abort_reasons": {},
             })
+            if abort_reason:
+                g["abort_reasons"][abort_reason] = (
+                    g["abort_reasons"].get(abort_reason, 0) + 1)
             g["elapsed"].append(elapsed or 0.0)
             g["in_flight"].append(in_flight or 0)
             g["queued"].append(queued or 0)
@@ -1692,6 +1714,7 @@ class PersistentQueue:
                     if g["ctx_pct"] else None
                 ),
                 "top_callers": top_callers,
+                "abort_reasons": dict(g["abort_reasons"]),
             })
         out.sort(key=lambda r: (-r["count"], r["endpoint"], r["priority"], r["layer"]))
         return {
@@ -1700,6 +1723,7 @@ class PersistentQueue:
             "premature_unplanned": premature_unplanned,
             "premature_foreground_unplanned": premature_foreground_unplanned,
             "planned": planned_total,
+            "by_abort_reason": by_abort_reason,
             "rows": out,
             "maintenance_windows": windows,
         }

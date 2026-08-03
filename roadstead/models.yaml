@@ -51,6 +51,10 @@
 #   timeout_floor_s     per-class floor (llmproxy/timeout_model.FLOOR_S)
 #   timeout_ceiling_s   per-role override of the adaptive-timeout upper bound (else the
 #                       interactive/background tier band; llmproxy/timeout_model.resolve_ceiling_s)
+#   stream_hard_cap_s   per-role override of the ABSOLUTE cap on a proxy-chosen STREAMING
+#                       deadline that is being extended by token progress (else the band
+#                       default; llmproxy/constants._STREAM_HARD_CAP_*). Never applies to an
+#                       explicit caller deadline, which stays a hard wall.
 #   policy.*            EndpointConfig knobs (reserve / floor_pct / cap / affinity / skip_discovery)
 #   capabilities.*      vision / streaming / reasoning / tool_calling / structured_output
 #   dispatcher_capability   media: the GenerationCapability key the dispatcher uses
@@ -394,9 +398,17 @@ models:
     # interactive caller is killed around ~430K tokens. P3/P4 get 1800 s and fit. Anything
     # sending >400K MUST be background priority or it will time out.
     #
-    # ⚠️ timeout_model.size_stretch SATURATES at size_max=4.0 x the 16384 top edge = 65,536
-    # tokens, so a 578K prompt gets the SAME stretch as an 82K one. That constant was tuned when
-    # the ceiling was 128K and is now ~10x too early. Revisit before relying on near-max calls.
+    # ✅ FIXED 2026-08-03 — this block used to warn that timeout_model.size_stretch SATURATED
+    # at "size_max=4.0 x the 16384 top edge = 65,536 tokens" (the arithmetic was also wrong: 5 x
+    # 16384 = 81,920), so a 578K prompt got the SAME 3.0x stretch as an 82K one. It was prose-only
+    # with no guard, and it duly came true: a live 123,466-token `pool` prompt was killed three
+    # times at exactly 540 s (= the 180 s thinker floor x a clamped 3.0x). size_stretch is now
+    # superlinear in calibrated size UNITS and reaches 9.0x at 700K; _IN_EDGES gained
+    # 32768/65536/131072/262144 so long context has real empirical cells instead of sharing one
+    # bucket with 17K calls. Pinned by tests/llmproxy/test_timeout_sizing.py.
+    #
+    # ⚠️ The interactive/background split above still stands and is now the binding constraint
+    # for long prompts: ultra-long remains BACKGROUND-ONLY.
     context_window: 32768            # fleet chunkers size against 32K on purpose
     # 20 = the backend's HARD cap (`--max-num-seqs 20` in serve_tier3_prod.sh). vLLM does NOT
     # expose --max-num-seqs over its API, so this seed is the ONLY source of the proxy's

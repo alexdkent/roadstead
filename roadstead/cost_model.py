@@ -285,6 +285,62 @@ class CostModel:
 # Token estimation helper
 # ---------------------------------------------------------------------------
 
+#: Content-part types whose payload is BINARY, not prompt text.  Counting a
+#: base64 data URI as characters would overstate est_in by megabytes.
+_NON_TEXT_PART_TYPES = frozenset({
+    "image", "image_url", "input_audio", "audio", "video", "file", "document",
+})
+
+
+def _json_chars(obj) -> int:
+    """Serialized length of a structure, 0 if it cannot be serialized."""
+    import json as _json
+
+    if obj is None:
+        return 0
+    if isinstance(obj, str):
+        return len(obj)
+    try:
+        return len(_json.dumps(obj, default=str))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _content_chars(content) -> int:
+    """Characters a message's ``content`` contributes to the prompt.
+
+    Handles the three shapes the proxy actually receives: a plain string, an
+    OpenAI multipart list, and an Anthropic typed-block list.  The old walk read
+    ``part["text"]`` and nothing else, so an Anthropic ``tool_use`` block (whose
+    payload is in ``input``) and a ``tool_result`` block (whose payload is in
+    ``content``) both counted as ZERO."""
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, dict):
+        return _json_chars(content)
+    if not isinstance(content, list):
+        return 0
+    total = 0
+    for part in content:
+        if isinstance(part, str):
+            total += len(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if isinstance(part.get("text"), str):
+            total += len(part["text"])
+        elif ptype == "tool_use":                      # Anthropic tool call
+            total += len(str(part.get("name") or "")) + _json_chars(part.get("input"))
+        elif ptype == "tool_result":                   # Anthropic tool reply
+            total += _content_chars(part.get("content"))
+        elif ptype in _NON_TEXT_PART_TYPES:
+            continue
+        else:                                          # unknown shape — be honest
+            total += _json_chars(part)
+    return total
+
+
 def estimate_input_tokens(payload: dict) -> int:
     """Rough token count from a chat-completion payload.  4 chars ≈ 1
     token.  Good enough for cost estimation — we calibrate from actuals.
@@ -293,9 +349,24 @@ def estimate_input_tokens(payload: dict) -> int:
     ``backend._normalize_chat_payload`` later inlines into ``messages``) and
     serialized ``tools`` schemas — both invisible to the old messages-only
     walk, which undercounted est_in for exactly the big-prompt callers
-    (orchestrator tool loops) where the estimate matters most."""
-    import json as _json
+    (orchestrator tool loops) where the estimate matters most.
 
+    D4 (2026-08-03) — the same class of undercount, one layer deeper.  A
+    tool-calling transcript keeps most of its tokens OUTSIDE
+    ``msg["content"]``: the assistant turn that calls a tool has
+    ``content: null`` and carries the whole call in
+    ``tool_calls[].function.arguments``, and the reply comes back as a separate
+    tool message (OpenAI) or a ``tool_result`` block (Anthropic).  Measured live
+    on one caller: est_in read 123,466 while the backend reported
+    ``input_tokens`` 226,014 — a ~1.8x undercount, and it shrank BOTH the
+    ``size_stretch`` and the streaming TTFT allowance
+    (``_STREAM_TTFT_DEADLINE_S + est_in/1000``) on exactly the callers that need
+    them most.  Now counted: OpenAI ``tool_calls`` / legacy ``function_call``,
+    Anthropic ``tool_use`` / ``tool_result`` blocks, and any unrecognised
+    content part (serialized rather than silently dropped).
+
+    Never raises: a malformed message contributes what can be read and nothing
+    more — this runs on the admission path of every request."""
     total_chars = 0
     system = payload.get("system")
     if isinstance(system, str):
@@ -308,17 +379,27 @@ def estimate_input_tokens(payload: dict) -> int:
                 total_chars += len(part)
     tools = payload.get("tools")
     if tools:
-        try:
-            total_chars += len(_json.dumps(tools))
-        except (TypeError, ValueError):
-            pass
+        total_chars += _json_chars(tools)
     messages = payload.get("messages") or []
     for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    total_chars += len(str(part.get("text", "")))
+        if isinstance(msg, str):
+            total_chars += len(msg)
+            continue
+        if not isinstance(msg, dict):
+            continue
+        total_chars += _content_chars(msg.get("content"))
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function")
+                fn = fn if isinstance(fn, dict) else {}
+                total_chars += len(str(fn.get("name") or ""))
+                # `arguments` is a JSON STRING on the wire, not an object.
+                total_chars += _json_chars(fn.get("arguments"))
+        fn_call = msg.get("function_call")          # legacy single-call shape
+        if isinstance(fn_call, dict):
+            total_chars += len(str(fn_call.get("name") or ""))
+            total_chars += _json_chars(fn_call.get("arguments"))
     return max(1, total_chars // 4)

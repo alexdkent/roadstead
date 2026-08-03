@@ -160,21 +160,90 @@ def surge_factor(
     return 1.0 + k_load * min(over, surge_max)
 
 
+# ---------------------------------------------------------------------------
+# Size stretch (D1, 2026-08-03).
+#
+# The stretch used to measure ``over`` in LINEAR multiples of ``_IN_EDGES[-1]``
+# (16,384) and clamp it at ``size_max`` (4.0 from config), so the multiplier
+# capped at 3.0x and stopped growing at 5 x 16,384 = 81,920 input tokens. tier3
+# now serves 700K context — the constant was tuned when the ceiling was 128K,
+# and models.yaml has carried a warning comment about it. A 700K prompt was
+# advised exactly what an 82K one was.
+#
+# Two things change, and neither of them is "raise the clamp" (config.py owns
+# `timeout_size_k` / `timeout_size_max` and is not ours to edit — the fix has to
+# be right with k_size=0.5, size_max=4.0 arriving unchanged):
+#
+#   1. `over` is now measured in SIZE UNITS — a fixed multiplicative step in
+#      prompt length — rather than in linear multiples of the reference. The
+#      step is chosen so that the default clamp of 4.0 units is reached at the
+#      largest context the fleet serves (700K) instead of at 82K.
+#   2. The term is SUPERLINEAR in those units, because prefill is superlinear in
+#      length: measured tier3 prefill falls from ~1,426 tok/s at 213K to ~729
+#      tok/s at 578K, so doubling the prompt more than doubles the prefill. A
+#      linear term with a bigger clamp would still under-serve the top end.
+#
+# The reference is pinned to its own constant rather than to ``_IN_EDGES[-1]``,
+# so widening the empirical buckets (D2) does not silently move the point where
+# the stretch starts — those are independent decisions and coupling them cost a
+# regression while this was being written.
+#
+# The result is the MAX of the legacy linear term and the new superlinear one,
+# so the well-behaved 16K..82K band keeps exactly the multiplier it has today
+# (this fix only ever widens a deadline) and the superlinear term takes over
+# past ~107K, where the legacy one had already flatlined. That leaves a short
+# plateau at 82K..107K: intentional, and it is where the empirical cells that
+# D2 adds are best populated.
+#
+# With the config defaults (k_size=0.5, size_max=4.0) the curve reads:
+#     32K -> 1.50x   64K -> 2.50x   82K -> 3.00x  (all unchanged)
+#    128K -> 3.46x  262K -> 5.37x  700K -> 9.00x  (was a flat 3.00x)
+# 9.0x on the 180s thinker floor is 1620s, just inside the 1800s background
+# ceiling and comfortably past the ~1085s of pure prefill a 700K prompt implies.
+# ---------------------------------------------------------------------------
+
+#: Prompt size at which the stretch starts (below it the factor is exactly 1.0).
+_SIZE_STRETCH_REF_TOKENS = 16_384
+#: The largest context the fleet serves — tier3 (`thinker`). The unit step below
+#: is calibrated so the default clamp lands here.
+_MAX_SERVED_CONTEXT_TOKENS = 700_000
+#: The default ``size_max``. Used ONLY to calibrate the unit step; the live value
+#: still arrives as an argument (config.timeout_size_max).
+_SIZE_STRETCH_DEFAULT_MAX_UNITS = 4.0
+#: One size unit = this multiplicative step in prompt length (~2.556x).
+_SIZE_STRETCH_UNIT_RATIO = (
+    _MAX_SERVED_CONTEXT_TOKENS / _SIZE_STRETCH_REF_TOKENS
+) ** (1.0 / _SIZE_STRETCH_DEFAULT_MAX_UNITS)
+#: Prefill is superlinear in prompt length, so the stretch is too.
+_SIZE_STRETCH_EXPONENT = 2.0
+
+
 def size_stretch(
     est_in: int,
     *,
     k_size: float = 0.5,
     size_max: float = 4.0,
+    ref_tokens: int = _SIZE_STRETCH_REF_TOKENS,
+    unit_ratio: float = _SIZE_STRETCH_UNIT_RATIO,
+    exponent: float = _SIZE_STRETCH_EXPONENT,
 ) -> float:
-    """Continuous multiplier ≥ 1.0 for prompts past the top input bucket.
+    """Continuous, monotonic multiplier ≥ 1.0 for prompts past ``ref_tokens``.
 
-    The coarse ``_IN_EDGES`` buckets top out at 16K, so a 60K-token prompt gets
-    the same empirical cell as a 17K one.  This smooths that cliff: ``over`` is
-    how many multiples of the top edge the prompt exceeds, clamped at
-    ``size_max``.  At or below the top edge the factor is 1.0."""
-    top = _IN_EDGES[-1]
-    over = max(0.0, (int(est_in) - top) / float(top))
-    return 1.0 + k_size * min(over, size_max)
+    The empirical cells resolve a prompt's size only as far as the top input
+    bucket; past that, this is what makes a bigger prompt get a longer deadline.
+    ``size_max`` clamps ``over`` as it always did — but ``over`` is now counted
+    in ``unit_ratio``-fold size units rather than linear multiples of the
+    reference, so the default clamp of 4.0 is reached at 700K rather than 82K.
+    See the block comment above for the calibration and the resulting curve."""
+    n = int(est_in)
+    if n <= ref_tokens:
+        return 1.0
+    # legacy linear term — unchanged below its clamp, so nothing in the
+    # 16K..82K band ever gets a shorter deadline than it does today.
+    linear = min((n - ref_tokens) / float(ref_tokens), size_max)
+    units = math.log(n / float(ref_tokens)) / math.log(unit_ratio)
+    superlinear = min(units, size_max) ** exponent
+    return 1.0 + k_size * max(linear, superlinear)
 
 
 def apply_load_and_ceiling(
@@ -201,7 +270,42 @@ def apply_load_and_ceiling(
 # Token-size bucket edges.  Output dominates decode time, so it is the
 # finer dimension; input (prefill) is coarse.
 _OUT_EDGES = [128, 512, 2048, 8192]   # → 5 buckets (indices 0..4)
-_IN_EDGES = [1024, 4096, 16384]       # → 4 buckets (indices 0..3)
+# D2 (2026-08-03): the top edge used to be 16384, so EVERY prompt from 17K to
+# 700K shared one empirical cell. That cell's p99 is dominated by ~20K-token
+# calls, so the class floor always won and the model could never learn
+# long-context latency — the live timeout events logged `recommended_ms` of
+# exactly 180000.0 (the thinker floor) for 123K-token prompts.
+#
+# The new edges follow the shape of the measured `thinker` traffic (14 days,
+# status=ok): <16K n=61,319 · 16-32K n=272 · 32-64K n=216 · 64-128K n=165 ·
+# >128K n=192. Every one of those clears `min_samples=30` in a 7-day window, so
+# the finer cells resolve empirically from the day they deploy rather than after
+# a warm-up. The 262144 edge separates the 128-256K population (avg input in the
+# >128K bucket is 177K) from the genuinely huge tier3 prompts; if that top cell
+# is thin it falls back up the ladder and the monotonicity guard gives it the
+# 128-256K cell's answer, which is the honest floor for it.
+_IN_EDGES = [1024, 4096, 16384, 32768, 65536, 131072, 262144]  # → 8 buckets
+
+#: D3: percentile of the OBSERVED output-size distribution used when a caller
+#: declared no output budget (``est_out <= 0``).  High, not median — an absent
+#: ``max_tokens`` is an absent CAP, and this picks the CELL whose p99 x margin
+#: then sizes the deadline, so it is a tail bound on a tail bound.
+#:
+#: Calibrated against the live `thinker` distribution (7 days, status=ok,
+#: n=32,858 — of which 62% genuinely omit ``max_tokens``, confirming this is the
+#: common path and not an edge case):
+#:     bucket 0 (<=128)   60.6%      p50 =    70 tokens
+#:     bucket 1 (<=512)   34.4%      p90 =   404 tokens  -> bucket 1
+#:     bucket 2 (<=2048)   4.9%      p95 -> bucket 2
+#:     bucket 3 (<=8192)   0.2%      p99 = 1,090 tokens
+#: 95 rather than 90: p90 lands in bucket 1 and leaves the ~5% of unknown-budget
+#: calls that run past 512 tokens sized off a distribution they will overrun —
+#: which is the exact failure this defect is about. 95 covers 99.4% of them.
+#: Raising this only ever lengthens a deadline; the per-caller ceiling still binds.
+_UNKNOWN_OUT_PCT = 95.0
+#: Used only when the endpoint has no samples at all; such a model answers from
+#: the floor regardless of bucket, so this is inert in practice.
+_UNKNOWN_OUT_FALLBACK_BUCKET = len(_OUT_EDGES) // 2
 
 
 def _bucket(n: int, edges: list[int]) -> int:
@@ -306,6 +410,12 @@ class TimeoutModel:
 
         ``None`` on a dimension means "aggregate over it" — this is how
         the fallback hierarchy coarsens."""
+        if priority is not None and in_b is not None and out_b is not None:
+            # Fully-specified: one dict lookup instead of a full scan. The
+            # monotonicity guard walks the whole (in x out) lattice, so this is
+            # the hot path now.
+            cell = self._cells.get((ep, priority, in_b, out_b))
+            return [v for _, v in cell] if cell else []
         out: list[float] = []
         for (k_ep, k_pri, k_in, k_out), cell in self._cells.items():
             if k_ep != ep:
@@ -321,6 +431,49 @@ class TimeoutModel:
 
     def floor_ms(self, endpoint: str) -> float:
         return self._floors.get(normalize_endpoint(endpoint), _DEFAULT_FLOOR_S) * 1000.0
+
+    def _resolve_unknown_out_bucket(self, ep: str, pri: int) -> int:
+        """Out-bucket to use when the caller declared NO output budget (D3).
+
+        ``est_out <= 0`` does not mean "this call will produce ~no output" — it
+        means the caller omitted ``max_tokens``, which EVERY stock OpenAI client
+        does (the ``pool`` CLI sends ``{messages, model, tools, stream,
+        stream_options}``). Bucketing that as 0 put it in the SHORTEST-output
+        distribution, and 0 is the lowest bucket the monotonicity guard can lift
+        from, so the guard structurally could not rescue it.
+
+        Policy: resolve it EMPIRICALLY, to the ``_UNKNOWN_OUT_PCT`` percentile of
+        the output sizes this endpoint/priority is actually observed to produce.
+        Rationale for a high percentile rather than the median: an absent
+        ``max_tokens`` is an absent CAP, so the call may run to the model's own
+        limit, and the cost of over-estimating is a slot held slightly too long
+        while the cost of under-estimating is the call being killed mid-answer.
+        Rationale for empirical rather than a constant: an endpoint whose outputs
+        really are tiny (``embed`` / ``rerank`` record 0 output tokens) resolves
+        straight back to bucket 0 and is not inflated at all.
+
+        Falls back across priorities when the tier is thin, then to a fixed
+        mid bucket — inert in practice, because a model with no samples for the
+        endpoint answers from the floor whatever bucket it picks."""
+        counts: dict[int, int] = {}
+        for (k_ep, k_pri, _k_in, k_out), cell in self._cells.items():
+            if k_ep != ep or k_pri != pri:
+                continue
+            counts[k_out] = counts.get(k_out, 0) + len(cell)
+        if not counts:
+            for (k_ep, _k_pri, _k_in, k_out), cell in self._cells.items():
+                if k_ep != ep:
+                    continue
+                counts[k_out] = counts.get(k_out, 0) + len(cell)
+        if not counts:
+            return _UNKNOWN_OUT_FALLBACK_BUCKET
+        target = sum(counts.values()) * _UNKNOWN_OUT_PCT / 100.0
+        cum = 0
+        for b in sorted(counts):
+            cum += counts[b]
+            if cum >= target:
+                return b
+        return max(counts)
 
     def advise(
         self,
@@ -339,10 +492,20 @@ class TimeoutModel:
         ep = normalize_endpoint(endpoint)
         pri = int(priority)
         in_b = _bucket(est_in, _IN_EDGES)
-        out_b = _bucket(est_out, _OUT_EDGES)
+        # D3: est_out <= 0 is UNKNOWN, not zero. See _resolve_unknown_out_bucket.
+        out_unknown = int(est_out) <= 0
+        out_b = (
+            self._resolve_unknown_out_bucket(ep, pri) if out_unknown
+            else _bucket(est_out, _OUT_EDGES)
+        )
         floor_ms = self.floor_ms(ep)
 
-        mn, med, p95, recommended, n, source = self._advise_at(ep, pri, in_b, out_b, floor_ms)
+        # One memo per advice call: the guard below re-walks the ladder for every
+        # lower cell, and the coarse levels (tier / tier_out / endpoint) are
+        # identical across all of them.
+        cache: dict[tuple, list[float]] = {}
+        mn, med, p95, recommended, n, source = self._advise_at(
+            ep, pri, in_b, out_b, floor_ms, cache)
 
         # ── MONOTONICITY GUARD (regression ledger `llm-output-budget-starvation`) ──
         # The advice MUST NOT shrink as the caller asks for more output. It could,
@@ -369,17 +532,38 @@ class TimeoutModel:
         # stays sparse forever. A guard is the only way out of that loop.
         #
         # The guard: a request can never be advised LESS than a request for FEWER
-        # output tokens on the same endpoint/priority. Cheap (<= 4 extra lookups
-        # over in-memory reservoirs, and `_OUT_EDGES` yields only 5 buckets), and
-        # strictly safe — it can only ever RAISE a deadline, and the caller-side
-        # `cap_s` ceiling still bounds the result.
+        # output tokens on the same endpoint/priority. Strictly safe — it can only
+        # ever RAISE a deadline, and the caller-side `cap_s` ceiling still bounds
+        # the result.
+        #
+        # ── EXTENDED TO THE INPUT AXIS (2026-08-03, with D2) ──
+        # Finer `_IN_EDGES` made input a real axis, and it starves exactly the
+        # same way: the 262K+ cell is thin, falls through to `tier`, and `tier` is
+        # dominated by small fast calls — so asking for MORE input would be
+        # advised LESS time. Reproduced in test_timeout_sizing.py the moment the
+        # new edges landed and before this loop was widened: 120K -> 360000ms,
+        # 400K -> 180000ms. Same self-perpetuating trap, too, since `record()`
+        # admits only status=="ok" samples and a cell whose calls always time out
+        # can never gather the evidence that would correct it.
+        #
+        # The guarantee is over the whole lattice, not the two axes separately: a
+        # caller can raise both at once (a truncation retry on a long prompt), and
+        # max-over-each-axis alone does not compose into monotonicity in both.
+        # Cost is (in_b+1)*(out_b+1) <= 40 ladder walks, but with `cache` the only
+        # uncached work is a dict lookup per cell — the expensive coarse levels
+        # are computed once.
         lifted_from = None
-        for lower_b in range(out_b):
-            _mn, _med, _p95, cand, _n, _src = self._advise_at(
-                ep, pri, in_b, lower_b, floor_ms)
-            if cand > recommended:
-                recommended = cand
-                lifted_from = lower_b
+        lifted_from_in = None
+        for lo_in in range(in_b + 1):
+            for lo_out in range(out_b + 1):
+                if lo_in == in_b and lo_out == out_b:
+                    continue
+                _mn, _med, _p95, cand, _n, _src = self._advise_at(
+                    ep, pri, lo_in, lo_out, floor_ms, cache)
+                if cand > recommended:
+                    recommended = cand
+                    lifted_from = lo_out if lo_out < out_b else None
+                    lifted_from_in = lo_in if lo_in < in_b else None
 
         out = {
             "min_ms": round(mn, 1),
@@ -390,20 +574,29 @@ class TimeoutModel:
             "sample_count": n,
             "source": source,
         }
+        if out_unknown:
+            # Observable: a shadow report must be able to tell an absent
+            # max_tokens from a caller that genuinely asked for ~nothing.
+            out["out_bucket_unknown_resolved_to"] = out_b
         if lifted_from is not None:
             # Observable, so a dashboard/shadow report can see that this endpoint's
             # high out-buckets are starved of samples rather than genuinely fast.
             out["monotonic_lift_from_out_bucket"] = lifted_from
+        if lifted_from_in is not None:
+            out["monotonic_lift_from_in_bucket"] = lifted_from_in
         return out
 
     def _advise_at(
         self, ep: str, pri: int, in_b: int, out_b: int, floor_ms: float,
+        cache: dict[tuple, list[float]] | None = None,
     ) -> tuple[float, float, float, float, int, str]:
         """The raw fallback-ladder lookup for one (in_bucket, out_bucket) cell.
 
         Returns ``(min, median, p95, recommended, n, source)`` in ms. Split out of
-        ``advise`` so the monotonicity guard can re-query lower out-buckets without
-        duplicating the ladder."""
+        ``advise`` so the monotonicity guard can re-query lower cells without
+        duplicating the ladder.  ``cache`` memoises ``_collect`` results for the
+        duration of ONE ``advise()`` call — the coarse ladder levels do not depend
+        on the cell being probed, so the guard's lattice walk recomputes nothing."""
         levels = (
             ("cell", dict(priority=pri, in_b=in_b, out_b=out_b)),
             ("tier_out", dict(priority=pri, out_b=out_b)),
@@ -413,7 +606,14 @@ class TimeoutModel:
         samples: list[float] = []
         source = "floor"
         for name, filt in levels:
-            collected = self._collect(ep, **filt)
+            if cache is None:
+                collected = self._collect(ep, **filt)
+            else:
+                ck = (filt.get("priority"), filt.get("in_b"), filt.get("out_b"))
+                collected = cache.get(ck)
+                if collected is None:
+                    collected = self._collect(ep, **filt)
+                    cache[ck] = collected
             if len(collected) >= self._min_samples:
                 samples = collected
                 source = name

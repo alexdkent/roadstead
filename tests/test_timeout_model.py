@@ -166,6 +166,7 @@ def test_timeout_floor_yaml_sync():
 from originfleet.llmproxy.timeout_model import (  # noqa: E402
     _BACKGROUND_CEILING_S,
     _INTERACTIVE_CEILING_S,
+    _SIZE_STRETCH_REF_TOKENS,
     apply_load_and_ceiling,
     resolve_ceiling_s,
     size_stretch,
@@ -191,13 +192,20 @@ def test_surge_unknown_capacity_is_neutral():
     assert surge_factor(10, 10, 0) == 1.0
 
 
-def test_size_stretch_only_past_top_bucket():
+def test_size_stretch_only_past_the_reference():
+    """The 16K..82K band is unchanged by the D1 recalibration (2026-08-03); the
+    curve past it lives in ``test_timeout_sizing.py``.  Note the reference is
+    ``_SIZE_STRETCH_REF_TOKENS``, deliberately NOT ``_IN_EDGES[-1]`` — widening
+    the empirical buckets must not move where the stretch starts."""
+    ref = _SIZE_STRETCH_REF_TOKENS
     assert size_stretch(1000) == 1.0
-    assert size_stretch(_IN_EDGES[-1]) == 1.0            # exactly at 16K edge
-    # 2x the top edge over → (32768-16384)/16384 = 1 → 1.5
-    assert size_stretch(_IN_EDGES[-1] * 2) == 1.5
-    # clamped at size_max (4) → 1 + 0.5*4 = 3.0
-    assert size_stretch(_IN_EDGES[-1] * 100) == 3.0
+    assert size_stretch(ref) == 1.0                      # exactly at the 16K ref
+    # 2x the reference → (32768-16384)/16384 = 1 → 1.5
+    assert size_stretch(ref * 2) == 1.5
+    # the legacy linear term still clamps at size_max (4) → 1 + 0.5*4 = 3.0 …
+    assert size_stretch(ref * 5) == 3.0
+    # … but past it the superlinear term takes over instead of flatlining.
+    assert size_stretch(ref * 100) > 3.0
 
 
 def test_ceiling_tier_bands_and_role_override():

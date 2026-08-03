@@ -68,6 +68,24 @@ class QueuedRequest:
     # treating it as such. Without this the strip would silently drop those
     # guarantees and hand a truncated half-object back to a caller that parses it.
     json_object_stripped: bool = False
+    # True when ``timeout_deadline`` is a deadline the PROXY chose (the
+    # default/adaptive resolve_default_timeout path), False when the CALLER
+    # supplied one explicitly (body ``timeout_s`` / ``X-Timeout-S``).
+    #
+    # The distinction is a contract boundary, not a detail: a caller deadline is
+    # a promise we keep to the letter, while a deadline we invented for a caller
+    # that expressed no opinion is only ever a BUDGET. The streaming path (and
+    # ONLY the streaming path) treats the latter as soft, extending it while the
+    # stream demonstrably emits tokens. Everything else that reads
+    # ``timeout_deadline`` — admission, the retry budget, the sync dispatch
+    # bound — is unchanged and unaware of this flag.
+    #
+    # Defaults False so every construction site that does not opt in keeps
+    # today's hard-wall behaviour. That deliberately includes WAL-recovered
+    # requests: a recovered STREAM has no SSE consumer to receive it anyway (it
+    # records a 'cancelled' completion immediately), so persisting this across a
+    # restart would buy nothing and add a migration for no reader.
+    deadline_is_default: bool = False
 
     @classmethod
     def create(
@@ -85,6 +103,7 @@ class QueuedRequest:
         caller_id: str | None = None,
         request_id: str | None = None,
         now: float | None = None,
+        deadline_is_default: bool = False,
     ) -> QueuedRequest:
         # Soft-default a malformed priority to P1 (never raise on the request
         # path — a bad label must not 500 the caller's LLM call).
@@ -107,6 +126,7 @@ class QueuedRequest:
             turn_id=turn_id,
             caller_id=caller_id,
             stream=bool(payload.get("stream")),
+            deadline_is_default=deadline_is_default,
         )
 
 

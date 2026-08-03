@@ -177,6 +177,121 @@ class TestEstimateInputTokens:
         assert estimate_input_tokens(payload) == 80 // 4
 
 
+class TestToolHeavyPayloadsAreNotHalved:
+    """A tool-calling chat transcript keeps most of its tokens OUTSIDE
+    ``msg["content"]``.
+
+    An assistant turn that calls a tool has ``content: null`` and carries the
+    whole call in ``tool_calls[].function.arguments``; the tool's reply comes
+    back as a separate message. A messages[].content-only walk therefore sees
+    almost none of a long agentic transcript.
+
+    Measured live on one caller (2026-08-03): est_in read 123,466 while the
+    backend reported ``input_tokens`` 226,014 — a ~1.8x undercount. That
+    undercount shrinks BOTH the size_stretch and the streaming TTFT allowance
+    (``_STREAM_TTFT_DEADLINE_S + est_in/1000``) on exactly the callers that need
+    them most. Same class of bug the ``system``/``tools`` fix already closed one
+    layer up.
+    """
+
+    @staticmethod
+    def _openai_tool_transcript() -> tuple[dict, int]:
+        """An OpenAI-shaped tool loop, plus the true character count."""
+        args = '{"path": "' + "a" * 40_000 + '"}'
+        result = "R" * 60_000
+        prompt = "P" * 4_000
+        payload = {
+            "model": "thinker",
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": prompt},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": args},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": result},
+            ],
+        }
+        return payload, len(prompt) + len("read_file") + len(args) + len(result)
+
+    def test_openai_tool_calls_arguments_are_counted(self):
+        payload, real_chars = self._openai_tool_transcript()
+        est = estimate_input_tokens(payload)
+        assert est >= real_chars * 0.9 / 4, (
+            f"est_in {est} is far below the {real_chars // 4} tokens actually "
+            "in this transcript — the tool_calls arguments were skipped")
+
+    def test_the_undercount_would_have_been_about_half(self):
+        """Guard on the guard: prove the content-only walk really does miss most
+        of this payload, so the assertion above cannot pass vacuously."""
+        payload, real_chars = self._openai_tool_transcript()
+        content_only = sum(
+            len(m.get("content") or "") for m in payload["messages"])
+        assert content_only < real_chars * 0.7, (
+            "fixture does not reproduce the undercount")
+
+    def test_anthropic_tool_use_and_tool_result_blocks_are_counted(self):
+        """The other wire shape the proxy accepts: tool traffic lives in typed
+        CONTENT BLOCKS, and only ``{"type": "text"}`` blocks were being read."""
+        tool_input = {"query": "Q" * 30_000}
+        result_text = "R" * 50_000
+        payload = {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "search",
+                     "input": tool_input},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1",
+                     "content": [{"type": "text", "text": result_text}]},
+                ]},
+            ],
+        }
+        est = estimate_input_tokens(payload)
+        assert est >= (30_000 + 50_000) * 0.9 / 4, (
+            f"est_in {est} misses the tool_use input / tool_result content")
+
+    def test_a_tool_result_carried_as_a_plain_string_block_is_counted(self):
+        body = "R" * 20_000
+        payload = {"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tu_1", "content": body},
+        ]}]}
+        assert estimate_input_tokens(payload) >= 20_000 * 0.9 / 4
+
+    def test_legacy_function_call_shape_is_counted(self):
+        args = '{"q": "' + "z" * 10_000 + '"}'
+        payload = {"messages": [
+            {"role": "assistant", "content": None,
+             "function_call": {"name": "search", "arguments": args}},
+        ]}
+        assert estimate_input_tokens(payload) >= 10_000 * 0.9 / 4
+
+    def test_binary_parts_are_not_counted_as_characters(self):
+        """An image part's data URI is not prompt text — counting its base64
+        would overstate est_in by megabytes."""
+        payload = {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url",
+             "image_url": {"url": "data:image/png;base64," + "A" * 200_000}},
+        ]}]}
+        assert estimate_input_tokens(payload) < 1_000
+
+    def test_malformed_messages_do_not_raise(self):
+        for payload in (
+            {"messages": [None, 7, "loose string"]},
+            {"messages": [{"role": "assistant", "tool_calls": "not-a-list"}]},
+            {"messages": [{"role": "assistant", "tool_calls": [None, 3]}]},
+            {"messages": [{"content": [None, 3, {"type": "text"}]}]},
+        ):
+            assert estimate_input_tokens(payload) >= 1
+
+
 class TestZeroSlotEndpoint:
     def test_completion_after_slots_drop_to_zero_does_not_crash(self):
         # endpoint_loss regression: update_max_slots(0) clears decode_tps; a

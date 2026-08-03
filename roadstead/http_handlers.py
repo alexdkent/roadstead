@@ -1138,11 +1138,28 @@ class ProxyHttpHandlers:
     async def handle_timeouts_report(self, request: Request) -> Response:
         """Calls that hit their timeout instead of finishing, per
         (model, tier, layer), with the load context when they gave up and
-        how many fired below the recommended deadline (premature)."""
+        how many fired below the recommended deadline (premature).
+
+        ``by_abort_reason`` splits the ``stream`` layer into ttft / stall /
+        hard_cap / caller_deadline. ``stream_extensions`` is the counterpart the
+        DB cannot show: streams that SURVIVED past a proxy-chosen deadline
+        because they were still emitting tokens. Those never write a timeout
+        row, so without this the progress-governed deadline would be an
+        invisible capacity sink — you'd see the kills it prevents and never the
+        slot-seconds it spends. Process-lifetime counters (reset on restart),
+        read straight off the loop."""
         hours = _to_float(request.query_params.get("hours"), 24)
         hours = min(max(hours, 0.1), 168)
         report = await asyncio.to_thread(self.state.queue_db.timeouts_report, hours)
-        return JSONResponse({"hours": hours, **report})
+        return JSONResponse({
+            "hours": hours,
+            **report,
+            "stream_extensions": {
+                "count": self.state.stream_deadline_extended,
+                "total_s": round(self.state.stream_extension_s_total, 1),
+                "hard_cap_aborts": self.state.stream_hard_cap_aborts,
+            },
+        })
     async def handle_health(self, request: Request) -> Response:
         ok = self.health.scheduler_loop_alive()
         poller_ok = self.health.poller_alive()

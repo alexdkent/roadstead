@@ -60,7 +60,10 @@ class ProxyState:
         # model swap (e.g. classify 45→180 / composer 180→360, 2026-07 nexus
         # loadout) silently did nothing — enforcement kept using the stale
         # hardcoded values. Fallback covers any class absent from the yaml.
-        from .model_catalog import build_class_ceilings, build_class_floors
+        from .model_catalog import (
+            build_class_ceilings, build_class_floors,
+            build_class_stream_hard_caps,
+        )
         from .timeout_model import FLOOR_S
         floors = {**FLOOR_S, **build_class_floors()}
         self.timeout_model = TimeoutModel(
@@ -73,6 +76,22 @@ class ProxyState:
         # let an inherently long-running class keep a generous ceiling even on an
         # interactive tier, overriding the interactive/background tier band.
         self.timeout_ceilings = build_class_ceilings()
+        # Per-class ABSOLUTE streaming hard caps (models.yaml
+        # `stream_hard_cap_s`) — the upper bound on extending a PROXY-CHOSEN
+        # streaming deadline that is still making token progress. Classes absent
+        # here fall back to the band default in constants. Same yaml→catalog→
+        # state path as the floors/ceilings above, so the yaml stays the single
+        # source of truth instead of the cap being a bare literal in the
+        # streaming path.
+        self.stream_hard_caps = build_class_stream_hard_caps()
+        # Progress-governed streaming: how often a proxy-chosen deadline was
+        # actually outlived by a still-progressing stream, and by how much in
+        # total. Without these the extension is an INVISIBLE capacity sink — an
+        # operator must be able to see how often it fires and for how long.
+        # Plain ints on the single event loop (no locks, no threads).
+        self.stream_deadline_extended = 0      # streams that ran past their soft budget
+        self.stream_extension_s_total = 0.0    # summed seconds granted beyond it
+        self.stream_hard_cap_aborts = 0        # ...and how many hit the absolute cap
         self.budget_mgr = BudgetManager(starvation_timeout_s=config.starvation_timeout_s)
         self.scheduler = Scheduler(config, self.cost_model, self.budget_mgr)
         self.backend = BackendClientPool()

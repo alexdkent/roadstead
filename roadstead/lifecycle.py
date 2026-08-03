@@ -45,7 +45,10 @@ from .constants import (
     _PAYLOAD_KIND,
     _RETRY_BACKOFF_S,
     _SMART_DEFAULT_CAP_S,
+    _STREAM_HARD_CAP_BACKGROUND_S,
+    _STREAM_HARD_CAP_INTERACTIVE_S,
     _STREAM_INTERTOKEN_GAP_S,
+    _STREAM_PREFILL_FLOOR_TOK_S,
     _STREAM_TTFT_DEADLINE_S,
 )
 from .correction import _EMPTY_RESCUE_MIN_TOKENS, _ToolCallStreamSanitizer
@@ -196,6 +199,9 @@ class Lifecycle:
         # (priority is soft-defaulted inside QueuedRequest.create; payload/
         # endpoint/call_site already use safe .get defaults.)
         raw_timeout = body.get("timeout_s")
+        # Tracks whether the deadline is OURS or the CALLER's — the identity
+        # floor below applies only to a deadline the proxy chose.
+        deadline_is_default = raw_timeout is None
         if raw_timeout is None:
             timeout_s = self.resolve_default_timeout(endpoint, body)
         else:
@@ -212,6 +218,24 @@ class Lifecycle:
                 logger.warning("submit: bad timeout_s %r (%s); using default",
                                raw_timeout, exc)
                 timeout_s = self.resolve_default_timeout(endpoint, body)
+                # A value we could not use is not a caller deadline; this
+                # request is on the default and the floor applies to it.
+                deadline_is_default = True
+
+        # Per-identity MINIMUM deadline floor (2026-08-03). Some registered
+        # OpenAI-door callers (the `pool` CLI) send NO deadline at all, so the
+        # deadline is entirely ours — and the adaptive model's size_stretch
+        # clamps at 3.0, producing a flat 540s wall on tier3 that killed real
+        # work mid-stream at elapsed_s=539.999. Raise such a caller's deadline
+        # to its registered floor. Deliberately NOT applied when the caller
+        # supplied its own timeout_s/X-Timeout-S: an explicit caller deadline
+        # stays authoritative in both directions, including shorter than the
+        # floor. Independent of the smart_default_timeout flag — the flat 180s
+        # default is if anything a tighter wall than the smart one.
+        if deadline_is_default:
+            min_s = self._identity_min_timeout_s(request)
+            if min_s is not None and timeout_s < min_s:
+                timeout_s = min_s
 
         # On-demand endpoints cold-load for minutes — a caller's short timeout
         # (or the 180s default) would expire mid-load and never see a token.
@@ -236,6 +260,11 @@ class Lifecycle:
             caller_id=body.get("caller_id"),
             request_id=body.get("request_id"),
             now=now,
+            # Carries the caller-vs-proxy deadline distinction resolved above
+            # into the streaming path, which is the ONLY consumer: a deadline we
+            # chose is a soft budget that token progress may extend, a deadline
+            # the caller chose is a hard wall. Nothing else reads it.
+            deadline_is_default=deadline_is_default,
         )
 
         # Payload-shape gate (north-face hardening). A chat payload whose
@@ -564,6 +593,18 @@ class Lifecycle:
         queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         self.state.pending_streams[req.request_id] = queue
 
+        # Consumer-side backstop, per EVENT (not per stream): how long this
+        # generator waits for the next frame before giving up on the producer.
+        # It must not be tighter than the producer's own watchdogs, or it would
+        # re-impose the very wall clock _execute_stream just stopped enforcing —
+        # a proxy-chosen 540s deadline would kill a stream whose TTFT allowance
+        # is legitimately 688s, and the fix would be silently half-applied.
+        # The producer always puts an error frame on its own abort, so this only
+        # ever fires if the producer itself wedged.
+        consumer_wait_s = req.timeout_s
+        if req.deadline_is_default:
+            consumer_wait_s = max(req.timeout_s, self._stream_hard_cap_s(req))
+
         self.state.scheduler.enqueue(req)
         self.state.queue_db.persist_enqueue(req)
         self.state.dispatch_event.set()
@@ -584,7 +625,7 @@ class Lifecycle:
             try:
                 while True:
                     event = await asyncio.wait_for(
-                        queue.get(), timeout=req.timeout_s,
+                        queue.get(), timeout=consumer_wait_s,
                     )
                     if openai:
                         etype = event.get("type")
@@ -630,7 +671,7 @@ class Lifecycle:
                     yield (
                         "data: "
                         + json.dumps({"error": {
-                            "message": f"proxy stream timeout after {req.timeout_s:.0f}s",
+                            "message": f"proxy stream timeout after {consumer_wait_s:.0f}s",
                             "type": "proxy_timeout",
                         }})
                         + "\n\n"
@@ -1050,27 +1091,63 @@ class Lifecycle:
         # Phase 1.5: bound the stream to the caller's remaining deadline so an
         # abandoned stream can't hold its slot past the SLA.
         stream_timeout = max(1.0, req.timeout_deadline - time.monotonic())
+        # Progress-governed streaming deadline (2026-08-03). A stream emitting a
+        # token every 200ms for nine minutes is manifestly not hung, and the wall
+        # clock killed it anyway: live P3_INGESTION evidence on thinker showed
+        # three consecutive kills at elapsed_s=539.999 against
+        # applied_timeout_s=540.0 on a 123,466-token prompt.
+        #
+        # The fix is a semantic, not a bigger number. A deadline the CALLER chose
+        # (body timeout_s / X-Timeout-S) is a contract and stays a hard wall,
+        # exactly as before. A deadline the PROXY chose (resolve_default_timeout)
+        # is a BUDGET — while the stream demonstrably makes progress it may run
+        # past it, bounded by an absolute hard cap. Under that semantic a stream
+        # dies when, and only when: no first token within the TTFT allowance, OR
+        # no token for the inter-token gap, OR the hard cap is reached, OR the
+        # client goes away (the SSE generator's finally cancels the producer).
+        #
+        # ``hard_limit_s`` is the single number every bound below is expressed
+        # against. For a caller deadline it IS stream_timeout, so this whole path
+        # is byte-identical to the previous behaviour. max() means the cap can
+        # only ever EXTEND: a proxy deadline already longer than the cap (a
+        # generous adaptive one) is never shortened by it.
+        soft_budget = bool(req.deadline_is_default)
+        hard_limit_s = stream_timeout
+        if soft_budget:
+            hard_limit_s = max(stream_timeout, self._stream_hard_cap_s(req))
         # Phase 5C: time-to-first-token watchdog. Start with a SHORT deadline; on
-        # the first token, reschedule to the full SLA. A 0-token hang then aborts
-        # in ~TTFT seconds (freeing the slot) instead of burning the whole 180s.
-        # TTFT scales with prefill size: a 20k+-token prompt legitimately takes
-        # >30s to first token under contention (observed: the 06-30 stream-kill
-        # storm at est_in=7360 and 21.7k openai_compat prefills, audit
-        # 2026-07-02). +1s per 1k estimated input tokens, still capped by the
-        # caller's own deadline. The INTER-token gap stays flat — once tokens
-        # flow, 30s of silence is a genuine stall regardless of prompt size.
+        # the first token, reschedule to the gap deadline. A 0-token hang then
+        # aborts in ~TTFT seconds (freeing the slot) instead of burning the whole
+        # deadline. TTFT scales with prefill size: a 20k+-token prompt
+        # legitimately takes >30s to first token under contention (observed: the
+        # 06-30 stream-kill storm at est_in=7360 and 21.7k openai_compat
+        # prefills, audit 2026-07-02).
+        #
+        # The rate used to be a hardcoded 1000 tok/s (+1s per 1k est input),
+        # which is simply not what the hardware does — tier3 measures 1,426 tok/s
+        # at 213K falling to 729 tok/s at 578K, and est_input_tokens undercounts
+        # a tool-heavy payload ~2x on top. That combination is what aborted a
+        # legitimate prefill at elapsed_s=145.078 (== 30 + 115077/1000).
+        # _STREAM_PREFILL_FLOOR_TOK_S is derived from the SLOW end of the
+        # measured range with headroom for both effects. Still capped by
+        # hard_limit_s so a caller asking for 10s is never over-waited.
+        # The INTER-token gap stays flat — once tokens flow, 30s of silence is a
+        # genuine stall regardless of prompt size, and it is that guard (not the
+        # wall clock) that makes the generous TTFT allowance safe.
         ttft_deadline_s = min(
-            _STREAM_TTFT_DEADLINE_S + (req.est_input_tokens or 0) / 1000.0,
-            stream_timeout,
+            _STREAM_TTFT_DEADLINE_S
+            + (req.est_input_tokens or 0) / _STREAM_PREFILL_FLOOR_TOK_S,
+            hard_limit_s,
         )
-        gap_deadline_s = min(_STREAM_INTERTOKEN_GAP_S, stream_timeout)
+        gap_deadline_s = min(_STREAM_INTERTOKEN_GAP_S, hard_limit_s)
         loop = asyncio.get_running_loop()
         last_chunk_at = t0
+        hit_hard_cap = False
         try:
             async with asyncio.timeout(ttft_deadline_s) as _cm:
                 async for event in self.state.backend.stream(
                     ep_cfg, payload, req.payload_type,
-                    req.request_id, timeout_s=stream_timeout,
+                    req.request_id, timeout_s=hard_limit_s,
                 ):
                     if event.event_type == "chunk":
                         now_m = time.monotonic()
@@ -1081,8 +1158,13 @@ class Lifecycle:
                         # deadline bounded by the caller's remaining SLA. A
                         # 0-token hang aborts in ~TTFT; a MID-STREAM stall aborts
                         # in ~gap — both free the slot instead of burning 180s.
-                        remaining = stream_timeout - (now_m - t0)
+                        remaining = hard_limit_s - (now_m - t0)
                         if remaining <= 0:
+                            # The absolute cap: this stream IS progressing, so
+                            # neither watchdog would ever fire. Only this stops
+                            # an infinitely-progressing stream from holding a
+                            # scarce slot forever.
+                            hit_hard_cap = True
                             raise asyncio.TimeoutError
                         _cm.reschedule(loop.time() + min(gap_deadline_s, remaining))
                         usage_only = False
@@ -1122,25 +1204,48 @@ class Lifecycle:
             # "backpressure" marker makes it deferrable (is_deferrable_llm_error)
             # so the caller defers instead of dead-lettering. A 0-token hang is
             # the common case — name it so log_scan can see the pattern.
-            watchdog = False  # proxy-initiated abort (TTFT/stall), not a client SLA
+            # Name WHICH bound fired. All four are "the stream ended early", but
+            # they mean completely different things to an operator: a TTFT abort
+            # is a backend that never spoke, a stall is one that died mid-answer,
+            # a hard-cap abort is a healthy stream we cut off for capacity, and a
+            # caller-deadline abort is us keeping a promise the caller made. Only
+            # the first three are proxy-initiated.
+            watchdog = False  # proxy-initiated abort, not a client SLA
+            now_m = time.monotonic()
+            # Most specific first. ``hit_hard_cap`` is only set when OUR explicit
+            # check wins the race; when the rescheduled asyncio.timeout fires at
+            # the same instant it raises first and the flag is never set, so the
+            # cap is ALSO recognised by elapsed time. Without that second arm a
+            # cap abort silently reports itself as a caller deadline — which is
+            # exactly what the hard-cap test caught.
             if ttft_ms is None and isinstance(exc, asyncio.TimeoutError):
+                abort_reason = "ttft"
                 err = ("backend produced no output within "
                        f"{ttft_deadline_s:.0f}s (ttft timeout) — backpressure")
                 watchdog = True
             elif (isinstance(exc, asyncio.TimeoutError)
-                  and (time.monotonic() - last_chunk_at) >= gap_deadline_s - 0.5):
+                  and (now_m - last_chunk_at) >= gap_deadline_s - 0.5):
+                abort_reason = "stall"
                 err = ("backend stalled mid-stream (no token for "
                        f"{gap_deadline_s:.0f}s) — backpressure")
                 watchdog = True
+            elif hit_hard_cap or (soft_budget and (now_m - t0) >= hard_limit_s):
+                abort_reason = "hard_cap"
+                err = (f"stream exceeded the absolute {hard_limit_s:.0f}s cap "
+                       f"while still progressing — backpressure")
+                watchdog = True
+                self.state.stream_hard_cap_aborts += 1
             else:
+                abort_reason = "caller_deadline"
                 err = f"stream deadline exceeded — backpressure ({exc})"
             await stream_q.put({"type": "error", "error": err})
             duration = time.monotonic() - t0
+            self._note_stream_extension(req, duration, stream_timeout, soft_budget)
             self.record_completion(req, decision, duration, input_tokens, output_tokens, "timeout")
             self.record_timeout_event(
                 req, layer="stream", elapsed_s=duration,
                 queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
-                proxy_initiated=watchdog,
+                proxy_initiated=watchdog, abort_reason=abort_reason,
             )
             self.health.record_dispatch_failure(req.endpoint, exc)  # Step 4b (BackendTimeout only)
             return
@@ -1152,6 +1257,9 @@ class Lifecycle:
             return
 
         duration = time.monotonic() - t0
+        # A stream that COMPLETED past its soft budget is the whole point of the
+        # progress-governed deadline — count it, or the feature is invisible.
+        self._note_stream_extension(req, duration, stream_timeout, soft_budget)
 
         # Operator-mandated structured end-of-stream guard (2026-07-11): the
         # chunks already streamed (can't un-send), but every structured-stream
@@ -1211,6 +1319,59 @@ class Lifecycle:
         # self-gated on the flag; no-op when uniform correction is off.
         if uniform_on:
             self.correction.finalize_stream(req, accumulated_content, last_finish_reason)
+    def _stream_hard_cap_s(self, req: QueuedRequest) -> float:
+        """Absolute ceiling (seconds) on a PROXY-CHOSEN streaming deadline that
+        token progress keeps extending.
+
+        Resolution order, mirroring the timeout floors/ceilings: a per-endpoint-
+        class ``stream_hard_cap_s`` from models.yaml wins; otherwise the band
+        default. Background (P3/P4) is sized to clear the measured worst case
+        (a 578K-token tier3 request at ~794s end-to-end) with room; interactive
+        (P0-P2) is deliberately far tighter, because a user-facing turn still
+        streaming after 15 minutes has already failed regardless of throughput.
+
+        Never consulted for an explicit caller deadline. Fully guarded — a
+        lookup fault must not abort a live stream, so it degrades to the
+        background default rather than raising into the streaming path."""
+        try:
+            cap = self.state.stream_hard_caps.get(normalize_endpoint(req.endpoint))
+            if cap and cap > 0:
+                return float(cap)
+            if req.band == PriorityBand.INTERACTIVE:
+                return _STREAM_HARD_CAP_INTERACTIVE_S
+            return _STREAM_HARD_CAP_BACKGROUND_S
+        except Exception:  # noqa: BLE001 — never break a live stream on a lookup
+            return _STREAM_HARD_CAP_BACKGROUND_S
+
+    def _note_stream_extension(
+        self, req: QueuedRequest, duration: float, budget_s: float,
+        soft_budget: bool,
+    ) -> None:
+        """Count a stream that outlived the proxy-chosen deadline it was given.
+
+        Extending a deadline trades a capacity guarantee for a completion, and a
+        trade nobody can measure is a trade nobody can revisit — so record BOTH
+        the count and the seconds granted, and log each one. Only fires on the
+        soft-budget path; a caller deadline can't be extended, so there is
+        nothing to count."""
+        if not soft_budget:
+            return
+        over = duration - budget_s
+        if over <= 0:
+            return
+        try:
+            self.state.stream_deadline_extended += 1
+            self.state.stream_extension_s_total += over
+            logger.info(
+                "stream deadline EXTENDED by progress: endpoint=%s tier=%s "
+                "caller=%s budget=%.1fs ran=%.1fs (+%.1fs)",
+                req.endpoint, req.priority.name,
+                req.caller_id or f"{req.agent_id}/{req.call_site}",
+                budget_s, duration, over,
+            )
+        except Exception:  # noqa: BLE001 — accounting must never break a stream
+            pass
+
     def on_admission_timeout(self, req: QueuedRequest) -> None:
         """Scheduler callback: a request expired while still queued. Log
         it and release the caller promptly with a timeout result (instead
@@ -1391,6 +1552,23 @@ class Lifecycle:
 
         # Trigger scheduler (a slot freed up)
         self.state.dispatch_event.set()
+    def _identity_min_timeout_s(self, request) -> float | None:
+        """The requesting IP's registered minimum-deadline floor, or None.
+
+        Keyed on the SOURCE IP (the ACL's own key), not on ``body.agent_id`` —
+        agent_id is caller-asserted on a bare /v1/submit, and the floor is a
+        capacity concession granted to a host we recognise. Fully guarded: a
+        request object without a client (or an ACL fault) means no floor, never
+        a 500 — the deadline is already resolved and valid by this point."""
+        try:
+            client = getattr(request, "client", None)
+            remote_ip = getattr(client, "host", None)
+            if not remote_ip:
+                return None
+            return self.state.acl.min_timeout_s(str(remote_ip))
+        except Exception:  # noqa: BLE001 — a floor lookup must never 500 a request
+            return None
+
     def resolve_default_timeout(self, endpoint: str, body: dict) -> float:
         """Deadline for a caller that supplied no ``timeout_s`` (the OpenAI door
         + a bare ``/v1/submit``). Caller-supplied deadlines never reach here.
@@ -1502,6 +1680,7 @@ class Lifecycle:
         queue_wait_ms: float | None = None,
         emit_metrics_and_log: bool = True,
         proxy_initiated: bool = False,
+        abort_reason: str | None = None,
     ) -> None:
         """Record a call that hit its timeout instead of finishing.
 
@@ -1513,6 +1692,14 @@ class Lifecycle:
         complete. Fully guarded: a fault here never disturbs the caller.
 
         ``layer``: admission | client_wait | backend | stream.
+
+        ``abort_reason`` (stream layer): which bound actually fired —
+        ``ttft`` (no first token) | ``stall`` (no token for the inter-token gap)
+        | ``hard_cap`` (a still-progressing stream cut off at the absolute cap)
+        | ``caller_deadline`` (the caller's own explicit wall). ``proxy_initiated``
+        alone can't distinguish these, and they call for opposite responses — a
+        stall means fix the backend, a hard_cap means the cap is too tight or a
+        caller is abusive. Surfaced per-reason by ``/v1/timeouts``.
         """
         rid = req.request_id
         if rid in self.state.timed_out_ids:
@@ -1555,12 +1742,12 @@ class Lifecycle:
                 "LLM TIMEOUT layer=%s endpoint=%s tier=%s caller=%s "
                 "elapsed=%.1fs applied=%.1fs in_flight=%d queued=%d est_in=%d "
                 "est_out=%d ctx_used=%s%% recommended=%.0fms premature=%s "
-                "proxy_watchdog=%s",
+                "proxy_watchdog=%s abort_reason=%s",
                 layer, req.endpoint, req.priority.name,
                 req.caller_id or f"{req.agent_id}/{req.call_site}",
                 elapsed_s, req.timeout_s, snap["in_flight"], snap["queued"],
                 est_in, est_out, context_used_pct, recommended_ms, under,
-                proxy_initiated,
+                proxy_initiated, abort_reason or "-",
             )
 
             if emit_metrics_and_log:
@@ -1633,6 +1820,7 @@ class Lifecycle:
                 caller_id=req.caller_id,
                 context_window=context_window,
                 context_used_pct=context_used_pct,
+                abort_reason=abort_reason,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("timeout event record failed for %s: %s", rid, exc)
