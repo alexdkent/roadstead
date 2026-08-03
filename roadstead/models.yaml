@@ -558,6 +558,26 @@ models:
          The reason the leak "fix" looked verified was an ABSENCE assertion
          (`"</think>" not in content`), which an empty string also satisfies. Gate G4
          must assert a POSITIVE property (non-empty, finish_reason=stop) too.
+         🚨 WHEN A CALLER OPTS IN (`thinking: true`), TWO THINGS SUPPRESS THE <think>
+         IT ASKED FOR — both silently, both looking exactly like "the model chose not
+         to reason". Measured 2026-08-02 against this endpoint, streamed, one unique
+         payload per request so nothing came from the proxy's identical-payload cache
+         (the first cut of the history row WAS cache-confounded — three identical
+         102-char replies — so re-check that before trusting a repeat):
+             [user]                    reasoned 4/4   (1321-3339 chars)
+             [user, assistant, user]   reasoned 0/4   <- ONE prior assistant turn
+             [system, user]            reasoned 1/4   (vs 4/4 without a system role)
+         The system-message case is the known template quirk, and the proxy's fold
+         (correction.fold_system_for_thinking) RAISES the rate without closing it.
+         The HISTORY case is not documented anywhere else and is the harder one:
+         treat `thinking: true` as a FIRST-TURN capability here. Any multi-turn
+         caller that opts in gets reasoning on turn 1 and silently never again.
+         Nothing in the proxy compensates for this today — a wrong guess would
+         corrupt replayed history, so it is surfaced to the user instead (the
+         Playground warns at the toggle and on any zero-reasoning turn).
+         ⚠️ Also: reasoning streams as `delta.reasoning` on this backend, NOT
+         `delta.reasoning_content`. A reader matching only the latter drops the whole
+         reasoning stream and reports zero while usage shows the tokens were spent.
       2. `--gpu-memory-utilization 0.81` is the live value; the old "0.72 is a HARD
          CEILING" line described a DIFFERENT configuration and no longer applies.
          When util sized the KV pool, 0.72 was the ceiling and 0.78 + a drafter
