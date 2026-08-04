@@ -131,6 +131,43 @@ def test_long_prefill_threshold_present_and_sane(script: str) -> None:
     )
 
 
+def test_patched_stable_abi_extension_is_mounted(script: str) -> None:
+    """The tier3 memory leak (~1 GiB/day) is torch 2.11's stable-ABI std::string
+    unbox: `ToImpl<std::string>::call` does `new std::string(...)` and returns a
+    COPY, never freeing it (pytorch#190493 -- on torch `main` ONLY; 2.11, 2.12 and
+    2.13 all still leak). vLLM passes `kv_cache_dtype` as a `str` on every
+    `reshape_and_cache_flash`, and FlashInfer + spec-decode forces PIECEWISE
+    cudagraphs, so that op dispatches EAGERLY on every engine step.
+
+    The header compiles INTO vllm/_C_stable_libtorch.abi3.so, so a new torch wheel
+    would NOT fix it -- the leaking code is inlined in the consumer. The fix is a
+    locally rebuilt extension bind-mounted over the image's copy.
+
+    This is guarded because the fix is ONE `-v` line with no other trace: drop it
+    and the leak returns silently, at full rate, with a green suite and a healthy
+    engine. Measured 2,719-4,176 B/step before, 1,186 B/step after.
+
+    ⚠️ The .so is a HOST artifact (/opt/anvil-bench/patched/) that this repo
+    cannot yet reproduce -- the upstream image rebuild is blocked on an Ubuntu
+    snapshot repo unreachable inside buildkit. A anvil rebuild drops the fix.
+    """
+    so = "_C_stable_libtorch.abi3.so"
+    assert so in script, (
+        f"the patched {so} bind-mount is missing -- the tier3 memory leak "
+        "(~1 GiB/day) returns SILENTLY without it: no error, no failed test, "
+        "just anvil running out of memory again in ~4 days"
+    )
+    mount = [ln for ln in script.splitlines() if so in ln]
+    assert len(mount) == 1, f"expected exactly one {so} mount, found {len(mount)}"
+    line = mount[0]
+    assert "/opt/anvil-bench/patched/" in line, (
+        "the patched extension must come from /opt/anvil-bench/patched/"
+    )
+    assert line.rstrip().rstrip("\\").rstrip().endswith(":ro"), (
+        "mount the patched extension READ-ONLY (:ro) -- it is a build artifact"
+    )
+
+
 def test_concurrent_partial_prefill_flags_are_absent(script: str) -> None:
     """vLLM's V1 engine raises NotImplementedError: 'Concurrent Partial Prefill
     is not supported' and CRASH-LOOPS. The fields exist on the legacy
