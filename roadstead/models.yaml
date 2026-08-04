@@ -540,6 +540,36 @@ models:
       1024 buys a 24x better interactive tail for 4.7% on the giant. That is the right
       direction because this stanza ALREADY declares ultra-long traffic background-only,
       and a 45 s stall reads to a caller as a hang and blows _INTERACTIVE_CEILING_S.
+
+      🚨 ATTENTION BACKEND IS FLASHINFER, AND THAT IS DELIBERATE (2026-08-04).
+      `docs/inference_thinker_triton_attn_fix.md` (2026-06-03) moved the THEN-current
+      model to TRITON_ATTN. Do not carry that conclusion to Laguna S 2.1 — it was
+      measured on Qwen3.6-27B where the two tied. Head-to-head on THIS model, identical
+      prompts, 3 reps:
+
+          backend       small conc1   200k decode   200k cold TTFT   worst-short
+          triton_attn      26.0          5.1 t/s        10.95 s         7.81 s
+          FLASHINFER       25.6         10.7 t/s         7.06 s         3.54 s
+
+      Small context ties; FlashInfer is 2.1x on long-context decode and 2.2x better on
+      the interactive tail (the giant occupies the engine 133 s vs 272 s). Overnight
+      big-context work is exactly where triton loses.
+      ALSO: that doc's mechanism (`VLLM_ATTENTION_BACKEND=...`) is a SILENT NO-OP on
+      vLLM 0.26.1 — the env var does not exist in the package. Forcing triton now needs
+      the CLI flag PLUS `attention_backend` inside `--speculative-config` (the draft
+      model otherwise falls through to priority selection, and FLASHINFER wins).
+
+      ⛔ TWO TUNING FLAGS THAT CANNOT WORK HERE — do not retry (each costs a 40-min
+      window to rediscover, because both present as a boot hang, not an error):
+        * `--moe-backend triton` (Poolside's OWN published recipe) ->
+          `ValueError: moe_backend='triton' is not supported for WNA16 MoE.
+           Expected one of ['marlin','humming','flashinfer_trtllm','emulation']`.
+          Their recipe assumes a different quantization; ours is WNA16 -> MARLIN.
+        * `--kv-cache-dtype-skip-layers sliding_window` (vLLM's own recommended FP8
+          variant) -> `AssertionError: page_size_padded >= unpadded_page_size_bytes`
+          in `unify_kv_cache_spec_page_size`. Mixed fp8/bf16 KV yields unequal page
+          sizes the hybrid coordinator cannot unify — a direct consequence of this
+          model's 12 full + 36 sliding attention split.
       Idle short latency was 0.30 s at every setting — normal traffic pays nothing.
       Our real distribution (1157 reqs) is 96% <=10k tokens, 0.7% >50k, so the giants
       this protects against are rare but severe.
