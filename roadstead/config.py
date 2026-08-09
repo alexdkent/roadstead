@@ -8,9 +8,9 @@ config only carries *policy* knobs (weights, floors, timeouts).
 whole system. The LLM proxy is the single front door to all LLM traffic
 (10.0.0.3 anvil / 10.0.0.6 nexus); every agent reaches a backend via
 ``make_nexus_client(role)`` → ``ProxyLLMClient`` → ``:42161`` → here.
-There is no other routing table. The ``infra/inference/profiles/*.yaml``
-files mirror this for the inferctl/profile-transition *operational*
-tooling only — when they disagree, this file wins.
+There is no other routing table. (The ``infra/inference/profiles/*.yaml``
+shadow map and its ``inferctl`` tooling were DELETED 2026-08-09 — they
+maintained a parallel role→URL table the proxy never read.)
 """
 
 from __future__ import annotations
