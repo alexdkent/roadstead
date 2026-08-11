@@ -430,15 +430,25 @@ def build_telemetry_units(cat: Catalog | None = None, host: str = "") -> list[tu
     return out
 
 
-def build_dispatcher_entries(cat: Catalog | None = None) -> list[dict[str, Any]]:
-    """One dict per anvil-dispatcher-managed model (media + the pinned creative
-    LLM) — everything needed to build MODEL_REGISTRY + DEFAULT_POLICY. Excludes
-    ``planned`` roles (e.g. video). The dispatcher constructs its own ModelMeta
-    from these (ModelMeta lives there, so we return plain dicts)."""
+def build_dispatcher_entries(cat: Catalog | None = None, host: str = "anvil") -> list[dict[str, Any]]:
+    """One dict per ``host``-resident dispatcher-managed model (media + the
+    pinned creative LLM) — everything needed to build that host's own
+    MODEL_REGISTRY + DEFAULT_POLICY. Excludes ``planned`` roles (e.g. video).
+    The dispatcher constructs its own ModelMeta from these (ModelMeta lives
+    there, so we return plain dicts).
+
+    ``host`` defaults to ``"anvil"`` for source compatibility with callers
+    that don't pass one. **The SAME vendored package (anvil_dispatcher) runs
+    on both nexus and anvil** — a hardcoded ``"anvil"`` here silently
+    dropped every nexus-hosted entry (imagegen) the moment nexus got its own
+    dispatcher, and the only reason it didn't break in production is that the
+    vendored copy on nexus was a stale pre-move ``models.yaml`` still claiming
+    ``host: anvil``. Re-vendoring the current authority alone would have
+    tripped this. See ``mesh_generation_nexus_design.md`` §0 finding 4."""
     cat = cat or load_catalog()
     out: list[dict[str, Any]] = []
     for e in cat.models.values():
-        if e.host != "anvil" or not e.dispatcher_capability:
+        if e.host != host or not e.dispatcher_capability:
             continue
         if e.status not in ("active", "on_demand"):
             continue
