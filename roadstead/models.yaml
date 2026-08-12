@@ -1082,6 +1082,17 @@ models:
       package (nexus_meshgen/) is tracked there. octree_resolution=512 is
       the non-negotiable default (256 is 2x nozzle width on a 0.4mm nozzle).
 
+      NEW 2026-08-12: `POST /generate` takes an optional `generator` field
+      (default "hunyuan3d-2.1"; "triposg" selectable, unknown value = 400)
+      and a new `POST /preprocess` returns the conditioning image with no
+      generation and no lease. TripoSG runs in its OWN subprocess/venv
+      (/opt/triposg-venv, weights at /srv/models/triposg, ~23.5 GB) and is
+      NOT a separate catalog entry here — see mesh_generation_nexus_design.md
+      E-results IX for why (one service, one host:port, one dispatcher
+      capability; the generator choice is a body parameter on this same
+      route, not a second routable model). Measured typical_s: hunyuan 535,
+      triposg 132 (~4x, not the ~11x first inferred from diffusion-time-alone).
+
   video:
     kind: media
     status: on_demand                # LIVE 2026-06-21 — Phase 0 validated on the GB10
