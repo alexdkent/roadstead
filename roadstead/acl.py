@@ -206,6 +206,24 @@ class IPIdentityMap:
         # default-only: an explicit caller deadline still wins. (2026-08-03)
         acl.register("10.0.0.17", "pool-observer", LLMPriority.P3_INGESTION,
                      min_timeout_s=_SMART_DEFAULT_CAP_S)
+        # pool-effector (Kestrel CTnnn, static 10.0.0.20, Phase 6 of
+        # docs/pool_capability_buildout_plan_2026-08.md — not provisioned yet as of
+        # 2026-08-12, code-authored ahead of the CT existing, same as its
+        # host_inventory.yaml row). Same reasoning as pool-observer immediately
+        # above: `pool` is a plain OpenAI-compat client with no identity header, so
+        # without this its traffic lands in `lan-generic` and is invisible in
+        # `proxy_completions`. Registered SEPARATELY from pool-observer, not as a
+        # second alias of the same identity, so the effector's traffic is
+        # independently deprioritizable from the observer's the day tier3 needs to
+        # shed load from one but not the other — they are different instances with
+        # different real-world blast radii, and QoS attribution should be able to
+        # tell them apart even though today both get the same P3 tier and the same
+        # timeout floor. Same min_timeout_s reasoning as pool-observer: pool
+        # supplies no deadline of its own, so it gets the smart default, and the
+        # size_stretch clamp binds long before any per-role ceiling would — see the
+        # pool-observer comment above for the full measurement.
+        acl.register("10.0.0.20", "pool-effector", LLMPriority.P3_INGESTION,
+                     min_timeout_s=_SMART_DEFAULT_CAP_S)
         # lan-generic carries the SAME floor, and that is a deliberate blunt
         # instrument, not an oversight: the mac dev host runs `pool` too and
         # lands here (only the Kestrel CT has a static registration), so flooring
