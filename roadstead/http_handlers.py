@@ -1160,6 +1160,29 @@ class ProxyHttpHandlers:
                 "hard_cap_aborts": self.state.stream_hard_cap_aborts,
             },
         })
+    async def handle_stall_aborts(self, request: Request) -> Response:
+        """Backend-stall aborts by ONE caller inside ONE time window.
+
+        The forensic counterpart to /v1/timeouts: that one aggregates and
+        answers "is the fleet under pressure?"; this answers "while this
+        specific run was alive, did the backend stall underneath it?" — the
+        question a consumer needs to tell an upstream substrate failure apart
+        from its own agent hanging. `caller` is a PREFIX (ids carry a per-run
+        suffix); `since`/`until` are epoch seconds, inclusive.
+
+        Read-only. Returns `{"caller","since","until","count","rows"}`; an
+        unknown caller or an empty window is `count: 0`, never an error — the
+        consumer treats "no evidence" and "cannot tell" identically."""
+        caller = (request.query_params.get("caller") or "").strip()
+        since = _to_float(request.query_params.get("since"), 0.0)
+        until = _to_float(request.query_params.get("until"), time.time())
+        rows = await asyncio.to_thread(
+            self.state.queue_db.stall_aborts, caller, since, until)
+        return JSONResponse({
+            "caller": caller, "since": since, "until": until,
+            "count": len(rows), "rows": rows,
+        })
+
     async def handle_health(self, request: Request) -> Response:
         ok = self.health.scheduler_loop_alive()
         poller_ok = self.health.poller_alive()

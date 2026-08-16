@@ -687,6 +687,9 @@ class ProxyService:
     async def handle_timeouts_report(self, request: Request) -> Response:
         return await self._http.handle_timeouts_report(request)
 
+    async def handle_stall_aborts(self, request: Request) -> Response:
+        return await self._http.handle_stall_aborts(request)
+
     # ----- handler: health -----
 
     def _scheduler_loop_alive(self) -> bool:

@@ -11,6 +11,7 @@ Provides:
   - GET  /v1/timeout-advice — recommended timeout for a model/tier/size
   - GET  /v1/timeout-advice/shadow-report — shadow-mode impact summary
   - GET  /v1/timeouts      — calls that hit their timeout (per model/tier/layer)
+  - GET  /v1/timeouts/stalls — backend-stall aborts for one caller + window
   - GET/POST /v1/admin/maintenance — annotate/list planned-restart windows
   - GET  /health           — health check
 """
@@ -81,6 +82,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_timeouts_report(request: Request) -> Response:
         return await svc.handle_timeouts_report(request)
 
+    async def handle_stall_aborts(request: Request) -> Response:
+        return await svc.handle_stall_aborts(request)
+
     async def handle_admin_pause(request: Request) -> Response:
         return await svc.handle_admin_endpoint_pause(
             request.path_params["endpoint"], request, pause=True)
@@ -142,6 +146,10 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         Route("/v1/timeout-advice", handle_timeout_advice, methods=["GET"]),
         Route("/v1/timeout-advice/shadow-report", handle_timeout_shadow_report, methods=["GET"]),
         Route("/v1/timeouts", handle_timeouts_report, methods=["GET"]),
+        # Per-caller, per-window backend-stall lookup. /v1/timeouts aggregates;
+        # this answers "did the backend stall under THIS run?" — the evidence a
+        # consumer needs to tell our substrate failing from its own hang.
+        Route("/v1/timeouts/stalls", handle_stall_aborts, methods=["GET"]),
         # Phase 1 — fleet call-metrics authority: real-time stream, non-LLM
         # ingest, and the usage/savings rollups ported from the host daemon.
         Route("/v1/stream", handle_stream, methods=["GET"]),

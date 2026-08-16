@@ -1608,6 +1608,65 @@ class PersistentQueue:
         out.sort(key=lambda r: (r["endpoint"], r["priority"]))
         return out
 
+    #: Which ``abort_reason`` values mean "the BACKEND stopped producing", as
+    #: opposed to a bound WE chose. `stall` is the mid-stream watchdog: tokens
+    #: were flowing and then stopped for `stall_s`. `ttft` is the same fault
+    #: caught earlier — the backend accepted the request and never emitted a
+    #: first token. Both are the substrate dying under a caller who did nothing
+    #: wrong. `hard_cap` and `caller_deadline` are deliberately NOT here: those
+    #: are us cutting off work that was still healthy, which is a capacity
+    #: decision, not a backend failure.
+    STALL_ABORT_REASONS = ("stall", "ttft")
+
+    def stall_aborts(self, caller_prefix: str, since: float,
+                     until: float) -> list[dict]:
+        """Backend-stall aborts by one caller inside a time window.
+
+        A narrow forensic read, NOT an aggregate: `timeouts_report` groups by
+        (endpoint, tier, layer) and answers "is the fleet under pressure?".
+        This answers a single yes/no about ONE run — "while job X was alive,
+        did the backend stall under its caller?" — which is what lets a
+        downstream consumer tell an upstream substrate failure from a genuine
+        agent-side hang. Aggregates cannot do that: they have already thrown
+        away which caller and which second.
+
+        `caller_prefix` is matched with LIKE `prefix%` because caller ids carry
+        a per-run suffix; the window is inclusive on both ends so a stall
+        recorded on the exact terminalisation second still counts (the row is
+        written when the stream is killed, which is the instant the consumer
+        then observes as its own failure).
+
+        Read-only and cheap: `idx_pto_occurred` carries the window, and the
+        result set is one run's worth of rows.
+        """
+        if not self._conn or not caller_prefix:
+            # An EMPTY prefix would LIKE-match every caller in the window and
+            # hand the consumer somebody else's stall as evidence about its own
+            # run. Refusing is the only safe reading of "no caller".
+            return []
+        # `_` and `%` are LIKE wildcards, and fleet caller ids contain `_`
+        # (`pool_broker.*`). Unescaped, `pool_broker` would also match
+        # `poolXbroker` — over-matching in exactly the direction that
+        # manufactures false evidence.
+        esc = caller_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = self._reader().execute(
+            "SELECT request_id, occurred_at, endpoint, abort_reason, caller_id, "
+            "       agent_id, call_site, elapsed_s, layer "
+            "FROM proxy_timeouts "
+            "WHERE occurred_at >= ? AND occurred_at <= ? "
+            "  AND abort_reason IN (%s) "
+            "  AND caller_id LIKE ? ESCAPE '\\' "
+            "ORDER BY occurred_at"
+            % ",".join("?" * len(self.STALL_ABORT_REASONS)),
+            (since, until, *self.STALL_ABORT_REASONS, f"{esc}%"),
+        ).fetchall()
+        return [
+            {"request_id": r[0], "occurred_at": r[1], "endpoint": r[2],
+             "abort_reason": r[3], "caller_id": r[4], "agent_id": r[5],
+             "call_site": r[6], "elapsed_s": r[7], "layer": r[8]}
+            for r in rows
+        ]
+
     def timeouts_report(self, hours: float = 24.0) -> dict:
         """Per-(endpoint, tier, layer) summary of timeout events: how
         often calls give up instead of finishing, the load when they do,
