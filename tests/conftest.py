@@ -25,8 +25,11 @@ from __future__ import annotations
 # collection, when sys.path[0] is still the stdlib-clean rootdir.
 import queue  # noqa: F401
 
+import glob
 import os
+import shutil
 import tempfile
+import time
 
 import pytest
 
@@ -50,11 +53,66 @@ from originfleet.llmproxy.backend import BackendClientPool
 # more than that free before choosing tmpfs over the (slower, roomy) default.
 _MIN_SHM_FREE_BYTES = 32 * 1024 * 1024
 
+# --- bounding the scratch we retain ---------------------------------------
+# 🚨 A CAP IS NOT A BOUND. The commit that introduced this redirect sized the
+# 64 MB tmpfs against ONE run's peak ("peak working set: 12.9 MB, existing 64M
+# shm is ample; no resize") — but pytest retains the last THREE numbered roots,
+# and the per-run peak has since grown to ~20 MB as Phase 3/4/5 added tests.
+# 3 x 20 MB against a 64 MB cap fills it and KEEPS it full. Worse, the state
+# LATCHES: once free space drops under the guard above we stop choosing this
+# basetemp, so pytest's own reaper — which only runs inside the basetemp in
+# use — never runs here again and the 64 MB is pinned forever. Measured
+# 2026-08-18: six retained roots, `shm 64M 64M 4.0K 100%`, tollgate back to
+# 71s from 20s. So we bound what we retain instead of trusting the cap.
+#
+# We are the sole owner of this basetemp, so we may reap it. A root is ours to
+# delete when pytest has finished with it: pytest writes a ``.lock`` into each
+# numbered dir and removes it on clean session exit, so "no .lock" means "no
+# live session". The age floor closes the one race that leaves — pytest creates
+# the numbered dir a hair before it writes the lock (``make_numbered_dir`` then
+# ``create_cleanup_lock``), so a root that young may belong to a session
+# starting concurrently. That window is microseconds; keep the floor SHORT.
+# 🚨 Do not raise it "to be safe" — the floor is the one thing that can still
+# let retention outrun the cap. A run leaves ~20 MB and takes ~30s, so a 10
+# MINUTE floor would pin ~20 roots during back-to-back iteration and put us
+# straight back in the 100%-full state this reaper exists to prevent. At 60s
+# the worst case is two retained roots (~40 MB); the free-space guard below
+# then sends that one run to the slower OS default and the next run reaps
+# normally. Slow and self-healing, never latched.
+_PRUNE_MIN_AGE_S = 60
+
+
+def _prune_stale_scratch(basetemp: str, *, now: float | None = None) -> int:
+    """Delete finished pytest roots under our own basetemp. Returns the count.
+
+    Never raises: a failure to reap costs wall-clock (we fall back to the OS
+    default) and must never take the suite down with it.
+    """
+    now = time.time() if now is None else now
+    reaped = 0
+    for root in glob.glob(os.path.join(basetemp, "pytest-of-*", "pytest-*")):
+        try:
+            if not os.path.isdir(root) or os.path.islink(root):
+                continue
+            if os.path.exists(os.path.join(root, ".lock")):
+                continue  # a live session owns it
+            if now - os.stat(root).st_mtime < _PRUNE_MIN_AGE_S:
+                continue  # may be a session that has not written its lock yet
+            shutil.rmtree(root, ignore_errors=True)
+            reaped += 1
+        except OSError:
+            continue
+    return reaped
+
 
 def _redirect_scratch_to_tmpfs() -> None:
     shm = "/dev/shm"
     if not os.path.isdir(shm) or not os.access(shm, os.W_OK):
         return
+    # Reap BEFORE measuring free space — the whole point is that the space the
+    # last run retained is space this run may have back. Reaping after the
+    # check would preserve exactly the latch described above.
+    _prune_stale_scratch(os.path.join(shm, "llmproxy-tests"))
     # 🚨 A FULL tmpfs is still a writable directory, so the writability check
     # above does not catch it. Without this guard the redirect proceeds, every
     # scratch SQLite open dies with "database or disk is full", and pytest
@@ -64,6 +122,9 @@ def _redirect_scratch_to_tmpfs() -> None:
     # there (`shm 64M 64M 4.0K 100%`) and the pytest tmpdirs pytest itself
     # retains fill it, after which EVERY subsequent tollgate run fails this
     # way. Falling back to the OS default costs wall-clock and nothing else.
+    # With the reaper above this is now a BACKSTOP, not the primary defence:
+    # it still catches a genuine outsider filling the tmpfs, but our own
+    # retention can no longer be what trips it.
     try:
         st = os.statvfs(shm)
         free = st.f_bavail * st.f_frsize
