@@ -218,7 +218,7 @@ models:
     proxy_endpoint: true
     endpoint_class: gemma
     role: gemma-router
-    aliases: [tier1, gemma-router, gemma, nexus-gemma]   # tier1 = canonical (2026-07-30 tier migration)
+    aliases: [router, tier1, gemma-router, gemma, nexus-gemma]   # tier1 = canonical (2026-07-30 tier migration). `router` is the entry's own KEY and must be listed here too — build_role_aliases() reads `aliases` only, so without it a call for role `router` 404s at the proxy (see test_every_canonical_name_is_dispatchable).
     host: kestrel-perception
     port: 9091
     backend_engine: llama.cpp
@@ -737,7 +737,13 @@ models:
     proxy_endpoint: true
     endpoint_class: creative
     role: creative
-    aliases: [creative, tier2, deckard, deckard-31b, companion-lite, qwen-classify, classify, chat, nexus-chat, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]   # THREE roles now resolve to this ONE boxa endpoint (2026-07-11 consolidation): (1) creative, (2) companion-lite = the orchestrator inner chat loop, (3) the whole classify/analyst/vision family (re-homed off anvil :9092). All pure ALIASES of the single endpoint so no caller changes AND slots aren't double-counted (two stanzas at one URL would double-count the 6 slots). deckard/deckard-31b are HISTORICAL anvil NVFP4 rollback aliases (the deployed model is NOT a DECKARD finetune). `creative` became an alias in the 2026-08-18 rename. ⚠️ Bare `tier2` DELIBERATELY stays here rather than following the conversational role (operator decision 2026-08-18) — it has live callers (sidekick/song_studio.py:425, discord_schema_smoke, llm_benchmark, external_facade, ~10 tools) and re-pointing a live alias at a different model is the exact July `companion` failure. Revisit at Phase 3: if `tier2` should mean the chat tier, SWEEP THE CALLERS, do not silently re-point.
+    # 🚨 `tier2-analyst` MUST be listed here even though it is the entry's KEY. The proxy's
+    # dispatch map comes from build_role_aliases(), which iterates `aliases` ONLY and maps each
+    # to `role:` — the catalog key never enters it. Measured 2026-08-18: with the key alone, a
+    # live call for role `tier2-analyst` got `404 unknown_endpoint` (known: creative, embed,
+    # gemma, rerank, thinker) while `creative`/`tier2` answered fine. cat.canonical() resolving
+    # the name is NOT evidence that the proxy will route it.
+    aliases: [tier2-analyst, creative, tier2, deckard, deckard-31b, companion-lite, qwen-classify, classify, chat, nexus-chat, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]   # THREE roles now resolve to this ONE boxa endpoint (2026-07-11 consolidation): (1) creative, (2) companion-lite = the orchestrator inner chat loop, (3) the whole classify/analyst/vision family (re-homed off anvil :9092). All pure ALIASES of the single endpoint so no caller changes AND slots aren't double-counted (two stanzas at one URL would double-count the 6 slots). deckard/deckard-31b are HISTORICAL anvil NVFP4 rollback aliases (the deployed model is NOT a DECKARD finetune). `creative` became an alias in the 2026-08-18 rename. ⚠️ Bare `tier2` DELIBERATELY stays here rather than following the conversational role (operator decision 2026-08-18) — it has live callers (sidekick/song_studio.py:425, discord_schema_smoke, llm_benchmark, external_facade, ~10 tools) and re-pointing a live alias at a different model is the exact July `companion` failure. Revisit at Phase 3: if `tier2` should mean the chat tier, SWEEP THE CALLERS, do not silently re-point.
     host: nasbox
     port: 9196
     backend_engine: llama.cpp
@@ -817,7 +823,7 @@ models:
     proxy_endpoint: true
     endpoint_class: embed
     role: bge-m3-embed
-    aliases: [bge-m3-embed]
+    aliases: [embed, bge-m3-embed]   # `embed` is the entry's own KEY and must be listed — build_role_aliases() reads `aliases` only, so without it a call for role `embed` 404s at the proxy (see test_every_canonical_name_is_dispatchable).
     host: nexus             # 2026-07-30: MOVED anvil -> nexus (ROCm/gfx1151) for hardware diversity
     port: 9087
     backend_engine: shim

@@ -46,9 +46,30 @@ from originfleet.llmproxy.backend import BackendClientPool
 # timing). Falls back to the OS default where ``/dev/shm`` is absent or not
 # writable (e.g. macOS dev), so it is a silent no-op there. Must run at
 # conftest-import time — before pytest's tmp_path_factory resolves its base.
+# The suite's own scratch high-water mark is ~15-20 MB; require comfortably
+# more than that free before choosing tmpfs over the (slower, roomy) default.
+_MIN_SHM_FREE_BYTES = 32 * 1024 * 1024
+
+
 def _redirect_scratch_to_tmpfs() -> None:
     shm = "/dev/shm"
     if not os.path.isdir(shm) or not os.access(shm, os.W_OK):
+        return
+    # 🚨 A FULL tmpfs is still a writable directory, so the writability check
+    # above does not catch it. Without this guard the redirect proceeds, every
+    # scratch SQLite open dies with "database or disk is full", and pytest
+    # reports it as ~59 unrelated failures across test_timeout_events.py and
+    # test_timeout_shadow.py — which reads as a code regression and sends you
+    # looking for one. Measured in-container 2026-08-18: /dev/shm is 64 MB
+    # there (`shm 64M 64M 4.0K 100%`) and the pytest tmpdirs pytest itself
+    # retains fill it, after which EVERY subsequent tollgate run fails this
+    # way. Falling back to the OS default costs wall-clock and nothing else.
+    try:
+        st = os.statvfs(shm)
+        free = st.f_bavail * st.f_frsize
+    except OSError:
+        return
+    if free < _MIN_SHM_FREE_BYTES:
         return
     d = os.path.join(shm, "llmproxy-tests")
     try:
