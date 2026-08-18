@@ -69,6 +69,12 @@ meta:
     nasbox: 10.0.0.10
     kestrel-speech: 10.0.0.13
     kestrel-perception: 10.0.0.18
+    # RESERVED, NOT BUILT (2026-08-18). The R9700 box that will serve
+    # `tier2-chat`. The address is a DHCP reservation driven by
+    # infra/firewall/host_inventory.yaml, and 🚨 its MAC there is still the
+    # PREVIOUS board's — jetty will not receive .27 until the real NIC MAC is
+    # captured at first boot and the inventory updated. Do not guess it.
+    jetty: 10.0.0.27
   # Provider context-window values preserved VERBATIM for callers/DB rows that
   # are not (yet) covered by a role entry. anthropic is the no-op v2 fallback;
   # the nexus-* legacy values are intentionally the OLD numbers — un-migrated
@@ -663,13 +669,75 @@ models:
       GLM-derived: `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>`).
       Served window is 32K (down from the 27B's 128K), matching the fleet chunkers.
 
-  creative:
+  tier2-chat:
+    # 🔵 RESERVED 2026-08-18 — NAME AND HOST ONLY. NOT DEPLOYED, NOT ROUTED, NOTHING BEHIND IT.
+    # `status: planned` means exactly that (see the field reference at the top of this file):
+    # nothing dispatches here, and no caller should name it until Phase 3.
+    #
+    # The plan: the abliterated Qwen3.6-35B-A3B currently serving as `tier2-analyst` on the boxa
+    # ALSO becomes the fleet's conversational model here, on jetty's Radeon AI PRO R9700 under
+    # SGLang — same weights, different host and engine. SGLang is chosen for its radix cache,
+    # which is global and token-keyed rather than per-slot, and is what attacks the measured
+    # defect: chat TTFT p50 204ms / p90 271ms but **p95 2688ms**, the ~2.5% prefix-cache miss
+    # paying a full reprefill. See tier2_split_architecture_2026-08.md §5.
+    #
+    # 🚨 DEGRADATION IS FLEET-WIDE GO DARK (operator decision 2026-08-18). When this endpoint is
+    # unreachable every chat surface REFUSES the turn and says so — no fallback to tier2-analyst,
+    # none to tier3. That is deliberate: it forecloses the working-fallback-hides-a-dead-primary
+    # pattern. It also makes jetty a fleet-wide SPOF by design, so §8.0 of the plan turns five
+    # reliability items into REQUIREMENTS — the startup throughput probe most of all, because
+    # ROCm#6347 fixes decode throughput at process spawn silently and "up but permanently slow"
+    # is precisely the failure go-dark does NOT catch.
+    #
+    # ⚠️ Port 30000 is SGLang's default and is PROVISIONAL — confirm on first deploy.
+    # ⚠️ Gate A must pass before this goes active: SGLang prefill tok/s on a SINGLE R9700 with
+    # our actual abliterated Qwen3.6. Every number motivating this move was measured on a
+    # DIFFERENT model (a plain MoE, no Gated-DeltaNet). See §8.1.
+    kind: chat
+    status: planned
+    proxy_endpoint: false           # owns no endpoint class until Phase 3 cutover
+    role: tier2-chat
+    aliases: []                     # `companion-lite`/`chat`/`nexus-chat` migrate here at Phase 3
+    host: jetty
+    port: 30000
+    backend_engine: sglang
+    model_family: Qwen3.6-35B-A3B (abliterated, Heretic) — MoE 35B total / ~3B active
+    params: {active: 3B, total: 35B}
+    capabilities:
+      vision: false                 # vision lives on tier2-analyst; this lane is text-only
+      streaming: true
+      reasoning: false
+      tool_calling: true
+      structured_output: true
+    purpose: |
+      RESERVED. The fleet-wide conversational model — the orchestrator inner chat loop, the
+      glasses assistant lane, and Discord's conversational turns. Long-form authoring does NOT
+      come here: it goes to tier3 (operator decision 2026-08-18), which keeps this lane purely
+      interactive with no 1800s jobs competing with a chat turn.
+    notes: |
+      NOT BUILT. Reserved so the name exists before the traffic does. Full design, gates and
+      phasing: originfleet/docs/tier2_split_architecture_2026-08.md.
+
+  # RENAMED 2026-08-18: `creative` → `tier2-analyst` (operator decision — every official role
+  # carries the `tier` designator). This is a NAME change only. `role:` and `endpoint_class:`
+  # below are DELIBERATELY still `creative`, because they are what the wire and the code key off:
+  # the llama.cpp container runs `-a creative`, and `timeout_model.FLOOR_S`, `usage_rates` and
+  # `DEFAULT_ENDPOINTS` are all keyed by the class string. Changing those is a code sweep plus a
+  # backend restart; changing the catalog key is neither. `creative` stays in `aliases:` so every
+  # existing caller keeps resolving (schema rule: rename → change the key, old name → aliases).
+  #
+  # 🚨 NOTHING MOVED IN THIS CHANGE. Every alias below — including the CHAT ones
+  # (`companion-lite`, `chat`, `nexus-chat`) — still resolves HERE, to the boxa. They migrate to
+  # `tier2-chat` at the Phase 3 cutover, once jetty exists and its gates pass. Splitting them now
+  # would point live chat traffic at a backend that does not exist.
+  # Plan: originfleet/docs/tier2_split_architecture_2026-08.md §7, §9.
+  tier2-analyst:
     kind: chat
     status: active                  # PINNED always-resident on the boxa. Standalone docker container `llamacpp-creative-boxa` (--restart always) on :9196 — no dispatcher/systemd; proxy dispatches directly, capacity self-discovered via /props. CONSOLIDATED 2026-07-11: ONE Qwen3.6-35B-A3B-abliterated container (+mmproj) now backs THREE roles — `creative`, `companion-lite`(alias, chat loop), AND the `classify`/`analyst`/vision family(alias, re-homed off anvil :9092). Superseded the Trinity-Mini(creative)/Gemma-4-26B(companion-lite) split AND the anvil llama-classify.service (stopped). Not evictable (dedicated card) — the anvil eviction dance is gone.
     proxy_endpoint: true
     endpoint_class: creative
     role: creative
-    aliases: [tier2, deckard, deckard-31b, companion-lite, qwen-classify, classify, chat, nexus-chat, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]   # THREE roles now resolve to this ONE boxa endpoint (2026-07-11 consolidation): (1) creative, (2) companion-lite = the orchestrator inner chat loop, (3) the whole classify/analyst/vision family (re-homed off anvil :9092). All pure ALIASES of the single endpoint so no caller changes AND slots aren't double-counted (two stanzas at one URL would double-count the 6 slots). deckard/deckard-31b are HISTORICAL anvil NVFP4 rollback aliases (the deployed model is NOT a DECKARD finetune).
+    aliases: [creative, tier2, deckard, deckard-31b, companion-lite, qwen-classify, classify, chat, nexus-chat, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]   # THREE roles now resolve to this ONE boxa endpoint (2026-07-11 consolidation): (1) creative, (2) companion-lite = the orchestrator inner chat loop, (3) the whole classify/analyst/vision family (re-homed off anvil :9092). All pure ALIASES of the single endpoint so no caller changes AND slots aren't double-counted (two stanzas at one URL would double-count the 6 slots). deckard/deckard-31b are HISTORICAL anvil NVFP4 rollback aliases (the deployed model is NOT a DECKARD finetune). `creative` became an alias in the 2026-08-18 rename. ⚠️ Bare `tier2` DELIBERATELY stays here rather than following the conversational role (operator decision 2026-08-18) — it has live callers (sidekick/song_studio.py:425, discord_schema_smoke, llm_benchmark, external_facade, ~10 tools) and re-pointing a live alias at a different model is the exact July `companion` failure. Revisit at Phase 3: if `tier2` should mean the chat tier, SWEEP THE CALLERS, do not silently re-point.
     host: nasbox
     port: 9196
     backend_engine: llama.cpp
