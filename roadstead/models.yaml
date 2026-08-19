@@ -752,6 +752,28 @@ models:
   # would point live chat traffic at a backend that does not exist.
   # Plan: originfleet/docs/tier2_split_architecture_2026-08.md §7, §9.
   tier2-analyst:
+    # 🔒 NEXT MODEL DECIDED 2026-08-19 (operator): **Qwen3.8-27B** replaces Qwen3.6-35B-A3B here.
+    # ⚠️ NOT DEPLOYED YET — every field below still describes what the boxa is ACTUALLY serving
+    # today (Qwen3.6-35B-A3B abliterated). Do not edit them to the new model until it is live;
+    # a catalog that describes a design rather than a deployment is how this repo has been
+    # burned before. Flip model_family/quant/params/token_speed IN THE SAME COMMIT as the swap.
+    #
+    # The decided serve config, measured on the boxa (tier2_split_architecture_2026-08.md §8.1g/i):
+    #   -m Qwen3.8-27B-Q4_0.gguf --mmproj mmproj-bf16.gguf
+    #   -fa on -ctk f16 -ctv f16 -b 8192 -ub 4096
+    #   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.4
+    #   --jinja --chat-template-kwargs '{"enable_thinking":false}'
+    # Staged at /mnt/cache/llm/qwen38-27b on nasbox. 592 prefill / 47.3 decode at 2.6K;
+    # 866/41.3 at 32K. Dense 27B, native vision (no separate VL), built-in MTP head.
+    #
+    # 🚨 THREE THINGS THAT MUST NOT BE CHANGED CASUALLY when this lands:
+    #  1. `enable_thinking:false` is LOAD-BEARING. With thinking on, llama.cpp #20345 silently
+    #     DISABLES response_format enforcement on this model family. Verified today that the
+    #     live endpoint enforces (forced-enum probe); never enable thinking without re-testing.
+    #  2. Q4_0 not Q4_K_M. For a DENSE model on SYCL, Q4_0 decode is 26% faster — the INVERSE
+    #     of the MoE law recorded in memory `reference_boxa_backend_and_moe_fit`.
+    #  3. MTP is worth +94% decode on SYCL and is a NET LOSS on Vulkan. Backend-specific.
+    #     Stay on SYCL: measured 1.9x prefill / 1.5x decode over Vulkan on this card (§8.1h).
     kind: chat
     status: active                  # PINNED always-resident on the boxa. Standalone docker container `llamacpp-creative-boxa` (--restart always) on :9196 — no dispatcher/systemd; proxy dispatches directly, capacity self-discovered via /props. CONSOLIDATED 2026-07-11: ONE Qwen3.6-35B-A3B-abliterated container (+mmproj) now backs THREE roles — `creative`, `companion-lite`(alias, chat loop), AND the `classify`/`analyst`/vision family(alias, re-homed off anvil :9092). Superseded the Trinity-Mini(creative)/Gemma-4-26B(companion-lite) split AND the anvil llama-classify.service (stopped). Not evictable (dedicated card) — the anvil eviction dance is gone.
     proxy_endpoint: true
