@@ -263,6 +263,17 @@ class EndpointConfig:
     # never means anything). max_slots/context stay config-seeded.
     skip_discovery: bool = False
 
+    # This endpoint backs the fleet's CONVERSATIONAL lane, so `/readyz` fails
+    # CLOSED when it is unhealthy or paused (tier2 split plan §8.0 req 4:
+    # "the proxy stops dispatching rather than queueing to a dead box").
+    #
+    # Deliberately a DECLARATION rather than `kind: chat`, which spans tier1
+    # router through tier3 reasoner — 503-ing fleet readiness because a
+    # long-form authoring tier was down would be a different and wrong claim.
+    # ⚠️ It marks a ROLE, so it MOVES with that role: at the Phase 3 cutover it
+    # leaves `tier2-analyst` and lands on `tier2-chat`.
+    readiness_critical: bool = False
+
     @property
     def effective_max_slots(self) -> int:
         """Concurrency ceiling the scheduler dispatches against: max_slots,

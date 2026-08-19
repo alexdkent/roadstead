@@ -1206,6 +1206,61 @@ class ProxyHttpHandlers:
             },
             status_code=200 if ok else 503,
         )
+    async def handle_readyz(self, request: Request) -> Response:
+        """READINESS, which is the opposite question from `/health` above.
+
+        `/health` is deliberately fail-OPEN — a dead backend degrades its status
+        but must not 503 the proxy, because a monitor should not restart a
+        healthy front door over a backend blip (alert-don't-kill). That is right
+        for liveness and useless for routing.
+
+        `/readyz` fails CLOSED (tier2 split plan §8.0 req 4): when the endpoint
+        backing the conversational lane is unhealthy or paused, say NOT READY so
+        callers stop dispatching rather than queueing at a dead box. Under the
+        fleet-wide go-dark decision a chat surface must refuse the turn and say
+        so, and it cannot do that if the proxy keeps accepting work.
+
+        🚨 THIS DOES NOT SEE "UP BUT SLOW", and must not be read as if it did.
+        It is built on the circuit-breaker health flag, and `Health._probe` RESETS
+        `consecutive_failures` to 0 whenever `/health` answers — so a backend that
+        responds promptly and generates at a fraction of its speed is, to this
+        endpoint, perfectly ready. Slow detection lives in two other places by
+        design: `infra/jetty/tier2-chat/bootgate.py` catches a bad SPAWN at boot
+        (§8.0 req 1), and the health-verifier ground-truth verifier catches slow DRIFT
+        continuously (§8.0 req 2). Do not add a latency guess here to paper over
+        that — a readiness endpoint that flaps on a slow prompt is worse than one
+        with a documented blind spot.
+        """
+        critical = [
+            name for name, cfg in self.state.config.endpoints.items()
+            if getattr(cfg, "readiness_critical", False)
+        ]
+        scheduler_ok = self.health.scheduler_loop_alive()
+        unready: dict[str, str] = {}
+        for name in critical:
+            if name in self.state.paused_endpoints:
+                unready[name] = "paused"          # operator drain
+            elif not self.state.endpoint_health.get(name, {}).get("healthy", True):
+                unready[name] = "circuit_open"    # consecutive probe failures
+        if not scheduler_ok:
+            unready["_scheduler"] = "dead"
+        ready = not unready
+        return JSONResponse(
+            {
+                "ready": ready,
+                # Empty `critical` means NOTHING declared itself conversational,
+                # which is a config error rather than a clean bill of health —
+                # reported so it cannot masquerade as ready. (An endpoint whose
+                # role has not been cut over yet is the expected cause.)
+                "readiness_critical_endpoints": critical,
+                "unready": unready,
+                "scheduler_alive": scheduler_ok,
+                "reason": ("ok" if ready else
+                           ", ".join(f"{k}={v}" for k, v in sorted(unready.items()))),
+            },
+            status_code=200 if ready else 503,
+        )
+
     def audit_admin_ip(self, route: str, remote_ip: str) -> None:
         """Track source IPs per admin-ish route (exposed on /v1/status) and log
         the FIRST hit per (route, ip) — the data the ACL-tightening go/no-go

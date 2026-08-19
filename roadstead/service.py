@@ -701,6 +701,14 @@ class ProxyService:
     async def handle_health(self, request: Request) -> Response:
         return await self._http.handle_health(request)
 
+    async def handle_readyz(self, request: Request) -> Response:
+        # Liveness is handle_health (fail-open); this is READINESS and fails
+        # closed on the conversational endpoint — §8.0 req 4. ProxyHttpHandlers
+        # is composed, not inherited, so a handler needs this delegator too:
+        # routes.py calls `svc.handle_readyz`, and without it the route 500s
+        # with AttributeError rather than failing to register.
+        return await self._http.handle_readyz(request)
+
     # ----- scheduler loop -----
 
     def _on_loop_task_exit(self, name: str, task: asyncio.Task) -> None:

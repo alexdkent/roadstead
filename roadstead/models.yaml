@@ -804,6 +804,17 @@ models:
       fast_path_reserve_slots: 2     # reserve 2 of 6 slots for interactive chat turns (companion-lite alias) so a real-time chat turn isn't head-of-line blocked behind a background song-compose.
       # llama.cpp --parallel. Keep EQUAL to `slots: 6` above; the shadow reconciler warns on drift.
       documented_max_num_seqs: 6
+      # 🚨 THIS ENDPOINT BACKS THE CONVERSATIONAL LANE, so `/readyz` fails CLOSED
+      # when it is unhealthy or paused (§8.0 req 4 of the tier2 split plan): the
+      # proxy must stop accepting work rather than queue it at a dead box, or a
+      # chat surface cannot go dark and say so. NOT derived from `kind: chat`,
+      # which spans tier1 router through tier3 reasoner — 503-ing fleet readiness
+      # because long-form authoring was down is a different, wrong claim.
+      # ⚠️ IT MARKS A ROLE AND MUST MOVE WITH IT: at the Phase 3 cutover this
+      # line leaves `tier2-analyst` and lands on the `tier2-chat` stanza, in the
+      # SAME commit as the alias move. Leaving it here would point readiness at
+      # the box the conversational lane no longer uses.
+      readiness_critical: true
     capabilities:
       vision: true                  # mmproj loaded (mmproj-bf16.gguf, 861 MB) — classify's vision callers (attachments stage-2, knowledge_store intake, browser_broker perceive./vision.) route here now. Verified 2026-07-11: perfect OCR + shape/number extraction on the boxa/SYCL, ~79 t/s vision decode.
       streaming: true

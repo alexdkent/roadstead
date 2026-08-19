@@ -67,6 +67,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_health(request: Request) -> Response:
         return await svc.handle_health(request)
 
+    async def handle_readyz(request: Request) -> Response:
+        return await svc.handle_readyz(request)
+
     async def handle_history(request: Request) -> Response:
         return await svc.handle_history(request)
 
@@ -171,6 +174,10 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         # Runtime feature flags: the shadow→enforce flip surface (internal/ACL).
         Route("/v1/admin/flags", handle_admin_flags, methods=["GET", "POST"]),
         Route("/health", handle_health, methods=["GET"]),
+        # LIVENESS is /health (fail-open, alert-don't-kill). READINESS is here
+        # and fails CLOSED on the conversational endpoint — §8.0 req 4. The two
+        # answer different questions; do not collapse them.
+        Route("/readyz", handle_readyz, methods=["GET"]),
         # Prometheus text exposition of current QoS aggregates (scraped by VM).
         Route("/metrics", handle_prometheus_metrics, methods=["GET"]),
     ]

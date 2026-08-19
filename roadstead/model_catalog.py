@@ -272,6 +272,11 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
             # test_json_object_guard.py::test_models_yaml_flag_reaches_endpoint_config
             # is the guard that this one is really wired.
             ("disable_any_whitespace", "disable_any_whitespace"),
+            # §8.0 req 4 — marks the endpoint backing the conversational lane,
+            # which is what `/readyz` fails closed on. Guarded by
+            # test_readyz.py::test_readiness_critical_flag_reaches_endpoint_config,
+            # because a key missing from THIS tuple is silently dropped.
+            ("readiness_critical", "readiness_critical"),
         ):
             if src in pol:
                 kw[dst] = pol[src]
