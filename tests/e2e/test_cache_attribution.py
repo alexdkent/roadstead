@@ -82,10 +82,13 @@ async def test_sync_capture_rollup_deblend_and_surfaces(proxy):
         assert (await proxy.chat("hi", model="thinker")).status_code == 200
 
     attr = _attr(proxy)
-    # "chat" model= input normalizes to the "creative" endpoint class (the boxa
-    # :9196 llama.cpp endpoint that backs chat/classify/analyst/vision as aliases
-    # after the 2026-07-11 one-model consolidation).
-    chat_ep = next(e for e in attr["by_endpoint"] if e["endpoint"] == "creative")
+    # 2026-08-19 (tier2 split): `model="chat"` normalizes to the "tier2-chat"
+    # endpoint class now — jetty's llama.cpp/Vulkan box — NOT "creative". `chat`
+    # left the boxa with the whole conversational lane. The test's shape is
+    # unchanged (llama.cpp emits no prefix-cache counter on either box); only
+    # the class the rows land under moved, which is precisely the drift a
+    # hardcoded class name here would have hidden.
+    chat_ep = next(e for e in attr["by_endpoint"] if e["endpoint"] == "tier2-chat")
     assert chat_ep["attributed_calls"] == 2
     assert chat_ep["unattributed_calls"] == 0
     assert chat_ep["cached_tokens"] == 12             # 2 × 6
@@ -107,7 +110,7 @@ async def test_sync_capture_rollup_deblend_and_surfaces(proxy):
     assert resp.status_code == 200
     j = resp.json()
     assert set(("window_s", "by_call_site", "by_endpoint", "fleet")) <= set(j)
-    assert any(r["endpoint"] == "creative" and r["hit_rate"] == 0.5
+    assert any(r["endpoint"] == "tier2-chat" and r["hit_rate"] == 0.5
                for r in j["by_endpoint"])
     for row in j["by_call_site"]:
         assert set(("call_site", "endpoint", "calls", "attributed_calls",
@@ -123,8 +126,9 @@ async def test_endpoint_rate_uses_real_backend_metric_not_null(proxy):
     counter) shows n/a — never a fabricated 0.
 
     The fake exposes vllm:prefix_cache_{hits,queries}_total from these knobs;
-    'thinker' is a vLLM endpoint, 'chat' (→ 'creative', the boxa llama.cpp
-    endpoint post-2026-07-11 consolidation) has no counter."""
+    'thinker' is a vLLM endpoint, 'chat' (→ 'tier2-chat' since the 2026-08-19
+    split — jetty's llama.cpp/Vulkan box; it was the boxa 'creative' class
+    before) has no counter."""
     proxy.controller.prefix_cache_hits = 40
     proxy.controller.prefix_cache_queries = 100     # → 0.40 real endpoint rate
     await proxy.chat("hi", model="thinker")
@@ -135,7 +139,7 @@ async def test_endpoint_rate_uses_real_backend_metric_not_null(proxy):
     # /v1/status: real rate for the vLLM endpoint, absent for llama.cpp.
     snap = (await proxy.client.get("/v1/status")).json()["endpoints"]
     assert snap["thinker"].get("cache_hit_rate") == 0.4
-    assert "cache_hit_rate" not in snap["creative"], "llama.cpp has no counter → n/a"
+    assert "cache_hit_rate" not in snap["tier2-chat"], "llama.cpp has no counter → n/a"
 
     # attribution by_endpoint: the vLLM row's headline hit_rate is overlaid with
     # the real metric + flagged; llama.cpp stays n/a (no overlay).
@@ -143,7 +147,7 @@ async def test_endpoint_rate_uses_real_backend_metric_not_null(proxy):
     thinker = next(r for r in j["by_endpoint"] if r["endpoint"] == "thinker")
     assert thinker["hit_rate"] == 0.4
     assert thinker["hit_rate_source"] == "backend_prefix_cache_metrics"
-    chat = next((r for r in j["by_endpoint"] if r["endpoint"] == "creative"), None)
+    chat = next((r for r in j["by_endpoint"] if r["endpoint"] == "tier2-chat"), None)
     if chat is not None:  # llama.cpp: no metric overlay, no source flag
         assert "hit_rate_source" not in chat
 
@@ -154,7 +158,7 @@ async def test_stream_cached_tokens_captured(proxy):
     proxy.controller.cached_tokens = 3   # 3/12 = 0.25
     frames = await proxy.stream_frames("a b c", model="chat")
     assert frames and any("[DONE]" in f or "stop" in f for f in frames)
-    chat_ep = next(e for e in _attr(proxy)["by_endpoint"] if e["endpoint"] == "creative")
+    chat_ep = next(e for e in _attr(proxy)["by_endpoint"] if e["endpoint"] == "tier2-chat")
     assert chat_ep["attributed_calls"] == 1
     assert chat_ep["cached_tokens"] == 3
     assert chat_ep["hit_rate"] == 0.25

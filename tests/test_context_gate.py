@@ -57,18 +57,19 @@ async def test_shadow_counts_but_admits():
     _ok_backend(svc)
     await svc.startup()
     try:
-        # chat (-> creative, the boxa :9196 endpoint after the 2026-07-11 one-model
-        # consolidation, 65536/slot); ~150K tokens ≈ 600K chars blows it.
+        # chat (-> tier2-chat, jetty :30000, since the 2026-08-19 tier2 split;
+        # 262144/slot). ~300K tokens ≈ 1.2M chars blows it. The old numbers here
+        # (600K chars against creative's 65536) went with the alias.
         resp = await asyncio.wait_for(
-            svc.handle_submit(_body("chat", 600_000, timeout_s=10.0), _Req()),
+            svc.handle_submit(_body("chat", 1_200_000, timeout_s=10.0), _Req()),
             timeout=10.0)
         assert resp.status_code == 200  # shadow: admitted (backend faked ok)
-        tally = svc._context_overflows["creative"]
+        tally = svc._context_overflows["tier2-chat"]
         assert tally["count"] == 1
         assert tally["callers"] == {"a": 1}
-        assert tally["max_est_in"] >= 149_000
+        assert tally["max_est_in"] >= 299_000
         status = json.loads((await svc.handle_status(_Req())).body)
-        assert "creative" in status["reliability"]["context_overflows_shadow"]
+        assert "tier2-chat" in status["reliability"]["context_overflows_shadow"]
     finally:
         await svc.shutdown()
 
@@ -77,8 +78,8 @@ async def test_shadow_counts_but_admits():
 async def test_enforce_422_with_chunker_marker_and_code():
     svc = ProxyService(ProxyConfig())
     svc._flags.set_many({"context_gate_enforce": True})
-    # classify 131072/slot (kv-unified, 2026-07-04) → ~150K tokens ≈ 600K chars.
-    resp = await svc.handle_submit(_body("chat", 600_000), _Req())
+    # chat -> tier2-chat, 262144/slot (2026-08-19 split) → ~300K tokens ≈ 1.2M chars.
+    resp = await svc.handle_submit(_body("chat", 1_200_000), _Req())
     body = json.loads(resp.body)
     assert resp.status_code == 422
     assert body["code"] == "context_overflow"
@@ -92,10 +93,27 @@ async def test_enforce_422_with_chunker_marker_and_code():
 async def test_enforce_max_tokens_counts_toward_limit():
     svc = ProxyService(ProxyConfig())
     svc._flags.set_many({"context_gate_enforce": True})
-    # chat: 131072/slot (kv-unified, 2026-07-04). est_in ≈ 130000 fits alone;
-    # +4000 max_tokens (→134000) overflows — proves max_tokens counts toward the limit.
+    # 🚨 THIS TEST WAS VACUOUS AND THE 2026-08-19 SPLIT EXPOSED IT. It claimed
+    # "est_in ≈ 130000 fits alone; +4000 max_tokens overflows", sized against a
+    # 131072/slot comment — but `chat` resolved to `creative`, which was trimmed
+    # 131072 -> 65536 on 2026-07-11. est_in of 130000 was ALREADY double the real
+    # limit, so the 422 came from the input alone and the max_tokens bump proved
+    # nothing. A guard satisfiable by something OTHER than the thing it is about.
+    #
+    # Re-sized against tier2-chat's real 262144, and with the CONTROL asserted:
+    # 1_048_000 chars = 262,000 est_in, which fits alone (+100 default max_tokens
+    # = 262,100 <= 262,144) and only overflows once max_tokens=4000 is counted.
+    # Without the control the repair could rot back into the same vacuum.
+    # The control asserts the GATE's verdict, not the call's outcome: with no
+    # faked backend an admitted request just times out, and a 200 here would be
+    # asserting the wrong thing. What must be true is that the gate did not
+    # reject it — no 422, no context_overflow code.
+    ok = await svc.handle_submit(_body("chat", 1_048_000, timeout_s=0.05), _Req())
+    assert ok.status_code != 422 and json.loads(ok.body).get("code") != "context_overflow", (
+        "control: est_in must FIT alone, or the max_tokens assertion below is "
+        "satisfied by the input size and proves nothing")
     resp = await svc.handle_submit(
-        _body("chat", 520_000, max_tokens=4000), _Req())
+        _body("chat", 1_048_000, max_tokens=4000), _Req())
     assert resp.status_code == 422
 
 
@@ -155,12 +173,12 @@ async def test_non_chat_and_unknown_context_skip_the_gate():
         assert resp.status_code == 200
         # An endpoint with context_per_slot == 0 (nothing discovered/seeded)
         # must skip rather than reject everything.
-        # `chat` aliases to the `creative` endpoint post-2026-07-11 consolidation.
-        svc._config.endpoints["creative"].context_per_slot = 0
+        # `chat` aliases to the `tier2-chat` endpoint since the 2026-08-19 split.
+        svc._config.endpoints["tier2-chat"].context_per_slot = 0
         resp = await asyncio.wait_for(
             svc.handle_submit(_body("chat", 200_000, timeout_s=10.0), _Req()),
             timeout=10.0)
         assert resp.status_code == 200
-        assert "creative" not in svc._context_overflows
+        assert "tier2-chat" not in svc._context_overflows
     finally:
         await svc.shutdown()

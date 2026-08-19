@@ -671,9 +671,9 @@ models:
       Served window is 32K (down from the 27B's 128K), matching the fleet chunkers.
 
   tier2-chat:
-    # 🟡 BUILT AND SERVING, NOT ROUTED (updated 2026-08-19). The box is real and the server is
-    # up; `status: planned` now means only "nothing dispatches here yet". No caller should name
-    # it until the Phase 3 cutover, which is a separate operator decision.
+    # ✅ LIVE AND ROUTED (Phase 3 cutover, 2026-08-19). `chat`, `nexus-chat` and
+    # `companion-lite` resolve HERE now — that is the orchestrator inner chat loop, the glasses
+    # lane and Discord's conversational turn. Bare `tier2` stayed on the analyst (see below).
     #
     # What is actually running: the SAME abliterated Qwen3.6-35B-A3B Heretic Q4_K_M that
     # `tier2-analyst` serves on the boxa — no requantisation, no persona change — on jetty's
@@ -701,19 +701,64 @@ models:
     # NAT shim, so `host: jetty, port: 30000` is literally true and verified end-to-end).
     # ✅ Gate A is retired as written — it asked for SGLang prefill. Both engines were measured
     # on the real card with our actual abliterated Qwen3.6; llama.cpp won. See the runbook.
-    # ⚠️ Gate G (startup throughput probe) is still OPEN and is the one that matters before
-    # cutover: "up but permanently slow" answers /health perfectly and go-dark will not catch it.
+    # ✅ Gate G CLOSED — `infra/jetty/tier2-chat/bootgate.py` runs as ExecStartPost and asserts one
+    # server, decode >= 90 tok/s and real schema enforcement, restarting the unit if any fails.
+    # "Up but permanently slow" answers /health perfectly, so the boot gate and the health-verifier
+    # `llm_tier_dispatch` probe (slow_after_s: 8) are what catch it — /readyz structurally cannot.
     kind: chat
-    status: planned
-    proxy_endpoint: false           # owns no endpoint class until Phase 3 cutover
+    status: active                  # ROUTED 2026-08-19 (Phase 3 cutover)
+    proxy_endpoint: true
+    endpoint_class: tier2-chat      # its OWN class — `creative` stays with the analyst. A class
+                                    # string is what `timeout_model.FLOOR_S`, `usage_rates` and
+                                    # `DEFAULT_ENDPOINTS` key off, so a new class is a mirrored
+                                    # edit in all three (test_timeout_floor_yaml_sync is loud).
     role: tier2-chat
-    aliases: []                     # `companion-lite`/`chat`/`nexus-chat` migrate here at Phase 3
+    # ⚠️ `tier2-chat` MUST be listed here even though it is the entry's KEY — build_role_aliases()
+    # iterates `aliases` ONLY, so the key alone would 404 at the proxy (measured 2026-08-18 on
+    # `tier2-analyst`; pinned by test_every_canonical_name_is_dispatchable).
+    #
+    # MOVED HERE 2026-08-19 from `tier2-analyst`: `chat`, `nexus-chat` and `companion-lite`.
+    # `companion-lite` carries the orchestrator inner chat loop (loop_runner.LOOP_CHAT_ROLE) AND
+    # the glasses lane (agents/glasses/service.py LLM_ROLE) — moving the ALIAS moves both without
+    # touching either call site, which is the whole point of routing by role.
+    # 🚨 Bare `tier2` DELIBERATELY does NOT move (operator decision 2026-08-19). It also carries
+    # discord's ATTRIBUTION/SELF_STATE/NIGHTSHIFT/ARC_MODEL_ROLE (`agents/discord/_common.py`),
+    # song_studio and ~10 tools, all of which must stay on the analyst. Discord's CHAT turn got
+    # its OWN role instead — `_common.CHAT_MODEL_ROLE = "tier2-chat"`.
+    aliases: [tier2-chat, chat, nexus-chat, companion-lite]
     host: jetty
     port: 30000
     backend_engine: llama.cpp      # NOT sglang — built, measured and dropped 2026-08-18
     probe_kind: llama
     model_family: Qwen3.6-35B-A3B (abliterated, Heretic) — MoE 35B total / ~3B active
+    quant: Q4_K_M                   # the same file the boxa serves — no requantisation
     params: {active: 3B, total: 35B}
+    context_per_slot: 262144        # STARTUP SEED — the capacity poller overwrites from /props.
+                                    # llama.cpp reports n_ctx_slot=262144 (the model's own limit);
+                                    # under `--kv-unified` the real bound is the SHARED 448K pool,
+                                    # i.e. the SUM of live conversations, ~22.4K per slot at 20.
+    context_window: 32768           # POLICY, not slot size — same 32K the fleet chunkers size
+                                    # against on tier2-analyst, so moving an alias here changes
+                                    # no caller's chunking.
+    slots: 20                       # llama.cpp -np 20, shared 448K f16 KV pool (~30.0 of 31.9 GiB)
+    timeout_floor_s: 120            # HELD EQUAL to tier2-analyst's floor on purpose: this cutover
+                                    # moves aliases, not callers, and a floor change at the same
+                                    # time would confound any post-cutover latency reading.
+                                    # Right-sizing is Phase 5, after the workload is proved.
+                                    # (mirrors timeout_model FLOOR_S["tier2-chat"] — bump BOTH.)
+    # NOTE: no `timeout_ceiling_s` override, deliberately — unlike tier2-analyst this lane has no
+    # inherently long-running caller (long-form authoring goes to tier3, operator decision
+    # 2026-08-18), so the standard interactive/background bands apply.
+    policy:
+      # llama.cpp -np. Keep EQUAL to `slots: 20`; the shadow reconciler warns on drift.
+      documented_max_num_seqs: 20
+      # 🚨 MOVED HERE 2026-08-19 from `tier2-analyst`, in the same commit as the alias move.
+      # It marks the CONVERSATIONAL ROLE, and the conversational role now lives on jetty: with
+      # go-dark there is no fallback, so `/readyz` must fail closed here or the proxy would keep
+      # accepting work for a dead box and no chat surface could refuse and say so (§8.0 req 4).
+      # Leaving it on the analyst would have pointed fleet readiness at the box the chat lane no
+      # longer uses. Exactly one endpoint may carry it — test_exactly_one_endpoint_is_conversational.
+      readiness_critical: true
     capabilities:
       vision: false                 # vision lives on tier2-analyst; this lane is text-only
       streaming: true
@@ -726,13 +771,18 @@ models:
       come here: it goes to tier3 (operator decision 2026-08-18), which keeps this lane purely
       interactive with no 1800s jobs competing with a chat turn.
     notes: |
-      BUILT AND SERVING as of 2026-08-18, NOT ROUTED. The name exists and so does the traffic
-      path; only the alias cutover is left. Runbook (config + every measured number):
-      infra/jetty/tier2-chat/README.md. Design, gates and phasing:
+      SERVING since 2026-08-18, ROUTED since the Phase 3 cutover 2026-08-19. Runbook (config +
+      every measured number): infra/jetty/tier2-chat/README.md. Design, gates and phasing:
       originfleet/docs/tier2_split_architecture_2026-08.md.
-      Liveness is watched by fleet-health `jetty-tier2-chat` (infra/fleet-health/services.yaml) —
-      registered deliberately while planned, because build_telemetry_units() and the
-      llm_tier_dispatch scenario are both blind to a non-active endpoint.
+      🚨 EDITING THIS STANZA CHANGES NOTHING UNTIL THE PROXY AND GATEWAY RESTART. The catalog is
+      cached per process (model_catalog._cache) and config.DEFAULT_ENDPOINTS is built at import,
+      so a yaml edit is invisible to every surface — including the SPA Inference page, which
+      keeps rendering the OLD model with no error at all. Restart `llmproxy` AND `gateway`
+      (single-agent restarts, the preferred path). Checklist: plan doc §9b.
+      Liveness is watched by fleet-health `jetty-tier2-chat` (infra/fleet-health/services.yaml)
+      and, now that this endpoint is active, by the health-verifier `llm_tier_dispatch` scenario, whose
+      `roles:` list gained `tier2-chat` in the same commit — without that the fleet's whole
+      conversational lane would have gone unprobed while the analyst box kept reading green.
       🚫 Do NOT pin callers to a slot via `id_slot`. Measured 2026-08-19 on the deployed config:
       pinning the glasses lane to slot 0 gave 790 ms TTFT after a burst vs 204 ms unpinned
       (~3.9x WORSE, 14/14 pinned trials cold). llama.cpp has no server-side slot reservation,
@@ -746,10 +796,10 @@ models:
   # backend restart; changing the catalog key is neither. `creative` stays in `aliases:` so every
   # existing caller keeps resolving (schema rule: rename → change the key, old name → aliases).
   #
-  # 🚨 NOTHING MOVED IN THIS CHANGE. Every alias below — including the CHAT ones
-  # (`companion-lite`, `chat`, `nexus-chat`) — still resolves HERE, to the boxa. They migrate to
-  # `tier2-chat` at the Phase 3 cutover, once jetty exists and its gates pass. Splitting them now
-  # would point live chat traffic at a backend that does not exist.
+  # 🚨 THE SPLIT HAPPENED 2026-08-19 (Phase 3). The CHAT aliases — `companion-lite`, `chat`,
+  # `nexus-chat` — LEFT this stanza for `tier2-chat` on jetty, and `readiness_critical` went
+  # with them. What is left here is the ANALYST lane. When you read a number or a rationale
+  # below that argues from "this endpoint also serves the chat loop", it predates the split.
   # Plan: originfleet/docs/tier2_split_architecture_2026-08.md §7, §9.
   tier2-analyst:
     # 🔒 NEXT MODEL DECIDED 2026-08-19 (operator): **Qwen3.8-27B** replaces Qwen3.6-35B-A3B here.
@@ -785,7 +835,7 @@ models:
     # live call for role `tier2-analyst` got `404 unknown_endpoint` (known: creative, embed,
     # gemma, rerank, thinker) while `creative`/`tier2` answered fine. cat.canonical() resolving
     # the name is NOT evidence that the proxy will route it.
-    aliases: [tier2-analyst, creative, tier2, deckard, deckard-31b, companion-lite, qwen-classify, classify, chat, nexus-chat, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]   # THREE roles now resolve to this ONE boxa endpoint (2026-07-11 consolidation): (1) creative, (2) companion-lite = the orchestrator inner chat loop, (3) the whole classify/analyst/vision family (re-homed off anvil :9092). All pure ALIASES of the single endpoint so no caller changes AND slots aren't double-counted (two stanzas at one URL would double-count the 6 slots). deckard/deckard-31b are HISTORICAL anvil NVFP4 rollback aliases (the deployed model is NOT a DECKARD finetune). `creative` became an alias in the 2026-08-18 rename. ⚠️ Bare `tier2` DELIBERATELY stays here rather than following the conversational role (operator decision 2026-08-18) — it has live callers (sidekick/song_studio.py:425, discord_schema_smoke, llm_benchmark, external_facade, ~10 tools) and re-pointing a live alias at a different model is the exact July `companion` failure. Revisit at Phase 3: if `tier2` should mean the chat tier, SWEEP THE CALLERS, do not silently re-point.
+    aliases: [tier2-analyst, creative, tier2, deckard, deckard-31b, qwen-classify, classify, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]   # 🚨 SPLIT 2026-08-19 (Phase 3): `companion-lite`, `chat` and `nexus-chat` LEFT this list for `tier2-chat` on jetty. What remains is the ANALYST lane — the creative/long-form voice plus the whole classify/analyst/vision family (re-homed off anvil :9092 in the 2026-07-11 consolidation). All pure ALIASES of the single endpoint so no caller changes AND slots aren't double-counted (two stanzas at one URL would double-count the 6 slots). deckard/deckard-31b are HISTORICAL anvil NVFP4 rollback aliases (the deployed model is NOT a DECKARD finetune). `creative` became an alias in the 2026-08-18 rename. ⚠️ Bare `tier2` DELIBERATELY STAYS HERE (operator decision, re-affirmed 2026-08-19 at the cutover) — it has live callers that are NOT chat: discord attribution/self-state/nightshift/arc (agents/discord/_common.py), sidekick/song_studio.py:425, discord_schema_smoke, llm_benchmark, external_facade and ~10 tools. Re-pointing a live alias at a different model is the exact July `companion` failure, so Discord's chat turn was given its OWN role (`tier2-chat`) instead of `tier2` being moved under everybody else.
     host: nasbox
     port: 9196
     backend_engine: llama.cpp
@@ -797,24 +847,20 @@ models:
     context_per_slot: 65536          # llama.cpp -c 393216 --parallel 6 = 65536/slot, f16 KV cache. Trimmed 76800->65536 (2026-07-11) to make room for the mmproj (861 MB) + vision-encoder compute buffer now that classify/vision re-homed here; ~30.5 GiB resident of the 32GB boxa, no GTT spill.
     context_window: 32768            # fleet chunkers size against 32K on purpose (policy, not slot size) — same policy classify used, so re-homing classify here changes no chunk sizing
     slots: 6                         # llama.cpp --parallel 6 — the shadow reconciler warns if this drifts from actual --parallel (6)
-    timeout_floor_s: 120            # compromise: this endpoint now serves BOTH long creative song-compose AND latency-sensitive chat (companion-lite alias). 120s min-budget; adaptive surge×size widens to the ceiling for big song-compose, and a stuck chat turn fails in ~120s instead of 900s. (mirrors timeout_model FLOOR_S["creative"] — bump BOTH in lockstep.)
+    timeout_floor_s: 120            # compromise: this endpoint serves BOTH long creative song-compose AND latency-sensitive classify/vision/tool calls. 120s min-budget; adaptive surge×size widens to the ceiling for big song-compose, and a stuck call fails in ~120s instead of 900s. (mirrors timeout_model FLOOR_S["creative"] — bump BOTH in lockstep.) The chat-loop half of this compromise left with `companion-lite` on 2026-08-19; held at 120 through the cutover so a latency reading is not confounded by two changes at once — re-derive at Phase 5.
     timeout_ceiling_s: 1800         # inherently long-running (long-form gen); a role override so the generous background band applies on EVERY tier (song-compose runs at an interactive tier). Adaptive surge×size widens up to here.
     policy:
       background_floor_pct: 0.0
-      fast_path_reserve_slots: 2     # reserve 2 of 6 slots for interactive chat turns (companion-lite alias) so a real-time chat turn isn't head-of-line blocked behind a background song-compose.
+      fast_path_reserve_slots: 2     # reserve 2 of 6 slots for latency-sensitive traffic (the classify/analyst/vision family, discord's attribution+self-state gates, the ~10 tool callers on bare `tier2`) so none is head-of-line blocked behind a background song-compose. The chat-loop justification left with `companion-lite` on 2026-08-19; the reserve stays because the remaining interactive callers still need it. Re-derive at Phase 5 with the post-split workload, not before.
       # llama.cpp --parallel. Keep EQUAL to `slots: 6` above; the shadow reconciler warns on drift.
       documented_max_num_seqs: 6
-      # 🚨 THIS ENDPOINT BACKS THE CONVERSATIONAL LANE, so `/readyz` fails CLOSED
-      # when it is unhealthy or paused (§8.0 req 4 of the tier2 split plan): the
-      # proxy must stop accepting work rather than queue it at a dead box, or a
-      # chat surface cannot go dark and say so. NOT derived from `kind: chat`,
-      # which spans tier1 router through tier3 reasoner — 503-ing fleet readiness
-      # because long-form authoring was down is a different, wrong claim.
-      # ⚠️ IT MARKS A ROLE AND MUST MOVE WITH IT: at the Phase 3 cutover this
-      # line leaves `tier2-analyst` and lands on the `tier2-chat` stanza, in the
-      # SAME commit as the alias move. Leaving it here would point readiness at
-      # the box the conversational lane no longer uses.
-      readiness_critical: true
+      # 🚨 `readiness_critical` LEFT THIS STANZA 2026-08-19, in the same commit as the alias
+      # move — it is now on `tier2-chat`. It marks the CONVERSATIONAL role, and after the split
+      # this box no longer serves one: it serves creative/long-form authoring plus the
+      # classify/analyst/vision family. 503-ing fleet readiness because song-compose or a
+      # classify extract is down is a different, wrong claim — which is also why the flag was
+      # never derived from `kind: chat` (that spans tier1 router through tier3 reasoner).
+      # Exactly one endpoint may carry it; test_exactly_one_endpoint_is_conversational pins that.
     capabilities:
       vision: true                  # mmproj loaded (mmproj-bf16.gguf, 861 MB) — classify's vision callers (attachments stage-2, knowledge_store intake, browser_broker perceive./vision.) route here now. Verified 2026-07-11: perfect OCR + shape/number extraction on the boxa/SYCL, ~79 t/s vision decode.
       streaming: true

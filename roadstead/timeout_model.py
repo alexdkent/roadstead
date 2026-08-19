@@ -77,6 +77,18 @@ FLOOR_S: dict[str, float] = {
     # vision extract. Mirrors models.yaml creative.timeout_floor_s (bump BOTH in lockstep). (The former
     # companion-lite AND classify FLOOR_S entries are removed — both resolve via the alias.)
     "creative": 120.0,
+    # tier2-chat (Qwen3.6-35B-A3B abliterated, 20 slots on jetty's R9700 under
+    # llama.cpp/Vulkan). NEW CLASS 2026-08-19 at the Phase 3 split: `chat`,
+    # `nexus-chat` and `companion-lite` left the `creative` class for this one, so
+    # normalize_endpoint() resolves all three to "tier2-chat" and THIS floor is what
+    # the orchestrator inner loop, the glasses lane and Discord chat now get.
+    # Deliberately EQUAL to creative's 120s at the cutover: the split moves aliases,
+    # not callers, and changing the floor in the same commit would confound any
+    # post-cutover latency reading. This lane is purely interactive (long-form
+    # authoring goes to tier3) and decode here is ~1.5x the boxa, so 120 is loose —
+    # right-size it at Phase 5 against the proved workload, together with the yaml.
+    # Mirrors models.yaml tier2-chat.timeout_floor_s (bump BOTH in lockstep).
+    "tier2-chat": 120.0,
     "gemma": 60.0,
     # 2026-06-08: the "gemma-hot" endpoint class was removed from DEFAULT_ENDPOINTS
     # (E2B :9090 decommissioned; gemma-greeter consolidated onto the "gemma"/E4B

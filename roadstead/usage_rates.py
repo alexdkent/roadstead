@@ -55,6 +55,11 @@ _RATES_BY_CLASS: dict[str, tuple[float, float]] = {
     # so pre-cutover rows in the usage tables still price instead of falling to a default.
     "companion": (0.15, 0.60),   # historical: Qwen3.5-122B-A10B → Qwen3-235B-A22B-Instruct-2507
     "creative":  (0.15, 0.55),   # Qwen3.6-35B-A3B+vis → Qwen3-VL-30B-A3B-Instruct (vision billed as input tokens, no premium)
+    # 2026-08-19 tier2 split: the CHAT half of `creative` moved to its own class on
+    # jetty. Same weights, same quant, text-only (no mmproj on that box), so the same
+    # anchor — the row exists because the CLASS is what proxy_completions records and
+    # a class with no rate silently bills $0, which reads as "this lane is free".
+    "tier2-chat": (0.15, 0.55),  # Qwen3.6-35B-A3B (text) → Qwen3-VL-30B-A3B-Instruct
     "gemma":     (0.04, 0.08),   # Gemma-4-E4B         → Gemma-3-4B-it (DeepInfra)
     "embed":     (0.01, 0.0),    # BGE-M3 (EXACT model on DeepInfra) — market floor
     "rerank":    (0.02, 0.02),   # BGE-Reranker-v2-m3  → Voyage/Jina lite (per-token)
@@ -104,8 +109,14 @@ _ENDPOINT_CLASS: dict[str, str | None] = {
     # routable alias.
     "llama-companion": None, "tier3-backup": None, "llama-companion-122b": None,
     "creative": "creative", "deckard": "creative", "deckard-31b": "creative",
-    "companion-lite": "creative",
-    "chat": "creative", "nexus-chat": "creative",
+    # 2026-08-19 tier2 split: these three left `creative` for `tier2-chat` on jetty.
+    # Rows already in proxy_completions carry the endpoint string they were logged
+    # with, so both sides must keep pricing — the pre-cutover ones are `creative`
+    # traffic and the post-cutover ones are not, and mapping them all to one class
+    # would make the split invisible in the cost tables.
+    "tier2-chat": "tier2-chat",
+    "companion-lite": "tier2-chat",
+    "chat": "tier2-chat", "nexus-chat": "tier2-chat",
     "classify": "creative", "qwen-classify": "creative",
     "analyst": "creative", "qwen-analyst": "creative",
     "analyst-vision": "creative", "qwen-vision-8b": "creative",
