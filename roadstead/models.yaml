@@ -1032,6 +1032,46 @@ models:
       2026-07-02; relocated to Kestrel CTnnn "audio" (10.0.0.13, same
       image/port) 2026-07-03. Nasbox's copy left running as rollback during soak.
 
+  asr:
+    kind: stt
+    status: active
+    proxy_endpoint: false
+    role: nexus-asr
+    aliases: [nexus-asr, asr]
+    host: nexus
+    port: 9088
+    slots: 1
+    quant: q8_0
+    backend_engine: llama.cpp (Vulkan)
+    unit: nexus-asr.service
+    health_path: /health
+    model_family: nemotron-3.5-asr-streaming-0.6b
+    purpose: Streaming multilingual ASR for the glasses conversation lane.
+    when_used:
+      - the Even G2 glasses lane (and the phone microphone driving the same lane)
+    fallback: null
+    notes: |
+      🚨 DIALLED DIRECT, not through the proxy — the lane opens a WebSocket to
+      :9088/v1/realtime itself (docs/asr_api.md §7; the gateway facade cannot
+      carry a WS upgrade). Declared here anyway because this file is the
+      AUTHORITY the Inference page and the nexus telemetry lane read: an
+      ACTIVE unit that is undeclared here renders as a generic system_service
+      with no throughput/latency capability, and `inference_page_audit` has
+      been carrying a standing WARN about exactly that.
+
+      No `endpoint_class`, deliberately: this is not a proxy endpoint class, so
+      it must not enter ROLE_TO_CLASS (`build_role_to_class` skips entries
+      without one). The rollup key stays `asr` — `normalize_endpoint` strips
+      the `nexus-` prefix — which is what the gateway's usage join now
+      accounts for (`_usage_row_for`).
+
+      fallback: null is LITERAL. The English-only model was deleted at the
+      2026-08-18 swap with nothing behind it; multilingual costs +0.87 pp of
+      English WER (3.10 → 3.97 %, n=200) and that trade is permanent and
+      accepted. The lane pins a language by default (a LOCK, not an accuracy
+      control — pinned en-US and `auto` scored identically); pinning the WRONG
+      language returns an EMPTY transcript, not a wrong one.
+
   # ---------------------------------------------------------------- media / generation
   # All dispatcher-managed, on-demand (GPU-slot lease). Keyed by
   # dispatcher_capability; `unit` is the systemd unit the dispatcher brokers.
