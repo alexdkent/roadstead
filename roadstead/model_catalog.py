@@ -417,7 +417,14 @@ def build_telemetry_units(cat: Catalog | None = None, host: str = "") -> list[tu
     box (classifier shares router's E4B → excluded); media is dispatcher-managed
     (not telemetry); ``planned`` roles are excluded. Order is catalog order."""
     cat = cat or load_catalog()
-    probed = {"chat", "embed", "rerank", "ocr", "tts"}
+    # `stt` joined 2026-08-19 for nexus-asr, the glasses lane's streaming ASR.
+    # It is a first-class always-on service on nexus with its own /health, and
+    # leaving the kind out meant it could be DECLARED in the authority and still
+    # never probed — declared and invisible, which is the state it shipped in
+    # for a few hours. The only other stt entry is whisper-1 on kestrel-speech,
+    # and this function is only ever called with host nexus/anvil, so nothing
+    # else changes (enumerated against the live catalog, not inferred).
+    probed = {"chat", "embed", "rerank", "ocr", "tts", "stt"}
     out: list[tuple[str, str, int, str]] = []
     for e in cat.models.values():
         if e.host != host or e.status not in ("active", "on_demand"):

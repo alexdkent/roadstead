@@ -1042,6 +1042,14 @@ models:
     port: 9088
     slots: 1
     quant: q8_0
+    # 🔑 `systemd_unit` (no .service) is the TELEMETRY field — it is what
+    # build_telemetry_units() reads to probe a unit on the box. `unit:` below is
+    # the DISPATCHER-brokered field; every other entry using it is kind: media,
+    # and nexus-asr is a plain always-on service, not dispatcher-managed. They
+    # are different fields and setting only the second one leaves the service
+    # declared but unprobed — which is what shipped first.
+    systemd_unit: nexus-asr
+    probe_kind: health
     backend_engine: llama.cpp (Vulkan)
     unit: nexus-asr.service
     health_path: /health
