@@ -69,11 +69,12 @@ meta:
     nasbox: 10.0.0.10
     kestrel-speech: 10.0.0.13
     kestrel-perception: 10.0.0.18
-    # RESERVED, NOT BUILT (2026-08-18). The R9700 box that will serve
-    # `tier2-chat`. The address is a DHCP reservation driven by
-    # infra/firewall/host_inventory.yaml, and 🚨 its MAC there is still the
-    # PREVIOUS board's — jetty will not receive .27 until the real NIC MAC is
-    # captured at first boot and the inventory updated. Do not guess it.
+    # BUILT AND SERVING (2026-08-18/19). The R9700 box serving `tier2-chat`
+    # (llama.cpp/Vulkan, CTnnn, :30000). Not yet ROUTED — see the stanza below.
+    # The DHCP reservation MAC in infra/firewall/host_inventory.yaml was captured
+    # at first boot and corrected to 38:05:25:3a:91:bf, and applied live to
+    # OPNsense; forward + reverse DNS resolve. Runbook:
+    # infra/jetty/tier2-chat/README.md
     jetty: 10.0.0.27
   # Provider context-window values preserved VERBATIM for callers/DB rows that
   # are not (yet) covered by a role entry. anthropic is the no-op v2 fallback;
@@ -670,16 +671,23 @@ models:
       Served window is 32K (down from the 27B's 128K), matching the fleet chunkers.
 
   tier2-chat:
-    # 🔵 RESERVED 2026-08-18 — NAME AND HOST ONLY. NOT DEPLOYED, NOT ROUTED, NOTHING BEHIND IT.
-    # `status: planned` means exactly that (see the field reference at the top of this file):
-    # nothing dispatches here, and no caller should name it until Phase 3.
+    # 🟡 BUILT AND SERVING, NOT ROUTED (updated 2026-08-19). The box is real and the server is
+    # up; `status: planned` now means only "nothing dispatches here yet". No caller should name
+    # it until the Phase 3 cutover, which is a separate operator decision.
     #
-    # The plan: the abliterated Qwen3.6-35B-A3B currently serving as `tier2-analyst` on the boxa
-    # ALSO becomes the fleet's conversational model here, on jetty's Radeon AI PRO R9700 under
-    # SGLang — same weights, different host and engine. SGLang is chosen for its radix cache,
-    # which is global and token-keyed rather than per-slot, and is what attacks the measured
-    # defect: chat TTFT p50 204ms / p90 271ms but **p95 2688ms**, the ~2.5% prefix-cache miss
-    # paying a full reprefill. See tier2_split_architecture_2026-08.md §5.
+    # What is actually running: the SAME abliterated Qwen3.6-35B-A3B Heretic Q4_K_M that
+    # `tier2-analyst` serves on the boxa — no requantisation, no persona change — on jetty's
+    # Radeon AI PRO R9700 under **llama.cpp b10488 / Vulkan (RADV GFX1201)**. 20 slots, 448K
+    # shared f16 KV pool, `--kv-unified`, ~30.0 GiB of 31.9.
+    #
+    # 🚫 SGLang was built end-to-end on this card, measured, and DROPPED (operator decision
+    # 2026-08-18): decode 27.7 vs 125.7 tok/s, and it self-limited to max_running_requests=2 on
+    # KV capacity, giving p95 5,430 ms at 8 concurrent — WORSE than the 2,688 ms p95 defect this
+    # split exists to fix. Do not re-propose it without new evidence.
+    #
+    # Measured vs the incumbent boxa: prefill ~3.8× (3,443 vs 911 tok/s p50), decode ~1.5×
+    # (123-127 vs 82.2 tok/s), two-family warm TTFT 157/164 ms with both prefixes resident.
+    # Every number and the full tuning sweep: infra/jetty/tier2-chat/README.md.
     #
     # 🚨 DEGRADATION IS FLEET-WIDE GO DARK (operator decision 2026-08-18). When this endpoint is
     # unreachable every chat surface REFUSES the turn and says so — no fallback to tier2-analyst,
@@ -689,10 +697,12 @@ models:
     # ROCm#6347 fixes decode throughput at process spawn silently and "up but permanently slow"
     # is precisely the failure go-dark does NOT catch.
     #
-    # ⚠️ Port 30000 is SGLang's default and is PROVISIONAL — confirm on first deploy.
-    # ⚠️ Gate A must pass before this goes active: SGLang prefill tok/s on a SINGLE R9700 with
-    # our actual abliterated Qwen3.6. Every number motivating this move was measured on a
-    # DIFFERENT model (a plain MoE, no Gated-DeltaNet). See §8.1.
+    # ✅ Port 30000 CONFIRMED live (kept from the SGLang plan; llama.cpp is bound to it via a
+    # NAT shim, so `host: jetty, port: 30000` is literally true and verified end-to-end).
+    # ✅ Gate A is retired as written — it asked for SGLang prefill. Both engines were measured
+    # on the real card with our actual abliterated Qwen3.6; llama.cpp won. See the runbook.
+    # ⚠️ Gate G (startup throughput probe) is still OPEN and is the one that matters before
+    # cutover: "up but permanently slow" answers /health perfectly and go-dark will not catch it.
     kind: chat
     status: planned
     proxy_endpoint: false           # owns no endpoint class until Phase 3 cutover
@@ -700,7 +710,8 @@ models:
     aliases: []                     # `companion-lite`/`chat`/`nexus-chat` migrate here at Phase 3
     host: jetty
     port: 30000
-    backend_engine: sglang
+    backend_engine: llama.cpp      # NOT sglang — built, measured and dropped 2026-08-18
+    probe_kind: llama
     model_family: Qwen3.6-35B-A3B (abliterated, Heretic) — MoE 35B total / ~3B active
     params: {active: 3B, total: 35B}
     capabilities:
@@ -715,8 +726,17 @@ models:
       come here: it goes to tier3 (operator decision 2026-08-18), which keeps this lane purely
       interactive with no 1800s jobs competing with a chat turn.
     notes: |
-      NOT BUILT. Reserved so the name exists before the traffic does. Full design, gates and
-      phasing: originfleet/docs/tier2_split_architecture_2026-08.md.
+      BUILT AND SERVING as of 2026-08-18, NOT ROUTED. The name exists and so does the traffic
+      path; only the alias cutover is left. Runbook (config + every measured number):
+      infra/jetty/tier2-chat/README.md. Design, gates and phasing:
+      originfleet/docs/tier2_split_architecture_2026-08.md.
+      Liveness is watched by fleet-health `jetty-tier2-chat` (infra/fleet-health/services.yaml) —
+      registered deliberately while planned, because build_telemetry_units() and the
+      llm_tier_dispatch scenario are both blind to a non-active endpoint.
+      🚫 Do NOT pin callers to a slot via `id_slot`. Measured 2026-08-19 on the deployed config:
+      pinning the glasses lane to slot 0 gave 790 ms TTFT after a burst vs 204 ms unpinned
+      (~3.9x WORSE, 14/14 pinned trials cold). llama.cpp has no server-side slot reservation,
+      so a pin is a label, not an allocation. Detail: the runbook's "Reserving a slot" section.
 
   # RENAMED 2026-08-18: `creative` → `tier2-analyst` (operator decision — every official role
   # carries the `tier` designator). This is a NAME change only. `role:` and `endpoint_class:`
