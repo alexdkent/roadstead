@@ -48,6 +48,60 @@ _RATES_BY_CLASS: dict[str, tuple[float, float]] = {
     # against as `companion`, because it is the same workload on a bigger model; keeping the
     # 32B anchor made the "$ saved" figure understate every heavy-tier call.
     "thinker":   (0.15, 0.60),   # Laguna S 2.1 INT4 (~120B MoE) → Qwen3-235B-A22B-Instruct-2507
+    # ----------------------------------------------------------------------
+    # ⏸ PENDING CUTOVER — B2 of docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md
+    #   (drafted 2026-08-20). NOT LIVE: Laguna is serving and the hardware has not
+    #   arrived. Apply by deleting the `#⏸ ` marker and the live line above.
+    #
+    #⏸ "thinker":   (0.14, 0.28),   # DeepSeek-V4-Flash-DSpark → its OWN published API rate
+    #
+    #   UNITS — CHECKED, NOT ASSUMED. This dict is documented at the top of the file
+    #   as "(input, output) USD per 1M tokens" and `cloud_cost_usd` computes
+    #   `(ti/1e6)*rate[0] + (to/1e6)*rate[1]` (line ~168). So the plan's
+    #   "$0.14/$0.28 per 1M" maps 1:1 with no conversion. (The per-UNIT capabilities
+    #   further down this file pack a different quantity into the same columns —
+    #   audio-seconds*100, characters — which is exactly why this needed checking.)
+    #
+    #   ANCHOR CHANGE, not just a number change. Every other row here is a PROXY:
+    #   "the closest hostable open model, mid-of-market". This row stops being a proxy
+    #   — V4 Flash is served by its own vendor at a published rate, so tier3 becomes
+    #   the only EXACT-model anchor in the table. That is strictly better sourcing and
+    #   worth stating in the comment when it lands.
+    #
+    #   🚨 TWO THINGS FOR THE REVIEWER, neither of which is a defect:
+    #
+    #   1. THE SAVINGS FIGURE STEPS DOWN ON CUTOVER DAY. Output falls 0.60 → 0.28, so
+    #      the cloud-equivalent cost of a tier3 completion drops by more than half on
+    #      the output leg. A 1M-in/1M-out call goes $0.75 → $0.42. Nothing is broken;
+    #      the fleet just stops being credited for renting a 235B when it is running a
+    #      284B-total/13B-active model that is cheap to rent. Say so, or someone
+    #      "fixes" it back.
+    #
+    #   2. IT REPRICES HISTORY RETROACTIVELY. Unlike the 2026-08-19 tier2 split, this
+    #      cutover does NOT change the endpoint CLASS — pre- and post-cutover rows in
+    #      `proxy_completions` both carry `thinker`, so an in-place edit prices every
+    #      Laguna row that ever ran at DeepSeek's rate. The tier2 split avoided this by
+    #      minting a NEW class (`tier2-chat`) so both sides keep pricing.
+    #      RECOMMENDATION: edit IN PLACE anyway and accept it. Minting a class here
+    #      would mean changing `endpoint_class` in models.yaml, i.e. changing ROUTING
+    #      and DRR accounting to fix a reporting artifact — and an endpoint class that
+    #      is also an alias is the `endpoint-class-alias-collision` shape. Record the
+    #      cutover DATE in the comment instead, so the discontinuity in the savings
+    #      series is documented rather than mysterious.
+    #
+    #   TODO(confirm before applying) — the ONE thing not verifiable from the repo:
+    #   whether $0.14 input is the CACHE-MISS rate or a blended figure. DeepSeek have
+    #   historically published split cache-hit/cache-miss input pricing, and
+    #   `proxy_completions` logs raw input tokens with no cache-hit split, so a blended
+    #   number would understate. Confirm against the live price page at cutover; if it
+    #   is split, use cache-miss (the conservative leg) and note why.
+    #
+    #   COUPLED TEST EDIT — MUST land in the same commit or the suite goes RED:
+    #   tests/llmproxy/test_fleet_metrics.py hardcodes this rate five times —
+    #   lines 121-124 (`thinker`/`llama-thinker`/`composer`/`companion` == (0.15,0.60))
+    #   and line 138 (`cloud_cost_usd("thinker", 1e6, 1e6) == 0.75` → 0.42).
+    #   B2's four-file list does NOT mention it. That file is outside this draft's scope.
+    # ----------------------------------------------------------------------
     # HISTORICAL ONLY as of 2026-08-02: `companion` is no longer an endpoint class at all (the
     # 122B backup stopped being a proxy endpoint — its class name collided with the `companion`
     # alias and silently rerouted the backup to tier3; see models.yaml + the

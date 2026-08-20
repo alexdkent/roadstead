@@ -221,6 +221,155 @@ models:
       DEFAULT_ENDPOINTS row; this entry only contributes gemma-greeter→gemma to
       ROLE_TO_CLASS + its own context window.
 
+  # ==========================================================================
+  # ⏸ PENDING CUTOVER — DeepSeek-V4-Flash-DSpark as tier3 (B2 of
+  #   docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md, drafted 2026-08-20).
+  #
+  #   NOTHING BELOW IS LIVE. Laguna S 2.1 INT4 is serving; anvil2 has not
+  #   arrived. This block is a REVIEWED DIFF to be APPLIED in the Phase 2/3
+  #   window by deleting the `#⏸ ` markers and deleting the fields it replaces —
+  #   it is not authored under time pressure at 1am. Every number is labelled
+  #   OURS (measured here) / PUBLISHED (someone else's hardware) / TODO.
+  #
+  #   🚨 THIS STANZA CANNOT BE APPLIED ALONE. Three things move with it:
+  #     1. `infra/anvil/vllm/serve_tier3_prod.sh` (or its V4 successor) —
+  #        tests/llmproxy/test_tier3_serve_script_doctrine.py pins, BIDIRECTIONALLY:
+  #          slots                        == script --max-num-seqs
+  #          policy.documented_max_num_seqs == script --max-num-seqs
+  #          context_per_slot             == script --max-model-len
+  #          policy.disable_any_whitespace ⟺ script --structured-outputs-config
+  #        Change `context_per_slot` here without the script and the suite goes RED.
+  #     2. `llmproxy/usage_rates.py` + `tests/llmproxy/test_fleet_metrics.py`
+  #        (five hardcoded (0.15,0.60)/0.75 assertions) — see the PENDING block there.
+  #     3. `infra/common/model_cards.yaml` — see the PENDING block there.
+  #   NOT drafted here (out of B2's four files, flagged in the B2 report):
+  #     4. § 3's "one dedicated long-context role" is a SECOND stanza with its own
+  #        `timeout_ceiling_s` and a low priority tier. It does not exist yet.
+  #     5. `meta.hosts` has no `anvil2: 10.0.0.29` row (rank 1 serves no port, so
+  #        this is only needed if C1 makes anvil2 a first-class telemetry host).
+  #
+  #⏸ model_family: DeepSeek-V4-Flash-DSpark (sparse MoE, 284B total / 13B active) + DSpark MTP drafter
+  #⏸ quant: MXFP4 routed experts (quantization-aware TRAINED, not post-hoc) + FP8 attention/dense/shared
+  #⏸ params: {active: 13B, total: 284B}
+  #   PUBLISHED: 155.44 GiB on disk / 48 safetensors shards, MIT, text-only, revision
+  #   62af8fffb2f7030cac4de2f0169f5b8d1101b646 (verified against the HF API 2026-08-20,
+  #   public + ungated). ~77.7 GiB of weights PER RANK at TP=2. There is NO re-quant
+  #   step, so the NVFP4-vs-INT4 class of divergence we hit on Laguna cannot occur —
+  #   but that is a claim about the WEIGHTS, not about our kernels. G0 still applies.
+  #
+  #⏸ context_per_slot: 1048576
+  #   1M is the model's native window and, per § 3 (D4), `--max-model-len` is a
+  #   per-request CEILING, not a reservation: vLLM's PagedAttention allocates KV in
+  #   blocks from ONE shared pool on demand. PUBLISHED pool at util 0.78 with
+  #   --kv-cache-dtype nvfp4_ds_mla: 8.54 GiB/rank -> 1,268,110 tokens shared. The
+  #   startup line "Maximum concurrency for 1048576 tokens per request: 1.21x" is just
+  #   1,268,110 / 1,048,576 — advisory arithmetic, not a partition.
+  #   ⚠️ 1.21x means there is NO SLACK: if util ever drops the pool below 1,048,576
+  #   tokens vLLM REFUSES TO BOOT ("max seq len is larger than the KV cache can
+  #   store"). Any util change is now a boot-blocking change. Laguna's 700000 was a
+  #   MEMORY bound with 2.56x headroom; this is not the same kind of number.
+  #
+  #⏸ context_window: 32768            # UNCHANGED — fleet chunkers size against 32K on purpose
+  #   Phase 3.1 is explicit that the chunk policy does NOT move with the slot size.
+  #   Raising it would silently re-shape every fleet chunker at the same moment the
+  #   model changes, and then nothing could be attributed to either.
+  #
+  #⏸ slots: 20                        # TODO(confirm at cutover) — carry 20 forward
+  #   NOT a measured V4 number and deliberately not re-derived on paper. 20 is
+  #   Laguna's live value; holding it means concurrency does NOT move at the same
+  #   time as the model, so a G5 batch-wall-time regression is attributable. It MUST
+  #   equal the new serve script's --max-num-seqs (doctrine test above) — set both or
+  #   neither. Re-derive from a concurrency sweep AFTER G1/G5, not during the window.
+  #   ⚠️ vLLM does not expose --max-num-seqs over its API, so this seed is the ONLY
+  #   source of the proxy's admission ceiling; a stale value over-admits.
+  #
+  #⏸ timeout_floor_s: 180             # UNCHANGED through the soak
+  #   PUBLISHED decode is faster (42 prose / 76 code vs OURS 30.6 / 43.9), which
+  #   argues for a LOWER floor — do not take it yet. A floor is a minimum budget, and
+  #   lowering it in the same window as the model swap makes a timeout regression
+  #   unattributable. Re-derive at Phase 4 against G1's measured numbers.
+  #   🚨 CORRECTION to § 3 of the plan doc: there is no `timeout_ceiling_s: 900`
+  #   anywhere. This stanza has NO ceiling override, so it inherits timeout_model's
+  #   _INTERACTIVE_CEILING_S = 600 s (P0-P2) and _BACKGROUND_CEILING_S = 1800 s
+  #   (P3/P4). 900 is not the number that binds and never was.
+  #   The § 3 conclusion survives with different arithmetic: PUBLISHED prefill
+  #   1,400-2,100 t/s puts a 1M-token prefill at 500-750 s BEFORE any decode — over
+  #   the 600 s interactive ceiling, under the 1800 s background one. So Laguna's
+  #   "ULTRA-LONG IS BACKGROUND-ONLY" rule carries forward UNCHANGED; only the
+  #   token count at which it starts biting moves (~430K on Laguna, TODO(measure) here).
+  #
+  #⏸ capabilities:
+  #⏸   vision: false                  # text-only — PUBLISHED, and unchanged from Laguna
+  #⏸   streaming: true
+  #⏸   reasoning: true                # HYBRID thinking + DSpark MTP speculative
+  #⏸   tool_calling: true             # --tool-call-parser deepseek_v4 + --enable-auto-tool-choice
+  #⏸   structured_output: guidance    # TODO(decide with the serve script) — see below
+  #   ⚠️ `structured_output` and `policy.disable_any_whitespace` are a PAIR, and § 2.3's
+  #   flag list does NOT include --structured-outputs-config. Decide deliberately:
+  #     * keep the flag  -> keep `guidance` + `disable_any_whitespace: true` here;
+  #     * drop the flag  -> drop BOTH, and Correction.apply_json_object_guard stops
+  #                         stripping bare json_object.
+  #   Either is legal; a MISMATCH is what the bidirectional doctrine test forbids, and
+  #   both halves of the mismatch fail SILENTLY (callers get `{}`, or a constraint the
+  #   backend would have honoured is stripped). The whitespace-runaway measurement that
+  #   justified the flag is Laguna+guidance ONLY — it is NOT evidence about V4 Flash.
+  #   Re-run it (the real gate went 10/10 runaway -> 0/10; a synthetic schema reproduced
+  #   only ~2/50, so do NOT conclude "fine" from a toy).
+  #
+  #⏸ token_speed: {decode_tok_s_at_1: TODO, aggregate_tok_s_full: TODO}   # TODO(measure at cutover — gate G1)
+  #   PUBLISHED for reference ONLY, someone else's GB10 pair: 42 t/s prose, 76 t/s code.
+  #   🔴 DO NOT WRITE A PUBLISHED NUMBER INTO THIS FIELD. Every other value in it is
+  #   OURS, and this plan already burned three revisions arguing from a 14.1 t/s figure
+  #   that had stopped describing reality. G1's floors are the MEASURED incumbent
+  #   (>=43.9 code, >=30.6 prose, artifact
+  #   infra/anvil/bench_results/tier3_laguna_baseline_20260819.json) — a replacement
+  #   that misses them is a regression no matter what the vendor published.
+  #
+  #⏸ purpose: Heavy MoE reasoning + agentic-coding tier (tier3 — the fleet's deepest model), TP=2 across anvil + anvil2.
+  #⏸ when_used:
+  #⏸   - knowledge extraction, news synthesis, thread/device enrichment
+  #⏸   - browser-broker default, forum-agent thread summary
+  #⏸   - dsh agentic lanes as they migrate off pool (D5)
+  #
+  #   UNCHANGED, do NOT touch in this window (they are the failover that shipped
+  #   2026-08-20 and are not part of this swap):
+  #     fallback: creative
+  #     policy.failover_dwell_s: 120
+  #     policy.background_floor_pct: 0.0
+  #     policy.fast_path_reserve_slots: 1
+  #     host: anvil · port: 9083   (Phase 2.3 keeps rank 0 on :9083 so this barely moves)
+  #     systemd_unit: vllm-tier3     (TODO(confirm) the V4 unit keeps this name; an empty
+  #                                   systemd_unit silently drops the health probe entirely)
+  #
+  #   ALIASES — one judgement call, flagged rather than silently made:
+  #     `poolside/laguna-s-2.1` is the model name the stock `pool` CLI hardcodes in every
+  #     request body. After this swap tier3 is NOT Laguna, so the alias becomes a lie —
+  #     but D5 keeps `pool` live lane-by-lane until the last one migrates, and removing it
+  #     404s every stock pool client on day one. RECOMMENDATION: KEEP it through Phase 5,
+  #     delete it in Phase 6 alongside `pool` itself, and say so in the alias comment.
+  #     RECOMMENDATION (additive, same reasoning that created the poolside alias): add
+  #     `deepseek-ai/DeepSeek-V4-Flash-DSpark` so a stock DeepSeek-shaped client — dsh
+  #     included — works against the proxy with no client-side model config.
+  #     ⚠️ Add it to `aliases:` ONLY. Do not create an endpoint CLASS with the same
+  #     string: an endpoint class that is also an alias is what made normalize_endpoint()
+  #     non-idempotent and silently served every backup request from tier3
+  #     (ledger `endpoint-class-alias-collision`).
+  #
+  #   The whole existing `notes:` block below is Laguna's and must be REPLACED, not
+  #   appended to. It is ~150 lines of measurements about INT4/DFlash/guidance/
+  #   FLASHINFER/marlin on a single GB10 — a comment that lies about which model is
+  #   serving is exactly how the 2026-07-30 rename trap works (§ 8 C3). What to
+  #   re-assert in the replacement, per "replacing a component silently drops its
+  #   guarantees": (a) ultra-long is background-only, (b) whichever way the
+  #   structured-output pair is decided and WHY, (c) the two-node failure domain and the
+  #   ~10-minute restart outage, (d) that KV is now util-driven with 1.21x and no slack,
+  #   (e) TODO(measure) placeholders for prefix-cache hit rate, DSpark acceptance (G2:
+  #   >=0.7 on code) and headroom-under-load — none of which have a V4 number yet.
+  #   🚨 Laguna's "~8 GiB free under load, NOT the ~12 you see at startup" is OURS and
+  #   about THIS BOX — re-measure it, do not delete it and do not carry it forward as
+  #   though it described V4. The two hard-hangs happened at ~0 GiB free.
+  # ==========================================================================
+
   reasoner:
     kind: chat
     status: active
@@ -1280,119 +1429,36 @@ models:
       route, not a second routable model). Measured typical_s: hunyuan 535,
       triposg 132 (~4x, not the ~11x first inferred from diffusion-time-alone).
 
-  video:
-    kind: media
-    status: on_demand                # LIVE 2026-06-21 — Phase 0 validated on the GB10
-    proxy_endpoint: false
-    role: ltx2-videogen
-    # `videogen` included so Catalog.entry("videogen") RESOLVES: the gateway facade looks the
-    # video service up by that literal string (external_facade.inference_models), and the
-    # stanza key is `video` while the role is `ltx2-videogen` — so entry() returned None and
-    # the payload shipped with no canonical/status/healthy/model. The Inference page then
-    # rendered a card with every stat as "—" and no real health signal. Found 2026-07-31.
-    aliases: [videogen, ltx2-videogen, anvil-videogen, anvil-ltx]
-    host: anvil
-    port: 9211                       # anvil-videogen FastAPI service (adjacent to imagegen :9210)
-    backend_engine: shim
-    dispatcher_capability: video_fast
-    dispatcher_capability_aliases: [video_hq]
-    dispatcher_unit_key: anvil-videogen
-    unit: anvil-videogen.service
-    manage_process: false            # always-on service; self-manages ComfyUI residency + the slot lease
-    health_path: /healthz
-    warmup_sec: 30
-    model_family: LTX-2.3 (LTX 2.3 22B distilled, fp8-scaled)
-    quant: fp8-scaled
-    purpose: On-demand text-to-video and image-to-video.
-    when_used:
-      - short-form video gen, animate Image-Studio stills
-    fallback: null
-    notes: |
-      LTX-2.3 22B distilled fp8 on the anvil GB10 via an isolated headless
-      ComfyUI (/opt/comfyui-video, PyTorch SDPA — sm_121 has no FlashAttention;
-      SageAttention deferred). The anvil-videogen FastAPI service (:9211,
-      manage_process:false) is always-on, owns the dispatcher GPU-slot lease, and
-      lazy-starts / idle-stops the ComfyUI child + memory-guards loads — the ~80GB
-      video stack shares the 121GB unified pool with the always-resident vLLM
-      thinker, so generation is strictly serialized + memory-preflighted. Gemma-3-12B
-      is the prompt text encoder. Per-checkpoint sub-registry lives in
-      infra/anvil/anvil_videogen/models.yaml (not folded into this authority).
-
-  musicgen:
-    kind: media
-    status: on_demand
-    proxy_endpoint: false
-    role: anvil-musicgen
-    aliases: [anvil-musicgen, musicgen]
-    host: anvil
-    port: 9220
-    backend_engine: shim
-    dispatcher_capability: music_generate
-    dispatcher_unit_key: anvil-musicgen
-    unit: musicgen.service
-    health_path: /healthz
-    warmup_sec: 45
-    model_family: MusicGen
-    purpose: AI music generation bridge.
-    when_used: [dj audio production]
-    fallback: null
-
-  stem:
-    kind: media
-    status: on_demand
-    proxy_endpoint: false
-    role: anvil-htdemucs
-    aliases: [anvil-htdemucs, htdemucs]
-    host: anvil
-    port: 9221
-    backend_engine: shim
-    dispatcher_capability: stem_separate
-    dispatcher_unit_key: anvil-htdemucs
-    unit: htdemucs.service
-    health_path: /healthz
-    warmup_sec: 60
-    model_family: HTDemucs
-    purpose: Stem separation.
-    when_used: [dj audio production]
-    fallback: null
-
-  lyrics:
-    kind: media
-    status: on_demand
-    proxy_endpoint: false
-    role: anvil-lyrics
-    aliases: [anvil-lyrics]
-    host: anvil
-    port: 9222
-    backend_engine: shim
-    dispatcher_capability: lyrics_transcribe
-    dispatcher_unit_key: anvil-lyrics
-    unit: lyrics.service
-    health_path: /healthz
-    warmup_sec: 60
-    model_family: Whisper (lyrics transcription)
-    purpose: Lyrics transcription for catalog tracks.
-    when_used: [dj/sidekick lyric alignment]
-    fallback: null
-
-  audio-variation:
-    kind: media
-    status: on_demand
-    proxy_endpoint: false
-    role: anvil-vampnet
-    aliases: [anvil-vampnet, vampnet]
-    host: anvil
-    port: 9223
-    backend_engine: shim
-    dispatcher_capability: audio_variation
-    dispatcher_unit_key: anvil-vampnet
-    unit: vampnet.service
-    health_path: /health
-    warmup_sec: 30
-    model_family: VampNet
-    purpose: Audio variations.
-    when_used: [dj audio production]
-    fallback: null
+  # ---------------------------------------------------------------------------
+  # 🗑️  THE ANVIL MEDIA TIER WAS REMOVED HERE, 2026-08-20. Five stanzas went:
+  #     video (ltx2-videogen, :9211) · musicgen (:9220) · stem (htdemucs, :9221)
+  #     lyrics (:9222) · audio-variation (vampnet, :9223)
+  #
+  # WHY: operator decision D6 — DeepSeek-V4-Flash becomes the ONLY thing running on
+  # anvil + anvil2, which become a single-purpose tier3 appliance. Nothing else
+  # may be scheduled onto either box. See
+  # docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md.
+  #
+  # WHAT WAS ACTUALLY THERE, measured before removal — the four audio ones were
+  # DECLARED BUT NEVER REAL: ports 9220-9223 were not listening, `vampnet` had no
+  # unit file at all, the other three units were inactive+disabled, and the four
+  # capabilities (music_generate / stem_separate / lyrics_transcribe /
+  # audio_variation) had ZERO callers anywhere in the repo. Only `video` was ever
+  # live, and it had served zero requests in the 7 days before it was retired.
+  #
+  # 🔎 A clue worth keeping: the unit names declared HERE (musicgen.service,
+  # htdemucs.service, …) never matched the names anvil_dispatcher brokered them
+  # under (anvil-musicgen, anvil-htdemucs, …). A capability whose declared unit
+  # name does not match the name its broker uses can never start — which is most
+  # likely WHY these were never installed. If you add an on-demand model, assert
+  # those two names are equal.
+  #
+  # 🚨 STEM SEPARATION AND LYRICS ARE NOT GONE FROM THE FLEET. A separate, LIVE
+  # HTDemucs/lyrics deployment runs on kestrel CTnnn (OpenVINO iGPU) and the DJ agent
+  # calls it DIRECTLY at 10.0.0.13:8086 — it never went through this catalog or the
+  # anvil dispatcher. Do not "restore" these stanzas thinking the capability was
+  # lost; it was duplicated here and never worked.
+  # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Decommissioned — kept for HISTORY only (not loaded into any routing table).

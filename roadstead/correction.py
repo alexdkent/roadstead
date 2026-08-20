@@ -1333,6 +1333,104 @@ class Correction:
         self.state.thinking_active[req.request_id] = {
             "allowed_keys": self.thinking_allowed_keys(p)}
 
+    # =====================================================================
+    # ⏸ PENDING CUTOVER — B2 of
+    #   docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md, analysed 2026-08-20.
+    #   NOTHING IS CHANGED HERE. This is the reviewed VERDICT, parked next to the
+    #   code so the cutover window applies a decision instead of taking one.
+    #
+    #   RECOMMENDATION: **DELETE this method at the tier3 cutover** unless the
+    #   measurement below is actually run and comes back positive on V4 Flash.
+    #   Do NOT carry it forward, and do NOT "keep it, it's harmless".
+    #
+    #   WHY DELETE IS THE DEFAULT (all verifiable from this repo today):
+    #
+    #   1. ITS BLAST RADIUS IS EXACTLY THE MODEL BEING REPLACED. `apply_thinking`
+    #      returns early on `engine != "vllm"` (see above), and the `reasoner`
+    #      stanza is the ONLY `backend_engine: vllm` entry in models.yaml — every
+    #      other endpoint is llama.cpp or shim. So this compensation applies to
+    #      tier3 and to nothing else. When Laguna leaves, its entire population
+    #      leaves with it.
+    #
+    #   2. ITS MECHANISM IS A LAGUNA CHAT-TEMPLATE ARTIFACT, BY THE DOCSTRING'S OWN
+    #      ACCOUNT. The docstring's finding is that /tokenize renders
+    #      `<assistant><think>` in BOTH shapes, and that when no system message is
+    #      supplied the template injects its OWN — so the fold is "let the model see
+    #      its native system prompt". That is a property of Laguna's template, not of
+    #      vLLM, not of reasoning parsers, and not of thinking models in general.
+    #      V4 Flash ships a different tokenizer and template entirely
+    #      (`--tokenizer-mode deepseek_v4`, `--reasoning-parser deepseek_v4`), so
+    #      there is no construction by which the premise transfers.
+    #
+    #   3. IT NEVER WORKED WELL EVEN ON LAGUNA. The 2026-08-02 streaming re-measure
+    #      in the docstring: no system 4/4 reasoned, system+folded 1/4. models.yaml
+    #      says it "RAISES the rate without closing it". We are not defending much.
+    #
+    #   4. CARRYING IT FORWARD IS NOT NEUTRAL — IT MUTATES EVERY OPTED-IN REQUEST.
+    #      It deletes the `system` role and prepends its text to the first user turn.
+    #      On a template that handles the system role properly that is an UNMEASURED
+    #      reshaping of the prompt, and a hybrid thinking model gates reasoning on an
+    #      explicit switch rather than on learned suppression — so the reshape would
+    #      be paying a cost to solve a problem that has no reason to exist. This is
+    #      the "a test stub outlives what it models" / "delete falsified mechanisms,
+    #      don't flag them off" shape.
+    #
+    #   5. DELETING IS CHEAP AND REVERSIBLE. No agent or framework code sets
+    #      `thinking: true` anywhere — verified by grep. The only production consumer
+    #      is the Playground's toggle (frontend PlaygroundPage.tsx), plus two dev
+    #      tools (tools/thinking_ab.py, tools/ha_llm_eval.py). One operator-facing
+    #      toggle on one page is the whole blast radius.
+    #
+    #   WHAT GOES WITH IT, if deleted: this staticmethod; the `folded = ...` block in
+    #   `apply_thinking`; the cross-reference in that method's docstring (~line 1285);
+    #   the mention in models.yaml (~line 557, inside a block that is being replaced
+    #   anyway); and ~9 fold-specific tests plus the binding line in
+    #   tests/llmproxy/test_thinking_option.py (`test_fold_*`,
+    #   `test_apply_thinking_streaming_folds_system`).
+    #   WHAT STAYS regardless — these are INDEPENDENT of the fold and must not be
+    #   swept up with it: `finalize_thinking`, `thinking_allowed_keys`, the
+    #   `thinking_noop` counter, and the Playground's zero-reasoning warning.
+    #
+    #   🚨 I CANNOT PROVE THE PHENOMENON IS ABSENT ON V4 FLASH WITHOUT THE LIVE
+    #   MODEL. The measurement that settles it, pre-registered so the result is a
+    #   verdict and not a vibe:
+    #
+    #     CELLS (streamed, against the live V4 tier3, thinking: true, no schema):
+    #       A  [user]                        — no system message at all
+    #       B  [system, user]                — unfolded (what deletion would ship)
+    #       C  [system, user]                — folded (what this method does today)
+    #       D  [user, assistant, user]       — the history cell (see trap 4)
+    #     METRIC: fraction of responses with non-empty reasoning, plus reasoning
+    #       length. DECISION RULE: keep/re-derive ONLY if C beats B at the
+    #       pre-registered bar. Otherwise delete.
+    #     N: >= 20 per cell. The Laguna numbers were n=4, which cannot support a
+    #       null — at 4/4 vs 1/4 you need ~10-12/cell for 80% power, and any
+    #       SMALLER residual effect needs far more. If B-vs-C comes back
+    #       non-significant, report the effect size the N could have detected
+    #       instead of writing "no effect".
+    #
+    #     FIVE TRAPS, every one of them already paid for in this repo:
+    #       1. CACHE. Nonce every payload — the first cut of the Laguna measurement
+    #          was cache-confounded (three identical 102-char replies). And
+    #          temperature=0 voids repeated-measures A/Bs entirely (N trials = 1
+    #          generation), so nonce it or run above 0.
+    #       2. CHANNEL. Laguna streams reasoning as `delta.reasoning`, NOT
+    #          `delta.reasoning_content`. The deepseek_v4 parser may use either.
+    #          Read BOTH and take the union, or you will measure zero while usage
+    #          shows the tokens were spent.
+    #       3. POSITIVE ASSERTIONS ONLY. "`</think>` not in content" is an ABSENCE
+    #          assertion that an empty string also satisfies — that is exactly how
+    #          the earlier leak "fix" looked verified. Assert non-empty content AND
+    #          finish_reason == "stop" alongside the reasoning length.
+    #       4. THE HISTORY CELL IS NOT OPTIONAL. On Laguna, ONE prior assistant turn
+    #          took reasoning to 0/4 — harder than the system-message effect and
+    #          documented nowhere else. If that transfers, `thinking: true` is a
+    #          FIRST-TURN capability on V4 too, and the Playground's warning must
+    #          stay whatever happens to this fold.
+    #       5. NO STRUCTURED-OUTPUT ARM. Phase 3.3 / vLLM #41132: response_format
+    #          json + thinking on DeepSeek V4 leaks a reasoning field. Keep
+    #          structured calls thinking-OFF; do not combine them in the rig.
+    # =====================================================================
     @staticmethod
     def fold_system_for_thinking(messages):
         """Merge system message(s) into the first non-system turn, returning a NEW
