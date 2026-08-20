@@ -468,9 +468,24 @@ class Health:
                 except Exception:  # noqa: BLE001
                     pass
             # Phase 2a — ACTUAL per-endpoint prefix-cache hit rate. vLLM per-request
-            # usage.prompt_tokens_details.cached_tokens is NULL on our builds (a
-            # vLLM build gap, not a flag — verified 2026-07-01), so the per-caller
-            # cached_tokens rollup reads n/a. The GLOBAL vLLM /metrics prefix-cache
+            # usage.prompt_tokens_details.cached_tokens is NULL on our tier3 build,
+            # so the per-caller cached_tokens rollup reads n/a.
+            # 🚨 CORRECTED 2026-08-20 — this comment said "a vLLM build gap, not a
+            # flag — verified 2026-07-01". THAT IS BACKWARDS: it is exactly a flag.
+            # Read off the installed build (0.26.1.dev0+g568afb3a1) on anvil:
+            # `entrypoints/openai/cli_args.py:132` defines
+            # `enable_prompt_tokens_details: bool = False`, and
+            # `chat_completion/serving.py:97` returns None unless it is set —
+            # gating BOTH the streaming (:764) and non-streaming (:1039) call
+            # sites, so there is no asymmetry to chase either. The code is present
+            # and correct; `serve_tier3_prod.sh` simply never passes
+            # `--enable-prompt-tokens-details`. Prefix caching itself works (global
+            # /metrics: 46.7% lifetime), which is why the gap looked like a
+            # reporting-only build defect for seven weeks.
+            # Fix = one flag + a backend restart (operator-gated). Until then the
+            # endpoint-level fallback below stands, and MUST stay labelled
+            # per-ENDPOINT — see the absent-is-not-zero contract at queue.py.
+            # The GLOBAL vLLM /metrics prefix-cache
             # counters DO work, so surface the real per-ENDPOINT lifetime rate from
             # those here (llama.cpp exposes no counter → stays absent = n/a). This is
             # what /v1/status.cache_hit_rate + the attribution by_endpoint overlay

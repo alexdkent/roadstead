@@ -1317,11 +1317,20 @@ class PersistentQueue:
         observability doc specced but never built).
 
         Hit rate = ``sum(cached_tokens) / sum(input_tokens)`` computed ONLY over
-        rows where the backend actually reported ``cached_tokens`` (vLLM). Rows
-        where it is NULL (llama.cpp exposes no such counter) are EXCLUDED from
-        the ratio and surfaced separately as ``unattributed_calls`` — so a
-        non-reporting backend can never masquerade as a 0% hit rate and drag the
-        number down (the exact ~4.8% attribution artifact this fixes).
+        rows where the backend actually reported ``cached_tokens``. Rows where it
+        is NULL are EXCLUDED from the ratio and surfaced separately as
+        ``unattributed_calls`` — so a non-reporting backend can never masquerade
+        as a 0% hit rate and drag the number down (the exact ~4.8% attribution
+        artifact this fixes). 🚨 THAT PROPERTY IS LOAD-BEARING: do not
+        synthesise a per-request count a backend did not report.
+
+        ⚠️ CORRECTED 2026-08-20 — the parenthetical here said "(vLLM)" and
+        "llama.cpp exposes no such counter". Backwards on both counts. Every
+        llama.cpp backend we run DOES report ``cached_tokens`` and is fully
+        attributed live (tier1 321/321, tier2-analyst 37/37, tier2-chat 5/7);
+        the backend currently reporting NOTHING is vLLM, whose
+        ``--enable-prompt-tokens-details`` is unset. Read
+        ``backend.extract_cached_tokens`` for the measurements.
 
         Returns per-(call_site,endpoint) rows ranked by volume, a per-endpoint
         rollup, and a fleet total. ``hit_rate`` is ``None`` (n/a) whenever no

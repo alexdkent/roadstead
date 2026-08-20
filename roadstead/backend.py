@@ -319,12 +319,24 @@ def extract_cached_tokens(usage: Any) -> int | None:
     """Pull the per-request prefix-cache hit count out of an OpenAI ``usage``
     block, defensively. Phase 2a attribution.
 
-    vLLM (V1, prefix caching on) emits ``usage.prompt_tokens_details.cached_tokens``
-    — the number of prompt tokens served from the KV prefix cache. llama.cpp does
-    NOT emit any such field. The distinction matters: a backend that reports ``0``
-    is a real *cold* miss (attributable), whereas an *absent* field means the
-    backend can't tell us (llama.cpp) — which must persist as NULL so the rollup
-    marks it ``n/a`` instead of dragging the hit rate toward zero.
+    ``usage.prompt_tokens_details.cached_tokens`` is the number of prompt tokens
+    served from the KV prefix cache. The distinction that matters: a backend
+    reporting ``0`` is a real *cold* miss (attributable), whereas an *absent*
+    field means the backend can't tell us — which must persist as NULL so the
+    rollup marks it ``n/a`` instead of dragging the hit rate toward zero.
+
+    🚨 CORRECTED 2026-08-20 — this docstring said "llama.cpp does NOT emit any
+    such field". IT DOES, on every build we run. Measured directly against all
+    three llama.cpp backends (tier1 :9091, tier2-analyst :9196, tier2-chat
+    :30000): each returns ``prompt_tokens_details: {"cached_tokens": N}``, and
+    the live ``/v1/fleet/cache-attribution`` rollup attributes them 321/321,
+    37/37 and 5/7 respectively. The function was always correct — it keys on the
+    SHAPE, not the backend — but the comment would have talked a reader out of
+    trusting a real number. It matters because tier2's genuinely near-zero reuse
+    (18.3% analyst / 5.2% chat vs tier1's 74.0%) is a MEASURED defect, and
+    "llama.cpp can't report it" is exactly the sentence that would file it as an
+    artifact. The backend that truly reports nothing here is vLLM, and only
+    because ``--enable-prompt-tokens-details`` is unset (see ``health.py``).
 
     Returns the int (including 0) when present and numeric, else ``None``.
     Never raises on a malformed/hostile usage shape (south-face safety)."""
