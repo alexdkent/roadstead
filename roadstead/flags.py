@@ -31,6 +31,15 @@ DEFAULT_FLAGS: dict[str, bool] = {
     # Phase 3 — unknown-endpoint submit validation: False = shadow (WARN +
     # counter, request proceeds to rot-at-deadline as before), True = fast 404.
     "unknown_endpoint_enforce": False,
+    # Vision-capability gate: False = shadow (WARN + counter, request proceeds
+    # to a backend that will answer 500 "image input is not supported"), True =
+    # fast 400. 🚨 KEEP THIS OFF until `vision_capability_violations` in
+    # /v1/status is clean: it reads `EndpointConfig.vision`, which DEFAULTS
+    # FALSE, so a models.yaml stanza that simply forgot to declare vision would
+    # become an instant 400 on a working caller. The counter tells you every
+    # declaration is right BEFORE the refusal is armed. Added 2026-08-20 —
+    # ledger `a-role-rename-carried-vision-to-a-text-only-box`.
+    "vision_capability_enforce": False,
     # Phase 6 — context-window pre-admission gate: False = shadow (WARN +
     # counter), True = fast 422 with a context-overflow marker.
     "context_gate_enforce": False,

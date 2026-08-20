@@ -290,6 +290,18 @@ class ProxyState:
         # can't route (today that request rots to its deadline — the bug
         # enforce mode fixes with a fast 404).
         self.unknown_endpoint_submits: dict[str, dict] = {}
+        # Vision-capability violations (shadow counter): endpoint → {count,
+        # callers}. Non-empty means somebody is sending IMAGE content to an
+        # endpoint whose models.yaml stanza says `capabilities.vision: false`
+        # — i.e. a backend with no mmproj, which answers HTTP 500 "image input
+        # is not supported". Added 2026-08-20 after exactly that shipped
+        # silently for a day: a shared role constant was re-pointed to a
+        # text-only box and carried discord's image describe with it, and the
+        # 500 was swallowed into "" by the caller's own error handling, which
+        # every vision caller reads as "couldn't read the image". The catalog
+        # DECLARED vision:false throughout and nothing read the field.
+        # Ledger: `a-role-rename-carried-vision-to-a-text-only-box`.
+        self.vision_capability_violations: dict[str, dict] = {}
         # Context-overflow gate counter (shadow): endpoint → {count, callers,
         # max_est_in}. Feeds the context_gate_enforce flip check — compared
         # against ACTUAL backend overflow errors before enforcement flips.

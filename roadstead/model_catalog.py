@@ -251,6 +251,14 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
             # a vLLM reasoning endpoint (e.g. the thinker) must NOT get it. e.g. creative
             # / Trinity-Mini.
             kw["forces_reasoning"] = True
+        if e.capabilities.get("vision"):
+            # Mirror the declaration so the submit path can READ it. Until
+            # 2026-08-20 `capabilities.vision` was pure documentation — nothing
+            # in llmproxy consulted it — and an alias move sent discord's image
+            # describe to a box with no mmproj for a day without a single test
+            # or alert noticing. Ledger:
+            # `a-role-rename-carried-vision-to-a-text-only-box`.
+            kw["vision"] = True
         for src, dst in (
             ("background_floor_pct", "background_floor_pct"),
             ("fast_path_reserve_slots", "fast_path_reserve_slots"),

@@ -238,6 +238,16 @@ class EndpointConfig:
     # by default, so no reasoning is emitted and the extra cap is never reached). ---
     forces_reasoning: bool = False
 
+    # --- the backend can actually SEE an image (mirrored from models.yaml
+    # ``capabilities.vision``; true where an mmproj / vision tower is loaded).
+    # Read by the submit-path vision gate in `lifecycle.handle_submit`. 🚨
+    # DEFAULTS FALSE ON PURPOSE, and that makes this field load-bearing in one
+    # direction only: it is a SHADOW COUNTER by default, never a rejection, so
+    # a stanza that forgets to declare vision produces a warning, not an
+    # outage. Do NOT arm `vision_capability_enforce` until the counter is
+    # clean, or a missing declaration becomes a 400 on a working caller. ---
+    vision: bool = False
+
     # --- on-demand lifecycle (see on_demand.OnDemandManager) ---
     # When True, this endpoint's model is NOT always-resident: before a request
     # dispatches, the proxy acquires the anvil GPU-slot dispatcher lease

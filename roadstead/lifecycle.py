@@ -77,6 +77,41 @@ logger = logging.getLogger(__name__)
 _STALL_BEST_EFFORT_RATIO = 0.5
 
 
+#: Content-part type tags that carry an IMAGE. Both wire shapes appear here:
+#: OpenAI multipart (``{"type": "image_url", ...}``) and Anthropic typed blocks
+#: (``{"type": "image", "source": {...}}``) — the proxy accepts both and
+#: rewrites Anthropic→OpenAI in ``backend.py``, so a check that knew only one
+#: shape would be blind to half the fleet's callers.
+_IMAGE_PART_TYPES = frozenset({"image", "image_url"})
+
+
+def _carries_image(body: dict) -> bool:
+    """True if this request puts an image on the wire.
+
+    Deliberately CHEAP and shallow: it walks message ``content`` lists looking
+    at the ``type`` tag only, and never touches the base64 payload — this runs
+    on the hot admission path for every request, including the text-only
+    majority. Returns False on any unexpected shape rather than raising; a
+    telemetry gate must never be able to reject a valid request.
+    """
+    try:
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return False
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue          # a plain string cannot carry an image
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in _IMAGE_PART_TYPES:
+                    return True
+    except Exception:  # noqa: BLE001 — telemetry must not break admission
+        return False
+    return False
+
+
 def _timeout_below_recommended(applied_timeout_s, recommended_ms) -> bool:
     """True if the applied deadline is far under the recommended time — a
     best-effort caller that never gave the backend a fair chance. Cheap + total:
@@ -191,6 +226,49 @@ class Lifecycle:
                 "request will wait out its full deadline; flip "
                 "unknown_endpoint_enforce for a fast 404",
                 endpoint, caller, body.get("call_site"))
+
+        # Vision-capability gate. An image sent to an endpoint with no mmproj
+        # gets a backend HTTP 500 "image input is not supported" — which the
+        # CALLER then usually swallows into an empty string, because a vision
+        # helper that returns "" is indistinguishable from one that honestly
+        # could not read the picture. That is how this shipped silently for a
+        # day (ledger `a-role-rename-carried-vision-to-a-text-only-box`): the
+        # catalog declared `vision: false` the whole time and NOTHING READ IT.
+        # This makes the declaration load-bearing.
+        #
+        # Shadow by default, exactly like the unknown-endpoint gate above:
+        # count + WARN, behaviour unchanged. `vision_capability_enforce` turns
+        # it into a fast 400 — deliberately NOT deferrable, since a text-only
+        # backend will never grow an mmproj by being retried. Enforce is left
+        # OFF because a WRONG `vision:` flag in models.yaml would then take a
+        # working caller down instantly; the counter tells you the flag is
+        # right before you arm it.
+        if _carries_image(body):
+            entry = self.state.config.endpoints.get(endpoint)
+            if entry is not None and not getattr(entry, "vision", False):
+                caller = str(body.get("caller_id") or body.get("agent_id")
+                             or "unknown")
+                tally = self.state.vision_capability_violations.setdefault(
+                    endpoint, {"count": 0, "callers": {}})
+                tally["count"] += 1
+                tally["callers"][caller] = tally["callers"].get(caller, 0) + 1
+                if self.state.flags.get("vision_capability_enforce"):
+                    err = (f"endpoint {endpoint!r} has no vision capability — "
+                           "this request carries image content and the backend "
+                           "would answer 500 'image input is not supported'")
+                    if openai:
+                        return _openai_error(
+                            err, "invalid_request_error", 400,
+                            code="vision_not_supported")
+                    return JSONResponse(
+                        {"status": "error", "error": err,
+                         "code": "vision_not_supported"}, status_code=400)
+                logger.warning(
+                    "IMAGE sent to non-vision endpoint %r by %s (call_site=%s) "
+                    "— the backend will 500 and the caller will most likely "
+                    "swallow it into an empty result. Route this to a "
+                    "vision-capable role.",
+                    endpoint, caller, body.get("call_site"))
 
         # Robust timeout_s. A caller either OMITS a deadline (→ the smart/flat
         # default via resolve_default_timeout; an explicit None counts as

@@ -628,6 +628,8 @@ class ProxyHttpHandlers:
                 # Unknown-endpoint submits since boot (shadow counter for the
                 # unknown_endpoint_enforce flip check). Empty = safe to flip.
                 "unknown_endpoint_submits": self.state.unknown_endpoint_submits,
+                "vision_capability_violations":
+                    self.state.vision_capability_violations,
                 # Context-gate hits since boot (shadow counter for the
                 # context_gate_enforce flip check — compare against actual
                 # backend overflow errors before flipping).
