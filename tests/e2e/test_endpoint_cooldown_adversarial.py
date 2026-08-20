@@ -318,6 +318,10 @@ def test_record_dispatch_failure_fail_open(monkeypatch, exc):
         endpoint_cooldown_trips={}, paused_endpoints=set(), endpoint_health={},
         on_demand=types.SimpleNamespace(manages=lambda ep: False),
         scheduler=types.SimpleNamespace(queued_requests=lambda ep, bands: []),
+        # § 9 failover: None = no failover armed. This suite asserts the
+        # cooldown RELEASES queued interactive work; a live failover would
+        # reroute it instead, which is a different behaviour under test.
+        failover=None,
     )
     h = Health(state)
     h.record_dispatch_failure("chat", exc)  # must never raise

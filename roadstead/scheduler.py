@@ -86,6 +86,18 @@ class QueuedRequest:
     # records a 'cancelled' completion immediately), so persisting this across a
     # restart would buy nothing and add a migration for no reader.
     deadline_is_default: bool = False
+    # § 9 tier3 failover: the endpoint class this request was ORIGINALLY
+    # submitted for, set only when it was rerouted while that endpoint was
+    # unhealthy. ``endpoint`` above is always the class actually serving it, so
+    # every existing consumer — queueing, occupancy, cost, dispatch, the
+    # in-flight view, the served-model reported to the caller — stays correct
+    # without knowing this field exists. It carries the ORIGIN, so the drain
+    # check can count the degraded cohort and the response can be labelled.
+    #
+    # Never persisted/recovered from the WAL: a recovered request has already
+    # lost its caller, and re-deriving degraded state for it would only
+    # complicate the drain.
+    degraded_from: str | None = None
 
     @classmethod
     def create(
@@ -421,6 +433,26 @@ class Scheduler:
 
     def active_count(self, endpoint: str) -> int:
         return len(self._active.get(endpoint, {}))
+
+    def degraded_inflight(self, source_endpoint: str) -> int:
+        """How many requests originally bound for ``source_endpoint`` are still
+        queued or in flight on its failover target (§ 9.7's drain condition).
+
+        Derived by walking the live structures rather than kept as a counter on
+        purpose: an increment/decrement pair has to be maintained across every
+        completion, timeout, cancel and error path, and the one that gets missed
+        leaves the drain permanently non-zero — a recovery that never happens
+        and reports nothing wrong.
+        """
+        n = 0
+        for active_map in self._active.values():
+            n += sum(1 for ar in active_map.values()
+                     if ar.request.degraded_from == source_endpoint)
+        for eq in self._queues.values():
+            for by_agent in eq._queues.values():
+                for dq in by_agent.values():
+                    n += sum(1 for r in dq if r.degraded_from == source_endpoint)
+        return n
 
     def queue_depth(self, endpoint: str) -> int:
         eq = self._queues.get(endpoint)

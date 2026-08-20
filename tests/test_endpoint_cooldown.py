@@ -64,6 +64,12 @@ def _state():
         on_demand=types.SimpleNamespace(manages=lambda ep: False),
         # fast_fail_interactive reads scheduler.queued_requests(ep, bands)
         scheduler=types.SimpleNamespace(queued_requests=lambda ep, bands: []),
+        # § 9 failover: None here means "no failover armed", which is what this
+        # suite wants — it exercises the COOLDOWN mechanics, and a live failover
+        # would reroute the very requests it asserts are released. The real
+        # ProxyState always has a Failover; a stub declaring it None is an
+        # explicit choice, not an accident of the stub being thin.
+        failover=None,
     )
 
 

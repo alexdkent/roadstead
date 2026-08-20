@@ -54,4 +54,35 @@ knowledge:
   max_balance_ss: 240.0
   default_priority: P3_INGESTION
 
+
+# --- degrade_ok: the tier3 failover opt-IN (§ 9.5) ---------------------------
+# When tier3 (`thinker`) is unhealthy, ONLY agents with `degrade_ok: true` are
+# rerouted to tier2-analyst; every other caller gets the same clean 503 it gets
+# today, now labelled and carrying Retry-After. Absent = false.
+#
+# 🚨 This set GROWS ONE AUDITED AGENT AT A TIME, through the normal audit cycle
+# (audit_dimensions.md § E9). It is not a migration and has no completion date.
+# The question each audit answers is "may this agent's tier3 calls be served by
+# a smaller model?", and recording a NO is as much of an answer as a yes.
+#
+# Granularity is per-AGENT by operator decision (2026-08-19), with a known cost:
+# an agent doing both conversational and authoring/extraction work is in or out
+# as a whole. Where that bites, the EXTRACTION path governs and the agent stays
+# OUT — so sidekick, whose chat turns would degrade fine, is not here, because her
+# one-shot authoring deliberately wants tier3.
+
+discord:
+  # DAY-1 SEED, and deliberately the only one. Chosen so the path runs in
+  # PRODUCTION rather than only in the journey — a failover that never fires is
+  # the guard-that-reads-green failure class.
+  #  * Conversational: its output is retractable by the person replying, which
+  #    is the house rule's own test for what may be softened without a code gate.
+  #  * ~200 requests/24h — the smallest real blast radius available.
+  # Two near-misses, recorded so they are not re-proposed:
+  #  * `dj` looks obvious and is NOT: its output is a public broadcast and a
+  #    listener cannot undo it by replying.
+  #  * `knowledge_store` is the canonical NEVER — 12,570 req and 64.7M input
+  #    tokens/24h, all of it extraction into durable state.
+  degrade_ok: true
+
 # (Other agents not listed here use AgentQuotaConfig defaults.)

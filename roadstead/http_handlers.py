@@ -722,6 +722,17 @@ class ProxyHttpHandlers:
             },
             # Phase 5F — endpoints an operator has drained for maintenance.
             "paused_endpoints": sorted(self.state.paused_endpoints),
+            # § 9.6 — endpoints currently served from their declared fallback.
+            # A SET (plus its counters), mirroring paused_endpoints above and
+            # deliberately NOT a per-endpoint bool — see ProxyState.
+            #
+            # This is the surface health-verifier's llmproxy verifier reads to raise the
+            # enter/leave transition chip: the proxy's own alert path is
+            # filtered to CRITICAL/ERROR by that verifier, so a WARNING alert
+            # here would be recorded and never chipped, while an ERROR one would
+            # page like an outage during a PLANNED drain (a drain reads
+            # unhealthy, so it trips degraded mode on purpose).
+            **self.state.failover.status(),
         })
     async def handle_admin_flags(self, request: Request) -> Response:
         """GET: current runtime flags. POST: update a subset (JSON object of

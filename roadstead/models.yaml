@@ -284,7 +284,19 @@ models:
     when_used:
       - Tool routers (temporal / health-verifier / research), email + proposal classify
       - knowledge audit/dedup classifiers
-    fallback: classifier
+    # NULLED 2026-08-20 with § 9, which made `fallback:` load-bearing. It said
+    # `classifier`, which is a role on THIS SAME E4B backend (see the note
+    # below) — as advisory metadata that meant "the greeter is the cheap
+    # fallback role", but as a failover declaration it would mean "when this
+    # endpoint is down, route to itself", which is not a failover.
+    #
+    # The value was harmless in practice — `classifier` is `proxy_endpoint:
+    # false`, so the derivation in build_endpoint_kwargs() skips it and arms
+    # nothing. That is exactly why it is nulled rather than left: it is a latent
+    # trap that would arm a self-referential failover the day somebody made the
+    # classifier stanza routable. Only ONE failover pair is designed and tested:
+    # tier3 -> tier2-analyst.
+    fallback: null
     notes: |
       Since 2026-06-08 this E4B backend ALSO serves the `classifier`
       (gemma-greeter) role — the E2B-hot :9090 was decommissioned.
@@ -459,6 +471,19 @@ models:
       # satisfies `{"type":"object"}` with no `required`, so the bug would survive).
       # Regression ledger: `tier3-json-object-empty-brace`.
       disable_any_whitespace: true
+      # § 9.7 — minimum time spent in degraded mode (serving from `fallback:`)
+      # before returning here, even once this endpoint is healthy again AND the
+      # degraded cohort has drained to zero.
+      #
+      # NOT redundant with the drain, which is the mistake it exists to prevent:
+      # drain alone means a tier3 flapping every 30s produces a model flip at
+      # every request boundary every 30s. 120s is a STARTING value, not a
+      # measured one — re-derive it from the observed flap interval the first
+      # time this fires in anger, and say so in the plan doc when you do.
+      # ⚠️ A policy key not listed in model_catalog.build_endpoint_kwargs()'s
+      # copy tuple is SILENTLY DROPPED; this one is pinned by
+      # test_failover.py::test_dwell_reaches_endpoint_config.
+      failover_dwell_s: 120
     capabilities:
       vision: false
       streaming: true
@@ -470,7 +495,25 @@ models:
     when_used:
       - knowledge extraction, news synthesis, thread/device enrichment
       - browser-broker default, forum-agent thread summary
-    fallback: tier3_backup
+    # 🚨 `fallback:` IS NOW LOAD-BEARING (§ 9 of the anvil2/V4-Flash plan,
+    # implemented 2026-08-20). It was advisory metadata that nothing consumed
+    # for routing — this stanza's own comments said so, and the tier3_backup it
+    # named was `proxy_endpoint: false`, i.e. a declared backup that could not
+    # serve. It now declares the endpoint CLASS this one degrades to while it is
+    # unhealthy: opted-in callers (llmproxy/agents.yaml `degrade_ok`) are served
+    # by tier2-analyst instead of getting a 503, and everyone else gets the same
+    # clean 503 as before, labelled and with Retry-After.
+    #
+    # `creative` is tier2-analyst's endpoint class (the boxa, :9196). It is NOT
+    # registered as an alias of anything here: aliasing is precisely what made
+    # `tier3-backup -> companion -> thinker` non-idempotent and served every
+    # backup request from tier3 itself (ledger `endpoint-class-alias-collision`).
+    #
+    # Guards: test_failover.py::test_declared_fallbacks_resolve_to_live_endpoints
+    # (a fallback must name a LIVE, ACTIVE proxy endpoint — the moment a field
+    # becomes load-bearing it needs a guard or it rots back into a comment) and
+    # test_model_naming_doctrine.py::test_catalog_loads_and_is_consistent.
+    fallback: creative
     notes: |
       TIER 3 — Laguna S 2.1 INT4 on vLLM (anvil/GB10, sm_121a image
       ghcr.io/timothystewart6/vllm-gb10), with the MATCHED Laguna-S-2.1-DFlash-INT4
@@ -898,7 +941,19 @@ models:
       - (NOT the inner chat loop — `companion-lite` moved to jetty 2026-08-19)
       - Tier-1.5/Tier-2 text classification (sidekick.extract_pad fallback, temporal.daily_summary, mail-agent.email_recent_overview, orchestrator.autonomous_chat-agent.reflect, forum-agent.peer_playbook) via the classify alias
       - attachments stage-2 full-resolution image extraction; knowledge_store ground-truth PII/document intake; browser_broker vision-routed capabilities (perceive./vision./insurance./portal.) via the vision aliases
-    fallback: tier3_backup
+    # 🚨 LITERAL null, and it must stay null (2026-08-20, § 9). This stanza said
+    # `tier3_backup` for the same reason `reasoner` did — as advisory metadata
+    # naming an endpoint that was `proxy_endpoint: false` and could not serve.
+    # Now that `fallback:` actually routes, a value here would ARM a
+    # tier2-analyst → somewhere failover that was never designed, decided or
+    # tested. Only ONE direction is authorised: tier3 → tier2-analyst.
+    #
+    # In particular do NOT set `thinker` to make it reciprocal. This endpoint is
+    # the failover TARGET; pointing it back at the source declares a pair that
+    # reads as a loop to anyone auditing it, and the case it appears to solve —
+    # both endpoints sick — is already handled (failover refuses to enter
+    # degraded mode when the target is unhealthy, and never chains a second hop).
+    fallback: null
     notes: |
       CONSOLIDATED 2026-07-11 (three roles → one model): ONE standalone always-on docker container
       `llamacpp-creative-boxa` (`ghcr.io/ggml-org/llama.cpp:server-intel`, SYCL/level_zero:0,

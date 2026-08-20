@@ -191,6 +191,24 @@ class EndpointConfig:
     # .apply_json_object_guard`` uses this flag to strip bare json_object on
     # these endpoints. False everywhere the launch flag is absent.
     disable_any_whitespace: bool = False
+    # --- tier3 failover (§ 9 of the anvil2/V4-Flash plan) ------------------
+    # The endpoint CLASS this one degrades to while it is unhealthy, derived
+    # from the model stanza's `fallback:` in models.yaml. Empty = no failover
+    # (today's behaviour: a clean 503).
+    #
+    # 🚨 `fallback:` was advisory metadata that nothing consumed for MONTHS
+    # (models.yaml said so in its own comment). This field is what makes it
+    # load-bearing, which is exactly why it now owes a doctrine test that it
+    # resolves to a live, active proxy endpoint — otherwise it rots back into a
+    # comment and the failover target silently becomes nothing.
+    # Guard: test_failover.py::test_declared_fallbacks_resolve_to_live_endpoints.
+    failover_to: str = ""
+    # Minimum time (s) spent in degraded mode before returning to this endpoint,
+    # even once it is healthy again and the degraded cohort has drained. NOT
+    # redundant with the drain: without it a backend flapping every 30s produces
+    # a request-boundary model flip every 30s. From the stanza's
+    # `policy.failover_dwell_s`.
+    failover_dwell_s: float = 120.0
     background_floor_pct: float = 0.20
     # Slots held back from the BACKGROUND band so an occasional interactive /
     # fast-path call always has an open slot (no preemption exists). When set,
@@ -331,6 +349,17 @@ class AgentQuotaConfig:
     weight: float = 1.0
     max_balance_ss: float = 60.0
     default_priority: LLMPriority = LLMPriority.P1_TURN_SUPPORT
+    # Tier-3 failover opt-IN (§9.5 of the anvil2/V4-Flash plan). When an
+    # endpoint with a declared `failover_to` is unhealthy, ONLY agents that set
+    # this may be rerouted to the smaller model; everyone else gets the same
+    # clean 503 they get today. Absent = False on purpose: a degraded answer is
+    # a WORSE answer, and which callers can absorb one is a judgement made per
+    # agent in the audit cycle (audit_dimensions.md § E9), never a default.
+    #
+    # Granularity is per-AGENT by operator decision. An agent that does both
+    # conversational and extraction/authoring work is in or out as a whole, and
+    # the extraction path governs — so it stays OUT.
+    degrade_ok: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -702,8 +731,12 @@ def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaCo
     Values may set any subset of:
         weight (float),
         max_balance_ss (float),
-        default_priority (str enum name — e.g. "P3_INGESTION").
+        default_priority (str enum name — e.g. "P3_INGESTION"),
+        degrade_ok (bool — tier3 failover opt-in, § 9.5).
     Missing keys fall back to the AgentQuotaConfig dataclass defaults.
+    ⚠️ A key not parsed below is SILENTLY IGNORED — adding a knob to
+    AgentQuotaConfig is not enough to make it operator-reachable. Guarded by
+    test_failover.py::test_degrade_ok_reaches_agent_config.
 
     When ``path`` is None, looks for ``LLM_PROXY_AGENTS_CONFIG`` env
     var, else falls back to ``<package>/agents.yaml``. A missing file
@@ -740,6 +773,8 @@ def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaCo
             kwargs["max_balance_ss"] = float(cfg["max_balance_ss"])
         if "default_priority" in cfg:
             kwargs["default_priority"] = LLMPriority.coerce(cfg["default_priority"])
+        if "degrade_ok" in cfg:
+            kwargs["degrade_ok"] = bool(cfg["degrade_ok"])
         out[str(agent_id)] = AgentQuotaConfig(**kwargs)
     logger.info("loaded %d agent quota config(s) from %s", len(out), p)
     return out

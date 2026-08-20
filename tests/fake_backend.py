@@ -266,7 +266,8 @@ def _completion_body(content: str, *, finish: str = "stop",
                      with_usage: bool = True,
                      tool_calls: Optional[list] = None,
                      cached_tokens: Any = None,
-                     usage_override: Any = _UNSET) -> dict:
+                     usage_override: Any = _UNSET,
+                     model: str = "fake-model") -> dict:
     msg: Dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls is not None:
         msg["tool_calls"] = tool_calls
@@ -274,7 +275,7 @@ def _completion_body(content: str, *, finish: str = "stop",
         "id": "chatcmpl-fake",
         "object": "chat.completion",
         "created": 1,
-        "model": "fake-model",
+        "model": model,
         "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
     }
     if usage_override is not _UNSET:
@@ -438,7 +439,8 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
         return JSONResponse(_completion_body(
             "echo: " + _last_user_text(body),
             cached_tokens=controller.cached_tokens,
-            usage_override=controller.usage_override))
+            usage_override=controller.usage_override,
+            model=controller.served_model_id))
 
     def _stream_response(body: Optional[dict], fault: str, arg: float) -> StreamingResponse:
         text = "echo: " + _last_user_text(body)

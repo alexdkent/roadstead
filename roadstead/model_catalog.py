@@ -285,10 +285,40 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
             # test_readyz.py::test_readiness_critical_flag_reaches_endpoint_config,
             # because a key missing from THIS tuple is silently dropped.
             ("readiness_critical", "readiness_critical"),
+            # § 9.7 — minimum dwell in degraded mode before flipping back.
+            # Guarded by test_failover.py::test_dwell_reaches_endpoint_config,
+            # because a key missing from THIS tuple is silently dropped.
+            ("failover_dwell_s", "failover_dwell_s"),
         ):
             if src in pol:
                 kw[dst] = pol[src]
         out[e.endpoint_class] = kw
+
+    # § 9 — make `fallback:` load-bearing. Resolve each stanza's declared
+    # fallback to the endpoint CLASS the proxy would route to, and only when
+    # that target is itself a live, active proxy endpoint. A fallback naming a
+    # retired/non-routable stanza (as `tier3_backup` did for a year) resolves to
+    # nothing rather than arming a failover at a backend that cannot serve.
+    #
+    # 🚨 This is deliberately NOT an alias: `normalize_endpoint()` is untouched
+    # and stays idempotent. Registering the target as an alias of the source is
+    # what made `tier3-backup -> companion -> thinker` and served every backup
+    # request from tier3 itself (ledger `endpoint-class-alias-collision`).
+    live_classes = {
+        e.endpoint_class for e in cat.proxy_endpoints()
+        if e.endpoint_class and e.status == "active"
+    }
+    for e in cat.proxy_endpoints():
+        if not e.fallback or e.endpoint_class not in out:
+            continue
+        target = cat.entry(e.fallback)
+        if target is None or not target.proxy_endpoint or not target.endpoint_class:
+            continue
+        if target.endpoint_class == e.endpoint_class:
+            continue  # a stanza declaring itself its own fallback is a no-op
+        if target.endpoint_class not in live_classes:
+            continue
+        out[e.endpoint_class]["failover_to"] = target.endpoint_class
     return out
 
 

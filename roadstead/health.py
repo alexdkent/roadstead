@@ -145,14 +145,46 @@ class Health:
     def fast_fail_interactive(self, ep_name: str) -> None:
         """On the unhealthy transition, release queued INTERACTIVE/FOREGROUND
         requests for this endpoint with a deferrable error so they don't wait out
-        their full deadline; BACKGROUND stays queued to defer until recovery."""
+        their full deadline; BACKGROUND stays queued to defer until recovery.
+
+        § 9.2 — with a failover target armed, an eligible request is REROUTED
+        here instead of released. This is the one pre-existing behaviour the
+        failover change modifies, and the distinction is the whole point: these
+        requests are already in the queue at the moment the circuit trips, so
+        without this they are the ONE cohort that fails during an outage the
+        failover was built to absorb. They never reach the submit-path hook —
+        that ran before the endpoint was sick.
+        """
+        # Enter degraded mode now if this transition warrants it, so the plan()
+        # calls below see the state this very transition created.
+        if self.state.failover is not None:
+            self.state.failover.refresh()
         queued = self.state.scheduler.queued_requests(
             ep_name, (PriorityBand.INTERACTIVE, PriorityBand.FOREGROUND))
         for req in queued:
+            plan = (self.state.failover.plan(req)
+                    if self.state.failover is not None else None)
+            if plan is not None and plan.rerouted:
+                # Move it: out of the dead endpoint's queue, re-pointed, back in
+                # on the target's. Re-enqueue re-estimates cost and occupancy
+                # against the target, which is what makes the DRR accounting on
+                # the receiving endpoint correct rather than inherited.
+                self.state.scheduler.cancel(req.request_id)
+                self.state.failover.apply(req, plan.target)
+                self.state.scheduler.enqueue(req)
+                self.state.dispatch_event.set()
+                continue
             self.state.scheduler.cancel(req.request_id)
             self.state.queue_db.persist_expire(req.request_id)
-            self.state.resolve_error(
-                req, f"backend {ep_name} unavailable (circuit open)")
+            # The failover reason is APPENDED, never substituted: the base
+            # message carries the deferrability marker the fleet's clients sniff
+            # for, so replacing it would turn a retryable deferral into a hard
+            # error for every caller that could not be degraded.
+            err = f"backend {ep_name} unavailable (circuit open)"
+            if plan is not None and plan.refusal_code:
+                err += plan.refusal_detail
+                self.state.failover.record_refusal(req, plan)
+            self.state.resolve_error(req, err)
     def record_dispatch_failure(
         self, endpoint: str, exc: Exception, *, best_effort: bool = False,
     ) -> None:
@@ -473,6 +505,16 @@ class Health:
             self.evaluate_alerts(mono)
         except Exception as exc:  # noqa: BLE001
             logger.debug("alert evaluation failed: %s", exc)
+        # § 9.7 — drive the failover state machine on the poller cadence, not
+        # only on the submit path. LEAVING degraded mode must not require
+        # traffic: a tier3 that recovers during a quiet hour would otherwise
+        # stay marked degraded until the next request arrived, which is the
+        # `an-inert-probe-has-no-symptom` shape — a state nobody re-evaluates.
+        try:
+            if self.state.failover is not None:
+                self.state.failover.refresh(mono)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("failover refresh failed: %s", exc)
         # Age out stale timeout-model samples (cheap; piggybacks the
         # poller cadence instead of a dedicated task).
         self.state.timeout_model.prune(mono)

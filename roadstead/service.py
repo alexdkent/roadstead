@@ -82,6 +82,7 @@ from .correction import (
     _is_degenerate_text,  # noqa: F401
     _top_shingle_reps,  # noqa: F401
 )
+from .failover import Failover
 from .health import Health
 from .http_handlers import (
     ProxyHttpHandlers,
@@ -204,6 +205,11 @@ class ProxyService:
         # drain/pause). ProxyService keeps thin delegators to each collaborator's
         # methods so its frozen private surface stays intact.
         self._health = Health(self._state)
+        # Failover (§ 9): degraded routing from a sick endpoint to its declared
+        # `fallback:`. Built HERE rather than inside ProxyState because it
+        # consumes Health's endpoint_healthy() — the detection half already
+        # exists and must not be duplicated.
+        self._state.failover = Failover(self._state, self._health)
         # Correction: grammar/thinking/degeneration/empty-rescue/egress guards.
         self._correction = Correction(self._state)
         # Lifecycle: admission -> dispatch -> response hot path (uses Correction

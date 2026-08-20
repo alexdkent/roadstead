@@ -20,7 +20,7 @@ import asyncio
 import math
 import time
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .acl import IPIdentityMap
 from .agent_budget import BudgetManager
@@ -99,6 +99,11 @@ class ProxyState:
         # On-demand endpoints (e.g. `creative`, Gemma-4-31B abliterated): the model is loaded
         # lazily under the anvil GPU-slot dispatcher lease and idle-unloaded.
         self.on_demand = OnDemandManager(config.endpoints)
+        # § 9 tier3 failover. Assigned by ProxyService right after Health is
+        # built (Failover consumes endpoint_healthy and must not duplicate it),
+        # which is why this is a late-bound attribute rather than constructed
+        # here like the collaborators above. Never None in a running proxy.
+        self.failover: Any = None
 
         # Runtime-mutable feature flags (flags.py) — shadow→enforce switches +
         # kill-switches that must be flippable without a process restart (no
@@ -232,6 +237,26 @@ class ProxyState:
         # so a planned drain never fires the endpoint_paused ERROR alert. The
         # poller skips paused endpoints; /resume hands them back to the poller.
         self.paused_endpoints: set[str] = set()
+        # § 9 tier3 failover — endpoints currently serving their traffic from a
+        # declared fallback because they are unhealthy.
+        #
+        # 🚨 A SET, mirroring paused_endpoints above, and deliberately NOT a
+        # per-endpoint bool: the `paused` bool on /v1/status is already
+        # known-unreliable (observed False for an endpoint that WAS in
+        # paused_endpoints), and a second bool with the same bug would only give
+        # the operator a second thing to disbelieve.
+        #
+        # NOT persisted across a restart (unlike paused_endpoints, which is an
+        # operator INTENTION and must survive one). Degraded mode is a derived
+        # observation: a fresh process re-derives it from health within one
+        # poller tick, and re-seeding it would assert an outage that may be over.
+        self.degraded_endpoints: set[str] = set()
+        self.degraded_since: dict[str, float] = {}
+        self.degraded_rerouted: dict[str, int] = {}
+        # source endpoint → refusal code → count. The refusals matter more than
+        # the reroutes: they are what tells the operator that the opt-in set is
+        # too small, or that the failover target is too small for the traffic.
+        self.degraded_refused: dict[str, dict[str, int]] = {}
         # Step 4b — rate-windowed per-endpoint cooldown. Complements the
         # consecutive-fail circuit above: a FLAKY backend (intermittent 5xx that
         # never strings ``health_fail_threshold`` in a row) trips THIS instead.

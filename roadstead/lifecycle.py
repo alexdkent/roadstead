@@ -534,24 +534,58 @@ class Lifecycle:
         # error instead of queuing them to wait out their full deadline; let
         # background work queue so it defers until the backend recovers. (Cache
         # hits above are served regardless — they don't need the backend.)
-        if not self.health.endpoint_healthy(req.endpoint) and req.band != PriorityBand.BACKGROUND:
-            # Phase 5F: distinguish an operator drain (planned) from an
-            # auto-circuit trip (backend unreachable). Both are DEFERRABLE
-            # ("circuit open" / "backpressure" are is_deferrable_llm_error
-            # markers) so the caller retries; the wording just aids triage.
-            if normalize_endpoint(req.endpoint) in self.state.paused_endpoints:
-                err = f"backend {req.endpoint} paused for maintenance (drain) — backpressure"
-                code = "draining"
-            else:
-                err = f"backend {req.endpoint} unavailable (circuit open)"
-                code = "circuit_open"
-            if openai:
-                return _openai_error(err, "backend_unavailable", 503, code=code)
-            return JSONResponse(
-                {"status": "error", "request_id": req.request_id, "error": err,
-                 "code": code},
-                status_code=503,
-            )
+        if not self.health.endpoint_healthy(req.endpoint):
+            # § 9 tier3 failover. Evaluated for EVERY band, not just
+            # interactive/foreground: a background request that can be served
+            # now by the smaller model should be, rather than sitting deferred
+            # for the whole outage. Nothing below runs while the fleet is
+            # healthy — this is the branch that already meant "refuse".
+            src_ep = normalize_endpoint(req.endpoint)
+            self.state.failover.refresh()
+            fplan = self.state.failover.plan(req)
+            if fplan.rerouted:
+                self.state.failover.apply(req, fplan.target)
+            elif req.band != PriorityBand.BACKGROUND:
+                # Phase 5F: distinguish an operator drain (planned) from an
+                # auto-circuit trip (backend unreachable). Both are DEFERRABLE
+                # ("circuit open" / "backpressure" are is_deferrable_llm_error
+                # markers) so the caller retries; the wording just aids triage.
+                #
+                if src_ep in self.state.paused_endpoints:
+                    err = f"backend {req.endpoint} paused for maintenance (drain) — backpressure"
+                    code = "draining"
+                else:
+                    err = f"backend {req.endpoint} unavailable (circuit open)"
+                    code = "circuit_open"
+                # A failover REFUSAL (§ 9.4) APPENDS to that message and travels
+                # in its own field. It must not replace either: `code` is the
+                # taxonomy callers already classify on, and the message above is
+                # what distinguishes a planned drain from an outage for the
+                # operator — plus it carries the substrings the fleet's clients
+                # sniff for deferrability.
+                body_extra: dict = {}
+                if fplan.refusal_code:
+                    err += fplan.refusal_detail
+                    body_extra["degraded_refusal"] = fplan.refusal_code
+                    # Counted HERE, at the point the request is actually turned
+                    # away — not inside plan(), which is pure. A BACKGROUND
+                    # request that fails both gates never reaches this branch:
+                    # it falls through and queues to defer until recovery,
+                    # exactly as before failover existed. It was not refused,
+                    # and must not inflate the counter the operator reads to
+                    # decide whether the opt-in set is too small.
+                    self.state.failover.record_refusal(req, fplan)
+                retry_after = self.health.retry_after_s(src_ep)
+                if openai:
+                    resp = _openai_error(err, "backend_unavailable", 503, code=code)
+                else:
+                    resp = JSONResponse(
+                        {"status": "error", "request_id": req.request_id, "error": err,
+                         "code": code, **body_extra},
+                        status_code=503,
+                    )
+                resp.headers["Retry-After"] = str(retry_after)
+                return resp
 
         # Load-shed / backpressure (Phase 2.4): under sustained saturation, shed
         # NON-interactive work with 429 + Retry-After so callers defer instead of
@@ -1091,6 +1125,21 @@ class Lifecycle:
                 "response": resp.body,
                 "status": "ok",
             }
+            # § 9.6 — an explicit degraded marker, so an opted-in caller can
+            # still choose to defer its own work rather than accept a smaller
+            # model's answer. Added ONLY when degraded: the envelope shape for
+            # normal traffic is unchanged.
+            #
+            # The served model needs no special handling — ``resp.body`` is the
+            # backend's own reply and its ``model`` field is the model that
+            # ACTUALLY served, because the reroute re-pointed req.endpoint
+            # before the backend was chosen. Reading back resp.model is the
+            # fleet's own rule for trusting a rename; degraded mode must not
+            # break it, and this is why the reroute is one assignment on the
+            # routing key rather than a dispatcher-side override.
+            if req.degraded_from:
+                result["degraded"] = True
+                result["degraded_from"] = req.degraded_from
 
             future = self.state.pending_futures.get(req.request_id)
             if future and not future.done():
@@ -1422,13 +1471,19 @@ class Lifecycle:
         if stream_guard_err is not None:
             await stream_q.put({"type": "error", "error": stream_guard_err})
         else:
-            await stream_q.put({
+            done_frame = {
                 "type": "done",
                 "queue_wait_ms": round(decision.queue_wait_ms, 1),
                 "backend_latency_ms": round(duration * 1000, 1),
                 "ttft_ms": round(ttft_ms or 0.0, 1),  # Phase 4.1
                 "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
-            })
+            }
+            # § 9.6 — same degraded marker as the sync envelope, so a streaming
+            # caller is told too. Added only when degraded.
+            if req.degraded_from:
+                done_frame["degraded"] = True
+                done_frame["degraded_from"] = req.degraded_from
+            await stream_q.put(done_frame)
         # Phase 1.1: record truncation of a structured stream so the storm is
         # visible in metrics (kept independent of the guard kill-switch — with
         # the guard off the caller still got the legacy 'done', but the
