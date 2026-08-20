@@ -58,6 +58,7 @@ def _state():
         endpoint_failure_times={},
         endpoint_cooldown_until={},
         endpoint_cooldown_trips={},
+        cooldown_best_effort_skips={},
         paused_endpoints=set(),
         endpoint_health={},
         on_demand=types.SimpleNamespace(manages=lambda ep: False),
@@ -212,3 +213,110 @@ if __name__ == "__main__":  # plain-script mode (Mac 3.9)
         passed += 1
         print(f"ok {fn.__name__}")
     print(f"\n{passed}/{len(fns)} passed")
+
+
+# --- best-effort sub-floor timeouts must NOT cool the endpoint --------------
+# Regression, 2026-08-20. `orchestrator.gemma_greeter_advisory` hands the backend
+# a deadline far under the size-aware recommended time. When that deadline fired
+# it was counted as a backend fault, and 4 of them inside 60s cooled the WHOLE
+# tier1 endpoint for 30s — fast-failing unrelated P1 Discord turn-path callers
+# with 503 circuit_open. 143 such timeouts were logged, 91 on 2026-08-20 alone,
+# tripping 8 endpoint-wide cooldowns in one day. The identical
+# `_timeout_below_recommended` predicate already gated the endpoint_stalled
+# heuristic since 2026-07-05; it was simply never wired into the cooldown.
+
+def test_best_effort_timeout_never_trips_cooldown(monkeypatch):
+    monkeypatch.setenv(SHADOW, "1")
+    monkeypatch.setenv(ALLOWED, "2")
+    h = _health()
+    for _ in range(20):
+        h.record_dispatch_failure("gemma", BackendTimeout("gave up"), best_effort=True)
+    assert h.state.endpoint_cooldown_trips == {}
+    assert h.state.endpoint_failure_times.get("gemma", []) == []
+
+
+def test_best_effort_skip_is_counted_so_the_guard_is_observable(monkeypatch):
+    monkeypatch.setenv(SHADOW, "1")
+    h = _health()
+    for _ in range(3):
+        h.record_dispatch_failure("gemma", BackendTimeout("gave up"), best_effort=True)
+    # A guard nobody can see firing is indistinguishable from one that is dead.
+    assert h.state.cooldown_best_effort_skips.get("gemma") == 3
+
+
+def test_genuine_faults_still_cool_the_same_endpoint(monkeypatch):
+    """ANTI-VACUITY. The exclusion must narrow the cooldown, not delete it —
+    a version that simply stopped counting timeouts would pass the test above."""
+    monkeypatch.setenv(SHADOW, "1")
+    monkeypatch.setenv(ALLOWED, "2")
+    h = _health()
+    h.record_dispatch_failure("gemma", BackendTimeout("gave up"), best_effort=True)
+    assert h.state.endpoint_cooldown_trips == {}          # excluded
+    h.record_dispatch_failure("gemma", BackendTimeout("real stall"))
+    h.record_dispatch_failure("gemma", BackendTimeout("real stall"))
+    assert h.state.endpoint_cooldown_trips.get("gemma") == 1   # still cools
+
+
+def test_best_effort_defaults_false_so_existing_callers_are_unchanged(monkeypatch):
+    """ANTI-VACUITY. The keyword must be opt-in: an un-updated call site keeps
+    counting exactly as before."""
+    monkeypatch.setenv(SHADOW, "1")
+    monkeypatch.setenv(ALLOWED, "2")
+    h = _health()
+    h.record_dispatch_failure("creative", BackendTimeout("stall"))
+    h.record_dispatch_failure("creative", BackendTimeout("stall"))
+    assert h.state.endpoint_cooldown_trips.get("creative") == 1
+    assert h.state.cooldown_best_effort_skips == {}
+
+
+def test_best_effort_4xx_is_classified_out_before_the_skip_tally(monkeypatch):
+    """A caller error is not a best-effort give-up; it must not inflate the
+    skip counter, or the counter stops meaning what /v1/status says it means."""
+    monkeypatch.setenv(SHADOW, "1")
+    h = _health()
+    h.record_dispatch_failure("gemma", BackendError(400, "bad"), best_effort=True)
+    assert h.state.cooldown_best_effort_skips == {}
+    assert h.state.endpoint_cooldown_trips == {}
+
+
+def test_both_flags_off_still_noop_for_best_effort(monkeypatch):
+    _all_off(monkeypatch)
+    h = _health()
+    h.record_dispatch_failure("gemma", BackendTimeout("x"), best_effort=True)
+    assert h.state.cooldown_best_effort_skips == {}
+
+
+# --- the WIRING, not just the mechanism ------------------------------------
+# The bug was never in the predicate — it was that the predicate was not passed
+# at the timeout call sites. Assert that statically so a future edit that drops
+# the keyword fails here instead of silently restoring the outage.
+
+def test_every_backend_timeout_handler_passes_best_effort():
+    import ast
+    src = (REPO / "originfleet" / "llmproxy" / "lifecycle.py").read_text()
+    tree = ast.parse(src)
+    offenders, checked = [], 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        names = set()
+        t = node.type
+        for n in (t.elts if isinstance(t, ast.Tuple) else [t] if t else []):
+            if isinstance(n, ast.Name):
+                names.add(n.id)
+        if "BackendTimeout" not in names:
+            continue
+        for call in ast.walk(node):
+            if (isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "record_dispatch_failure"):
+                checked += 1
+                if not any(kw.arg == "best_effort" for kw in call.keywords):
+                    offenders.append(node.lineno)
+    assert checked >= 2, (
+        f"expected >=2 record_dispatch_failure calls inside BackendTimeout "
+        f"handlers, found {checked} — the sweep has gone blind, not green")
+    assert not offenders, (
+        f"record_dispatch_failure inside a BackendTimeout handler at line(s) "
+        f"{offenders} omits best_effort= — a sub-floor caller give-up will cool "
+        f"the endpoint for everyone again")

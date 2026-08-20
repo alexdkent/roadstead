@@ -76,6 +76,20 @@ logger = logging.getLogger(__name__)
 # observability._ENDPOINT_STALL_MIN_TIMEOUTS (2026-07-05 gemma stall-burst fix).
 _STALL_BEST_EFFORT_RATIO = 0.5
 
+# The COOLDOWN exclusion uses a DELIBERATELY TIGHTER ratio than the stall
+# heuristic above, and the difference is load-bearing. `recommended_ms` is
+# floored by timeout_model.FLOOR_S, which is 60-120s on the chat tiers — so at
+# 0.5 nearly EVERY interactive caller (whose deadline is single-digit seconds)
+# would read as best-effort and the cooldown would go inert for timeouts, which
+# is a safety mechanism silently disarmed rather than a bug fixed.
+#
+# 0.1 excludes only egregious under-budgeting — the case this exists for is
+# `orchestrator.gemma_greeter_advisory` at 0.9-1.6s against tier1's 60s floor,
+# a ratio of ~0.015-0.027, two orders below the bar. A caller that gave the
+# backend even a tenth of the recommended time still cools it on a genuine
+# stall. Raising this toward 0.5 re-disarms the cooldown; do not.
+_COOLDOWN_BEST_EFFORT_RATIO = 0.1
+
 
 #: Content-part type tags that carry an IMAGE. Both wire shapes appear here:
 #: OpenAI multipart (``{"type": "image_url", ...}``) and Anthropic typed blocks
@@ -128,15 +142,21 @@ def _carries_image(body: dict) -> bool:
     return False
 
 
-def _timeout_below_recommended(applied_timeout_s, recommended_ms) -> bool:
+def _timeout_below_recommended(
+    applied_timeout_s, recommended_ms, ratio: float = _STALL_BEST_EFFORT_RATIO,
+) -> bool:
     """True if the applied deadline is far under the recommended time — a
     best-effort caller that never gave the backend a fair chance. Cheap + total:
-    a missing/zero recommended or applied returns False (counts as genuine)."""
+    a missing/zero recommended or applied returns False (counts as genuine).
+
+    ``ratio`` defaults to the stall heuristic's 0.5; the cooldown passes the
+    much tighter ``_COOLDOWN_BEST_EFFORT_RATIO`` — see its comment for why the
+    two consumers must NOT share one threshold."""
     applied_ms = float(applied_timeout_s or 0.0) * 1000.0
     return bool(
         recommended_ms
         and applied_ms
-        and applied_ms < float(recommended_ms) * _STALL_BEST_EFFORT_RATIO
+        and applied_ms < float(recommended_ms) * ratio
     )
 
 
@@ -964,7 +984,14 @@ class Lifecycle:
                     req, layer="backend", elapsed_s=duration,
                     queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
                 )
-                self.health.record_dispatch_failure(req.endpoint, exc)  # Step 4b
+                # Step 4b. best_effort: a caller that never gave the backend a
+                # fair chance must not cool it for everyone else (tier1 greeter
+                # advisory, 2026-08-20).
+                self.health.record_dispatch_failure(
+                    req.endpoint, exc,
+                    best_effort=self._is_best_effort_timeout(
+                        req, _COOLDOWN_BEST_EFFORT_RATIO),
+                )
                 return
             except (BackendUnavailable, BackendError) as exc:
                 duration = time.monotonic() - t0
@@ -1341,7 +1368,13 @@ class Lifecycle:
                 queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
                 proxy_initiated=watchdog, abort_reason=abort_reason,
             )
-            self.health.record_dispatch_failure(req.endpoint, exc)  # Step 4b (BackendTimeout only)
+            # Step 4b (BackendTimeout only) — same best-effort exclusion as the
+            # non-stream path; a sub-floor stream deadline is not stall evidence.
+            self.health.record_dispatch_failure(
+                req.endpoint, exc,
+                best_effort=self._is_best_effort_timeout(
+                    req, _COOLDOWN_BEST_EFFORT_RATIO),
+            )
             return
         except Exception as exc:
             await stream_q.put({"type": "error", "error": str(exc)})
@@ -1590,17 +1623,8 @@ class Lifecycle:
         # deadline far under the recommended time) is not reliable stall evidence
         # — tag it so endpoint_stalled excludes it (2026-07-05 gemma bursts).
         # Only recomputes the advice on the rare timeout completion; fully guarded.
-        _best_effort = False
-        if status == "timeout":
-            try:
-                _rec = self.state.timeout_model.advise(
-                    req.endpoint, int(req.priority),
-                    req.est_input_tokens or estimate_input_tokens(req.payload),
-                    int(req.payload.get("max_tokens", 0) or 0),
-                )["recommended_ms"]
-                _best_effort = _timeout_below_recommended(req.timeout_s, _rec)
-            except Exception:  # noqa: BLE001
-                _best_effort = False
+        _best_effort = (
+            self._is_best_effort_timeout(req) if status == "timeout" else False)
 
         # Metrics
         self.state.metrics.record(MetricsSample(
@@ -1765,6 +1789,31 @@ class Lifecycle:
             source=advice["source"],
             would_timeout=(end_to_end_ms > recommended_ms),
         )
+    def _is_best_effort_timeout(
+        self, req: QueuedRequest, ratio: float = _STALL_BEST_EFFORT_RATIO,
+    ) -> bool:
+        """True when THIS request's applied deadline was a sub-floor give-up.
+
+        One definition, three consumers: the ``best_effort`` metric tag, the
+        ``endpoint_stalled`` heuristic, and (since 2026-08-20) the cooldown
+        window in ``health.record_dispatch_failure``. Keeping the computation in
+        one method is the point — the cooldown bug existed precisely because the
+        predicate lived inline next to ONE consumer and the other never got it.
+
+        Recomputes the size-aware advice, which is why it is called only on the
+        rare timeout path. Fully guarded: any fault answers False (counts as a
+        genuine backend fault), so a broken advice model can never silently
+        disarm the cooldown."""
+        try:
+            rec = self.state.timeout_model.advise(
+                req.endpoint, int(req.priority),
+                req.est_input_tokens or estimate_input_tokens(req.payload),
+                int(req.payload.get("max_tokens", 0) or 0),
+            )["recommended_ms"]
+            return _timeout_below_recommended(req.timeout_s, rec, ratio)
+        except Exception:  # noqa: BLE001 — never let telemetry break dispatch
+            return False
+
     def record_timeout_event(
         self,
         req: QueuedRequest,

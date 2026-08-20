@@ -153,7 +153,9 @@ class Health:
             self.state.queue_db.persist_expire(req.request_id)
             self.state.resolve_error(
                 req, f"backend {ep_name} unavailable (circuit open)")
-    def record_dispatch_failure(self, endpoint: str, exc: Exception) -> None:
+    def record_dispatch_failure(
+        self, endpoint: str, exc: Exception, *, best_effort: bool = False,
+    ) -> None:
         """Step 4b: feed the rate-windowed cooldown from the dispatch error paths.
 
         Counts ONLY a BACKEND-FAULT failure (5xx / timeout=504 / unavailable=503 —
@@ -161,12 +163,38 @@ class Health:
         backend. After ``cooldown_allowed_fails`` within ``cooldown_window_s``,
         cool the endpoint (enforce → briefly unhealthy + fast-fail its queued
         interactive, exactly like the circuit) or log a would-cool (shadow). No-op
-        — and zero cost — when both cooldown flags are off (byte-identical)."""
+        — and zero cost — when both cooldown flags are off (byte-identical).
+
+        🚨 ``best_effort`` EXCLUDES a caller's own sub-floor give-up from the
+        cooldown window. A caller that hands the backend a deadline far under the
+        size-aware recommended time (``lifecycle._timeout_below_recommended``)
+        learns nothing about backend health when that deadline fires — it never
+        gave the backend a fair chance. Counting it cooled the whole endpoint for
+        everyone else: measured 2026-08-20, ``orchestrator.gemma_greeter_advisory``
+        asks for ~122 tokens in 0.9-1.6s against a real ~2.3-2.5s decode, so it
+        timed out STRUCTURALLY (89 of 143 tier1 timeouts, 91 on 08-20 alone) and
+        tripped 8 endpoint-wide 30s cooldowns in one day, fast-failing unrelated
+        P1 Discord turn-path callers with 503 circuit_open.
+
+        The exclusion is deliberately keyed on the APPLIED DEADLINE, not on the
+        call site: any caller that under-budgets gets the same treatment, and a
+        genuine backend fault (which arrives with a normal deadline) still cools
+        exactly as before. The identical predicate already gated the
+        ``observability.endpoint_stalled`` heuristic for this same reason since
+        2026-07-05 — it was simply never wired into THIS consumer of the same
+        timeout data, which is the whole defect."""
         shadow = endpoint_cooldown_shadow()
         enforce = endpoint_cooldown_enabled()
         if not (shadow or enforce):
             return
         if not (isinstance(exc, BackendError) and exc.status_code >= 500):
+            return
+        if best_effort:
+            # Tally it so the exclusion is OBSERVABLE rather than a silent drop —
+            # a guard nobody can see firing is indistinguishable from a dead one.
+            ep_be = normalize_endpoint(endpoint)
+            self.state.cooldown_best_effort_skips[ep_be] = (
+                self.state.cooldown_best_effort_skips.get(ep_be, 0) + 1)
             return
         ep = normalize_endpoint(endpoint)
         now = time.monotonic()

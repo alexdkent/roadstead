@@ -242,6 +242,12 @@ class ProxyState:
         self.endpoint_failure_times: dict[str, list[float]] = {}
         self.endpoint_cooldown_until: dict[str, float] = {}
         self.endpoint_cooldown_trips: dict[str, int] = {}
+        # Per endpoint: timeouts EXCLUDED from the cooldown window because the
+        # caller's own applied deadline was a best-effort sub-floor give-up
+        # (health.record_dispatch_failure(best_effort=True)). Counted so the
+        # exclusion is visible on /v1/status — an invisible guard cannot be told
+        # apart from one that never fires.
+        self.cooldown_best_effort_skips: dict[str, int] = {}
         self.transient_retry_max = 1
         # Retention sweep cadence (Phase 2.3) — monotonic ts of the last DB trim.
         self.last_cleanup_at = 0.0

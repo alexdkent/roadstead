@@ -193,7 +193,15 @@ async def test_shadow_counts_but_never_pulls_e2e(proxy, monkeypatch):
 async def test_sync_timeout_counts_toward_cooldown(proxy, monkeypatch):
     """The BackendTimeout branch (lifecycle sync-timeout terminal) must feed the
     cooldown. Drives a per-request timeout_s below the backend's injected sleep so
-    the proxy raises BackendTimeout (504 → counts)."""
+    the proxy raises BackendTimeout (504 → counts).
+
+    The 0.2s deadline this uses is ITSELF a best-effort sub-floor give-up, which
+    the 2026-08-20 cooldown exclusion correctly filters out — so the exclusion is
+    disabled here (ratio 0.0 can never be met) to keep this focused on the thing
+    it actually tests: that the call site is WIRED. The exclusion's own behaviour
+    is asserted by test_sub_floor_timeout_excluded_from_cooldown_e2e below."""
+    import originfleet.llmproxy.lifecycle as _lc
+    monkeypatch.setattr(_lc, "_COOLDOWN_BEST_EFFORT_RATIO", 0.0)
     monkeypatch.setenv(SHADOW, "1")
     monkeypatch.setenv(ALLOWED, "2")
     base = proxy.total_in_flight()
@@ -331,3 +339,30 @@ def test_record_dispatch_failure_broken_state_never_crashes_dispatch(monkeypatch
     h = Health(object())  # no dicts at all
     # 4xx classified out before touching state → no AttributeError.
     h.record_dispatch_failure("chat", BackendError(404, "nope"))
+
+
+# --------------------------------------------------------------------------- #
+# 2b' — the same terminal, WITHOUT disabling the exclusion: a caller that gave
+#       the backend a fraction of the recommended time must NOT cool it.
+#       Regression for the 2026-08-20 tier1 outage (see test_endpoint_cooldown).
+# --------------------------------------------------------------------------- #
+
+async def test_sub_floor_timeout_excluded_from_cooldown_e2e(proxy, monkeypatch):
+    monkeypatch.setenv(SHADOW, "1")
+    monkeypatch.setenv(ALLOWED, "2")
+    st = proxy.svc._correction.state
+    before = st.endpoint_cooldown_trips.get(EP_CLASS, 0)
+    # Same shape as the wiring test above — 0.2s against a 2s backend sleep —
+    # but with the real ratio in force, so the give-up is classified best-effort.
+    for _ in range(4):
+        r = await proxy.chat("hi", timeout_s=0.2, fault=FAULT_TIMEOUT, fault_arg=2.0)
+        assert r.status_code >= 400
+    for _ in range(80):
+        if proxy.total_in_flight() == 0:
+            break
+        await asyncio.sleep(0.05)
+    assert st.endpoint_cooldown_trips.get(EP_CLASS, 0) == before, (
+        "a sub-floor caller give-up cooled the endpoint — the tier1 greeter "
+        "regression is back (89 such timeouts tripped 8 cooldowns on 2026-08-20)")
+    assert st.cooldown_best_effort_skips.get(EP_CLASS, 0) >= 4, (
+        "exclusions must be TALLIED, not silently dropped")

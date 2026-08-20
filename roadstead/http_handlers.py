@@ -561,6 +561,14 @@ class ProxyHttpHandlers:
             if _cd_until and now < _cd_until:
                 snap["cooling"] = True
                 snap["cooldown_remaining_s"] = round(_cd_until - now, 1)
+            # Timeouts EXCLUDED from the cooldown window as best-effort sub-floor
+            # give-ups (2026-08-20). Surfaced so the exclusion is auditable: a
+            # rising count here with a flat `cooldown_trips` is the guard WORKING,
+            # while a rising count on an endpoint nobody under-budgets would mean
+            # the advice model has drifted and is disarming real faults.
+            _be_skips = self.state.cooldown_best_effort_skips.get(ep_name, 0)
+            if _be_skips:
+                snap["cooldown_best_effort_skips"] = _be_skips
             # Survivorship fix (2026-06-06): the timeout-advice model + shadow
             # only ingest status==ok, so they reported a misleading "0 would
             # timeout" while requests were actually timing out. Surface the real

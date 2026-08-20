@@ -345,6 +345,28 @@ def estimate_input_tokens(payload: dict) -> int:
     """Rough token count from a chat-completion payload.  4 chars ≈ 1
     token.  Good enough for cost estimation — we calibrate from actuals.
 
+    🚫 DO NOT LOOSEN THE 4-CHARS/TOKEN RATIO. Measured 2026-08-20 against
+    90,326 real request rows in ``/data/logs/llmproxy_requests.jsonl`` (every
+    row carries BOTH ``estimated_input_tokens`` and the backend's actual
+    ``input_tokens``, so this is ground truth, not a model):
+
+        est/actual   p05 0.87 | p50 0.95 | p95 1.08 | max 1.50
+        undershoots (<1.0) on 86.8% of requests
+        exceeds actual at all on 13.1%; >=1.25x on 0.1%
+
+    The estimate is systematically CONSERVATIVE in the safe direction, exactly
+    as this docstring has always claimed. A raised ratio would push the
+    already-undershooting 86.8% further under and let real context overflows
+    reach the backend as errors instead of a clean 422.
+
+    This was nearly "fixed" on the strength of ONE synthetic benchmark prompt
+    that the context gate 422'd at an estimated 19,923 tokens against a real
+    ~14,000 — a 1.42x overshoot. That prompt was built from a short English
+    sentence repeated hundreds of times, which tokenizes far more efficiently
+    than prose and sits at the p100 tail above. The outlier was the TEST DATA,
+    not the estimator. If a false 422 is ever reported on REAL traffic, bring
+    a request row showing est/actual, not a synthetic repro.
+
     Counts the top-level Anthropic-shaped ``system`` field (which
     ``backend._normalize_chat_payload`` later inlines into ``messages``) and
     serialized ``tools`` schemas — both invisible to the old messages-only
