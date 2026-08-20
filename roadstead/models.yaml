@@ -802,30 +802,47 @@ models:
   # below that argues from "this endpoint also serves the chat loop", it predates the split.
   # Plan: originfleet/docs/tier2_split_architecture_2026-08.md §7, §9.
   tier2-analyst:
-    # 🔒 NEXT MODEL DECIDED 2026-08-19 (operator): **Qwen3.8-27B** replaces Qwen3.6-35B-A3B here.
-    # ⚠️ NOT DEPLOYED YET — every field below still describes what the boxa is ACTUALLY serving
-    # today (Qwen3.6-35B-A3B abliterated). Do not edit them to the new model until it is live;
-    # a catalog that describes a design rather than a deployment is how this repo has been
-    # burned before. Flip model_family/quant/params/token_speed IN THE SAME COMMIT as the swap.
+    # ✅ DEPLOYED 2026-08-19 (Phase 4): **Qwen3.8-27B** replaced Qwen3.6-35B-A3B here. Dense
+    # 27B, native vision (no separate VL), built-in MTP head. Every field below now describes
+    # what the boxa is ACTUALLY serving; they were flipped in the same commit as the swap.
     #
-    # The decided serve config, measured on the boxa (tier2_split_architecture_2026-08.md §8.1g/i):
-    #   -m Qwen3.8-27B-Q4_0.gguf --mmproj mmproj-bf16.gguf
-    #   -fa on -ctk f16 -ctv f16 -b 8192 -ub 4096
-    #   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.4
+    # The LIVE serve config (canonical copy: infra/nasbox-vllm-xpu/serve_creative_llamacpp.sh):
+    #   -m /models/qwen38-27b/Q4_0.gguf --mmproj /models/qwen38-27b/mmproj-bf16.gguf
+    #   -ngl 99 -c 262144 --parallel 6 --kv-unified
+    #   -fa on -ctk q8_0 -ctv q8_0 -b 4096 -ub 2048 --image-min-tokens 1024
     #   --jinja --chat-template-kwargs '{"enable_thinking":false}'
-    # Staged at /mnt/cache/llm/qwen38-27b on nasbox. 592 prefill / 47.3 decode at 2.6K;
-    # 866/41.3 at 32K. Dense 27B, native vision (no separate VL), built-in MTP head.
+    # Measured IN THIS SHAPE on llama.cpp b10499 (not the bench shape): prefill 565 @2K /
+    # 610 @8K, aggregate decode 24 tok/s at 1 stream rising to 65 at 6, six CONCURRENT
+    # 3-image requests all correct.
     #
-    # 🚨 THREE THINGS THAT MUST NOT BE CHANGED CASUALLY when this lands:
+    # 🚨 THREE PLAN DECISIONS DID NOT SURVIVE CONTACT — all three because §8.1g benched at
+    # ONE slot and this endpoint serves SIX:
+    #  * **MTP is OFF.** `--spec-type draft-mtp` is +40% single-stream and 2.6x WORSE at 6
+    #    concurrent (aggregate 24.5 vs 64.7; per-stream collapses to 4.3 tok/s). Speculative
+    #    decoding spends compute to buy latency, and a saturated batch has none to spend —
+    #    vLLM sees the same reversal at batch ~32, this backend at batch 2. Full table and
+    #    sources: the serve script. Re-enable ONLY if this endpoint becomes single-stream.
+    #  * `-b 8192 -ub 4096` recovers Q4_0's prefill gap at parallel 1 and recovers NOTHING at
+    #    parallel 6 (564 vs 563 tok/s), while costing HALF the KV pool. Now -b 4096 -ub 2048.
+    #  * `-c` could NOT be carried over from the incumbent. 393216 is 3-13x more KV than fits
+    #    beside these weights + mmproj; it degraded the endpoint to ~3 tok/s prefill while
+    #    /health stayed green. See the serve script for the two cheap tells.
+    #
+    # 🚨 AND THE BUILD WAS NOT THE BENCHED BUILD. The boxa was serving a six-week-old image
+    # (b9894) while every §8.1g number came from b10499. Re-pulled 2026-08-19; the config
+    # above is measured on b10499. A floating `:server-intel` tag hides this — check it.
+    #
+    # 🚨 THREE THINGS THAT MUST NOT BE CHANGED CASUALLY:
     #  1. `enable_thinking:false` is LOAD-BEARING. With thinking on, llama.cpp #20345 silently
     #     DISABLES response_format enforcement on this model family. Verified today that the
     #     live endpoint enforces (forced-enum probe); never enable thinking without re-testing.
     #  2. Q4_0 not Q4_K_M. For a DENSE model on SYCL, Q4_0 decode is 26% faster — the INVERSE
     #     of the MoE law recorded in memory `reference_boxa_backend_and_moe_fit`.
-    #  3. MTP is worth +94% decode on SYCL and is a NET LOSS on Vulkan. Backend-specific.
-    #     Stay on SYCL: measured 1.9x prefill / 1.5x decode over Vulkan on this card (§8.1h).
+    #  3. Stay on SYCL: measured 1.9x prefill / 1.5x decode over Vulkan on this card (§8.1h).
+    #  4. `--kv-unified` is REQUIRED — it makes `-c` ONE shared pool across the 6 slots
+    #     instead of a per-slot allocation demanding 6x the memory.
     kind: chat
-    status: active                  # PINNED always-resident on the boxa. Standalone docker container `llamacpp-creative-boxa` (--restart always) on :9196 — no dispatcher/systemd; proxy dispatches directly, capacity self-discovered via /props. CONSOLIDATED 2026-07-11: ONE Qwen3.6-35B-A3B-abliterated container (+mmproj) now backs THREE roles — `creative`, `companion-lite`(alias, chat loop), AND the `classify`/`analyst`/vision family(alias, re-homed off anvil :9092). Superseded the Trinity-Mini(creative)/Gemma-4-26B(companion-lite) split AND the anvil llama-classify.service (stopped). Not evictable (dedicated card) — the anvil eviction dance is gone.
+    status: active                  # PINNED always-resident on the boxa. Standalone docker container `llamacpp-creative-boxa` (--restart always) on :9196 — no dispatcher/systemd; proxy dispatches directly, capacity self-discovered via /props. Launched by infra/nasbox-vllm-xpu/serve_creative_llamacpp.sh, which is the canonical config. Since the 2026-08-19 Phase 4 swap it runs ONE Qwen3.8-27B DENSE container (+mmproj) backing TWO lanes — `creative` (long-form/song authoring) and the `classify`/`analyst`/vision family — plus bare `tier2`. HISTORY: it backed a THIRD role, `companion-lite` (the chat loop), until Phase 3 moved that to jetty the same day; before 2026-07-11 the box ran a Trinity-Mini/Gemma-4-26B two-container split and classify lived on the anvil llama-classify.service (stopped). Not evictable (dedicated card).
     proxy_endpoint: true
     endpoint_class: creative
     role: creative
@@ -841,12 +858,12 @@ models:
     backend_engine: llama.cpp
     probe_kind: llama
     served_model_names: [creative, deckard-31b, deckard]   # `creative` = the LIVE boxa llama.cpp server (-a creative); `deckard`/`deckard-31b` = the DORMANT anvil rollback (serve_deckard.sh, on anvil) — declared so the naming-doctrine test covers them. `companion-lite` is a ROUTING alias, NOT a served -a name — the container runs `-a creative`.
-    model_family: Qwen3.6-35B-A3B (abliterated, Heretic) — MoE 35B total / ~3B active, Q4_K_M GGUF
-    quant: Q4_K_M
-    params: {active: 3B, total: 35B}
-    context_per_slot: 65536          # llama.cpp -c 393216 --parallel 6 = 65536/slot, f16 KV cache. Trimmed 76800->65536 (2026-07-11) to make room for the mmproj (861 MB) + vision-encoder compute buffer now that classify/vision re-homed here; ~30.5 GiB resident of the 32GB boxa, no GTT spill.
+    model_family: Qwen3.8-27B — DENSE 27B, 3:1 hybrid (48 Gated-DeltaNet linear-attention + 16 full-attention), natively multimodal, Q4_0 GGUF
+    quant: Q4_0                      # NOT Q4_K_M — the dense law inverts the MoE law on SYCL (see above)
+    params: {total: 27B}             # dense: no active/total split
+    context_per_slot: 262144         # llama.cpp `-c 262144 --parallel 6 --kv-unified` — ONE SHARED 262,144-token pool (the model's full native context), NOT a per-slot allocation: it bounds the SUM of live conversations. Sized by measurement 2026-08-19, never inherited — the incumbent's 393216 does not fit this model and degraded the endpoint to ~3 tok/s with /health green. Three things bought this pool, largest first: dropping MTP (auto-fit 59,648 -> 206,592), q8_0 KV instead of f16 (-> 262,144, measured free on this DENSE model though it was slower on the MoE), and dropping -b 8192 -ub 4096. Verified at this size with 6 CONCURRENT 3-image requests (41s, all correct — faster than the same test at 131,072, because more KV means less eviction).
     context_window: 32768            # fleet chunkers size against 32K on purpose (policy, not slot size) — same policy classify used, so re-homing classify here changes no chunk sizing
-    slots: 6                         # llama.cpp --parallel 6 — the shadow reconciler warns if this drifts from actual --parallel (6)
+    slots: 6                         # llama.cpp --parallel 6 — unchanged across the model swap so the analyst keeps its 6-way concurrency; the shadow reconciler warns if this drifts from actual --parallel (6)
     timeout_floor_s: 120            # compromise: this endpoint serves BOTH long creative song-compose AND latency-sensitive classify/vision/tool calls. 120s min-budget; adaptive surge×size widens to the ceiling for big song-compose, and a stuck call fails in ~120s instead of 900s. (mirrors timeout_model FLOOR_S["creative"] — bump BOTH in lockstep.) The chat-loop half of this compromise left with `companion-lite` on 2026-08-19; held at 120 through the cutover so a latency reading is not confounded by two changes at once — re-derive at Phase 5.
     timeout_ceiling_s: 1800         # inherently long-running (long-form gen); a role override so the generous background band applies on EVERY tier (song-compose runs at an interactive tier). Adaptive surge×size widens up to here.
     policy:
@@ -864,18 +881,21 @@ models:
     capabilities:
       vision: true                  # mmproj loaded (mmproj-bf16.gguf, 861 MB) — classify's vision callers (attachments stage-2, knowledge_store intake, browser_broker perceive./vision.) route here now. Verified 2026-07-11: perfect OCR + shape/number extraction on the boxa/SYCL, ~79 t/s vision decode.
       streaming: true
-      reasoning: false              # Qwen3.6 reasoning is DISABLED via `--jinja --chat-template-kwargs '{"enable_thinking":false}'` (VERIFIED 0 reasoning_content).
-      tool_calling: grammar         # now backs the inner-loop chat tool-calling (companion-lite alias): the orchestrator's tool catalog is GBNF grammar-constrained.
+      reasoning: false              # Qwen3.8 is a REASONING checkpoint; CoT is DISABLED via `--jinja --chat-template-kwargs '{"enable_thinking":false}'` (VERIFIED 2026-08-19: 0 reasoning_content, and a forced-enum probe confirmed response_format is still ENFORCED — llama.cpp #20345 silently disables enforcement on this family when thinking is on).
+      tool_calling: grammar         # GBNF grammar-constrained. Qwen3.8 also ENFORCES `tool_choice: required`, which the Qwen3.6 incumbent did not (measured 2026-08-19); abstains correctly on tool_choice auto.
       structured_output: grammar    # llama.cpp GBNF / response_format json_schema. NOTE: give structured calls a generous max_tokens.
-    token_speed: {note: "Qwen3.6-35B-A3B MoE (~3B active) Q4_K_M on the boxa (SYCL), --parallel 6 / 76800 ctx-per-slot; consolidated creative+companion-lite endpoint. Per-model decode/prefill numbers not yet re-benchmarked on this loadout — the prior Trinity-Mini/Gemma-4-26B figures are retired."}
+    token_speed: {note: "Qwen3.8-27B dense Q4_0 on the boxa (SYCL, llama.cpp b10499), 6 slots / 262144 shared kv-unified pool, q8_0 KV. Measured 2026-08-19 IN PRODUCTION SHAPE: prefill 624 tok/s @2K, 810 @8K; decode AGGREGATE 23.7 tok/s at 1 stream -> 64.4 at 6 (per-stream 26.6 -> 12.0). Speculative decoding (MTP) is deliberately OFF: +40% at one stream, 2.6x WORSE aggregate at six, and its draft state was also the single biggest consumer of KV headroom. A single-stream decode number is NOT this endpoint's throughput — it serves six."}
     purpose: |
-      The consolidated boxa core model — ONE abliterated Qwen3.6-35B-A3B (+mmproj) serving THREE roles:
-      (1) creative / counterpoint generative voice, (2) the orchestrator inner chat-loop backend
-      (companion-lite alias), and (3) the fleet text-classify + vision tier (classify/analyst family,
-      re-homed off the anvil GB10 — which is now free for imagegen/videogen).
+      The boxa analyst model — ONE Qwen3.8-27B dense (+mmproj) serving TWO lanes: (1) the
+      creative / counterpoint generative voice (songs, DJ patter), and (2) the fleet
+      text-classify + VISION tier (classify/analyst family). Bare `tier2` also lands here.
+      🚨 It no longer serves the chat loop: `companion-lite` left for `tier2-chat` on jetty at
+      the 2026-08-19 Phase 3 cutover, and the model itself was swapped off Qwen3.6-35B-A3B at
+      Phase 4 the same day. This box is the fleet's ONLY vision tier — jetty has no mmproj.
     when_used:
       - sidekick song authoring (theme/hook/expand), dj crew speaker voice
-      - orchestrator inner chat loop (Sidekick's chat turn) via the companion-lite alias
+      - discord attribution / self-state / nightshift / arc gates and ~10 tools, via `tier2`
+      - (NOT the inner chat loop — `companion-lite` moved to jetty 2026-08-19)
       - Tier-1.5/Tier-2 text classification (sidekick.extract_pad fallback, temporal.daily_summary, mail-agent.email_recent_overview, orchestrator.autonomous_chat-agent.reflect, forum-agent.peer_playbook) via the classify alias
       - attachments stage-2 full-resolution image extraction; knowledge_store ground-truth PII/document intake; browser_broker vision-routed capabilities (perceive./vision./insurance./portal.) via the vision aliases
     fallback: tier3_backup
