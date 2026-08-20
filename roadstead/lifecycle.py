@@ -88,25 +88,41 @@ _IMAGE_PART_TYPES = frozenset({"image", "image_url"})
 def _carries_image(body: dict) -> bool:
     """True if this request puts an image on the wire.
 
-    Deliberately CHEAP and shallow: it walks message ``content`` lists looking
-    at the ``type`` tag only, and never touches the base64 payload — this runs
-    on the hot admission path for every request, including the text-only
-    majority. Returns False on any unexpected shape rather than raising; a
-    telemetry gate must never be able to reject a valid request.
+    🚨 LOOKS IN BOTH PLACES ON PURPOSE. Every real caller reaches this function
+    through the SUBMIT ENVELOPE — `{"agent_id", "endpoint", "payload": {...}}` —
+    with the actual chat request nested under ``payload``: the OpenAI front door
+    builds that wrapper in `http_handlers.handle_openai_chat`, and
+    `framework/llm_proxy_client` builds the same one. A first version of this
+    read only top-level ``messages``, passed its unit tests against a
+    hand-written body, and then fired on NOTHING in production — the counter sat
+    at {} through a live 500 while the gate believed no image had ever been
+    sent. Top-level is kept as well because it costs one `.get` and makes the
+    function safe to call on either shape.
+
+    Deliberately CHEAP and shallow: walks message ``content`` lists looking at
+    the ``type`` tag only, never touching the base64 payload — this runs on the
+    hot admission path for every request, including the text-only majority.
+    Returns False on any unexpected shape rather than raising; a telemetry gate
+    must never be able to reject a valid request.
     """
     try:
-        messages = body.get("messages")
-        if not isinstance(messages, list):
-            return False
-        for msg in messages:
-            if not isinstance(msg, dict):
+        payload = body.get("payload")
+        for source in (body, payload if isinstance(payload, dict) else None):
+            if source is None:
                 continue
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue          # a plain string cannot carry an image
-            for part in content:
-                if isinstance(part, dict) and part.get("type") in _IMAGE_PART_TYPES:
-                    return True
+            messages = source.get("messages")
+            if not isinstance(messages, list):
+                continue
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue      # a plain string cannot carry an image
+                for part in content:
+                    if (isinstance(part, dict)
+                            and part.get("type") in _IMAGE_PART_TYPES):
+                        return True
     except Exception:  # noqa: BLE001 — telemetry must not break admission
         return False
     return False

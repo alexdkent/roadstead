@@ -30,6 +30,23 @@ from originfleet.llmproxy.lifecycle import _carries_image
 
 # --------------------------------------------------------------- 1. detector
 
+def test_detector_sees_an_image_inside_the_SUBMIT_ENVELOPE():
+    """🚨 THE REGRESSION TEST FOR THE GATE'S OWN FIRST BUG. Every real caller
+    arrives wrapped — `{"agent_id", "endpoint", "payload": {...}}` — with the
+    chat request under ``payload``. A detector reading only top-level
+    ``messages`` passes a flat-body unit test and then never fires in
+    production, which is exactly what happened on 2026-08-20: the live counter
+    sat at {} through a confirmed backend 500."""
+    assert _carries_image({
+        "agent_id": "a", "endpoint": "e",
+        "payload": {"model": "e", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url",
+             "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
+        ]}]},
+    })
+
+
 def test_detector_sees_the_openai_image_shape():
     assert _carries_image({"messages": [{"role": "user", "content": [
         {"type": "text", "text": "what is this"},
@@ -117,16 +134,29 @@ def test_the_chat_lane_is_text_only_and_the_analyst_can_see():
 
 # ------------------------------------------------------------ 3. gate counting
 
+_IMAGE_MESSAGES = [{"role": "user", "content": [
+    {"type": "text", "text": "describe this"},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
+]}]
+
+
 def _image_body(endpoint: str) -> dict:
+    """The REAL submit envelope, not a hand-written flat body.
+
+    🚨 This shape is the whole point. Both front doors —
+    `http_handlers.handle_openai_chat` and `framework/llm_proxy_client` — wrap
+    the chat request under ``payload``. The first version of these tests put
+    ``messages`` at the top level, passed, and certified a gate that fired on
+    nothing in production. Build the fixture from the wire, not from memory.
+    """
     return {
-        "model": endpoint,
+        "agent_id": "test.vision_gate",
         "caller_id": "test.vision_gate",
         "call_site": "test.vision_gate",
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": "describe this"},
-            {"type": "image_url",
-             "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
-        ]}],
+        "endpoint": endpoint,
+        "priority": 2,
+        "payload_type": "chat_completion",
+        "payload": {"model": endpoint, "messages": _IMAGE_MESSAGES},
     }
 
 
@@ -162,7 +192,7 @@ def test_a_text_only_request_to_a_blind_endpoint_is_not_counted():
     text-only request is (correctly) NOT short-circuited — it would go on to
     enqueue against a scheduler this test never started."""
     body = _image_body("anything")
-    body["messages"] = [{"role": "user", "content": "plain text only"}]
+    body["payload"]["messages"] = [{"role": "user", "content": "plain text only"}]
     assert _carries_image(body) is False
 
 
