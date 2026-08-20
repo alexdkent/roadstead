@@ -939,15 +939,39 @@ class ProxyHttpHandlers:
         # are kept for transparency; hit_rate_source flags the real ones. The
         # per-CALLER (by_call_site) rows stay cached_tokens-based (n/a until the
         # backend emits it — Tier-1's LCP screen predicts per-caller reuse).
+        # 🚨 THE OVERLAY IS A GAP-FILLER, NOT A PREFERENCE — corrected 2026-08-20.
+        # It used to overwrite UNCONDITIONALLY, which was harmless only while no
+        # backend reported per-request `cached_tokens`. Two things changed:
+        #   1. llama.cpp always DID report it (three comments claimed otherwise);
+        #      those endpoints are fully attributed and now dominate the corpus.
+        #   2. tier3's vLLM started reporting it too, once
+        #      `--enable-prompt-tokens-details` was added to its launch args.
+        # So an unconditional overlay now DISCARDS good per-request data in favour
+        # of a coarser number. Worse, `state.endpoint_cache_hit_rate` is populated
+        # only `if ep_cfg.backend_engine == "vllm"` (health.compute_cache_stats),
+        # and those counters are CUMULATIVE-SINCE-BACKEND-BOOT — so the old
+        # fleet "query-weighted mean" was a mean of ONE endpoint, reporting a
+        # single backend's LIFETIME rate under a window-scoped `fleet` label
+        # (measured: fleet said 0.4672 while its own columns said 0.5833).
+        # Rule now: overlay ONLY where the window has no attributable data of its
+        # own. Real per-request measurement always wins.
         real = self.state.endpoint_cache_hit_rate
+
+        def _has_own_data(row: dict) -> bool:
+            return bool(row.get("attributable_input_tokens"))
+
         for row in data.get("by_endpoint", []):
+            if _has_own_data(row):
+                continue          # honest per-request sum — do not clobber it
             r = real.get(row.get("endpoint"))
             if r and r.get("hit_rate") is not None:
                 row["hit_rate"] = r["hit_rate"]
                 row["hit_rate_source"] = r.get("source", "backend_prefix_cache_metrics")
         fleet = data.get("fleet")
-        if fleet is not None and real:
-            # fleet headline = query-weighted mean of the real per-endpoint rates.
+        if fleet is not None and real and not _has_own_data(fleet):
+            # Only when NOTHING in the window was attributable. Otherwise the
+            # summed columns are the fleet number and must be left alone, so the
+            # headline and the columns beside it describe the same thing.
             tot_q = sum(v["queries"] for v in real.values() if v.get("queries"))
             if tot_q > 0:
                 fleet["hit_rate"] = round(
