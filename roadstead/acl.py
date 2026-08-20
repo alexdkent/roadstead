@@ -224,22 +224,13 @@ class IPIdentityMap:
         # pool-observer comment above for the full measurement.
         acl.register("10.0.0.20", "pool-effector", LLMPriority.P3_INGESTION,
                      min_timeout_s=_SMART_DEFAULT_CAP_S)
-        # pool-analyst (Kestrel CTnnn, static 10.0.0.23, Phase 4 of
-        # originfleet/docs/pool_loop_substrate_plan_2026-08.md — provisioned 2026-08-14).
-        # Same reasoning as pool-observer/pool-effector immediately above: `pool` is a
-        # plain OpenAI-compat client with no identity header, so without this its traffic
-        # lands in `lan-generic` and is invisible in `proxy_completions`. Registered
-        # SEPARATELY from the other two pool instances, not as a third alias of the same
-        # identity — the analyst is a distinct credential-poor instance (no hub SSH, no
-        # Proxmox key, no HA token; a gateway MCP token scoped to `research` only is its
-        # entire fleet reach) and QoS/spend attribution should be able to tell it apart
-        # from the observer and effector even though today all three get the same P3 tier
-        # and the same timeout floor. Same min_timeout_s reasoning as the other two: pool
-        # supplies no deadline of its own, so it gets the smart default, and the
-        # size_stretch clamp binds long before any per-role ceiling would — see the
-        # pool-observer comment above for the full measurement.
-        acl.register("10.0.0.23", "pool-analyst", LLMPriority.P3_INGESTION,
-                     min_timeout_s=_SMART_DEFAULT_CAP_S)
+        # pool-analyst (Kestrel CTnnn, 10.0.0.23) was registered here from
+        # 2026-08-14 until the CT was DESTROYED 2026-08-20. The registration is
+        # removed with it: .23 sits inside the DHCP pool, so leaving a stale
+        # source-IP identity would silently misattribute whatever takes the
+        # address next — the same mis-claim class this fleet has hit on
+        # .12/.18/.19/.86. Traffic from a future .23 lands in `lan-generic`
+        # until something re-registers it deliberately.
         # lan-generic carries the SAME floor, and that is a deliberate blunt
         # instrument, not an oversight: the mac dev host runs `pool` too and
         # lands here (only the Kestrel CT has a static registration), so flooring
