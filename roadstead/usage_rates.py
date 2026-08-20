@@ -104,9 +104,13 @@ _ENDPOINT_CLASS: dict[str, str | None] = {
     # exactly why it went unnoticed. Point them where the traffic actually goes.
     "companion": "thinker", "composer": "thinker", "qwen-composer": "thinker",
     "nexus-companion": "thinker",
-    # The 122B backup is no longer a proxy endpoint (see models.yaml) — it has
-    # no class to bill to. `llama-companion` is its systemd UNIT name, never a
-    # routable alias.
+    # The 122B backup is no longer a proxy endpoint, and as of 2026-08-20 its
+    # models.yaml stanza is gone entirely — it has no class to bill to.
+    # `llama-companion` is its systemd UNIT name, never a routable alias.
+    # DELIBERATELY KEPT despite the stanza's removal: historical `proxy_completions`
+    # rows logged while it was `proxy_endpoint: true` (pre-2026-08-02) still carry
+    # these strings, and this map must keep resolving them or billing/usage queries
+    # over that older data start raising on an unknown endpoint.
     "llama-companion": None, "tier3-backup": None, "llama-companion-122b": None,
     "creative": "creative", "deckard": "creative", "deckard-31b": "creative",
     # 2026-08-19 tier2 split: these three left `creative` for `tier2-chat` on jetty.

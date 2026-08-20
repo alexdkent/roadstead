@@ -100,119 +100,6 @@ models:
   # queue-wait. Same weights/mmproj as before, same 32K chunking policy (creative.context_window),
   # reasoning-off, grammar tool-calling — behavior-preserving for classify callers.
 
-  tier3_backup:
-    # 🔻 TIER-3 BACKUP ONLY as of 2026-07-30 (Phase B step 4 + §2b priority ladder).
-    # Every live role that used to land here — `composer`, `companion`, `nexus-companion`,
-    # `qwen-composer` — now resolves to the anvil `reasoner`/tier3 Laguna endpoint. This
-    # stanza exists to keep the ABLITERATED 122B reachable as tier3's declared fallback.
-    #
-    # `status: on_demand` because §2b makes its STEADY STATE **STOPPED** (priority 1: loaded
-    # only when tier3 is unhealthy). Leaving it running is not free — measured 2026-07-31, with
-    # the 122B resident nexus has ~8 GiB spare and moving SDXL to GPU took **701 s instead of
-    # seconds**, a ~40x penalty. imagegen and this model cannot usefully co-reside, which is the
-    # whole reason §2b specifies non-concurrency rather than sharing.
-    #
-    # Do NOT re-add `tier3` here — an alias maps to exactly ONE endpoint and load_catalog()
-    # raises `name collision` AT IMPORT, taking the proxy down on start (it did, ~4 min).
-    # 🚨 RECOVERY IS MANUAL TODAY — do not read `fallback: tier3_backup` as automatic failover.
-    # Two things are true and easy to conflate:
-    #   * `fallback:` is PARSED into the catalog but never consumed for routing. It is advisory
-    #     metadata. Nothing re-routes to this endpoint when tier3 fails.
-    #   * `status: on_demand` here is NOT the same field as EndpointConfig.on_demand. That flag
-    #     drives the ANVIL GPU-slot dispatcher lease (dispatcher_capability) and is anvil-
-    #     only; nexus has no dispatcher, so no existing machinery can load this model. Building
-    #     that is §4b.2 of the tier migration (the nexus memory arbiter) — NEW SOFTWARE.
-    # Until the arbiter lands, bringing the abliterated 122B back is an OPERATOR action:
-    #     ssh root@10.0.0.6 'systemctl start llama-companion'     # ~minutes, 70.6 GiB GGUF
-    # The unit is stopped AND disabled on purpose (§2b: steady state STOPPED so imagegen gets
-    # the run of the box). Starting it will contend with imagegen for nexus memory.
-    kind: chat
-    status: on_demand
-    # 🚨 NOT A PROXY ENDPOINT (2026-08-02). It was `proxy_endpoint: true` with
-    # `endpoint_class: companion`, and that CLASS NAME COLLIDED with `companion`,
-    # which the 2026-07-30 tier migration made an ALIAS of the reasoner/tier3
-    # stanza below. The collision made normalize_endpoint() NON-IDEMPOTENT:
-    #     tier3-backup -> companion -> thinker
-    # and the submit path normalizes twice (resolve_endpoint() then
-    # QueuedRequest.create()), so EVERY request for the 122B backup was silently
-    # served by tier3 — verified live on the wire (backend 10.0.0.3:9083,
-    # served_model=llama-thinker). The declared backup was unreachable, and on the
-    # day tier3 is sick that returns a confident wrong-model answer instead of a
-    # clean failure. Ledger: `endpoint-class-alias-collision`.
-    #
-    # Dropping the class (rather than the `companion` alias) is deliberate: the
-    # alias is load-bearing — dj, the prompt budgets and framework/nexus_stream
-    # all pass `companion` MEANING tier3, and removing it would point them at a
-    # dead nexus:8081. Dropping the class also stops us ADVERTISING a backend
-    # that physically cannot serve: the unit is stopped+disabled, nexus has no
-    # dispatcher to load it, so the endpoint was decorative. `tier3-backup` now
-    # 404s honestly instead of lying.
-    #
-    # The entry stays (kind/status/aliases/systemd_unit) so `canonical()` still
-    # resolves the reasoner stanza's `fallback: tier3_backup` and the model-card /
-    # telemetry derivations keep their metadata. RE-ADDING it as a proxy endpoint
-    # is part of the manual recovery below — and MUST use a class name that is not
-    # also an alias, or this bug returns.
-    proxy_endpoint: false
-    role: tier3-backup
-    aliases: [tier3-backup, llama-companion-122b]
-    host: nexus
-    port: 8081
-    backend_engine: llama.cpp
-    systemd_unit: llama-companion
-    probe_kind: llama
-    model_family: Qwen3.5-122B-A10B (Huihui abliterated)
-    quant: Q4_K_M
-    context_per_slot: 262144   # 2026-07-09: raised 131072->262144 (256K = native n_ctx_train; classify freed the mem, ~2 KV heads make 256K KV only ~14GB). --kv-unified shared pool; seed only, live value comes from /props. Was 131072 (2026-07-04), 32768/slot before that.
-    context_window: 32768      # fleet chunkers size against 32K on purpose (policy, not slot size) — deliberately NOT bumped with the 256K slot; 256K is rare-need headroom, not the default feed
-    slots: 8                   # 2026-07-17 prefill campaign: 4->8 (--parallel 8). llama-batched-bench on the final env: aggregate decode 28.5->62.8 t/s at 1->8-way (still climbing, no cliff), prefill holds ~430-460 t/s aggregate through 8-way. Seed only; live value from /props.
-    timeout_floor_s: 360       # 2026-07-04: raised 180->360 — kv-unified allows big single requests; 122B prefill (now ~400 t/s pp4096 after the 2026-07-17 env uplift) needs headroom past 128K (NB 2026-07-09: a FULL 256K prefill ~approaches timeout_ceiling_s 900 — the rare extreme, revisit ceiling if huge prompts become common)
-    timeout_ceiling_s: 900     # 2026-07-05: the 122B is legitimately slow even on turn-support tiers; a role override so the interactive band (600s) can't strangle a big synth under load. Adaptive surge×size widens up to here.
-    policy:
-      dispatch_concurrency_cap: 8   # 2026-07-17: 4->8 with --parallel 8; batched-bench validated through
-                                    # 8-way on the new env (no instability, monotonic aggregate gains).
-      fast_path_reserve_slots: 1    # background_cap = 8-1 = 7, the doctrine-MAX. Do NOT set reserve:0 to
-                                    # give extraction all slots (tried 2026-07-17): reserve:0 alone
-                                    # backfires (cap→0.20 floor=1); reserve:0+background_floor_pct:1.0 breaks
-                                    # the anti-starvation invariant (test_background_cap.py — floor must leave
-                                    # >=1 for interactive). Reclaiming the idle last slot needs a SCHEDULER
-                                    # change, not config. Real throughput lever = smoothing the kv3/kv4 feed.
-      slot_affinity: true           # pin a conversation to one slot (KV reuse via --slot-prompt-similarity)
-    capabilities:
-      vision: false
-      streaming: true
-      reasoning: false
-      tool_calling: true
-      structured_output: grammar
-    token_speed: {note: "single-stream ~28 t/s decode / ~422 pp2048 / ~399 pp4096; aggregate ~63 t/s decode / ~430-460 t/s pp at 8-way (2026-07-17 campaign: perf governor + amd_iommu=off + mesa 26.1.4; llama-bench + llama-batched-bench)"}
-    purpose: Streaming user-facing synth + high-capability composer/summarizer.
-    when_used:
-      - Inner-loop final-answer synthesis + tier2_synth streaming reply
-      - Speech-frame voice replies, recipe-runner recipe execution
-      - Large-context summary fallover (>24k tokens)
-    fallback: reasoner
-    notes: |
-      2026-07-03: swapped from Qwen3-Next-80B-A3B to Qwen3.5-122B-A10B, and the
-      binary from a patched llama.cpp (0be84685b, custom hybrid-recurrent
-      checkpoint-restore patch for the 80B's gated-delta-net architecture) to a
-      stock/mainline prebuilt (/opt/llama.cpp-b9849, build 9849) — the 122B is a
-      standard MoE ("qwen35moe"), so the old patch's checkpoint-restore feature
-      doesn't apply here and was dropped along with the patched binary.
-      Full optimization pass + concurrent-throughput validation:
-      infra/nexus/bench_results/composer_122b_optimization_20260703.md.
-      Findings baked into config: `--n-cpu-moe` hurts monotonically on this UMA
-      hardware (not used, ncmoe=0 effectively); `-b 4096 -ub 2048` is the
-      validated batch/ubatch sweet spot. A research pass found nothing in the
-      gap between b9849 and the (then-)current HEAD (b9870) worth chasing for
-      this hardware/backend — see the same bench doc.
-      2026-07-17/18 prefill campaign (same binary, env uplift + slots 4->8):
-      infra/nexus/bench_results/composer_prefill_campaign_20260717.md.
-      Nexus host state it depends on: CPU governor=performance
-      (nexus-perfgov.service), amd_iommu=off grub default, mesa-vulkan-drivers
-      26.1.4 kisak PPA under apt-mark hold (mesa version materially moves
-      composer throughput — never upgrade without a drained re-bench), unit
-      `--cache-ram 16384` (host prompt cache; KV f16 A/B rejected, q8_0 kept).
-
   router:
     kind: chat
     status: active
@@ -347,8 +234,12 @@ models:
     # tier3 = canonical (2026-07-30 tier migration). `composer`/`companion`/`qwen-composer`/
     # `nexus-companion` were MOVED here from the nexus 122B stanza on 2026-07-30 — Phase B
     # step 4, "point composer/companion/reasoner/thinker aliases at tier3". Laguna is now the
-    # single heavy tier; the 122B remains reachable as `tier3-backup` (on_demand) for its
-    # abliterated capability, per the §2b priority ladder.
+    # single heavy tier. The abliterated 122B's `tier3_backup` stanza (nexus, on_demand,
+    # `proxy_endpoint: false`) is REMOVED (2026-08-20) — it was manual-recovery-only and never
+    # actually served (see `fallback:` below), and the same day's tier3->tier2-analyst failover
+    # replaced automatically what it existed to provide by hand. The abliterated weights/unit
+    # are being retired on nexus too; there is no longer a way to reach that capability
+    # through the proxy.
     # `poolside/laguna-s-2.1` is the name POOLSIDE'S OWN CLIENTS send by default
     # (measured 2026-08-01: the `pool` CLI v1.0.14 in standalone mode hardcodes it
     # in every /v1/chat/completions body). It is the SAME model we serve here —
