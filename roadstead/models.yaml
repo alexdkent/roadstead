@@ -280,7 +280,16 @@ models:
     # client works against the proxy with no client-side model config. Without it
     # the proxy correctly 404s `model_not_found` and pool retries 3x and dies.
     aliases: [tier3, reasoner, llama-thinker, thinker, composer, companion, qwen-composer, nexus-companion, poolside/laguna-s-2.1]
-    host: anvil
+    host: anvil          # PRIMARY = rank 0, the box that serves `port` below
+    # tier3 is the fleet's FIRST model spanning two boxes. anvil2 is rank 1 of
+    # the V4-Flash TP=2 pair: --headless, serves no port of its own, and is
+    # reachable only over the direct 200GbE DAC. It is listed here so surfaces
+    # that show WHERE a model runs cannot claim tier3 lives on one box — the
+    # Inference page card said exactly that until 2026-08-22, and would have kept
+    # saying `anvil · healthy` with anvil2 dead.
+    # Health for anvil2 itself comes from health-verifier's host_inventory (node_exporter
+    # on :9100), NOT from here — meta.hosts is only a name->IP map.
+    co_hosts: [anvil2]
     port: 9083
     backend_engine: vllm
     # `vllm-tier3.service` WRAPS the docker container (same pattern the retired

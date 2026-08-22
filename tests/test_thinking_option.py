@@ -342,3 +342,61 @@ def test_apply_thinking_is_called_before_the_stream_branch():
     assert "apply_thinking" not in _lifecycle_calls("handle_sync_submit"), (
         "apply_thinking is called in BOTH handle_submit and handle_sync_submit — a "
         "sync request would get the reasoning budget added twice")
+
+
+# ===========================================================================
+# The template-KEY contract. Added 2026-08-22 after the tier3 cutover, because
+# "thinking works" had only ever been verified by calling vLLM DIRECTLY on
+# :9083 — which bypasses the proxy, and the proxy is what constructs the
+# switch. A layer test is not a journey test.
+#
+# The failure this pins is SILENT: the server pins a default
+# (--default-chat-template-kwargs '{"thinking":false}') and the proxy must
+# override it. Send the wrong key and the pinned default wins — no error, no
+# 4xx, just an answer with no reasoning. Nothing downstream can tell that from
+# a model that simply chose not to reason.
+# ===========================================================================
+
+def test_thinking_optin_sends_both_template_keys():
+    """Laguna's template read `enable_thinking`; DeepSeek-V4-Flash-0731 reads
+    `thinking`. BOTH must be sent, or the opt-in silently no-ops on whichever
+    backend spells it the other way."""
+    m = _mock_self("vllm")
+    p = {"messages": [], "max_tokens": 800, "thinking": True}
+    m._apply_thinking(_req(p))
+    ck = p.get("chat_template_kwargs", {})
+    assert ck.get("thinking") is True, (
+        "DeepSeek-V4-Flash keys this as `thinking`, and its serve script pins "
+        '`{"thinking": false}` as the default — omit it and that default wins, '
+        "making the opt-in a SILENT no-op."
+    )
+    assert ck.get("enable_thinking") is True, (
+        "`enable_thinking` is the older vLLM spelling; dropping it would silently "
+        "disable the opt-in on any backend still using that key."
+    )
+
+
+def test_thinking_optin_sends_both_template_keys_on_streaming():
+    """The Playground is the streaming consumer of this opt-in, so the key
+    contract has to hold on the streaming path too."""
+    m = _mock_self("vllm")
+    p = {"messages": [], "max_tokens": 800, "thinking": True}
+    m._apply_thinking(_req(p, stream=True))
+    ck = p.get("chat_template_kwargs", {})
+    assert ck.get("thinking") is True and ck.get("enable_thinking") is True
+    # ...and a streamed request must still NOT register for finalize, or the
+    # entry leaks: finalize_thinking cannot run over an SSE stream.
+    assert m.state.thinking_active == {}
+
+
+def test_thinking_keys_absent_without_optin():
+    """No opt-in => neither key is set. If `thinking: true` leaked in by default,
+    every ordinary tier3 call would spend its budget on reasoning BEFORE emitting
+    content — measured empty-content 3/5 at max_tokens=200, and tier3's real mean
+    output is 172 tokens."""
+    m = _mock_self("vllm")
+    p = {"messages": [], "max_tokens": 800}
+    m._apply_thinking(_req(p))
+    ck = p.get("chat_template_kwargs") or {}
+    assert not ck.get("thinking")
+    assert not ck.get("enable_thinking")

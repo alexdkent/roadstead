@@ -281,3 +281,47 @@ def test_image_is_pinned_by_digest(env_script: str) -> None:
     assert "@sha256:" in image, (
         f"IMAGE must be pinned by digest (@sha256:...), not a tag: {image!r}"
     )
+
+
+def test_tier3_declares_its_second_host(tier3: dict) -> None:
+    """tier3 is the fleet's first model spanning two boxes, and `host:` is a SCALAR.
+
+    Without `co_hosts` the Inference page renders `▸ anvil` and stops — it keeps
+    saying `anvil · healthy` while anvil2 (rank 1, --headless, no port of its
+    own) is DEAD. Not blank, not an error: a confident half-truth, which is the
+    worst shape an operator page can take.
+
+    Pinned here rather than in the frontend because the CATALOG is the authority —
+    if this declaration is dropped, every surface downstream silently reverts to
+    the half-truth with nothing failing.
+    """
+    assert tier3.get("host") == "anvil", (
+        "tier3's PRIMARY host must stay `anvil` — it is rank 0, the box that "
+        "serves port 9083, and host->IP resolution, telemetry units and port "
+        "probing all key off it."
+    )
+    co = tier3.get("co_hosts") or []
+    assert "anvil2" in co, (
+        "tier3 serves vLLM TP=2 across anvil + anvil2; the second rank must be "
+        "declared in `co_hosts` or the Inference page claims tier3 runs on one box."
+    )
+
+
+def test_co_hosts_survives_into_the_catalog(tier3: dict) -> None:
+    """A models.yaml key absent from the parser is discarded WITHOUT A WARNING —
+    the `min_expected_slots` / `disable_any_whitespace` trap, twice bitten. Assert
+    the declaration actually reaches ModelEntry rather than only existing in YAML."""
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from originfleet.llmproxy import model_catalog
+
+    entry = model_catalog.load_catalog().entry("tier3")
+    assert entry is not None, "tier3 did not resolve in the catalog"
+    assert "anvil2" in entry.co_hosts, (
+        "models.yaml declares co_hosts: [anvil2] but ModelEntry.co_hosts is "
+        f"{entry.co_hosts!r} — the key was dropped by the parser in "
+        "model_catalog (add it to the ModelEntry construction)."
+    )

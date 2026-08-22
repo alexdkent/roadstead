@@ -1288,7 +1288,7 @@ class Correction:
         answer, which is exactly the failure shape that reads as "the model didn't
         reason today". The bail was only ever needed for the RESPONSE side:
         :meth:`finalize_thinking` rewrites a complete result dict and cannot run
-        over an SSE stream. So a streamed request gets the enable + budget + fold
+        over an SSE stream. So a streamed request gets the enable + budget
         and is deliberately NOT registered in ``state.thinking_active`` — nothing
         will finalize it, and an un-popped entry would leak. A streaming caller
         that also wants structured output therefore gets vLLM's raw framing (the
@@ -1314,7 +1314,20 @@ class Correction:
             return
         ck = p.get("chat_template_kwargs")
         ck = dict(ck) if isinstance(ck, dict) else {}
+        # BOTH keys, deliberately. The two live vLLM chat templates spell this
+        # switch differently and the server default is what wins if we miss:
+        #   Laguna S 2.1 (retired)     -> enable_thinking
+        #   DeepSeek-V4-Flash-0731     -> thinking   (the serve script pins
+        #                                 --default-chat-template-kwargs
+        #                                 '{"thinking":false}')
+        # Sending only `enable_thinking` against V4 happened to work because its
+        # template accepts both — but had it not, the pinned `thinking:false`
+        # default would have won and the opt-in would have been a SILENT no-op:
+        # no error, just an answer with no reasoning, which reads as "the model
+        # didn't reason today". An unknown template kwarg is ignored harmlessly,
+        # so sending both is strictly safer than guessing per backend.
         ck["enable_thinking"] = True
+        ck["thinking"] = True
         p["chat_template_kwargs"] = ck
         budget = thinking_reasoning_budget()
         cur = p.get("max_tokens")

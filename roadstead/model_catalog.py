@@ -42,6 +42,14 @@ class ModelEntry:
     proxy_endpoint: bool = False
     endpoint_class: str = ""
     host: str = ""
+    #: Additional hosts this ONE model also occupies. `host` above stays the
+    #: PRIMARY (rank 0 — the box that serves `port`), so every existing consumer
+    #: that resolves host->IP, builds telemetry units or probes a port keeps
+    #: working unchanged; this is purely additive. Non-empty only for a model
+    #: split across boxes — tier3 since 2026-08-22 (V4-Flash TP=2: anvil rank 0
+    #: serving :9083, anvil2 rank 1 headless). Consumers that must not claim a
+    #: multi-box model lives on one box (the Inference page card) read this.
+    co_hosts: tuple[str, ...] = ()
     port: int = 0
     wyoming_port: int = 0
     backend_engine: str = ""
@@ -142,6 +150,7 @@ def _coerce_entry(name: str, raw: dict[str, Any]) -> ModelEntry:
         proxy_endpoint=bool(raw.get("proxy_endpoint", False)),
         endpoint_class=raw.get("endpoint_class", ""),
         host=raw.get("host", ""),
+        co_hosts=tuple(raw.get("co_hosts", ()) or ()),
         port=int(raw.get("port", 0) or 0),
         wyoming_port=int(raw.get("wyoming_port", 0) or 0),
         backend_engine=raw.get("backend_engine", ""),
