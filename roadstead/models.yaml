@@ -360,21 +360,29 @@ models:
     #
     # ⚠️ The interactive/background split above still stands and is now the binding constraint
     # for long prompts: ultra-long remains BACKGROUND-ONLY.
+    # 32768 is the ADMISSION/chunking value and is deliberately NOT the model's
+    # window. The model serves 1,048,576 (see context_per_slot above, validated to
+    # 994,120 real tokens) and infra/common/model_cards.yaml records THAT number.
+    # The two disagree by 32x on purpose. Do not 'fix' this to 1048576: it would
+    # change proxy admission and trip test_tier3_serve_script_doctrine.py.
     context_window: 32768            # fleet chunkers size against 32K on purpose
-    # 20 = the backend's HARD cap (`--max-num-seqs 20` in serve_tier3_prod.sh). vLLM does NOT
-    # expose --max-num-seqs over its API, so this seed is the ONLY source of the proxy's
-    # admission ceiling; a stale value over-admits (the surplus just queues at the backend,
-    # bypassing the proxy's DRR fairness — a stale 32 once over-admitted the thinker by 12).
-    # NOTE: llama.cpp roles self-correct via /props; vLLM ones like this do NOT — the shadow
-    # reconciler warns on drift. Keep EQUAL to serve_tier3_prod.sh.
+    # 6 = the backend's HARD cap (`--max-num-seqs 6` in the COMMON_ARGS array of
+    # infra/anvil/vllm/v4flash/tier3_env.sh — NOT serve_tier3_prod.sh, which is now
+    # only the Laguna rollback). vLLM does NOT expose --max-num-seqs over its API, so
+    # this seed is the ONLY source of the proxy's admission ceiling; a stale value
+    # over-admits (the surplus just queues at the backend, bypassing the proxy's DRR
+    # fairness — a stale 32 once over-admitted the thinker by 12).
+    # NOTE: llama.cpp roles self-correct via /props; vLLM ones like this do NOT — the
+    # shadow reconciler warns on drift. Keep EQUAL to tier3_env.sh, which
+    # test_tier3_serve_script_doctrine.py pins bidirectionally.
     #
-    # 2026-07-31: raised 16 -> 20 (operator request). max_num_seqs is a SCHEDULER concurrency
-    # cap, not a KV allocation — the 26 GiB pool (722,390 tokens) is sized by
-    # --kv-cache-memory and is unchanged, and per-step activation is bounded by
-    # --max-num-batched-tokens 8192, not by this number. The real risk it carries is the
-    # DFlash drafter, which allocates OUTSIDE --gpu-memory-utilization (the mechanism that
-    # hard-hung this box twice, both needing a power cycle), so headroom was re-measured
-    # after the restart rather than assumed.
+    # 2026-08-22: 20 -> 6 at the V4-Flash TP=2 cutover. This is the validated 1M
+    # profile's value, not a carry-over: max_num_seqs is a SCHEDULER concurrency cap,
+    # and at 1M context the measured KV pool (1,717,142 tokens) admits only ~1.64
+    # concurrent max-length requests anyway. Per-step activation stays bounded by
+    # --max-num-batched-tokens 8192. Unlike Laguna's DFlash drafter, DSpark is
+    # IN-MODEL (layers 40-42) so there is no separate drafter allocating outside
+    # --gpu-memory-utilization — the mechanism that hard-hung this box twice.
     slots: 6
     timeout_floor_s: 180
     policy:
@@ -469,10 +477,32 @@ models:
     # test_model_naming_doctrine.py::test_catalog_loads_and_is_consistent.
     fallback: creative
     notes: |
-      TIER 3 — Laguna S 2.1 INT4 on vLLM (anvil/GB10, sm_121a image
+      TIER 3 — DeepSeek-V4-Flash-0731 on vLLM, TENSOR-PARALLEL ACROSS TWO BOXES:
+      anvil (10.0.0.3) is rank 0 and serves :9083; anvil2 (10.0.0.29) is rank 1
+      and is --headless, serving no port of its own. They are joined by a direct
+      200GbE ConnectX-7 DAC (no switch). Image is pinned BY DIGEST to
+      eugr/spark-vllm-b12x@sha256:52f8e633… (nightly-20260822); the serve config is
+      infra/anvil/vllm/v4flash/tier3_env.sh. DSpark MTP is IN-MODEL (no separate
+      drafter checkpoint) at num_speculative_tokens=5. Weights are on each node's
+      LOCAL NVMe at /srv/models/deepseek-v4-flash-0731 (155.44 GiB per node) — NOT
+      the nasbox share, so tier3 no longer fails to boot when that share is away.
+
+      Measured at cutover 2026-08-22 (warm, stream:false, usage.completion_tokens —
+      streamed deltas under spec-decode count steps/s and under-report ~4x):
+      decode 61.1 t/s code / 32.8 t/s prose; DSpark acceptance 73.8% on code and
+      28.5% on prose (the pooled figure is workload-dependent, so quote the split);
+      prefix-cache hit 99% on a repeated 21K prefix; mixed-traffic c4 soak 328 req,
+      0 errors, ~83 t/s aggregate / ~21 per-stream. Full 1M context VALIDATED with a
+      994,120-token needle-in-haystack retrieved correctly from mid-depth.
+
+      ⚠️ A ~1M call costs ~974s of PREFILL, over the inherited 600s interactive
+      ceiling — ultra-long context is BACKGROUND-ONLY. See context_per_slot above.
+
+      --- history below refers to the RETIRED Laguna S 2.1, kept for archaeology ---
+      TIER 3 was Laguna S 2.1 INT4 on vLLM (anvil/GB10, sm_121a image
       ghcr.io/timothystewart6/vllm-gb10), with the MATCHED Laguna-S-2.1-DFlash-INT4
       drafter at num_speculative_tokens=3. Replaced the dense Qwen3.6-27B NVFP4 on
-      2026-07-30. Weights live on the NVMe-backed `llmmodels` share (67 GB + 2.1 GB).
+      2026-07-30. Weights lived on the NVMe-backed `llmmodels` share (67 GB + 2.1 GB).
 
       Measured at cutover: decode 29.9 t/s, DFlash acceptance 43.1% (2.29 tok/forward),
       prefix-cache hit 64-70%. Prefix caching WORKS here — it was structurally 0% on
