@@ -66,6 +66,7 @@ meta:
   hosts:
     nexus: 10.0.0.6
     anvil: 10.0.0.3
+    anvil2: 10.0.0.29     # tier3 rank 1 (TP=2); serves no port of its own
     nasbox: 10.0.0.10
     kestrel-speech: 10.0.0.13
     kestrel-perception: 10.0.0.18
@@ -222,152 +223,35 @@ models:
       ROLE_TO_CLASS + its own context window.
 
   # ==========================================================================
-  # ⏸ PENDING CUTOVER — DeepSeek-V4-Flash-DSpark as tier3 (B2 of
-  #   docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md, drafted 2026-08-20).
+  # ✅ APPLIED 2026-08-22 — tier3 IS DeepSeek-V4-Flash-0731, TP=2 across
+  #   anvil (rank 0, :9083) + anvil2 (rank 1, headless), over a direct
+  #   200GbE ConnectX-7 DAC. Plan: docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md
   #
-  #   NOTHING BELOW IS LIVE. Laguna S 2.1 INT4 is serving; anvil2 has not
-  #   arrived. This block is a REVIEWED DIFF to be APPLIED in the Phase 2/3
-  #   window by deleting the `#⏸ ` markers and deleting the fields it replaces —
-  #   it is not authored under time pressure at 1am. Every number is labelled
-  #   OURS (measured here) / PUBLISHED (someone else's hardware) / TODO.
+  #   Five places the DRAFTED block was WRONG, all corrected by measurement.
+  #   Recorded because each cost real time and would otherwise be re-derived:
   #
-  #   🚨 THIS STANZA CANNOT BE APPLIED ALONE. Three things move with it:
-  #     1. `infra/anvil/vllm/serve_tier3_prod.sh` (or its V4 successor) —
-  #        tests/llmproxy/test_tier3_serve_script_doctrine.py pins, BIDIRECTIONALLY:
-  #          slots                        == script --max-num-seqs
-  #          policy.documented_max_num_seqs == script --max-num-seqs
-  #          context_per_slot             == script --max-model-len
-  #          policy.disable_any_whitespace ⟺ script --structured-outputs-config
-  #        Change `context_per_slot` here without the script and the suite goes RED.
-  #     2. `llmproxy/usage_rates.py` + `tests/llmproxy/test_fleet_metrics.py`
-  #        (five hardcoded (0.15,0.60)/0.75 assertions) — see the PENDING block there.
-  #     3. `infra/common/model_cards.yaml` — see the PENDING block there.
-  #   NOT drafted here (out of B2's four files, flagged in the B2 report):
-  #     4. § 3's "one dedicated long-context role" is a SECOND stanza with its own
-  #        `timeout_ceiling_s` and a low priority tier. It does not exist yet.
-  #     5. `meta.hosts` has no `anvil2: 10.0.0.29` row (rank 1 serves no port, so
-  #        this is only needed if C1 makes anvil2 a first-class telemetry host).
+  #   1. KV dtype is `fp8_ds_mla`, NOT `nvfp4_ds_mla` (D4's assumption).
+  #      nvfp4_ds_mla is implemented ONLY by the B12X_MLA_SPARSE backend, and that
+  #      path is gated behind _is_glm_moe_dsa_model() plus a calibrated per-layer
+  #      scales file for a 78-layer GLM stack. It is a GLM path, not a DeepSeek-V4
+  #      one. Forcing it does not fail cleanly -- it resolves away to another
+  #      backend that then asserts about fp8 layouts, three layers from the cause.
+  #   2. D4's 1M profile SURVIVED anyway. The plan predicted fp8 would cost the
+  #      1M context (~500K). Measured pool: 1,717,142 tokens, 1.64x margin, and a
+  #      994,120-token needle-in-haystack retrieved correctly.
+  #   3. B12X_MLA_SPARSE is STRUCTURALLY UNUSABLE for this checkpoint: it accepts
+  #      block_size exactly [64], the sliding-window group needs [256], so no
+  #      common size exists ("No common block size for 64"). FLASHINFER_MLA_SPARSE_DSV4
+  #      @ block 256 is the only coherent combination.
+  #   4. slots is 6, not the drafted 20 carried over from Laguna.
+  #   5. gpu-memory-utilization is 0.85, ratcheted from OUR TP=2 measurement, not
+  #      the planned 0.78 -- at 0.78 the engine REFUSES TO BOOT at 1M ctx (KV
+  #      available 9.41 GiB vs 11.04 GiB needed for one 1M request).
   #
-  #⏸ model_family: DeepSeek-V4-Flash-DSpark (sparse MoE, 284B total / 13B active) + DSpark MTP drafter
-  #⏸ quant: MXFP4 routed experts (quantization-aware TRAINED, not post-hoc) + FP8 attention/dense/shared
-  #⏸ params: {active: 13B, total: 284B}
-  #   PUBLISHED: 155.44 GiB on disk / 48 safetensors shards, MIT, text-only, revision
-  #   62af8fffb2f7030cac4de2f0169f5b8d1101b646 (verified against the HF API 2026-08-20,
-  #   public + ungated). ~77.7 GiB of weights PER RANK at TP=2. There is NO re-quant
-  #   step, so the NVFP4-vs-INT4 class of divergence we hit on Laguna cannot occur —
-  #   but that is a claim about the WEIGHTS, not about our kernels. G0 still applies.
-  #
-  #⏸ context_per_slot: 1048576
-  #   1M is the model's native window and, per § 3 (D4), `--max-model-len` is a
-  #   per-request CEILING, not a reservation: vLLM's PagedAttention allocates KV in
-  #   blocks from ONE shared pool on demand. PUBLISHED pool at util 0.78 with
-  #   --kv-cache-dtype nvfp4_ds_mla: 8.54 GiB/rank -> 1,268,110 tokens shared. The
-  #   startup line "Maximum concurrency for 1048576 tokens per request: 1.21x" is just
-  #   1,268,110 / 1,048,576 — advisory arithmetic, not a partition.
-  #   ⚠️ 1.21x means there is NO SLACK: if util ever drops the pool below 1,048,576
-  #   tokens vLLM REFUSES TO BOOT ("max seq len is larger than the KV cache can
-  #   store"). Any util change is now a boot-blocking change. Laguna's 700000 was a
-  #   MEMORY bound with 2.56x headroom; this is not the same kind of number.
-  #
-  #⏸ context_window: 32768            # UNCHANGED — fleet chunkers size against 32K on purpose
-  #   Phase 3.1 is explicit that the chunk policy does NOT move with the slot size.
-  #   Raising it would silently re-shape every fleet chunker at the same moment the
-  #   model changes, and then nothing could be attributed to either.
-  #
-  #⏸ slots: 20                        # TODO(confirm at cutover) — carry 20 forward
-  #   NOT a measured V4 number and deliberately not re-derived on paper. 20 is
-  #   Laguna's live value; holding it means concurrency does NOT move at the same
-  #   time as the model, so a G5 batch-wall-time regression is attributable. It MUST
-  #   equal the new serve script's --max-num-seqs (doctrine test above) — set both or
-  #   neither. Re-derive from a concurrency sweep AFTER G1/G5, not during the window.
-  #   ⚠️ vLLM does not expose --max-num-seqs over its API, so this seed is the ONLY
-  #   source of the proxy's admission ceiling; a stale value over-admits.
-  #
-  #⏸ timeout_floor_s: 180             # UNCHANGED through the soak
-  #   PUBLISHED decode is faster (42 prose / 76 code vs OURS 30.6 / 43.9), which
-  #   argues for a LOWER floor — do not take it yet. A floor is a minimum budget, and
-  #   lowering it in the same window as the model swap makes a timeout regression
-  #   unattributable. Re-derive at Phase 4 against G1's measured numbers.
-  #   🚨 CORRECTION to § 3 of the plan doc: there is no `timeout_ceiling_s: 900`
-  #   anywhere. This stanza has NO ceiling override, so it inherits timeout_model's
-  #   _INTERACTIVE_CEILING_S = 600 s (P0-P2) and _BACKGROUND_CEILING_S = 1800 s
-  #   (P3/P4). 900 is not the number that binds and never was.
-  #   The § 3 conclusion survives with different arithmetic: PUBLISHED prefill
-  #   1,400-2,100 t/s puts a 1M-token prefill at 500-750 s BEFORE any decode — over
-  #   the 600 s interactive ceiling, under the 1800 s background one. So Laguna's
-  #   "ULTRA-LONG IS BACKGROUND-ONLY" rule carries forward UNCHANGED; only the
-  #   token count at which it starts biting moves (~430K on Laguna, TODO(measure) here).
-  #
-  #⏸ capabilities:
-  #⏸   vision: false                  # text-only — PUBLISHED, and unchanged from Laguna
-  #⏸   streaming: true
-  #⏸   reasoning: true                # HYBRID thinking + DSpark MTP speculative
-  #⏸   tool_calling: true             # --tool-call-parser deepseek_v4 + --enable-auto-tool-choice
-  #⏸   structured_output: guidance    # TODO(decide with the serve script) — see below
-  #   ⚠️ `structured_output` and `policy.disable_any_whitespace` are a PAIR, and § 2.3's
-  #   flag list does NOT include --structured-outputs-config. Decide deliberately:
-  #     * keep the flag  -> keep `guidance` + `disable_any_whitespace: true` here;
-  #     * drop the flag  -> drop BOTH, and Correction.apply_json_object_guard stops
-  #                         stripping bare json_object.
-  #   Either is legal; a MISMATCH is what the bidirectional doctrine test forbids, and
-  #   both halves of the mismatch fail SILENTLY (callers get `{}`, or a constraint the
-  #   backend would have honoured is stripped). The whitespace-runaway measurement that
-  #   justified the flag is Laguna+guidance ONLY — it is NOT evidence about V4 Flash.
-  #   Re-run it (the real gate went 10/10 runaway -> 0/10; a synthetic schema reproduced
-  #   only ~2/50, so do NOT conclude "fine" from a toy).
-  #
-  #⏸ token_speed: {decode_tok_s_at_1: TODO, aggregate_tok_s_full: TODO}   # TODO(measure at cutover — gate G1)
-  #   PUBLISHED for reference ONLY, someone else's GB10 pair: 42 t/s prose, 76 t/s code.
-  #   🔴 DO NOT WRITE A PUBLISHED NUMBER INTO THIS FIELD. Every other value in it is
-  #   OURS, and this plan already burned three revisions arguing from a 14.1 t/s figure
-  #   that had stopped describing reality. G1's floors are the MEASURED incumbent
-  #   (>=43.9 code, >=30.6 prose, artifact
-  #   infra/anvil/bench_results/tier3_laguna_baseline_20260819.json) — a replacement
-  #   that misses them is a regression no matter what the vendor published.
-  #
-  #⏸ purpose: Heavy MoE reasoning + agentic-coding tier (tier3 — the fleet's deepest model), TP=2 across anvil + anvil2.
-  #⏸ when_used:
-  #⏸   - knowledge extraction, news synthesis, thread/device enrichment
-  #⏸   - browser-broker default, forum-agent thread summary
-  #⏸   - dsh agentic lanes as they migrate off pool (D5)
-  #
-  #   UNCHANGED, do NOT touch in this window (they are the failover that shipped
-  #   2026-08-20 and are not part of this swap):
-  #     fallback: creative
-  #     policy.failover_dwell_s: 120
-  #     policy.background_floor_pct: 0.0
-  #     policy.fast_path_reserve_slots: 1
-  #     host: anvil · port: 9083   (Phase 2.3 keeps rank 0 on :9083 so this barely moves)
-  #     systemd_unit: vllm-tier3     (TODO(confirm) the V4 unit keeps this name; an empty
-  #                                   systemd_unit silently drops the health probe entirely)
-  #
-  #   ALIASES — one judgement call, flagged rather than silently made:
-  #     `poolside/laguna-s-2.1` is the model name the stock `pool` CLI hardcodes in every
-  #     request body. After this swap tier3 is NOT Laguna, so the alias becomes a lie —
-  #     but D5 keeps `pool` live lane-by-lane until the last one migrates, and removing it
-  #     404s every stock pool client on day one. RECOMMENDATION: KEEP it through Phase 5,
-  #     delete it in Phase 6 alongside `pool` itself, and say so in the alias comment.
-  #     RECOMMENDATION (additive, same reasoning that created the poolside alias): add
-  #     `deepseek-ai/DeepSeek-V4-Flash-DSpark` so a stock DeepSeek-shaped client — dsh
-  #     included — works against the proxy with no client-side model config.
-  #     ⚠️ Add it to `aliases:` ONLY. Do not create an endpoint CLASS with the same
-  #     string: an endpoint class that is also an alias is what made normalize_endpoint()
-  #     non-idempotent and silently served every backup request from tier3
-  #     (ledger `endpoint-class-alias-collision`).
-  #
-  #   The whole existing `notes:` block below is Laguna's and must be REPLACED, not
-  #   appended to. It is ~150 lines of measurements about INT4/DFlash/guidance/
-  #   FLASHINFER/marlin on a single GB10 — a comment that lies about which model is
-  #   serving is exactly how the 2026-07-30 rename trap works (§ 8 C3). What to
-  #   re-assert in the replacement, per "replacing a component silently drops its
-  #   guarantees": (a) ultra-long is background-only, (b) whichever way the
-  #   structured-output pair is decided and WHY, (c) the two-node failure domain and the
-  #   ~10-minute restart outage, (d) that KV is now util-driven with 1.21x and no slack,
-  #   (e) TODO(measure) placeholders for prefix-cache hit rate, DSpark acceptance (G2:
-  #   >=0.7 on code) and headroom-under-load — none of which have a V4 number yet.
-  #   🚨 Laguna's "~8 GiB free under load, NOT the ~12 you see at startup" is OURS and
-  #   about THIS BOX — re-measure it, do not delete it and do not carry it forward as
-  #   though it described V4. The two hard-hangs happened at ~0 GiB free.
+  #   The serve config is vendored at infra/anvil/vllm/v4flash/ (tier3_env.sh
+  #   holds the engine args; the two launchers are thin). Laguna stays on disk and
+  #   as `vllm-tier3-laguna.service` on anvil until Phase 6 -- it is the only
+  #   same-class rollback.
   # ==========================================================================
 
   reasoner:
@@ -412,15 +296,15 @@ models:
     systemd_unit: vllm-tier3
     probe_kind: vllm
     served_model_names: [llama-thinker, thinker, tier3, reasoner, claude-sonnet-4-5, llama]
-    model_family: Laguna-S-2.1-INT4 (+ Laguna-S-2.1-DFlash-INT4 drafter)
-    quant: INT4 (compressed-tensors pack-quantized, W4A16, group 32)
+    model_family: DeepSeek-V4-Flash-0731 (sparse MoE, 284B total / 13B active) + in-model DSpark MTP drafter
+    quant: MXFP4 routed experts (quantization-aware TRAINED, not post-hoc) + FP8 attention/dense/shared
     # Sparse MoE: 256 experts, top-10, 48 layers, hidden 3072.
     # 2026-08-03: these were previously ~6B/~120B, DERIVED from config.json on the belief that
     # poolside publish no parameter count. They DO — the launch material states 118B total /
     # 8B active — so these are now the vendor's numbers, not ours. The derived figures were in
     # the right neighbourhood but the active count was ~25% low, which matters when it is used
     # to reason about decode cost.
-    params: {active: 8B, total: 118B}
+    params: {active: 13B, total: 284B}
     # 262144 = the SERVED window (--max-model-len) = THIS CHECKPOINT's ceiling. Raised
     # 131072 -> 262144 on 2026-07-30 with an explicit --kv-cache-memory of 26 GiB.
     #
@@ -445,7 +329,15 @@ models:
     # Raised to 700000 on 2026-07-30 via `--hf-overrides`, using the BASE repo's rope_parameters
     # VERBATIM (attention_factor is YaRN-factor-dependent — 1.4852 at factor 128 vs 1.3466 at 32
     # — so it must be copied, never hand-computed).
-    context_per_slot: 700000
+    # 1,048,576 and it is REAL: validated end-to-end 2026-08-22 with a needle-in-
+    # haystack at 994,120 prompt tokens, retrieved correctly from mid-depth.
+    # Measured KV pool 1,717,142 tokens => 1.64x margin at full context.
+    # 🚨 A ~1M call costs ~974s of PREFILL -- OVER the inherited
+    # _INTERACTIVE_CEILING_S = 600, under _BACKGROUND_CEILING_S = 1800.
+    # Measured prefill curve (OURS): 32K 2,153 t/s . 133K ~1,980 . 273K 1,742 .
+    # 548K 1,351 . 994K 1,020 -- the 600s interactive ceiling is crossed at roughly
+    # 650-700K tokens. Ultra-long context is BACKGROUND-ONLY, measured not assumed.
+    context_per_slot: 1048576
     # ⚠️ 700000 is a MEMORY bound, not a model bound. vLLM: "estimated maximum model length is
     # 723472" at our 26 GiB KV. The MODEL reaches 1,048,576, but that needs 37.16 GiB of KV and
     # the only ~11 GiB spare is the DFlash drafter — so 1M costs ~half the decode speed
@@ -483,7 +375,7 @@ models:
     # DFlash drafter, which allocates OUTSIDE --gpu-memory-utilization (the mechanism that
     # hard-hung this box twice, both needing a power cycle), so headroom was re-measured
     # after the restart rather than assumed.
-    slots: 20
+    slots: 6
     timeout_floor_s: 180
     policy:
       background_floor_pct: 0.0
@@ -491,7 +383,7 @@ models:
       # Step 4c: the backend's real --max-num-seqs (serve_tier3_prod.sh). Keep
       # EQUAL to `slots` above; the shadow reconciler warns if they drift (the
       # 32-vs-20 class). Update BOTH whenever serve_tier3_prod.sh changes.
-      documented_max_num_seqs: 20
+      documented_max_num_seqs: 6
       # 2026-08-01: MIRRORS a host-side serve-script launch flag the proxy cannot
       # introspect — exactly like `documented_max_num_seqs` above. The flag is
       # `--structured-outputs-config '{"backend":"guidance","disable_any_whitespace":true}'`
@@ -510,7 +402,13 @@ models:
       # STRIPS bare json_object (it does not substitute a permissive schema — `{}`
       # satisfies `{"type":"object"}` with no `required`, so the bug would survive).
       # Regression ledger: `tier3-json-object-empty-brace`.
-      disable_any_whitespace: true
+      # disable_any_whitespace DELIBERATELY ABSENT (it was true for Laguna).
+      # Ledger `disable_any_whitespace_is_declared_in_the_catalog`: banning
+      # whitespace makes a bare `json_object` grammar legal to close immediately,
+      # so tier3 returned "{}" -- 2 chars, and VALID -- 10/10. The V4 serve script
+      # passes NO --structured-outputs-config, and structured output measured 10/10
+      # well-formed and non-empty without it (2026-08-22). The doctrine test pins
+      # script <-> catalog bidirectionally, so these two stay absent together.
       # § 9.7 — minimum time spent in degraded mode (serving from `fallback:`)
       # before returning here, even once this endpoint is healthy again AND the
       # degraded cohort has drained to zero.
@@ -527,11 +425,27 @@ models:
     capabilities:
       vision: false
       streaming: true
-      reasoning: true               # MTP speculative + per-request thinking
+      # Hybrid thinking model, OFF by default at the server
+      # (--default-chat-template-kwargs '{"thinking":false}'); callers opt IN per
+      # request via chat_template_kwargs {"thinking": true}. Verified 2026-08-22.
+      # 🚨 The response key is `reasoning`. `reasoning_content` is ALWAYS EMPTY on
+      # this runtime -- a client reading it sees nothing and concludes reasoning is
+      # broken. Opposite polarity to the Laguna trap, identical shape.
+      # 🚨 Do NOT flip the default ON: reasoning spends the budget BEFORE content,
+      # and tier3's measured mean output is 172 tokens/req. At max_tokens=200
+      # thinking returned EMPTY content 3/5; at 400, 1/5; at 800+, 0/5. Opt-in
+      # lanes should use max_tokens >= 800. Also measured: with thinking ON a
+      # structured call emits a reasoning field 8/8 (vLLM #41132) -- pure overhead
+      # on extraction paths, so keep structured calls thinking-off.
+      reasoning: true
       tool_calling: true
-      structured_output: guidance
-    token_speed: {decode_tok_s_at_1: 30, aggregate_tok_s_full: 120}   # 29.9 t/s measured 2026-07-30
-    purpose: Heavy MoE reasoning/synthesis tier (tier3 — the fleet's deepest model).
+      structured_output: auto      # no --structured-outputs-config; see policy note above
+    # OURS, measured 2026-08-22 warm, stream:false, reading usage.completion_tokens
+    # (streamed deltas under spec-decode count steps/s and under-report ~4x):
+    # code 61.1 t/s, prose 32.8 t/s. Incumbent Laguna measured 43.9 / 30.6.
+    # DSpark acceptance 47.9% pooled over 2,022 drafts, effective k=5.
+    token_speed: {decode_tok_s_at_1: 61, aggregate_tok_s_full: 120}
+    purpose: Heavy MoE reasoning + agentic-coding tier (tier3 — the fleet's deepest model), TP=2 across anvil + anvil2.
     when_used:
       - knowledge extraction, news synthesis, thread/device enrichment
       - browser-broker default, forum-agent thread summary

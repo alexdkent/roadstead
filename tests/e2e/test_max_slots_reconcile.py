@@ -37,7 +37,7 @@ async def test_max_slots_drift_reconciler(proxy, monkeypatch):
     # Pinned deliberately rather than read from config: this seed is the ONLY source of the
     # proxy's admission ceiling (vLLM does not expose --max-num-seqs over its API), so a silent
     # edit to models.yaml should break a test, not drift unnoticed into over-admission.
-    assert thinker.documented_max_num_seqs == 20
+    assert thinker.documented_max_num_seqs == 6   # V4-Flash TP=2 profile (was 20 on Laguna)
     admitted_before = thinker.max_slots
     thinker.max_slots = 32
     health.evaluate_alerts(time.monotonic())
@@ -45,7 +45,7 @@ async def test_max_slots_drift_reconciler(proxy, monkeypatch):
     assert len(drift) == 1, f"drift not detected: {state.alerts}"
     assert drift[0]["severity"] == "WARNING"
     assert "thinker" in drift[0]["detail"] and "32" in drift[0]["detail"] \
-        and "20" in drift[0]["detail"]
+        and "6" in drift[0]["detail"]
     # shadow: the reconciler never rewrote admission
     assert thinker.max_slots == 32
 

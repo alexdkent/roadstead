@@ -216,8 +216,15 @@ def surge_factor(
 
 #: Prompt size at which the stretch starts (below it the factor is exactly 1.0).
 _SIZE_STRETCH_REF_TOKENS = 16_384
-#: The largest context the fleet serves — tier3 (`thinker`). The unit step below
-#: is calibrated so the default clamp lands here.
+#: The context at which the stretch clamps. ⚠️ 2026-08-22: tier3 now serves
+#: 1,048,576, so this is NO LONGER 'the largest context the fleet serves' —
+#: it is a CALIBRATION POINT, left at 700K DELIBERATELY. Moving it changes
+#: _SIZE_STRETCH_UNIT_RATIO (2.556 -> 2.828) and therefore retunes the timeout
+#: curve for EVERY endpoint, which is not a cutover-window change.
+#: Leaving it is safe, and that was checked rather than assumed: prompts above
+#: 700K simply clamp to the same 9.0x, giving 9.0 x 180s = 1620s against a
+#: MEASURED 974s of prefill for a 994,120-token call (2026-08-22) — inside the
+#: 1800s background ceiling with room. Revisit only with a deliberate retune.
 _MAX_SERVED_CONTEXT_TOKENS = 700_000
 #: The default ``size_max``. Used ONLY to calibrate the unit step; the live value
 #: still arrives as an argument (config.timeout_size_max).

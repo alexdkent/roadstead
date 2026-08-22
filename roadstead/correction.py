@@ -1281,8 +1281,6 @@ class Correction:
         Records the request for response-side structured-output recovery. Strips
         the ``thinking`` control field (not a backend param) regardless. Fully
         transparent when not requested, feature-disabled, or non-vLLM.
-        Also folds any system message(s) into the first user turn — see
-        :meth:`fold_system_for_thinking` for why.
 
         STREAMING (2026-08-02): the request side applies to streamed requests too.
         It used to bail on ``req.stream`` outright, which made ``thinking: true``
@@ -1321,11 +1319,6 @@ class Correction:
         budget = thinking_reasoning_budget()
         cur = p.get("max_tokens")
         p["max_tokens"] = (cur if isinstance(cur, int) and cur > 0 else 800) + budget
-        # Thinking IS being applied from here — the template quirk below only
-        # matters on this path, so the fold stays scoped to the opt-in.
-        folded = self.fold_system_for_thinking(p.get("messages"))
-        if folded is not None:
-            p["messages"] = folded
         if req.stream:
             # No finalize_thinking runs over a stream — registering here would
             # leak an entry in thinking_active that nothing ever pops.
@@ -1334,195 +1327,21 @@ class Correction:
             "allowed_keys": self.thinking_allowed_keys(p)}
 
     # =====================================================================
-    # ⏸ PENDING CUTOVER — B2 of
-    #   docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md, analysed 2026-08-20.
-    #   NOTHING IS CHANGED HERE. This is the reviewed VERDICT, parked next to the
-    #   code so the cutover window applies a decision instead of taking one.
-    #
-    #   RECOMMENDATION: **DELETE this method at the tier3 cutover** unless the
-    #   measurement below is actually run and comes back positive on V4 Flash.
-    #   Do NOT carry it forward, and do NOT "keep it, it's harmless".
-    #
-    #   WHY DELETE IS THE DEFAULT (all verifiable from this repo today):
-    #
-    #   1. ITS BLAST RADIUS IS EXACTLY THE MODEL BEING REPLACED. `apply_thinking`
-    #      returns early on `engine != "vllm"` (see above), and the `reasoner`
-    #      stanza is the ONLY `backend_engine: vllm` entry in models.yaml — every
-    #      other endpoint is llama.cpp or shim. So this compensation applies to
-    #      tier3 and to nothing else. When Laguna leaves, its entire population
-    #      leaves with it.
-    #
-    #   2. ITS MECHANISM IS A LAGUNA CHAT-TEMPLATE ARTIFACT, BY THE DOCSTRING'S OWN
-    #      ACCOUNT. The docstring's finding is that /tokenize renders
-    #      `<assistant><think>` in BOTH shapes, and that when no system message is
-    #      supplied the template injects its OWN — so the fold is "let the model see
-    #      its native system prompt". That is a property of Laguna's template, not of
-    #      vLLM, not of reasoning parsers, and not of thinking models in general.
-    #      V4 Flash ships a different tokenizer and template entirely
-    #      (`--tokenizer-mode deepseek_v4`, `--reasoning-parser deepseek_v4`), so
-    #      there is no construction by which the premise transfers.
-    #
-    #   3. IT NEVER WORKED WELL EVEN ON LAGUNA. The 2026-08-02 streaming re-measure
-    #      in the docstring: no system 4/4 reasoned, system+folded 1/4. models.yaml
-    #      says it "RAISES the rate without closing it". We are not defending much.
-    #
-    #   4. CARRYING IT FORWARD IS NOT NEUTRAL — IT MUTATES EVERY OPTED-IN REQUEST.
-    #      It deletes the `system` role and prepends its text to the first user turn.
-    #      On a template that handles the system role properly that is an UNMEASURED
-    #      reshaping of the prompt, and a hybrid thinking model gates reasoning on an
-    #      explicit switch rather than on learned suppression — so the reshape would
-    #      be paying a cost to solve a problem that has no reason to exist. This is
-    #      the "a test stub outlives what it models" / "delete falsified mechanisms,
-    #      don't flag them off" shape.
-    #
-    #   5. DELETING IS CHEAP AND REVERSIBLE. No agent or framework code sets
-    #      `thinking: true` anywhere — verified by grep. The only production consumer
-    #      is the Playground's toggle (frontend PlaygroundPage.tsx), plus two dev
-    #      tools (tools/thinking_ab.py, tools/ha_llm_eval.py). One operator-facing
-    #      toggle on one page is the whole blast radius.
-    #
-    #   WHAT GOES WITH IT, if deleted: this staticmethod; the `folded = ...` block in
-    #   `apply_thinking`; the cross-reference in that method's docstring (~line 1285);
-    #   the mention in models.yaml (~line 557, inside a block that is being replaced
-    #   anyway); and ~9 fold-specific tests plus the binding line in
-    #   tests/llmproxy/test_thinking_option.py (`test_fold_*`,
-    #   `test_apply_thinking_streaming_folds_system`).
-    #   WHAT STAYS regardless — these are INDEPENDENT of the fold and must not be
-    #   swept up with it: `finalize_thinking`, `thinking_allowed_keys`, the
-    #   `thinking_noop` counter, and the Playground's zero-reasoning warning.
-    #
-    #   🚨 I CANNOT PROVE THE PHENOMENON IS ABSENT ON V4 FLASH WITHOUT THE LIVE
-    #   MODEL. The measurement that settles it, pre-registered so the result is a
-    #   verdict and not a vibe:
-    #
-    #     CELLS (streamed, against the live V4 tier3, thinking: true, no schema):
-    #       A  [user]                        — no system message at all
-    #       B  [system, user]                — unfolded (what deletion would ship)
-    #       C  [system, user]                — folded (what this method does today)
-    #       D  [user, assistant, user]       — the history cell (see trap 4)
-    #     METRIC: fraction of responses with non-empty reasoning, plus reasoning
-    #       length. DECISION RULE: keep/re-derive ONLY if C beats B at the
-    #       pre-registered bar. Otherwise delete.
-    #     N: >= 20 per cell. The Laguna numbers were n=4, which cannot support a
-    #       null — at 4/4 vs 1/4 you need ~10-12/cell for 80% power, and any
-    #       SMALLER residual effect needs far more. If B-vs-C comes back
-    #       non-significant, report the effect size the N could have detected
-    #       instead of writing "no effect".
-    #
-    #     FIVE TRAPS, every one of them already paid for in this repo:
-    #       1. CACHE. Nonce every payload — the first cut of the Laguna measurement
-    #          was cache-confounded (three identical 102-char replies). And
-    #          temperature=0 voids repeated-measures A/Bs entirely (N trials = 1
-    #          generation), so nonce it or run above 0.
-    #       2. CHANNEL. Laguna streams reasoning as `delta.reasoning`, NOT
-    #          `delta.reasoning_content`. The deepseek_v4 parser may use either.
-    #          Read BOTH and take the union, or you will measure zero while usage
-    #          shows the tokens were spent.
-    #       3. POSITIVE ASSERTIONS ONLY. "`</think>` not in content" is an ABSENCE
-    #          assertion that an empty string also satisfies — that is exactly how
-    #          the earlier leak "fix" looked verified. Assert non-empty content AND
-    #          finish_reason == "stop" alongside the reasoning length.
-    #       4. THE HISTORY CELL IS NOT OPTIONAL. On Laguna, ONE prior assistant turn
-    #          took reasoning to 0/4 — harder than the system-message effect and
-    #          documented nowhere else. If that transfers, `thinking: true` is a
-    #          FIRST-TURN capability on V4 too, and the Playground's warning must
-    #          stay whatever happens to this fold.
-    #       5. NO STRUCTURED-OUTPUT ARM. Phase 3.3 / vLLM #41132: response_format
-    #          json + thinking on DeepSeek V4 leaks a reasoning field. Keep
-    #          structured calls thinking-OFF; do not combine them in the rig.
+    # DELETED 2026-08-22: fold_system_for_thinking. It merged the system
+    # message into the first user turn to work around a Laguna (vLLM/tier3)
+    # chat-template quirk where reasoning only fired on a first turn with no
+    # system role present (measured 2026-07-31/08-02: no-system 4/4 reasoned,
+    # system+folded 1/4). tier3 is now DeepSeek-V4-Flash-0731, a hybrid
+    # thinking model that gates reasoning on an explicit
+    # `chat_template_kwargs {"thinking": true}` switch rather than on learned
+    # suppression. Re-measured all four cells live (N=6, thinking:true):
+    #   A no-system 6/6 · B system+user unfolded 6/6 · C folded 6/6 ·
+    #   D multi-turn history 6/6. No gap for the fold to close, so it goes —
+    #   carrying it forward would have kept reshaping every opted-in request
+    #   for no measured benefit. `finalize_thinking`, `thinking_allowed_keys`,
+    #   `thinking_noop` and the Playground zero-reasoning warning are
+    #   independent of this and stay.
     # =====================================================================
-    @staticmethod
-    def fold_system_for_thinking(messages):
-        """Merge system message(s) into the first non-system turn, returning a NEW
-        list (or ``None`` when there is nothing to do / it can't be done losslessly).
-
-        WHY (measured 2026-07-31, laguna/tier3 = vLLM on anvil:9083):
-        ``chat_template_kwargs.enable_thinking=true`` is accepted with no error
-        and no warning, and the model still emits NO reasoning far more often
-        when a caller-supplied ``role: "system"`` message is present. Measured
-        against the live endpoint on a think-worthy prompt (n samples per cell,
-        `reasoning` field length):
-
-            system + user, no schema  →     0,     0 ch
-            same text, folded in      →  8200, 13565 ch
-            system + user, schema     →     0 x6, 11411 ch      (1/7 reasoned)
-            same text, folded, schema →  12416, 3935, 31300, 0 x5 (3/8 reasoned)
-
-        It tracks the PRESENCE of the caller's system role, not its content or
-        its length. NOTE — this is NOT the template dropping the prefix:
-        ``/tokenize`` shows the rendered prompt ends in ``<assistant><think>``
-        in BOTH shapes. When no system message is supplied the template injects
-        its OWN default one, so the fold is really "let the model see its
-        native system prompt". The suppression is learned behaviour, hence
-        probabilistic rather than absolute — folding raises the reasoning rate,
-        it does not guarantee it.
-
-        Re-measured 2026-08-02 on the STREAMING path (live tier3, n=4 per cell,
-        no schema — a cleaner control than the table above), `reasoning` chars:
-
-            no system message at all  →  2459, 1846, 3956, 2244   (4/4 reasoned)
-            system message, folded    →     0,    0,  955,    0   (1/4 reasoned)
-
-        So the fold does NOT close the gap: WITH a caller system prompt, thinking
-        still no-ops most of the time. Anything offering thinking as a user-facing
-        control has to say so rather than let it look like a dead switch — the
-        Playground warns at the toggle and again on a zero-reasoning turn.
-
-        🚨 CONVERSATION HISTORY suppresses it HARDER, and this is not documented
-        anywhere else. Same rig, unique nonce per request so nothing is served
-        from the proxy's identical-payload cache (the first cut of this
-        measurement WAS cache-confounded — three identical 102-char replies —
-        so re-check that before trusting any repeat of it):
-
-            [user]                     →  1321, 1625, 2557, 3339   (4/4 reasoned)
-            [user, assistant, user]    →     0,    0,    0,    0   (0/4 reasoned)
-
-        A single prior assistant turn is enough. Any multi-turn caller that opts
-        into thinking gets it on the first turn and silently never again, so
-        treat `thinking: true` as a FIRST-TURN capability on this backend until
-        the template is understood. Not fixed here: the fix is not obviously the
-        proxy's to make, and a wrong guess would corrupt replayed history.
-
-        Because essentially every fleet caller sends a system prompt, production
-        thinking calls have been reasoning far less than the opt-in implies —
-        and the responses were still schema-conformant, so ``thinking_clean``
-        reported health the whole time (that hole is now covered by
-        ``thinking_noop``).
-
-        Do NOT "simplify" this away. Same class of fix as
-        ``backend._normalize_strict_alternation`` (Mistral's strict alternation):
-        reshape the messages to satisfy a template quirk the backend won't report.
-
-        Content- and order-preserving: system texts are joined in order and
-        prefixed to the first remaining turn; nothing is dropped or reordered.
-        """
-        if not isinstance(messages, list):
-            return None
-        sys_parts, rest = [], []
-        for m in messages:
-            if isinstance(m, dict) and m.get("role") == "system":
-                c = m.get("content")
-                if not isinstance(c, str):
-                    return None  # non-text system block — can't fold losslessly
-                sys_parts.append(c)
-            else:
-                rest.append(m)
-        if not sys_parts or not rest:
-            return None  # no system, or system-only — nothing to fold into
-        head = rest[0]
-        if not isinstance(head, dict):
-            return None
-        prefix = "\n\n".join(sys_parts)
-        content = head.get("content")
-        out = list(rest)
-        if isinstance(content, str):
-            out[0] = {**head, "content": prefix + "\n\n" + content}
-        elif isinstance(content, list):
-            # vision/multipart turn — prepend the system text as its own text block
-            out[0] = {**head, "content": [{"type": "text", "text": prefix}, *content]}
-        else:
-            return None
-        return out
     def finalize_thinking(self, req: QueuedRequest, result: dict) -> None:
         """Response-side normalization for an opted-in thinking request (mutates
         ``result`` in place). vLLM already splits reasoning into

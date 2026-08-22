@@ -35,6 +35,7 @@ Self-contained in the house style of test_thinking_option.py: the real
 ``.state`` fields they touch.
 """
 import importlib
+import inspect
 import sys
 import types
 from pathlib import Path
@@ -310,16 +311,23 @@ def test_queued_request_carries_the_field():
 
 def test_policy_key_is_in_the_catalog_mapping():
     """A models.yaml policy key that is NOT in build_endpoint_kwargs' mapping
-    tuple is discarded WITHOUT A WARNING (the `min_expected_slots` trap). Assert
-    the mapping carries it, by running the real builder over the real catalog."""
+    tuple is discarded WITHOUT A WARNING (the `min_expected_slots` trap).
+
+    🔄 2026-08-22: tier3 no longer DECLARES disable_any_whitespace (see the
+    module docstring), so this can no longer be asserted through tier3 without
+    going vacuous. The trap it guards is about the MAPPING, not about tier3, so
+    it is asserted directly against the builder's src/dst tuple list instead —
+    the plumbing stays armed for whichever endpoint next needs the flag.
+    """
+    src = inspect.getsource(model_catalog.build_endpoint_kwargs)
+    assert "disable_any_whitespace" in src, (
+        "build_endpoint_kwargs no longer maps disable_any_whitespace. Any stanza "
+        "declaring it would be silently dropped — add "
+        '("disable_any_whitespace", "disable_any_whitespace") back to the src/dst '
+        "tuple list in model_catalog.build_endpoint_kwargs"
+    )
     kwargs = model_catalog.build_endpoint_kwargs()
     assert "thinker" in kwargs, "tier3 (endpoint_class `thinker`) missing from the catalog"
-    assert kwargs["thinker"].get("disable_any_whitespace") is True, (
-        "models.yaml declares reasoner.policy.disable_any_whitespace: true but "
-        "build_endpoint_kwargs dropped it — add "
-        '("disable_any_whitespace", "disable_any_whitespace") to the src/dst tuple '
-        "list in model_catalog.build_endpoint_kwargs"
-    )
 
 
 def test_models_yaml_flag_reaches_endpoint_config():
@@ -331,11 +339,19 @@ def test_models_yaml_flag_reaches_endpoint_config():
         "EndpointConfig has no disable_any_whitespace field — the policy knob was "
         "never added (config.py)"
     )
-    assert ep.disable_any_whitespace is True, (
-        "tier3's disable_any_whitespace declaration did not reach EndpointConfig; "
-        "bare json_object will silently return '{}' again"
+    # 🔄 2026-08-22: tier3 is DeepSeek-V4-Flash-0731 and its serve script passes NO
+    # --structured-outputs-config, so whitespace is not banned and the "{}" bug
+    # cannot occur. VERIFIED on the live endpoint that day, which is the only
+    # evidence that actually settles it: bare json_object returned 306-319 chars
+    # of real JSON 3/3 (containing newlines, i.e. whitespace unbanned), where the
+    # 2026-07-31 Laguna backend returned literally "{}" with finish_reason=stop.
+    # This must stay FALSE while the serve script omits the flag — the doctrine
+    # test tests/llmproxy/test_tier3_serve_script_doctrine.py pins that direction.
+    assert ep.disable_any_whitespace is False, (
+        "tier3 now declares disable_any_whitespace, but its serve script passes no "
+        "--structured-outputs-config. Those two must move together or bare "
+        "json_object silently returns '{}' again."
     )
-    # And it must NOT leak onto endpoints that don't run the flag.
     other = config.DEFAULT_ENDPOINTS[config.normalize_endpoint("creative")]
     assert other.disable_any_whitespace is False
 
@@ -347,4 +363,9 @@ def test_every_alias_of_tier3_resolves_to_the_guarded_endpoint():
     for alias in ("tier3", "reasoner", "llama-thinker", "thinker", "composer",
                   "companion", "qwen-composer", "nexus-companion"):
         ep = config.DEFAULT_ENDPOINTS[config.normalize_endpoint(alias)]
-        assert ep.disable_any_whitespace is True, f"alias {alias!r} is unguarded"
+        # 🔄 2026-08-22: what this test protects is the alias/class-collision
+        # history — every tier3 alias must resolve to the SAME endpoint object.
+        # The guard FLAG is now False by design (V4-Flash bans no whitespace;
+        # see the module docstring and test_models_yaml_flag_reaches_endpoint_config),
+        # so assert the flag is uniform across aliases rather than True.
+        assert ep.disable_any_whitespace is False, f"alias {alias!r} unexpectedly guarded"

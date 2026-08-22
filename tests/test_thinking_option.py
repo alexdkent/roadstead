@@ -39,7 +39,6 @@ def _mock_self(engine="vllm"):
     state.thinking_requests = state.thinking_clean = state.thinking_recovered = 0
     state.thinking_truncated = state.thinking_fallback = state.thinking_noop = 0
     m = types.SimpleNamespace(state=state)
-    m.fold_system_for_thinking = C.fold_system_for_thinking
     # bind the real Correction methods to the mock under their public names (so
     # internal cross-calls like self.thinking_allowed_keys resolve) AND under the
     # old underscore-prefixed names the test bodies call.
@@ -118,18 +117,6 @@ def test_apply_thinking_streaming_does_not_register_for_finalize():
     assert set(m2.state.thinking_active["r1"]["allowed_keys"]) == {"action", "params", "why"}
 
 
-def test_apply_thinking_streaming_folds_system():
-    """The template quirk that suppresses <think> when a system role is present is
-    not stream-specific — the fold has to happen on the streaming path too."""
-    m = _mock_self("vllm")
-    p = {"messages": [{"role": "system", "content": "You are Sidekick."},
-                      {"role": "user", "content": "why?"}],
-         "max_tokens": 800, "thinking": True}
-    m._apply_thinking(_req(p, stream=True))
-    assert [x["role"] for x in p["messages"]] == ["user"]
-    assert p["messages"][0]["content"] == "You are Sidekick.\n\nwhy?"
-
-
 def test_apply_thinking_streaming_transparent_without_optin():
     """Zero blast radius for the streaming traffic that does NOT opt in — which is
     all of it today."""
@@ -140,107 +127,6 @@ def test_apply_thinking_streaming_transparent_without_optin():
     assert "chat_template_kwargs" not in p
     assert p["max_tokens"] == 800 and p["messages"] == orig
     assert m.state.thinking_active == {}
-
-
-SYS = "You are Sidekick. Be terse."
-SYS2 = "Second system block."
-USR = "What is 17*23?"
-
-
-def _msgs(*roles_contents):
-    return [{"role": r, "content": c} for r, c in roles_contents]
-
-
-def test_fold_system_when_thinking_applied():
-    """laguna/tier3's template silently drops <think> when a system role is
-    present (measured: 0 ch reasoning with system, 4928 ch without). On the
-    opt-in path the system text is folded into the first user turn, verbatim."""
-    m = _mock_self("vllm")
-    p = {"messages": _msgs(("system", SYS), ("user", USR)),
-         "max_tokens": 800, "thinking": True}
-    m._apply_thinking(_req(p))
-    assert [x["role"] for x in p["messages"]] == ["user"]
-    merged = p["messages"][0]["content"]
-    assert merged == SYS + "\n\n" + USR
-    assert SYS in merged and USR in merged  # both survive verbatim
-
-
-def test_fold_does_not_happen_without_optin():
-    m = _mock_self("vllm")
-    orig = _msgs(("system", SYS), ("user", USR))
-    p = {"messages": list(orig), "max_tokens": 800}
-    m._apply_thinking(_req(p))
-    assert p["messages"] == orig  # untouched — zero blast radius off the opt-in
-
-
-def test_fold_does_not_happen_on_llamacpp():
-    m = _mock_self("llama.cpp")
-    orig = _msgs(("system", SYS), ("user", USR))
-    p = {"messages": list(orig), "max_tokens": 800, "thinking": True}
-    m._apply_thinking(_req(p))
-    assert p["messages"] == orig
-
-
-def test_fold_does_not_happen_when_feature_disabled():
-    m = _mock_self("vllm")
-    orig = _msgs(("system", SYS), ("user", USR))
-    p = {"messages": list(orig), "max_tokens": 800, "thinking": True}
-    os.environ["COLLECTIVE_PROXY_THINKING"] = "0"
-    try:
-        m._apply_thinking(_req(p))
-    finally:
-        os.environ.pop("COLLECTIVE_PROXY_THINKING")
-    assert p["messages"] == orig and p["max_tokens"] == 800
-
-
-def test_fold_noop_without_system():
-    m = _mock_self("vllm")
-    orig = _msgs(("user", USR), ("assistant", "391"), ("user", "again"))
-    p = {"messages": list(orig), "max_tokens": 800, "thinking": True}
-    m._apply_thinking(_req(p))
-    assert p["messages"] == orig
-
-
-def test_fold_noop_when_system_only():
-    """Nothing to fold INTO — leave it alone rather than invent a user turn."""
-    m = _mock_self("vllm")
-    orig = _msgs(("system", SYS))
-    p = {"messages": list(orig), "max_tokens": 800, "thinking": True}
-    m._apply_thinking(_req(p))
-    assert p["messages"] == orig
-
-
-def test_fold_preserves_multiple_systems_in_order():
-    m = _mock_self("vllm")
-    p = {"messages": _msgs(("system", SYS), ("user", USR), ("system", SYS2),
-                           ("assistant", "391")),
-         "max_tokens": 800, "thinking": True}
-    m._apply_thinking(_req(p))
-    assert [x["role"] for x in p["messages"]] == ["user", "assistant"]
-    assert p["messages"][0]["content"] == SYS + "\n\n" + SYS2 + "\n\n" + USR
-    assert p["messages"][1] == {"role": "assistant", "content": "391"}
-
-
-def test_fold_does_not_mutate_caller_message_dicts():
-    m = _mock_self("vllm")
-    user_msg = {"role": "user", "content": USR}
-    p = {"messages": [{"role": "system", "content": SYS}, user_msg],
-         "max_tokens": 800, "thinking": True}
-    m._apply_thinking(_req(p))
-    assert user_msg["content"] == USR  # new dicts built, caller's untouched
-
-
-def test_fold_handles_multipart_user_content():
-    m = _mock_self("vllm")
-    blocks = [{"type": "text", "text": USR},
-              {"type": "image_url", "image_url": {"url": "x"}}]
-    p = {"messages": [{"role": "system", "content": SYS},
-                      {"role": "user", "content": blocks}],
-         "max_tokens": 800, "thinking": True}
-    m._apply_thinking(_req(p))
-    out = p["messages"][0]["content"]
-    assert out[0] == {"type": "text", "text": SYS}
-    assert out[1:] == blocks
 
 
 def test_finalize_recovers_brace_dup():
