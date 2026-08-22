@@ -188,12 +188,11 @@ def test_timeout_event_records_identity_and_context(tmp_path):
     assert row[0] == "sess9"
     assert row[1] == "turn1"
     assert row[2] == "sidekick/sidekick.test/sess9"
-    # thinker context_per_slot (vLLM --max-model-len). 700000 since 2026-07-30: tier3 became
-    # Laguna S 2.1 and the window was raised by overriding the QUANT's YaRN factor 32 up to the
-    # base repo's 128. Was 131072 on the retired Qwen3.6-27B. MEMORY-bound, not model-bound —
-    # the model reaches 1,048,576 but that needs 37.16 GiB of KV against our 26.
-    assert row[3] == 700000
-    # est_in = 4000 chars / 4 = 1000 tokens; 1000 / 700000 * 100 ≈ 0.1%
+    # thinker context_per_slot (vLLM --max-model-len). 1048576 since 2026-08-22: tier3 cut
+    # over to the two-node DeepSeek-V4-Flash-0731 pair, which serves the model's full native
+    # window directly (no YaRN override needed, unlike Laguna's 700000 memory-bound cap).
+    assert row[3] == 1048576
+    # est_in = 4000 chars / 4 = 1000 tokens; 1000 / 1048576 * 100 ≈ 0.0954%, rounds to 0.1%
     assert row[4] == 0.1
 
 
