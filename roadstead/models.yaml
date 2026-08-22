@@ -275,10 +275,22 @@ models:
     # through the proxy.
     # `poolside/laguna-s-2.1` is the name POOLSIDE'S OWN CLIENTS send by default
     # (measured 2026-08-01: the `pool` CLI v1.0.14 in standalone mode hardcodes it
-    # in every /v1/chat/completions body). It is the SAME model we serve here —
-    # tier3 IS Laguna S 2.1 — so this alias exists purely so a stock poolside
-    # client works against the proxy with no client-side model config. Without it
-    # the proxy correctly 404s `model_not_found` and pool retries 3x and dies.
+    # in every /v1/chat/completions body). The alias exists purely so a stock
+    # poolside client works against the proxy with no client-side model config;
+    # without it the proxy correctly 404s `model_not_found` and pool retries 3x
+    # and dies.
+    # 🚨 CORRECTED 2026-08-22: this used to read "It is the SAME model we serve
+    # here — tier3 IS Laguna S 2.1". That is NO LONGER TRUE. tier3 is now
+    # DeepSeek-V4-Flash-0731 (see `model_family` below), so the alias is now a
+    # COMPATIBILITY SHIM POINTING AT A DIFFERENT MODEL: a poolside client asking
+    # for `poolside/laguna-s-2.1` gets DeepSeek and cannot tell. Keep the alias
+    # while pool is still in service (it is being replaced by dsh, lane by lane);
+    # delete it with the last pool lane rather than leaving a name that lies.
+    # Thinking: see the dispatch-side treatment landed in `50e2b6c50` — the key
+    # is `chat_template_kwargs.thinking` because the serve script pins
+    # `{"thinking": false}`, and `enable_thinking` works only incidentally
+    # (V4's template accepts both). dsh sends the same key per-model via
+    # `infra/dsh/plugins/collective-llm`.
     aliases: [tier3, reasoner, llama-thinker, thinker, composer, companion, qwen-composer, nexus-companion, poolside/laguna-s-2.1]
     host: anvil          # PRIMARY = rank 0, the box that serves `port` below
     # tier3 is the fleet's FIRST model spanning two boxes. anvil2 is rank 1 of
