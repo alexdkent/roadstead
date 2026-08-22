@@ -224,6 +224,41 @@ class IPIdentityMap:
         # pool-observer comment above for the full measurement.
         acl.register("10.0.0.20", "pool-effector", LLMPriority.P3_INGESTION,
                      min_timeout_s=_SMART_DEFAULT_CAP_S)
+        # cli-read (jetty CTnnn, static 10.0.0.25) and cli-write (jetty CTnnn,
+        # static 10.0.0.41), created 2026-08-22 — see
+        # docs/dsh_builder_containers_plan_2026-08.md. Same situation as goose
+        # and the pool CTs above: dsh reaches the proxy through a plain
+        # OpenAI-compatible route with no identity header, so without these two
+        # lines both land in `lan-generic` and are invisible in
+        # `proxy_completions`. Registered in CODE, not via LLM_PROXY_ACL,
+        # because container env is baked at `docker run` and an env change would
+        # force a permission-gated full-fleet re-run for a one-line identity fix.
+        #
+        # Registered SEPARATELY rather than as two aliases of one `dsh`
+        # identity, for the same reason pool-observer and pool-effector are
+        # separate: they are the READ and WRITE halves of a deliberate
+        # blast-radius split, and the day tier3 needs to shed load from the
+        # write lane but not the read lane, QoS attribution has to be able to
+        # tell them apart. Same P3 tier the subnet default already gave them, so
+        # this changes attribution, not priority.
+        #
+        # min_timeout_s: identical reasoning to pool-observer above — dsh
+        # supplies NO deadline of its own, so it gets the smart default, whose
+        # size_stretch clamp binds long before any per-role ceiling. The floor
+        # raises it to the cap the smart default may already reach rather than
+        # inventing a new bound; an explicit caller deadline still wins.
+        #
+        # 🚨 BOTH ADDRESSES SIT INSIDE THE DHCP DYNAMIC POOL
+        # (dhcp-range=10.0.0.20,10.0.0.254) and are protected only by their
+        # dnsmasq reservations (added the same day via opnsense_netctl). If
+        # either CT is ever destroyed, DELETE ITS REGISTRATION HERE TOO —
+        # leaving a stale source-IP identity would silently misattribute
+        # whatever takes the address next, which is exactly why the
+        # pool-analyst entry below was removed with its CT.
+        acl.register("10.0.0.25", "cli-read", LLMPriority.P3_INGESTION,
+                     min_timeout_s=_SMART_DEFAULT_CAP_S)
+        acl.register("10.0.0.41", "cli-write", LLMPriority.P3_INGESTION,
+                     min_timeout_s=_SMART_DEFAULT_CAP_S)
         # pool-analyst (Kestrel CTnnn, 10.0.0.23) was registered here from
         # 2026-08-14 until the CT was DESTROYED 2026-08-20. The registration is
         # removed with it: .23 sits inside the DHCP pool, so leaving a stale
