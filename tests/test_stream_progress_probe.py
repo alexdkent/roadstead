@@ -35,8 +35,8 @@ import time
 import pytest
 
 from originfleet.llmproxy import lifecycle as lifecycle_mod
-from originfleet.llmproxy.backend import BackendStreamEvent
-from originfleet.llmproxy.config import ProxyConfig
+from originfleet.llmproxy.backend import BackendClientPool, BackendStreamEvent
+from originfleet.llmproxy.config import EndpointConfig, ProxyConfig
 from originfleet.llmproxy.service import ProxyService
 
 
@@ -161,10 +161,11 @@ async def test_frozen_counters_still_abort(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_absent_counters_fall_back_to_aborting(monkeypatch):
-    """A backend that exposes no counters (llama.cpp, unreachable, non-200)
-    must behave EXACTLY as it did before C6. `None` means "cannot
-    discriminate", and reading it as evidence of life would silently disable
-    the stall guard for every non-vLLM endpoint in the fleet."""
+    """A backend that exposes no counters (unreachable, non-200, an engine with
+    no `/metrics`) must behave EXACTLY as it did before C6. `None` means "cannot
+    discriminate", and reading it as evidence of life would silently disable the
+    stall guard wherever the probe cannot see. (llama.cpp is NOT such a backend
+    — it publishes `llamacpp:n_decode_total`; see section 4.)"""
     monkeypatch.setattr(lifecycle_mod, "_STREAM_INTERTOKEN_GAP_S", 1.5)
     svc = ProxyService(ProxyConfig())
     svc._backend.stream = _speaks_then_silent(60.0, then_done=False)
@@ -278,3 +279,78 @@ async def test_tool_carrying_request_gets_the_wider_gap(monkeypatch):
     with_tools = await run(True)
     assert '"done"' in with_tools, with_tools[-400:]
     assert "stalled mid-stream" not in with_tools, with_tools[-400:]
+
+
+# --- 4. WHICH counter, per engine family -------------------------------------
+#
+# The discriminator is only as good as the counter it reads, and llama.cpp has
+# a same-sounding counter that is WRONG for this purpose. These pin the choice.
+
+def _probe_returning(body: str):
+    """A BackendClientPool whose `/metrics` returns ``body``."""
+    pool = BackendClientPool.__new__(BackendClientPool)
+
+    class _Resp:
+        status_code = 200
+        text = body
+
+    class _Client:
+        async def get(self, path):
+            assert path == "/metrics", path
+            return _Resp()
+
+    pool._client_for = lambda host, port, min_pool=0: _Client()
+    return pool
+
+
+_EP = EndpointConfig(endpoint_class="x", role="x")
+
+_VLLM = """# HELP vllm:prompt_tokens_total x
+vllm:prompt_tokens_total{engine="0",model_name="m"} 7815245.0
+vllm:generation_tokens_total{engine="0",model_name="m"} 358688.0
+"""
+
+# Real shape, copied from the live boxa (nasbox:9196). Note `n_decode_total`
+# carries no labels and no `tokens_total` substring — an earlier cut of this
+# parser filtered on `"tokens_total" in line` and would have dropped it.
+_LLAMACPP = """# HELP llamacpp:prompt_tokens_total x
+llamacpp:prompt_tokens_total 1.90511e+06
+llamacpp:tokens_predicted_total 420506
+llamacpp:n_decode_total 196408
+"""
+
+
+@pytest.mark.asyncio
+async def test_vllm_counters_are_read():
+    got = await _probe_returning(_VLLM).probe_progress_counters(_EP)
+    assert got == {"prompt": 7815245, "generation": 358688}
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_generation_reads_n_decode_not_tokens_predicted():
+    """🚨 The trap this test exists for.
+
+    MEASURED on the live boxa during a 400-token generation, sampled every 3 s:
+    `tokens_predicted_total` went +0, +0, +0 and then +400 AT COMPLETION, while
+    `n_decode_total` went +24, +66, +66, +65. `tokens_predicted_total` is
+    credited when the request finishes, so it reads FROZEN for exactly the
+    window the watchdog judges — mapping it to vLLM's `generation_tokens_total`
+    by name would make the probe report "no progress" on every llama.cpp
+    endpoint, and C6 would protect nothing while looking green.
+    """
+    got = await _probe_returning(_LLAMACPP).probe_progress_counters(_EP)
+    assert got is not None, "llama.cpp must not read as 'cannot discriminate'"
+    assert got["generation"] == 196408, (
+        f"generation must come from n_decode_total; got {got['generation']} "
+        f"(420506 means it read tokens_predicted_total, which is frozen "
+        f"mid-generation)")
+    assert got["prompt"] == 1905110      # 6-sig-fig float parsed, not dropped
+
+
+@pytest.mark.asyncio
+async def test_backend_without_counters_reads_as_cannot_discriminate():
+    """Absence must stay distinguishable from zero — the watchdog falls back to
+    aborting on None, and a 0 would look like a frozen backend instead."""
+    got = await _probe_returning("# nothing useful here\nfoo_bar 1\n"
+                                 ).probe_progress_counters(_EP)
+    assert got is None

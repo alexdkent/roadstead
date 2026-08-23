@@ -797,22 +797,43 @@ class BackendClientPool:
     async def probe_progress_counters(self, ep_cfg: EndpointConfig) -> dict | None:
         """Scrape a backend's `/metrics` for CUMULATIVE work counters (C6).
 
-        Returns ``{"prompt": int, "generation": int}`` — vLLM's
-        ``vllm:prompt_tokens_total`` / ``vllm:generation_tokens_total`` summed
-        across engines — or ``None`` when the backend exposes neither (llama.cpp,
-        an unreachable backend, a non-200). ``None`` means "cannot discriminate",
-        and every caller must fall back to today's behaviour on it rather than
-        treating it as "no progress"; that distinction is the whole safety
-        property of the progress-aware watchdog.
+        Returns ``{"prompt": int, "generation": int}``, or ``None`` when the
+        backend exposes neither (an unreachable backend, a non-200, an engine
+        with no `/metrics`). ``None`` means "cannot discriminate", and every
+        caller must fall back to today's behaviour on it rather than treating it
+        as "no progress"; that distinction is the whole safety property of the
+        progress-aware watchdog.
+
+        BOTH engine families are covered, because the stall this exists for is
+        not vLLM-specific — `creative`/`tier2`/the classify family are llama.cpp
+        and were stalling too.
+
+        🚨 **The llama.cpp generation counter is `n_decode_total`, NOT
+        `tokens_predicted_total`.** The same-sounding name is the trap: MEASURED
+        2026-08-23 against the live boxa during a 400-token generation, sampling
+        every 3 s —
+            tokens_predicted_total  +0, +0, +0, then +400 AT COMPLETION
+            n_decode_total         +24, +66, +66, +65   (live, ~22/s)
+        `tokens_predicted_total` is credited when the request FINISHES, so it
+        reads frozen for exactly the window the watchdog is judging. Mapping it
+        to vLLM's `generation_tokens_total` by name would have made this probe
+        return "no progress" on every llama.cpp endpoint — a fix that runs,
+        reports green, and protects nothing.
+
+        Precision note: llama.cpp prints 6 significant figures, so a counter
+        past 1e6 quantises (observed `prompt_tokens_total` stepping 1905110 →
+        1905130). `n_decode_total` is the smaller counter and stays exact for
+        far longer, and a backend emitting fewer than ~10 tokens per probe
+        interval is not one we want to call healthy anyway.
 
         These are ENGINE-WIDE, not per-request: on a busy engine another
         request's tokens also advance them, so this can only ever prove the
         BACKEND is alive, never that MY stream is. That is why the watchdog
         bounds its extensions instead of trusting this indefinitely.
 
-        Best-effort and short-timeout by construction: it runs on the abort path
-        of a stream that is already unhappy, so it must never become the thing
-        that hangs. Any error → None.
+        Best-effort and short-timeout by construction: it runs alongside a
+        stream that is already unhappy, so it must never become the thing that
+        hangs. Any error → None.
         """
         client = self._client_for(ep_cfg.host, ep_cfg.port)
         try:
@@ -821,9 +842,10 @@ class BackendClientPool:
                 return None
             prompt = generation = None
             for line in resp.text.splitlines():
-                if line.startswith("#") or "tokens_total" not in line:
+                if line.startswith("#"):
                     continue
                 # 'vllm:prompt_tokens_total{engine="0",model_name="x"} 7815245.0'
+                # 'llamacpp:n_decode_total 196408'
                 try:
                     name, val = line.rsplit(" ", 1)
                     v = int(float(val))
@@ -835,6 +857,10 @@ class BackendClientPool:
                 if name.startswith("vllm:prompt_tokens_total"):
                     prompt = v if prompt is None else prompt + v
                 elif name.startswith("vllm:generation_tokens_total"):
+                    generation = v if generation is None else generation + v
+                elif name.startswith("llamacpp:prompt_tokens_total"):
+                    prompt = v if prompt is None else prompt + v
+                elif name.startswith("llamacpp:n_decode_total"):
                     generation = v if generation is None else generation + v
             if prompt is not None or generation is not None:
                 return {"prompt": prompt or 0, "generation": generation or 0}
