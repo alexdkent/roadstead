@@ -289,6 +289,13 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
             # test_json_object_guard.py::test_models_yaml_flag_reaches_endpoint_config
             # is the guard that this one is really wired.
             ("disable_any_whitespace", "disable_any_whitespace"),
+            # 2026-08-23: fraction of max_tokens allowed for REASONING on a backend
+            # launched with `--reasoning-config` (vLLM will not honour
+            # `thinking_token_budget` without it, and 400s the request instead).
+            # Mirrored from the serve script; pinned by
+            # test_tier3_serve_script_doctrine.py. Absent/0 = inject nothing, which
+            # is what every endpoint except the reasoner wants.
+            ("thinking_budget_ratio", "thinking_budget_ratio"),
             # §8.0 req 4 — marks the endpoint backing the conversational lane,
             # which is what `/readyz` fails closed on. Guarded by
             # test_readyz.py::test_readiness_critical_flag_reaches_endpoint_config,

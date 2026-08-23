@@ -325,3 +325,71 @@ def test_co_hosts_survives_into_the_catalog(tier3: dict) -> None:
         f"{entry.co_hosts!r} — the key was dropped by the parser in "
         "model_catalog (add it to the ModelEntry construction)."
     )
+
+
+def _flag_in_docker_run(script: str, flag: str) -> bool:
+    """Is `flag` actually PASSED, as opposed to merely mentioned?
+
+    🚨 Written after the naive `flag in script` version was sabotage-tested and did
+    NOT fail: this file's own explanatory comments name `--reasoning-config` twice, so
+    the substring check was satisfied by prose and would have reported the flag present
+    after it was deleted from the command. A guard anything can satisfy is not a guard.
+
+    So: look only inside the `exec docker run` continuation, and only at lines that are
+    not comments.
+    """
+    body = re.search(r"^exec docker run.*", script, re.S | re.M)
+    if not body:
+        return False
+    return any(flag in ln for ln in body.group(0).splitlines()
+               if not ln.lstrip().startswith("#"))
+
+
+def test_thinking_budget_ratio_matches_the_script(head_script: str, tier3: dict) -> None:
+    """BIDIRECTIONAL pin: `--reasoning-config` in the launcher ⟺ a declared ratio.
+
+    vLLM honours the per-request `thinking_token_budget` ONLY when the server was
+    started with `--reasoning-config`; without it the server refuses the whole request
+    ("thinking_token_budget is set but reasoning_config is not configured"). So the two
+    must move together in both directions:
+
+      * flag present, declaration missing -> the proxy never caps reasoning, and this
+        model's natural length is BIMODAL: measured 2026-08-23, it sometimes ran past a
+        12,000-token ceiling and returned `content: ""` after 8-13 minutes;
+      * declaration present, flag removed -> the proxy injects a parameter the backend
+        rejects, and EVERY thinking request to tier3 400s. That direction does not
+        degrade the endpoint, it breaks it.
+
+    ⚠️ `--reasoning-parser` alone does NOT satisfy this. vLLM's auto-init only stamps
+    the parser name INTO an existing reasoning_config object
+    (`EngineArgs._set_default_reasoning_config_args` returns early when it is None), so
+    the parser flag can be present while the whole path stays disabled — which is
+    exactly the state this endpoint was in until 2026-08-23.
+    """
+    in_script = _flag_in_docker_run(head_script, "--reasoning-config")
+    declared = float(tier3.get("policy", {}).get("thinking_budget_ratio") or 0.0)
+    assert in_script == bool(declared), (
+        f"drift: head launcher passes --reasoning-config={in_script} but "
+        f"models.yaml reasoner.policy.thinking_budget_ratio={declared}. "
+        "vLLM rejects the request outright when the flag is missing — these must "
+        "change together."
+    )
+    if declared:
+        assert 0 < declared < 1, f"ratio must be a fraction of max_tokens, got {declared}"
+        # A cap that leaves no room for the answer recreates the failure it prevents.
+        assert declared <= 0.8, (
+            f"ratio {declared} leaves under 20% of max_tokens for the ANSWER; the "
+            "whole point of the cap is answer headroom"
+        )
+
+
+def test_reasoning_parser_is_still_present_for_the_budget_to_work(head_script: str) -> None:
+    """The budget needs BOTH flags. `--reasoning-config '{}'` self-derives its
+    delimiters from the parser, so removing `--reasoning-parser` while keeping the
+    config would leave the config unable to initialize its token ids and the cap
+    silently inert."""
+    if _flag_in_docker_run(head_script, "--reasoning-config"):
+        assert _flag_in_docker_run(head_script, "--reasoning-parser"), (
+            "--reasoning-config without --reasoning-parser: the config cannot derive "
+            "reasoning_start_str/reasoning_end_str and the budget never applies"
+        )

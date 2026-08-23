@@ -191,6 +191,28 @@ class EndpointConfig:
     # .apply_json_object_guard`` uses this flag to strip bare json_object on
     # these endpoints. False everywhere the launch flag is absent.
     disable_any_whitespace: bool = False
+    #: Fraction of a request's ``max_tokens`` to give the model for REASONING, when
+    #: this backend supports a reasoning budget at all. 0.0 = unsupported, inject
+    #: nothing — and that is the safe default for every endpoint.
+    #:
+    #: 🚨 This is a DECLARATION of a launch flag, like ``disable_any_whitespace``
+    #: above: vLLM only honours ``thinking_token_budget`` when the server was started
+    #: with ``--reasoning-config``, and it 400s the whole request when it was not
+    #: ("thinking_token_budget is set but reasoning_config is not configured").
+    #: The proxy cannot introspect that flag, so it is mirrored here and pinned
+    #: against the vendored serve script by
+    #: test_tier3_serve_script_doctrine.py::test_thinking_budget_ratio_matches_the_script.
+    #: Setting this on an endpoint whose server lacks the flag does not degrade it —
+    #: it breaks every thinking request to it outright.
+    #:
+    #: WHY A RATIO AND NOT A FIXED NUMBER. Measured 2026-08-23 on tier3: with no
+    #: budget, reasoning consumed the ENTIRE completion allowance and the caller got
+    #: ``content: ""`` — twice out of twice, after 8 and 13 minutes. The failure is
+    #: not slowness, it is that reasoning leaves no room for an answer. So the number
+    #: that matters is answer HEADROOM, which is a fraction of ``max_tokens`` — not
+    #: prompt size, and not a constant that is generous for one caller and starving
+    #: for the next.
+    thinking_budget_ratio: float = 0.0
     # --- tier3 failover (§ 9 of the anvil2/V4-Flash plan) ------------------
     # The endpoint CLASS this one degrades to while it is unhealthy, derived
     # from the model stanza's `fallback:` in models.yaml. Empty = no failover

@@ -413,6 +413,29 @@ models:
       # EQUAL to `slots` above; the shadow reconciler warns if they drift (the
       # 32-vs-20 class). Update BOTH whenever serve_tier3_prod.sh changes.
       documented_max_num_seqs: 6
+      # 2026-08-23: fraction of a request's max_tokens the model may spend on
+      # REASONING. MIRRORS `--reasoning-config` in the vendored head launcher
+      # (infra/anvil/vllm/v4flash/serve_tier3_v4flash_head.sh); vLLM honours
+      # `thinking_token_budget` ONLY when the server was launched with that flag and
+      # 400s the whole request otherwise, so this declaration is not a tuning knob —
+      # it is a statement about how the backend was started. Pinned script⟺catalog in
+      # BOTH directions by test_tier3_serve_script_doctrine.py.
+      #
+      # WHY IT EXISTS. Measured 2026-08-23, N=2, interleaved, streaming: with no cap
+      # this model's natural reasoning length is BIMODAL — sometimes ~7-8k tokens and
+      # a clean answer, sometimes past a 12,000-token ceiling with `content: ""` and
+      # finish=length, which is 8-13 minutes of compute returning nothing. That is
+      # very likely the "sporadic tier3 502" this file has recorded as unexplained;
+      # `empty_completion_error` already names the shape. The cap bounds that TAIL.
+      # It does not shorten the median, and it is deliberately generous for that
+      # reason: at 0.6 of a 32,768-token request it clamps to the 16,000 ceiling and
+      # never fires on a normal call.
+      #
+      # It COMPLEMENTS Correction.apply_thinking, which ADDS 8000 tokens of headroom
+      # on the proxy's own `thinking: true` opt-in — that makes the allowance bigger,
+      # this stops reasoning consuming all of it. Different callers, both needed: dsh
+      # sets chat_template_kwargs directly and never sends the opt-in field.
+      thinking_budget_ratio: 0.6
       # 2026-08-01: MIRRORS a host-side serve-script launch flag the proxy cannot
       # introspect — exactly like `documented_max_num_seqs` above. The flag is
       # `--structured-outputs-config '{"backend":"guidance","disable_any_whitespace":true}'`

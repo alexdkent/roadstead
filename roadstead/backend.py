@@ -164,6 +164,7 @@ def _normalize_strict_alternation(messages: Any) -> list:
 
 def _normalize_chat_payload(
     payload: dict, vllm: bool = False, model_id: str | None = None,
+    thinking_budget_ratio: float = 0.0,
 ) -> dict:
     """Make an Anthropic/extra_body-shaped chat payload wire-correct for the
     backend.
@@ -220,6 +221,7 @@ def _normalize_chat_payload(
         and not needs_thinking_default
         and not needs_vision_xlate
         and not needs_alternation
+        and not (thinking_budget_ratio > 0)
     ):
         return payload
     p = dict(payload)
@@ -270,7 +272,67 @@ def _normalize_chat_payload(
         ck = dict(ck) if isinstance(ck, dict) else {}
         ck["enable_thinking"] = False
         p["chat_template_kwargs"] = ck
+    _apply_thinking_token_budget(p, thinking_budget_ratio)
     return p
+
+
+#: Floor and ceiling on an injected reasoning cap.
+#:
+#: FLOOR: vLLM #44676 reports forced reasoning-end tokens landing INSIDE tool-call
+#: JSON at ~256 tokens, ~75% of runs. Anthropic's published minimum thinking budget is
+#: 1024 and is the only floor-shaped number anyone documents. 2000 sits above both.
+#: Measured here 2026-08-23: at 2000 the model answered but rambled to the ceiling
+#: every time, so this is a floor to stay ABOVE, not a target.
+#: CEILING: past ~12k, published accuracy curves are falling, not rising
+#: (arXiv 2604.10739 peaks at 10-12k and crosses into net harm around 7k), and our own
+#: worst observed block was 16,562 tokens — well past the peak.
+_THINKING_BUDGET_FLOOR = 2000
+_THINKING_BUDGET_CEILING = 16000
+#: Below this `max_tokens` there is no sane split: the floor would eat the whole
+#: allowance and leave nothing for an answer, which is the failure we are preventing.
+_THINKING_BUDGET_MIN_MAX_TOKENS = 3000
+
+
+def _apply_thinking_token_budget(p: dict, ratio: float) -> None:
+    """Cap REASONING at a fraction of `max_tokens`, so an answer always has room.
+
+    Complements — never replaces — `Correction.apply_thinking`, which ADDS
+    `thinking_reasoning_budget()` (8000) of headroom to `max_tokens` on the proxy's
+    own `thinking: true` opt-in. That mechanism makes the pie bigger so reasoning does
+    not truncate the answer; this one slices the pie so reasoning cannot eat all of it.
+    Both are needed, and they act on different callers: the opt-in only fires for
+    callers that send the top-level control field, while this fires for anyone who has
+    thinking on by any route (dsh sets `chat_template_kwargs` directly and never
+    touches the opt-in).
+
+    Measured on tier3 2026-08-23, N=2, interleaved, streaming: with no cap the model's
+    natural reasoning length is BIMODAL — sometimes ~7-8k tokens and a clean answer,
+    sometimes past a 12,000-token ceiling with `content: ""` and finish=length. The cap
+    exists to bound that TAIL, not to shorten the median, which is why the ratio is
+    generous rather than tight.
+
+    Silent no-op unless the endpoint DECLARES support (`thinking_budget_ratio` > 0,
+    mirrored from its `--reasoning-config` launch flag). vLLM 400s the entire request
+    when the parameter arrives at a server without that flag, so a wrong declaration
+    does not degrade an endpoint, it breaks every thinking call to it.
+    """
+    if not ratio or ratio <= 0:
+        return
+    if "thinking_token_budget" in p:
+        return                      # caller declared intent; never override it
+    ck = p.get("chat_template_kwargs")
+    if not isinstance(ck, dict):
+        return
+    if not (ck.get("thinking") or ck.get("enable_thinking")):
+        return                      # thinking is off — a budget would be meaningless
+    mt = p.get("max_tokens")
+    if not isinstance(mt, int) or mt < _THINKING_BUDGET_MIN_MAX_TOKENS:
+        return
+    budget = int(mt * ratio)
+    budget = max(_THINKING_BUDGET_FLOOR, min(budget, _THINKING_BUDGET_CEILING))
+    if budget >= mt:
+        return                      # nothing left for an answer; leave it alone
+    p["thinking_token_budget"] = budget
 
 
 
@@ -495,7 +557,8 @@ class BackendClientPool:
         if payload_type == "chat_completion":
             payload = _normalize_chat_payload(
                 payload, vllm=(ep_cfg.backend_engine == "vllm"),
-                model_id=ep_cfg.effective_model_id)
+                model_id=ep_cfg.effective_model_id,
+                thinking_budget_ratio=ep_cfg.thinking_budget_ratio)
 
         t0 = time.monotonic()
         try:
@@ -586,7 +649,8 @@ class BackendClientPool:
         if payload_type == "chat_completion":
             payload = _normalize_chat_payload(
                 payload, vllm=(ep_cfg.backend_engine == "vllm"),
-                model_id=ep_cfg.effective_model_id)
+                model_id=ep_cfg.effective_model_id,
+                thinking_budget_ratio=ep_cfg.thinking_budget_ratio)
 
         try:
             async with client.stream(
