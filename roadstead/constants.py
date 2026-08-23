@@ -103,6 +103,22 @@ _STREAM_HARD_CAP_INTERACTIVE_S = 900.0
 # by the caller's remaining SLA), so a mid-stream stall aborts in ~this many
 # seconds and frees the slot with a deferrable error instead of hanging to 180s.
 _STREAM_INTERTOKEN_GAP_S = 30.0
+# 🚨 2026-08-22 — THIS FIRES ON WORK THAT WOULD HAVE SUCCEEDED, and raising the
+# number is NOT the fix. tier3 (DeepSeek-V4-Flash, TP=2) JIT-compiles kernels
+# mid-request (TileLang `mhc_pre_big_fuse_broadcast_*`, Triton
+# `_build_c128a_topk_metadata_kernel`; vLLM logs them at jit_monitor.py:135).
+# Compilation is CPU work, so the GPU sits at 0% and the stream produces no
+# token for longer than this gap — and the watchdog aborts a request that was
+# going to finish. It cost a real dsh turn. Raising the constant re-opens the
+# 2026-06-06 contention hole above and only delays this one.
+# THE FIX (plan item C6) is to make this PROGRESS-AWARE: on expiry, poll the
+# backend /metrics once — if vllm:prompt_tokens_total or
+# vllm:generation_tokens_total advanced since the gap opened, the backend is
+# alive and working, so extend the deadline a bounded number of times; abort
+# only when BOTH are frozen (which is the true-wedge signature — see the
+# `thinker-silent-hang` ledger entry). Measured during the incident: +1,972
+# prompt and +12 generation tokens in the 30s the client saw nothing.
+# Ledger: `a-jit-compile-and-a-wedge-look-identical-to-an-inter-token-watchdog`.
 
 # Map the scheduler's payload_type to the completion `kind` tag (so the unified
 # Inference page can group LLM sub-kinds; non-LLM calls pushed via /v1/calls/log
