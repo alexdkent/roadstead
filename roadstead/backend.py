@@ -794,6 +794,54 @@ class BackendClientPool:
             pass
         return None
 
+    async def probe_progress_counters(self, ep_cfg: EndpointConfig) -> dict | None:
+        """Scrape a backend's `/metrics` for CUMULATIVE work counters (C6).
+
+        Returns ``{"prompt": int, "generation": int}`` — vLLM's
+        ``vllm:prompt_tokens_total`` / ``vllm:generation_tokens_total`` summed
+        across engines — or ``None`` when the backend exposes neither (llama.cpp,
+        an unreachable backend, a non-200). ``None`` means "cannot discriminate",
+        and every caller must fall back to today's behaviour on it rather than
+        treating it as "no progress"; that distinction is the whole safety
+        property of the progress-aware watchdog.
+
+        These are ENGINE-WIDE, not per-request: on a busy engine another
+        request's tokens also advance them, so this can only ever prove the
+        BACKEND is alive, never that MY stream is. That is why the watchdog
+        bounds its extensions instead of trusting this indefinitely.
+
+        Best-effort and short-timeout by construction: it runs on the abort path
+        of a stream that is already unhappy, so it must never become the thing
+        that hangs. Any error → None.
+        """
+        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        try:
+            resp = await asyncio.wait_for(client.get("/metrics"), timeout=3.0)
+            if resp.status_code != 200:
+                return None
+            prompt = generation = None
+            for line in resp.text.splitlines():
+                if line.startswith("#") or "tokens_total" not in line:
+                    continue
+                # 'vllm:prompt_tokens_total{engine="0",model_name="x"} 7815245.0'
+                try:
+                    name, val = line.rsplit(" ", 1)
+                    v = int(float(val))
+                except ValueError:
+                    continue
+                # Summed, not replaced: a data-parallel backend publishes one
+                # series per engine and taking the last would silently track
+                # only whichever engine sorted last.
+                if name.startswith("vllm:prompt_tokens_total"):
+                    prompt = v if prompt is None else prompt + v
+                elif name.startswith("vllm:generation_tokens_total"):
+                    generation = v if generation is None else generation + v
+            if prompt is not None or generation is not None:
+                return {"prompt": prompt or 0, "generation": generation or 0}
+        except Exception:
+            pass
+        return None
+
     async def call_shadow(
         self,
         shadow_host: str,

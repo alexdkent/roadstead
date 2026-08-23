@@ -47,6 +47,9 @@ from .constants import (
     _SMART_DEFAULT_CAP_S,
     _STREAM_HARD_CAP_BACKGROUND_S,
     _STREAM_HARD_CAP_INTERACTIVE_S,
+    _STREAM_GAP_MAX_EXTENSIONS,
+    _STREAM_GAP_PROBE_FRACTION,
+    _STREAM_GAP_TOOLS_S,
     _STREAM_INTERTOKEN_GAP_S,
     _STREAM_PREFILL_FLOOR_TOK_S,
     _STREAM_TTFT_DEADLINE_S,
@@ -1185,6 +1188,86 @@ class Lifecycle:
             payload=req.payload, response=shadow_resp.body,
             cached_tokens=shadow_resp.cached_tokens,
         )
+
+    async def _stream_progress_probe(
+        self,
+        ep_cfg,
+        cm: asyncio.Timeout,
+        get_last_chunk_at,
+        get_ttft_ms,
+        gap_s: float,
+        hard_limit_s: float,
+        t0: float,
+        req: QueuedRequest,
+    ) -> None:
+        """C6 — extend the inter-token deadline while the BACKEND is provably working.
+
+        Runs as a companion task for the life of one stream. The gap watchdog on
+        its own sees only its own wire, so it cannot tell a wedged backend from
+        one doing legitimate work that emits no token — JIT compilation and
+        vLLM's tool-call batching both look exactly like death. This asks the
+        backend directly.
+
+        Cadence, not expiry: `asyncio.timeout` firing CANCELS the `async for`, so
+        a probe that waited for the deadline would arrive at a stream that is
+        already dead. Two samples are taken inside each gap (see
+        `_STREAM_GAP_PROBE_FRACTION`) so a verdict exists before it fires.
+
+        The three outcomes, and why each is what it is:
+          * counters ADVANCED  → backend alive; push the deadline out, at most
+            `_STREAM_GAP_MAX_EXTENSIONS` times, never past the absolute cap.
+          * counters FROZEN    → the true-wedge signature (`thinker-silent-hang`).
+            Stop arguing and let the deadline fire — a watchdog that no longer
+            fires on a real wedge is worse than the bug it fixed.
+          * counters ABSENT    → cannot discriminate (llama.cpp, unreachable,
+            non-200). Also stop: fall back to today's behaviour rather than
+            inventing evidence of life.
+        """
+        extensions = 0
+        prev: dict | None = None
+        # The floor only guards against a pathologically small gap spinning the
+        # probe; the production gaps (30 s / 60 s) give 9 s and 18 s and never
+        # reach it. Keeping it low is what makes this behaviour testable at all.
+        check_s = max(0.2, gap_s * _STREAM_GAP_PROBE_FRACTION)
+        loop = asyncio.get_running_loop()
+        while extensions < _STREAM_GAP_MAX_EXTENSIONS:
+            await asyncio.sleep(check_s)
+            # Before the first token the TTFT watchdog owns the stream, and it
+            # is deliberately generous about prefill; don't second-guess it.
+            if get_ttft_ms() is None:
+                prev = None
+                continue
+            if (time.monotonic() - get_last_chunk_at()) < check_s:
+                prev = None  # flowing — any baseline we held is stale
+                continue
+            counters = await self.state.backend.probe_progress_counters(ep_cfg)
+            if counters is None:
+                return
+            if prev is None:
+                prev = counters
+                continue
+            advanced = (counters["prompt"] > prev["prompt"]
+                        or counters["generation"] > prev["generation"])
+            prev = counters
+            if not advanced:
+                return
+            remaining = hard_limit_s - (time.monotonic() - t0)
+            if remaining <= 0:
+                return  # the absolute cap owns it from here
+            extensions += 1
+            try:
+                cm.reschedule(loop.time() + min(gap_s, remaining))
+            except RuntimeError:
+                return  # stream already finished and left the context
+            self.state.stream_progress_extensions += 1
+            logger.info(
+                "LLMPROXY_STREAM_PROGRESS_EXTEND endpoint=%s caller=%s "
+                "request_id=%s extension=%d/%d gap_s=%.0f prompt=%d generation=%d",
+                req.endpoint, req.agent_id, req.request_id, extensions,
+                _STREAM_GAP_MAX_EXTENSIONS, gap_s,
+                counters["prompt"], counters["generation"],
+            )
+
     async def execute_streaming(
         self,
         req: QueuedRequest,
@@ -1309,12 +1392,30 @@ class Lifecycle:
             + (req.est_input_tokens or 0) / _STREAM_PREFILL_FLOOR_TOK_S,
             hard_limit_s,
         )
-        gap_deadline_s = min(_STREAM_INTERTOKEN_GAP_S, hard_limit_s)
+        # C6 (2026-08-23): a request CARRYING tools has a legitimately bursty
+        # wire — vLLM's tool-call parser withholds argument deltas until it can
+        # emit a complete tool_call, measured at 14.23 s of silence mid-answer on
+        # an otherwise idle tier3. Give that shape the wider measured base; a
+        # tool-less stream keeps the tighter 30 s. See constants.py for the
+        # frames/gap table this number comes from.
+        base_gap_s = (_STREAM_GAP_TOOLS_S if payload.get("tools")
+                      else _STREAM_INTERTOKEN_GAP_S)
+        gap_deadline_s = min(base_gap_s, hard_limit_s)
         loop = asyncio.get_running_loop()
         last_chunk_at = t0
         hit_hard_cap = False
+        # C6 progress probe: a companion task that extends the deadline while the
+        # BACKEND is demonstrably working, so a silent-but-alive stream is not
+        # killed. It has to run alongside the stream rather than on the abort
+        # path, because `asyncio.timeout` firing cancels the `async for` — once
+        # we are in the except block the stream is already gone.
+        progress_probe: asyncio.Task | None = None
         try:
             async with asyncio.timeout(ttft_deadline_s) as _cm:
+                progress_probe = asyncio.create_task(self._stream_progress_probe(
+                    ep_cfg, _cm, lambda: last_chunk_at, lambda: ttft_ms,
+                    gap_deadline_s, hard_limit_s, t0, req,
+                ))
                 async for event in self.state.backend.stream(
                     ep_cfg, payload, req.payload_type,
                     req.request_id, timeout_s=hard_limit_s,
@@ -1431,6 +1532,12 @@ class Lifecycle:
             self.record_completion(req, decision, duration, input_tokens, output_tokens, "error")
             self.health.record_dispatch_failure(req.endpoint, exc)  # Step 4b
             return
+        finally:
+            # Every exit path, including the two `return`s above: the probe holds
+            # a reference to the timeout context, and rescheduling one that has
+            # already exited raises. Cancel is idempotent on a finished task.
+            if progress_probe is not None:
+                progress_probe.cancel()
 
         duration = time.monotonic() - t0
         # A stream that COMPLETED past its soft budget is the whole point of the

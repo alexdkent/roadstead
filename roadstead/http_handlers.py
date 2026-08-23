@@ -1203,6 +1203,10 @@ class ProxyHttpHandlers:
                 "count": self.state.stream_deadline_extended,
                 "total_s": round(self.state.stream_extension_s_total, 1),
                 "hard_cap_aborts": self.state.stream_hard_cap_aborts,
+                # C6 — gap deadlines extended on proven backend progress. Read it
+                # beside by_abort_reason.stall: rising here with stalls falling is
+                # the fix working, both rising is a backend genuinely in trouble.
+                "progress_extensions": self.state.stream_progress_extensions,
             },
         })
     async def handle_stall_aborts(self, request: Request) -> Response:

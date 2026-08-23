@@ -92,6 +92,11 @@ class ProxyState:
         self.stream_deadline_extended = 0      # streams that ran past their soft budget
         self.stream_extension_s_total = 0.0    # summed seconds granted beyond it
         self.stream_hard_cap_aborts = 0        # ...and how many hit the absolute cap
+        # C6: gap deadlines pushed out because the backend's /metrics counters
+        # proved it was still working. A stall that is NOT in this number was a
+        # genuinely frozen backend; one that is tells you the watchdog saved a
+        # turn it used to kill. Without it the fix is unobservable.
+        self.stream_progress_extensions = 0
         self.budget_mgr = BudgetManager(starvation_timeout_s=config.starvation_timeout_s)
         self.scheduler = Scheduler(config, self.cost_model, self.budget_mgr)
         self.backend = BackendClientPool()
