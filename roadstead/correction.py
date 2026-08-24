@@ -1274,13 +1274,26 @@ class Correction:
         except Exception:  # noqa: BLE001 — a compensation must never break a request
             logger.debug("json_object guard failed", exc_info=True)
     def apply_thinking(self, req: QueuedRequest) -> None:
-        """Request-side: honor a per-request ``thinking: true`` opt-in. On a vLLM
-        (reasoning-parser) backend, enable native <think> and add a GENEROUS
-        reasoning budget to max_tokens (reasoning is generated output → counts
-        against the cap; operator directive is to prefer slowness over cutoffs).
-        Records the request for response-side structured-output recovery. Strips
-        the ``thinking`` control field (not a backend param) regardless. Fully
-        transparent when not requested, feature-disabled, or non-vLLM.
+        """Request-side: honor a per-request ``thinking:`` opt-in. On an endpoint
+        whose model DECLARES its thinking switch (``policy.thinking_kwargs`` in
+        models.yaml), set that switch and add reasoning headroom to max_tokens
+        (reasoning is generated output → counts against the cap; operator
+        directive is to prefer slowness over cutoffs). Records the request for
+        response-side structured-output recovery. Strips the ``thinking``
+        control field (not a backend param) regardless. Fully transparent when
+        not requested, feature-disabled, or undeclared.
+
+        THE FIELD TAKES TWO SHAPES. ``thinking: true`` → the flat
+        ``thinking_reasoning_budget()`` headroom (8000), which is right for a
+        long-form author and far too much for a chat turn. ``thinking: <int>``
+        → that many tokens of headroom instead, capped at the flat default so
+        the field can only ever ask for LESS. An interactive caller should send
+        the int; see the budget block below for the measured reason.
+
+        WHICH KEY IS SET is per-model, not per-engine — the switch is a chat
+        TEMPLATE variable. DeepSeek-V4 (tier3) reads ``thinking``; Qwen3.6/3.8
+        (tier2-chat/tier2-analyst) read ``enable_thinking``. Hardcoding one
+        family's spelling here is the defect this method used to carry.
 
         STREAMING (2026-08-02): the request side applies to streamed requests too.
         It used to bail on ``req.stream`` outright, which made ``thinking: true``
@@ -1298,10 +1311,10 @@ class Correction:
         p = req.payload
         if not isinstance(p, dict):
             return
-        want = bool(p.get("thinking"))
+        want = p.get("thinking")
         eb = p.get("extra_body")
         if isinstance(eb, dict):
-            want = want or bool(eb.get("thinking"))
+            want = want if want else eb.get("thinking")
             eb.pop("thinking", None)
         p.pop("thinking", None)  # control field — never forward to the backend
         if not want or req.payload_type != "chat_completion":
@@ -1309,27 +1322,45 @@ class Correction:
         if not thinking_enabled():
             return
         ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
-        engine = ep.backend_engine if ep is not None else "llama.cpp"
-        if engine != "vllm":   # reasoning parser is vLLM-only; llama.cpp ignores
+        keys = tuple(ep.thinking_kwargs) if ep is not None else ()
+        if not keys:
+            # Undeclared template → we do not know which variable switches
+            # reasoning on this model, and guessing is how the tier3 swap went
+            # unnoticed. Refusing here is a no-op for the caller, same as the
+            # old `engine != "vllm"` bail, but it now says WHY and it is fixed
+            # by one line in models.yaml rather than by an engine check that
+            # was never the real question.
+            #
+            # 🚨 The old bail was `engine != "vllm"`, and that was WRONG, not
+            # merely conservative: it made `thinking: true` a silent no-op on
+            # BOTH llama.cpp chat endpoints even though both demonstrably
+            # separate reasoning into their own field (measured 2026-08-24:
+            # tier2-analyst 2,913 chars, tier2-chat 2,572 chars, `content`
+            # clean in both). The reasoning PARSER being a vLLM concept is
+            # true; "llama.cpp cannot do this" was not.
             return
         ck = p.get("chat_template_kwargs")
         ck = dict(ck) if isinstance(ck, dict) else {}
-        # BOTH keys, deliberately. The two live vLLM chat templates spell this
-        # switch differently and the server default is what wins if we miss:
-        #   Laguna S 2.1 (retired)     -> enable_thinking
-        #   DeepSeek-V4-Flash-0731     -> thinking   (the serve script pins
-        #                                 --default-chat-template-kwargs
-        #                                 '{"thinking":false}')
-        # Sending only `enable_thinking` against V4 happened to work because its
-        # template accepts both — but had it not, the pinned `thinking:false`
-        # default would have won and the opt-in would have been a SILENT no-op:
-        # no error, just an answer with no reasoning, which reads as "the model
-        # didn't reason today". An unknown template kwarg is ignored harmlessly,
-        # so sending both is strictly safer than guessing per backend.
-        ck["enable_thinking"] = True
-        ck["thinking"] = True
+        for key in keys:
+            ck[key] = True
         p["chat_template_kwargs"] = ck
+        # HOW MUCH REASONING HEADROOM. `thinking: true` keeps the historic flat
+        # allowance; `thinking: <int>` asks for exactly that many tokens.
+        #
+        # 🔑 The int form exists because the flat 8000 is the wrong number for a
+        # CHAT caller, and getting it wrong is expensive rather than merely
+        # untidy. The model spends the budget it is given: measured on the song
+        # author, `thinking: true` on a ~60-token ask produced 5,576 completion
+        # tokens over 443.6s, against 3.0s with thinking off. The same open-ended
+        # prompt sent with the caller's own max_tokens and no inflation reasoned
+        # for 556 chars and answered in 11.0s — FASTER than the 21.9s the
+        # non-thinking arm took to write the same deliberation out as prose.
+        # So an interactive caller wants a small explicit headroom, a long-form
+        # author wants the generous default, and the proxy cannot tell which is
+        # which from the payload. Let the caller say.
         budget = thinking_reasoning_budget()
+        if isinstance(want, int) and not isinstance(want, bool) and want > 0:
+            budget = min(want, budget)
         cur = p.get("max_tokens")
         p["max_tokens"] = (cur if isinstance(cur, int) and cur > 0 else 800) + budget
         if req.stream:

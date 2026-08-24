@@ -315,15 +315,36 @@ def test_normalize_consecutive_user_via_full_payload_llamacpp():
     assert out["messages"][0]["content"] == "one\n\ntwo"
 
 
-# --- vLLM thinking-leak fix: default chat_template_kwargs.enable_thinking off ---
-# The thinker (Qwen3.6) emits chain-of-thought as prose with no <think> tags and
-# no reasoning parser, so thinking-on leaks the "Here's a thinking process: ..."
-# preamble into message.content and breaks structured parsers downstream.
+# --- vLLM thinking default: the switch the TARGET MODEL reads, set to off ---
+# 🚨 REWRITTEN 2026-08-24. The header here used to say the thinker was Qwen3.6,
+# that it emitted chain-of-thought as prose with no <think> tags, and that no
+# reasoning parser was configured. All three were stale: tier3 has been
+# DeepSeek-V4-Flash-0731 since 2026-08-23, served with `--reasoning-parser
+# deepseek_v4`, and with thinking ON the split is clean (measured: the JSON
+# probe returned `{"artist": "Miles Davis", "year": 1959}` in `content` with the
+# deliberation in a separate `reasoning` field). The default is OFF because
+# reasoning tokens are additive to a `max_tokens` every caller sized for the
+# answer alone — not because reasoning corrupts output.
+#
+# Which KEY is injected is now declared per model (`policy.thinking_kwargs`),
+# because the spelling belongs to the chat template: DeepSeek reads `thinking`,
+# Qwen reads `enable_thinking`. Full coverage of that:
+# tests/llmproxy/test_thinking_kwargs_are_family_aware.py.
 
-def test_vllm_defaults_enable_thinking_false():
+def test_vllm_defaults_the_declared_switch_to_false():
+    payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
+    out = _normalize_chat_payload(payload, vllm=True,
+                                  thinking_kwargs=("thinking", "enable_thinking"))
+    assert out["chat_template_kwargs"]["thinking"] is False
+    assert out["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_vllm_injects_nothing_when_the_model_declares_no_switch():
+    """No declaration → no guess. An unmeasured template must not have a key
+    driven at it on the strength of what the LAST model happened to read."""
     payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
     out = _normalize_chat_payload(payload, vllm=True)
-    assert out["chat_template_kwargs"]["enable_thinking"] is False
+    assert "chat_template_kwargs" not in out
 
 
 def test_llamacpp_does_not_touch_thinking():
@@ -340,8 +361,12 @@ def test_vllm_preserves_caller_enable_thinking_top_level():
         "messages": [{"role": "user", "content": "x"}],
         "chat_template_kwargs": {"enable_thinking": True},
     }
-    out = _normalize_chat_payload(payload, vllm=True)
+    out = _normalize_chat_payload(payload, vllm=True,
+                                  thinking_kwargs=("thinking", "enable_thinking"))
     assert out["chat_template_kwargs"]["enable_thinking"] is True
+    assert "thinking" not in out["chat_template_kwargs"], (
+        "a caller's pin must be left ALONE, not have the other family's switch "
+        "appended alongside it")
 
 
 def test_vllm_preserves_caller_enable_thinking_in_extra_body():

@@ -308,6 +308,20 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
         ):
             if src in pol:
                 kw[dst] = pol[src]
+        # Not in the loop above because YAML hands us a LIST and EndpointConfig
+        # holds a tuple — a list would make the dataclass unhashable-in-spirit
+        # and, worse, mutable shared state across endpoints. Declares which
+        # chat-template variable(s) switch reasoning for THIS model; see
+        # EndpointConfig.thinking_kwargs. Guarded by
+        # test_thinking_kwargs_are_family_aware.py::
+        # test_models_yaml_thinking_kwargs_reach_endpoint_config, because a key
+        # missing from this block is silently dropped.
+        raw_tk = pol.get("thinking_kwargs")
+        if isinstance(raw_tk, (list, tuple)):
+            kw["thinking_kwargs"] = tuple(
+                str(k) for k in raw_tk if isinstance(k, str) and k.strip())
+        elif isinstance(raw_tk, str) and raw_tk.strip():
+            kw["thinking_kwargs"] = (raw_tk.strip(),)
         out[e.endpoint_class] = kw
 
     # § 9 — make `fallback:` load-bearing. Resolve each stanza's declared

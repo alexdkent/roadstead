@@ -165,6 +165,7 @@ def _normalize_strict_alternation(messages: Any) -> list:
 def _normalize_chat_payload(
     payload: dict, vllm: bool = False, model_id: str | None = None,
     thinking_budget_ratio: float = 0.0,
+    thinking_kwargs: tuple[str, ...] = (),
 ) -> dict:
     """Make an Anthropic/extra_body-shaped chat payload wire-correct for the
     backend.
@@ -189,20 +190,18 @@ def _normalize_chat_payload(
     that the proxy routed here). llama.cpp ignores the field, so we only touch
     it for vLLM.
 
-    Finally, for vLLM we default ``chat_template_kwargs.enable_thinking`` to
-    False. The thinker (Qwen3.6) emits chain-of-thought as PROSE ("Here's a
-    thinking process: ...") — not ``<think>`` tags — and no reasoning parser is
-    configured, so with thinking on the reasoning leaks into
-    ``message.content`` and breaks every structured/section parser downstream
-    (song theme JSON, craft scorecards, knowledge extract, etc.). Nothing reads
-    the reasoning today, so it is pure pollution. A caller that genuinely wants
-    reasoning can set ``chat_template_kwargs.enable_thinking`` itself and we
-    leave it untouched. llama.cpp ignores the field, so this is vLLM-only.
+    Finally, for vLLM we default the endpoint's DECLARED thinking switch(es) to
+    False — see the block at the injection site for which key and why.
+    ``thinking_kwargs`` comes from the endpoint's ``policy.thinking_kwargs`` in
+    ``models.yaml``; empty means "we do not know this template's switch", and we
+    inject nothing rather than guess. A caller that pins ANY known thinking
+    switch is left completely untouched.
     """
     if not isinstance(payload, dict):
         return payload
     needs_model_set = bool(vllm and model_id and payload.get("model") != model_id)
-    needs_thinking_default = bool(vllm and not _has_enable_thinking(payload))
+    needs_thinking_default = bool(
+        vllm and thinking_kwargs and not _has_thinking_kwarg(payload))
     needs_vision_xlate = _has_anthropic_image_block(payload.get("messages"))
     # llama.cpp only: strict-alternation templates (Mistral/Ministral) 500 on
     # consecutive system/user/assistant AND on an assistant right after the
@@ -254,23 +253,50 @@ def _normalize_chat_payload(
     # Default thinking OFF for vLLM (checked AFTER the extra_body merge so a
     # caller's chat_template_kwargs nested in extra_body still wins).
     #
-    # ⚠️ WHY IT IS OFF, correctly stated. It is NOT that thinking is broken —
-    # that was the 2026-07-31 misdiagnosis (999308832, "silently returning
-    # EMPTY content"). Re-measured the same day: reasoning works and lands in
-    # the response's `reasoning` field; at max_tokens=500 the model spends the
-    # whole budget reasoning and never reaches `content` (finish_reason=length),
-    # and at 1500 it answers cleanly in ~922 tokens.
+    # 🔑 WHICH KEY — this is MODEL-FAMILY-SPECIFIC and it has already bitten us.
+    # The switch is a chat-TEMPLATE variable, so its spelling belongs to the
+    # model, not to vLLM. Measured live through the proxy 2026-08-24, one probe
+    # per cell, `chat_template_kwargs` sent verbatim:
+    #
+    #   endpoint       model                 `thinking`   `enable_thinking`
+    #   tier3          DeepSeek-V4-Flash     ON (556ch)   ON (518ch)
+    #   tier2-analyst  Qwen3.8-27B           NO-OP (0ch)  ON (2913ch)
+    #   tier2-chat     Qwen3.6-35B           NO-OP (0ch)  ON (2572ch)
+    #
+    # So `enable_thinking` happens to be understood by BOTH families today and
+    # `thinking` only by DeepSeek — which is why hardcoding the Qwen key
+    # survived the 2026-08-23 tier3 model swap without an alarm. It survived on
+    # luck: V4's template ORs the two names, and the serve script separately
+    # pins `--default-chat-template-kwargs '{"thinking":false}'`, so the two
+    # agreed. Driving it off the endpoint's declaration instead means the next
+    # swap onto a template that reads only its OWN key cannot repeat this.
+    #
+    # ⚠️ WHY IT IS OFF BY DEFAULT, correctly stated (the previous version of
+    # this comment was STALE and would have sent the next reader down the wrong
+    # path). It is NOT that "no reasoning parser is configured" and reasoning
+    # therefore corrupts structured output — tier3 runs `--reasoning-parser
+    # deepseek_v4` and the split is CLEAN. Measured the same day, thinking ON:
+    # the JSON-extraction probe returned `{"artist": "Miles Davis", "year":
+    # 1959}` in `content` with 119 chars in a SEPARATE `reasoning` field, and
+    # the judge probe returned `10`. Structured callers are not the problem.
     #
     # The default stays OFF because reasoning tokens are ADDITIVE to the answer
-    # and essentially every caller sizes max_tokens for the answer alone —
-    # flipping this globally would empty-complete the fleet. Thinking is
-    # opt-in per call site, and a call site that opts in MUST raise its budget.
-    # The empty-completion gate below now names this case explicitly so the
-    # next person does not re-derive "thinking is broken" from a bare "empty".
-    if vllm and not _has_enable_thinking(p):
+    # and essentially every caller sizes max_tokens for the answer alone, so a
+    # fleet-wide flip exposes every tier3 call to the recorded bimodal tail
+    # (reasoning past 12k tokens → `content: ""` + finish=length → a 502). That
+    # is a availability risk taken on behalf of callers who did not ask for it.
+    # Thinking is therefore OPT-IN per call site (`thinking: true`, handled in
+    # `Correction.apply_thinking`), which is also what lets a caller size its
+    # own budget. What the opt-in COSTS is small when the budget is not
+    # inflated: same open-ended prompt, 11.0s/384 completion tokens with
+    # thinking ON vs 21.9s/738 with it OFF — ON was FASTER and its `content`
+    # was 996 chars of answer instead of 2,772 chars of answer-with-
+    # deliberation-inline.
+    if vllm and thinking_kwargs and not _has_thinking_kwarg(p):
         ck = p.get("chat_template_kwargs")
         ck = dict(ck) if isinstance(ck, dict) else {}
-        ck["enable_thinking"] = False
+        for key in thinking_kwargs:
+            ck[key] = False
         p["chat_template_kwargs"] = ck
     _apply_thinking_token_budget(p, thinking_budget_ratio)
     return p
@@ -357,8 +383,11 @@ def empty_completion_error(role: str, msg: dict, finish_reason: str | None,
             f"REASONING and never reached content ({len(reasoning)} chars of "
             f"reasoning, finish_reason=length). This is a token-budget problem, "
             f"NOT a broken model: raise max_tokens (reasoning is additive to the "
-            f"answer), or use the proxy's `thinking: true` opt-in which adds a "
-            f"reasoning budget for you, or send enable_thinking=false.")
+            f"answer), or use the proxy's `thinking: <tokens>` opt-in which adds "
+            f"that much reasoning budget for you, or turn reasoning off with the "
+            f"chat_template_kwargs key THIS model reads — `thinking` for "
+            f"DeepSeek-V4, `enable_thinking` for Qwen (models.yaml "
+            f"policy.thinking_kwargs); the other family's key is a silent no-op.")
     return BackendError(
         502,
         f"backend {role} returned empty completion "
@@ -366,13 +395,33 @@ def empty_completion_error(role: str, msg: dict, finish_reason: str | None,
         f"finish_reason={finish_reason!r})")
 
 
-def _has_enable_thinking(payload: dict) -> bool:
-    """True when the caller has already pinned chat_template_kwargs.enable_thinking
-    (top-level or nested in extra_body) — in which case we don't override it."""
+#: Every spelling of the thinking switch any fleet chat template understands.
+#:
+#: DETECTION uses the whole union; INJECTION uses only the endpoint's declared
+#: `policy.thinking_kwargs`. The asymmetry is deliberate and is the actual bug
+#: fixed here: a caller pinning DeepSeek's `thinking` was invisible to a guard
+#: that only knew Qwen's `enable_thinking`, so the proxy appended a
+#: contradictory `enable_thinking: False` to a payload the caller had already
+#: made up its mind about. That was survivable only because V4's template ORs
+#: the two names (measured: `{"thinking": true}` + an injected
+#: `enable_thinking: false` still reasoned, 556 chars). A template that instead
+#: ANDs them, or lets the second name win, would have turned every opt-in into
+#: a SILENT no-op — an answer with no reasoning reads as "the model didn't
+#: reason today", not as a proxy bug. Respect a pin, whatever it is called.
+#:
+#: Add a name here when a new family arrives; that costs nothing, whereas
+#: MISSING a name silently overrides callers.
+_THINKING_KWARG_NAMES = frozenset({"thinking", "enable_thinking"})
+
+
+def _has_thinking_kwarg(payload: dict) -> bool:
+    """True when the caller has already pinned ANY known thinking switch in
+    chat_template_kwargs (top-level or nested in extra_body) — in which case we
+    leave the payload alone, whichever name and whichever value they chose."""
     for container in (payload, payload.get("extra_body")):
         if isinstance(container, dict):
             ck = container.get("chat_template_kwargs")
-            if isinstance(ck, dict) and "enable_thinking" in ck:
+            if isinstance(ck, dict) and not _THINKING_KWARG_NAMES.isdisjoint(ck):
                 return True
     return False
 
@@ -596,7 +645,8 @@ class BackendClientPool:
             payload = _normalize_chat_payload(
                 payload, vllm=(ep_cfg.backend_engine == "vllm"),
                 model_id=ep_cfg.effective_model_id,
-                thinking_budget_ratio=ep_cfg.thinking_budget_ratio)
+                thinking_budget_ratio=ep_cfg.thinking_budget_ratio,
+                thinking_kwargs=ep_cfg.thinking_kwargs)
 
         t0 = time.monotonic()
         try:
@@ -689,7 +739,8 @@ class BackendClientPool:
             payload = _normalize_chat_payload(
                 payload, vllm=(ep_cfg.backend_engine == "vllm"),
                 model_id=ep_cfg.effective_model_id,
-                thinking_budget_ratio=ep_cfg.thinking_budget_ratio)
+                thinking_budget_ratio=ep_cfg.thinking_budget_ratio,
+                thinking_kwargs=ep_cfg.thinking_kwargs)
 
         try:
             async with client.stream(

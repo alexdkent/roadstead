@@ -29,11 +29,15 @@ def _req(payload, *, stream=False, ptype="chat_completion", endpoint="thinker",
     return r
 
 
-def _mock_self(engine="vllm"):
+def _mock_self(engine="vllm", thinking_kwargs=("thinking", "enable_thinking")):
     # Correction operates on a shared `self.state`; mimic just the fields the
     # thinking methods touch. The mock IS the Correction `self`.
+    # `thinking_kwargs` mirrors models.yaml `policy.thinking_kwargs` — the
+    # per-MODEL declaration of which chat-template variable switches reasoning.
+    # Default here is the live tier3 (reasoner) declaration.
     state = types.SimpleNamespace()
-    ep = types.SimpleNamespace(backend_engine=engine)
+    ep = types.SimpleNamespace(backend_engine=engine,
+                               thinking_kwargs=tuple(thinking_kwargs))
     state.config = types.SimpleNamespace(endpoints={"thinker": ep})
     state.thinking_active = {}
     state.thinking_requests = state.thinking_clean = state.thinking_recovered = 0
@@ -76,12 +80,38 @@ def test_apply_thinking_transparent_without_optin():
     assert m.state.thinking_active == {}
 
 
-def test_apply_thinking_noop_on_llamacpp():
-    m = _mock_self("llama.cpp")
+def test_apply_thinking_noop_when_the_model_declares_no_switch():
+    """The opt-in bails on an UNDECLARED template, not on a non-vLLM engine.
+
+    REGRESSION (2026-08-24): this test used to assert `noop_on_llamacpp`, and
+    the production bail really was `if engine != "vllm": return`. That was
+    wrong, not merely conservative — both llama.cpp chat endpoints separate
+    reasoning into their own response field perfectly well (measured live:
+    tier2-analyst 2,913 chars, tier2-chat 2,572 chars, `content` clean in
+    both), so `thinking: true` was a SILENT no-op on backends that support it.
+    What the proxy actually cannot do is guess the switch's NAME, so that is
+    what it now refuses on."""
+    m = _mock_self("llama.cpp", thinking_kwargs=())
     p = {"messages": [], "max_tokens": 800, "thinking": True}
     m._apply_thinking(_req(p))
     assert "chat_template_kwargs" not in p and p["max_tokens"] == 800
     assert "thinking" not in p and m.state.thinking_active == {}  # still stripped, no-op
+
+
+def test_apply_thinking_applies_on_a_declared_llamacpp_endpoint():
+    """The mirror of the test above, and the behaviour change it protects: a
+    llama.cpp endpoint that DECLARES its switch gets the opt-in, with the Qwen
+    spelling and NOT DeepSeek's."""
+    m = _mock_self("llama.cpp", thinking_kwargs=("enable_thinking",))
+    p = {"messages": [], "max_tokens": 800, "thinking": True}
+    m._apply_thinking(_req(p))
+    ck = p["chat_template_kwargs"]
+    assert ck.get("enable_thinking") is True
+    assert "thinking" not in ck, (
+        "`thinking` is a MEASURED no-op on Qwen templates (0 chars of reasoning "
+        "on both tier2 endpoints). Sending it here would be cargo-culted from "
+        "DeepSeek and would hide a wrong declaration.")
+    assert p["max_tokens"] == 800 + config.thinking_reasoning_budget()
 
 
 def test_apply_thinking_applies_on_streaming_requests():

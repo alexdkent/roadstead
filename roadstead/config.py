@@ -214,6 +214,24 @@ class EndpointConfig:
     #: prompt size, and not a constant that is generous for one caller and starving
     #: for the next.
     thinking_budget_ratio: float = 0.0
+    #: The chat-template variable(s) that switch REASONING on/off for the model
+    #: this endpoint serves, from the stanza's ``policy.thinking_kwargs``.
+    #:
+    #: 🚨 THIS IS A PROPERTY OF THE MODEL'S CHAT TEMPLATE, NOT OF THE ENGINE.
+    #: It was hardcoded to Qwen's ``enable_thinking`` in ``backend.py`` until
+    #: 2026-08-24, which meant the 2026-08-23 tier3 swap from Qwen3.6 to
+    #: DeepSeek-V4-Flash left the proxy driving a switch it had no reason to
+    #: believe the new template read. Measured live per family (probe table in
+    #: ``backend.py``'s injection block): DeepSeek-V4 answers to BOTH
+    #: ``thinking`` and ``enable_thinking``; Qwen3.8/Qwen3.6 answer ONLY to
+    #: ``enable_thinking``. Declaring it here is what makes the next model swap
+    #: a one-line edit next to the model name instead of a silent no-op.
+    #:
+    #: Empty tuple = undeclared, and the proxy then injects NOTHING — the safe
+    #: default for an endpoint whose template we have not measured. Detection of
+    #: a caller's own pin is deliberately NOT gated on this: see
+    #: ``backend._THINKING_KWARG_NAMES``.
+    thinking_kwargs: tuple[str, ...] = ()
     # --- tier3 failover (§ 9 of the anvil2/V4-Flash plan) ------------------
     # The endpoint CLASS this one degrades to while it is unhealthy, derived
     # from the model stanza's `fallback:` in models.yaml. Empty = no failover
