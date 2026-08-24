@@ -483,6 +483,39 @@ class BackendUnavailable(BackendError):
         super().__init__(503, detail)
 
 
+#: Slack between the transport read deadline and the request's own deadline, so
+#: `asyncio.wait_for` is always the layer that fires and the failure is typed as
+#: a TIMEOUT (retryable, deferrable) rather than as a transport 502.
+_TRANSPORT_READ_MARGIN_S = 30.0
+
+
+def _transport_timeout(timeout_s: float) -> "httpx.Timeout":
+    """Per-request transport deadline for a non-streaming backend call.
+
+    🚨 WHY THIS EXISTS. The pooled client is built with a FLAT ``read=600.0``
+    (see ``_client_for``). That constant silently OVERRODE every caller deadline
+    above it: ``asyncio.wait_for`` was handed the real ``timeout_s``, but httpx
+    gave up reading at 600s first, and a ``ReadTimeout`` is an ``httpx.HTTPError``
+    — so the call surfaced as ``BackendError(502)``, not as a timeout. Two
+    consequences, both bad: a legitimately long generation could never exceed
+    600s no matter what it declared, and the failure was mistyped so the caller
+    saw an infrastructure fault instead of a deadline it could act on.
+
+    Measured 2026-08-24 on tier3 (DeepSeek-V4-Flash-0731): a native-reasoning
+    song-authoring call — ~15k prompt, 12k max_tokens after the proxy's reasoning
+    budget — is dispatched with a ~1230s deadline and died at exactly 600.0s with
+    ``status=error``, twice, while the scheduler's own clock still had 10 minutes
+    left on it.
+
+    The request's ``timeout_s`` stays the authority: the transport gets a small
+    margin ON TOP so `wait_for` fires first. The floor keeps short-deadline calls
+    on the historic behaviour (a tiny caller budget must not shorten the read
+    below what the pool was built for).
+    """
+    read = max(600.0, float(timeout_s) + _TRANSPORT_READ_MARGIN_S)
+    return httpx.Timeout(connect=5.0, read=read, write=10.0, pool=5.0)
+
+
 class BackendClientPool:
     """Manages httpx.AsyncClient instances for backend connections."""
 
@@ -518,6 +551,11 @@ class BackendClientPool:
             self._retired.append(client)
         client = httpx.AsyncClient(
             base_url=f"http://{host}:{port}",
+            # Default deadline for callers that pass none. The NON-STREAMING
+            # path overrides this per request (`_transport_timeout`) so a
+            # declared deadline above 600s is honoured instead of being cut here
+            # and mistyped as a 502; the streaming path keeps this as an
+            # inter-chunk read gap, where 600s is generous.
             timeout=httpx.Timeout(connect=5.0, read=600.0, write=10.0, pool=5.0),
             limits=httpx.Limits(
                 max_connections=want,
@@ -563,7 +601,8 @@ class BackendClientPool:
         t0 = time.monotonic()
         try:
             resp = await asyncio.wait_for(
-                client.post(path, json=payload, headers=headers),
+                client.post(path, json=payload, headers=headers,
+                            timeout=_transport_timeout(timeout_s)),
                 timeout=timeout_s,
             )
         except asyncio.TimeoutError:
