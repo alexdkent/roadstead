@@ -22,6 +22,15 @@ _DEFAULT_TIMEOUT_S = 180.0
 # p99*margin) yielding a pathological multi-hour deadline.
 _SMART_DEFAULT_CAP_S = 1800.0
 
+# The INTERACTIVE band's deadline ceiling. Single source of truth: `config`'s
+# `TimeoutConfig.timeout_ceiling_interactive_s` defaults to this, and `acl`
+# uses it as the min_timeout_s floor for interactive callers that supply no
+# deadline of their own. 🚨 Do NOT floor an interactive caller at
+# `_SMART_DEFAULT_CAP_S` (1800s) — that is the BACKGROUND cap and is three
+# times this, i.e. a floor above its own ceiling. That mistake was live on the
+# `beacon` registration from Phase 0 until the 2026-08-24 cutover.
+_INTERACTIVE_CEILING_S = 600.0
+
 # Phase 5C — time-to-first-token watchdog for streaming. Data (2026-05-31): the
 # then-companion Qwen3-Next-80B (retired 2026-07-03; companion is now the
 # Qwen3.5-122B-A10B on nexus) sometimes produced ZERO tokens on a large-context

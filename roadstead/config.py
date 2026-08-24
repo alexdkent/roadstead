@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from . import model_catalog
+from .constants import _INTERACTIVE_CEILING_S
 
 logger = logging.getLogger(__name__)
 
@@ -725,7 +726,7 @@ class ProxyConfig:
     timeout_surge_max: float = 3.0
     timeout_size_k: float = 0.5
     timeout_size_max: float = 4.0
-    timeout_ceiling_interactive_s: float = 600.0
+    timeout_ceiling_interactive_s: float = _INTERACTIVE_CEILING_S
     timeout_ceiling_background_s: float = 1800.0
 
     @property

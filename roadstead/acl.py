@@ -14,7 +14,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 from .config import LLMPriority
-from .constants import _SMART_DEFAULT_CAP_S
+from .constants import _INTERACTIVE_CEILING_S, _SMART_DEFAULT_CAP_S
 
 
 @dataclass(frozen=True)
@@ -271,19 +271,46 @@ class IPIdentityMap:
         # the Beacon CLI's bundled "custom" provider is a plain OpenAI-compat
         # client with no identity header, so without this line its traffic
         # lands in `lan-generic` and is invisible in `proxy_completions`.
-        # min_timeout_s: identical reasoning to pool-observer/dsh above —
-        # Beacon supplies no deadline of its own (config-side
-        # request_timeout_seconds is a client socket timeout, not an
-        # X-Timeout-S header), so it gets the smart default, and the floor
-        # raises it to the cap the smart default may already reach.
+        # 🚨 INTERACTIVE, not P3 — and unlike every other LAN registration here.
+        # goose/pool/dsh are batch agentic harnesses and belong in the BACKGROUND
+        # band. Beacon is NOT one of those any more: as of the 2026-08-24 cutover
+        # it IS the chat brain behind the SPA and SidekickApp, so a human is sitting
+        # and waiting on every one of its calls.
+        #
+        # It was registered P3_INGESTION at Phase 0, when the plan still framed it
+        # as a third evaluation surface. Leaving it there after the cutover put
+        # every user-facing chat turn in the BACKGROUND band
+        # (config.PriorityBand: INTERACTIVE = P0/P1, BACKGROUND = P3/P4) — behind
+        # ingestion and hygiene batch work, and excluded from
+        # fast_path_reserve_slots. Measured during the cutover investigation:
+        # `thinker` p95 background wait reached 583,017 ms and one trivial call
+        # took 254.9 s. The orchestrator it replaced runs its chat turns at
+        # P0_REALTIME/P1_TURN_SUPPORT, so P3 was a straight regression in the
+        # thing the user actually feels.
+        #
+        # P1_TURN_SUPPORT rather than P0_REALTIME deliberately: Beacon sends no
+        # priority header, so EVERY call it makes takes this default, and its
+        # tool ladder issues ~4 per turn. P0 is left for the genuinely
+        # latency-critical realtime lane (glasses) rather than being claimed four
+        # times per chat turn. P1 is still INTERACTIVE, which is what buys the
+        # reserved fast-path slots.
+        #
+        # min_timeout_s: same reasoning as pool-observer/dsh — Beacon supplies no
+        # deadline of its own (config-side request_timeout_seconds is a client
+        # socket timeout, not an X-Timeout-S header), so the floor hands it the
+        # full band window. 🚨 But the number MUST track the band: the background
+        # cap `_SMART_DEFAULT_CAP_S` (1800s) is ABOVE the interactive ceiling
+        # (`timeout_ceiling_interactive_s`, 600s), so keeping it here would set a
+        # floor higher than its own ceiling. Longest turn measured end-to-end was
+        # ~54 s, so 600 s is ~11x headroom.
         # 🚨 .23 SITS INSIDE THE DHCP DYNAMIC POOL, protected only by the
         # dnsmasq reservation added the same day via opnsense_netctl (see
         # infra/firewall/host_inventory.yaml's `beacon` row). The reservation,
         # this ACL line, and the CT are ONE UNIT — if CTnnn/beacon is ever
         # destroyed, delete this registration with it, same as pool-analyst
         # above and cli-read/cli-write's own warning.
-        acl.register("10.0.0.23", "beacon", LLMPriority.P3_INGESTION,
-                     min_timeout_s=_SMART_DEFAULT_CAP_S)
+        acl.register("10.0.0.23", "beacon", LLMPriority.P1_TURN_SUPPORT,
+                     min_timeout_s=_INTERACTIVE_CEILING_S)
         # lan-generic carries the SAME floor, and that is a deliberate blunt
         # instrument, not an oversight: the mac dev host runs `pool` too and
         # lands here (only the Kestrel CT has a static registration), so flooring
