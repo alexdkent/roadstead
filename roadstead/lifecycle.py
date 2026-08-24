@@ -1320,6 +1320,13 @@ class Lifecycle:
         output_tokens = 0
         cached_tokens: int | None = None  # Phase 2a — prefix-cache attribution
         last_finish_reason: str | None = None
+        # Did the BACKEND terminate its own stream properly (`data: [DONE]`)?
+        # This is the discriminator behind the terminal-chunk repair below: it
+        # separates "the backend says this response is complete but forgot to
+        # label it" from "the stream just stopped", which mean opposite things
+        # to a client and must never be collapsed.
+        saw_backend_done = False
+        chunks_relayed = 0
         ttft_ms: float | None = None  # Phase 4.1 — time to first token
         # Step 4a: accumulate assistant content across chunks for end-of-stream
         # DETECTION (degeneration loop / silent grammar-drop) — gated on the flag
@@ -1464,11 +1471,13 @@ class Lifecycle:
                                     if isinstance(piece, str):
                                         accumulated_content += piece
                         if not usage_only:
+                            chunks_relayed += 1
                             await stream_q.put({
                                 "type": "chunk",
                                 "data": event.data,
                             })
                     elif event.event_type == "done":
+                        saw_backend_done = True
                         break
         except (asyncio.TimeoutError, BackendTimeout) as exc:
             # ttft watchdog OR overall stream deadline OR backend timeout. The
@@ -1574,6 +1583,86 @@ class Lifecycle:
                     f"structured request (stream reassembly does not parse; "
                     f"output_tokens={output_tokens})")
                 stream_guard_status = "error"
+
+        # --- terminal-chunk repair + per-stream observability (2026-08-24) ---
+        #
+        # THE DEFECT. In an OpenAI SSE stream `finish_reason` rides ALONE on a
+        # final chunk whose `delta` is `{}` — it carries no content, so its
+        # loss is undetectable by content alone. When a backend ends a stream
+        # without ever emitting that chunk, we relayed the content and then
+        # `[DONE]`, and the client saw text with no finish_reason.
+        #
+        # Measured cost, on Beacon (CTnnn), 2026-08-24: 47 turns. Beacon's
+        # `_text_only_dropped_no_finish` guard (agent/chat_completion_helpers.py)
+        # treats finish_reason-less text as a mid-stream drop, stamps the turn
+        # `length`, and injects "[System: The previous response was cut off by a
+        # network error mid-stream. Continue exactly where you left off.]" — so
+        # it spends a SECOND full model call continuing an answer that was
+        # already complete. It is not a network error and not a token budget:
+        # Beacon has separate prompts for both of those causes and used them 0
+        # and 0 times, while the answers themselves end in complete sentences
+        # far below any cap.
+        #
+        # THE REPAIR, and why it is not a fabrication. We synthesize the missing
+        # terminal chunk ONLY when the backend sent its own `[DONE]` — i.e. the
+        # backend asserted the response is complete and merely failed to label
+        # it. That is normalising a spec violation, not inventing an outcome.
+        # When the stream ended WITHOUT `[DONE]` the truncation is real, we
+        # synthesize NOTHING, and the client's own drop handling is correct —
+        # collapsing those two cases would trade a visible bug for a silent one.
+        if (last_finish_reason is None and saw_backend_done
+                and chunks_relayed > 0 and not stream_guard_err):
+            last_finish_reason = "stop"
+            await stream_q.put({
+                "type": "chunk",
+                "data": json.dumps({
+                    "id": f"chatcmpl-{req.request_id}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": ep_cfg.effective_model_id,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                        "proxy_synthesized_finish": True,
+                    }],
+                }),
+            })
+            logger.warning(
+                "LLMPROXY_STREAM_FINISH_REPAIRED endpoint=%s caller=%s "
+                "request_id=%s chunks=%d out_tokens=%d — backend sent [DONE] "
+                "with no finish_reason chunk; synthesized finish_reason=stop. "
+                "Without this the client sees text with no finish_reason and "
+                "may treat a COMPLETE answer as a mid-stream drop.",
+                req.endpoint, req.agent_id, req.request_id,
+                chunks_relayed, output_tokens,
+            )
+        elif last_finish_reason is None and chunks_relayed > 0:
+            # Genuinely unterminated: no [DONE], no finish_reason. Say so —
+            # this is the case where the client's drop handling is RIGHT.
+            logger.warning(
+                "LLMPROXY_STREAM_UNTERMINATED endpoint=%s caller=%s "
+                "request_id=%s chunks=%d out_tokens=%d — backend stream ended "
+                "with NEITHER [DONE] nor a finish_reason; relaying as-is (a "
+                "real truncation, not repaired).",
+                req.endpoint, req.agent_id, req.request_id,
+                chunks_relayed, output_tokens,
+            )
+
+        # One line per STREAMING request. Before this there were 5 log lines
+        # covering 653 beacon requests, which is why the defect above could not
+        # be attributed to a layer for as long as it existed. Cheap and
+        # unconditional on purpose: a stream that only logs when something
+        # already went wrong cannot tell you what "normal" looked like.
+        logger.info(
+            "LLMPROXY_STREAM_DONE endpoint=%s caller=%s request_id=%s "
+            "chunks=%d ttft_ms=%.0f duration_ms=%.0f finish_reason=%s "
+            "backend_done=%s in_tokens=%d out_tokens=%d",
+            req.endpoint, req.agent_id, req.request_id, chunks_relayed,
+            ttft_ms or 0.0, duration * 1000.0,
+            last_finish_reason or "ABSENT", saw_backend_done,
+            input_tokens, output_tokens,
+        )
 
         if stream_guard_err is not None:
             await stream_q.put({"type": "error", "error": stream_guard_err})
