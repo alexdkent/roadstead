@@ -316,6 +316,12 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
         # test_thinking_kwargs_are_family_aware.py::
         # test_models_yaml_thinking_kwargs_reach_endpoint_config, because a key
         # missing from this block is silently dropped.
+        # Same reasoning as thinking_kwargs below: declared per MODEL, checked
+        # against what the backend actually serves. Guarded by
+        # test_model_fingerprint_drift.py::test_declared_fingerprints_reach_config.
+        raw_fp = pol.get("model_fingerprint")
+        if isinstance(raw_fp, str) and raw_fp.strip():
+            kw["model_fingerprint"] = raw_fp.strip()
         raw_tk = pol.get("thinking_kwargs")
         if isinstance(raw_tk, (list, tuple)):
             kw["thinking_kwargs"] = tuple(

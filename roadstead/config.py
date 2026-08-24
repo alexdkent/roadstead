@@ -232,6 +232,32 @@ class EndpointConfig:
     #: a caller's own pin is deliberately NOT gated on this: see
     #: ``backend._THINKING_KWARG_NAMES``.
     thinking_kwargs: tuple[str, ...] = ()
+    #: The expected identity of the WEIGHTS behind this endpoint, from the
+    #: stanza's ``policy.model_fingerprint``. vLLM reports `/v1/models[0].root`
+    #: (a weights path); llama.cpp reports a `meta` block folded to
+    #: ``params=N;vocab=N;ftype=X``. See ``backend.probe_model_fingerprint``.
+    #:
+    #: 🚨 This exists because ``served_model_id`` CANNOT detect a model swap.
+    #: tier3 is served as `--served-model-name llama-thinker`, so its id was
+    #: unchanged across the 2026-08-23 Qwen3.6 -> DeepSeek-V4-Flash cutover
+    #: while every model-dependent declaration on the stanza (thinking_kwargs,
+    #: thinking_budget_ratio, disable_any_whitespace, documented_max_num_seqs)
+    #: silently became a claim about a model that was no longer there.
+    #:
+    #: Empty = undeclared, and the drift alert stays silent. Comparison is
+    #: EQUALITY on an opaque string — never parse a fingerprint.
+    model_fingerprint: str = ""
+    # --- discovered at runtime (mutable), for the drift + canary alerts ------
+    #: What the backend actually reports now (None/"" = could not tell).
+    discovered_model_fingerprint: str = ""
+    #: Last thinking-canary verdict: "" = not yet probed / could not tell,
+    #: "ok" = the declared switch really turned reasoning on, otherwise a short
+    #: human-readable failure detail. Set by the poller, read by the alert
+    #: builder — the poller owns the I/O, the alert builder owns the judgement.
+    thinking_canary_state: str = ""
+    #: Monotonic timestamp of the last canary attempt (0 = never). The canary
+    #: costs a real generation, so it runs on a slow cadence, not every poll.
+    thinking_canary_checked_at: float = 0.0
     # --- tier3 failover (§ 9 of the anvil2/V4-Flash plan) ------------------
     # The endpoint CLASS this one degrades to while it is unhealthy, derived
     # from the model stanza's `fallback:` in models.yaml. Empty = no failover
@@ -498,6 +524,34 @@ def uniform_correction_enabled() -> bool:
     return os.environ.get("COLLECTIVE_PROXY_UNIFORM_CORRECTION", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+
+#: How often the thinking canary makes its one real call, per endpoint.
+#:
+#: Every other probe in the poller is a cheap GET; this one is a GENERATION, so
+#: the cadence is set by what it costs, not by how fast we want to notice. One
+#: hour against a defect that went unnoticed for a DAY is already two orders of
+#: magnitude better, and at ~1s/200 tokens per endpoint per hour the cost is
+#: not worth optimising further. A code constant, not an env var: this is
+#: tuning, and tuning belongs in code where it can be read next to its reason.
+_THINKING_CANARY_INTERVAL_S = 3600.0
+
+
+def thinking_canary_interval_s() -> float:
+    return _THINKING_CANARY_INTERVAL_S
+
+
+def thinking_canary_enabled() -> bool:
+    """Standing guard (2026-08-24, ledger `tier3-reasoning-parser-default-
+    mismatch`): prove each endpoint's DECLARED thinking switch still switches
+    reasoning on the model actually loaded, with one real call.
+
+    OBSERVABILITY ONLY — it raises a `thinking_switch_broken` WARNING and never
+    changes routing, admission or any caller's payload, so default ON for the
+    same reason the shadow-egress detector is. Env kill-switch
+    ``COLLECTIVE_PROXY_THINKING_CANARY=0`` for the case where a backend must not
+    be touched at all (a benchmark run wanting a quiet endpoint)."""
+    return os.environ.get("COLLECTIVE_PROXY_THINKING_CANARY", "1") != "0"
 
 
 def max_slots_reconcile_enabled() -> bool:

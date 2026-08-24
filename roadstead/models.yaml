@@ -120,6 +120,22 @@ models:
     slots: 4                          # 2026-07-12: 2->4 (--parallel 4, --ctx-size 65536 on anvil:9091). 2 slots couldn't absorb bursts from the many cheap gemma callers (greeter advisory every turn + sidekick.extract_pad/obs + tool routers + classify), spiking tail latency into their aggressive per-call timeouts. E4B is tiny (~4.3GB) with ample anvil headroom; live value still comes from /props.
     timeout_floor_s: 60
     policy:
+      # The identity of the WEIGHTS behind this endpoint, checked every poll
+      # against what the backend actually reports (backend.probe_model_fingerprint).
+      # Mismatch raises the `model_fingerprint_drift` WARNING.
+      #
+      # 🚨 THIS IS THE GUARD THAT WOULD HAVE CAUGHT 2026-08-23. Every
+      # model-dependent line on this stanza — thinking_kwargs,
+      # thinking_budget_ratio, disable_any_whitespace, documented_max_num_seqs,
+      # model_family — is a claim about specific weights, and the served model
+      # id CANNOT detect the weights changing (tier3 answers to the fixed alias
+      # `llama-thinker` whatever is loaded behind it). Measured live 2026-08-24.
+      # No `ftype` in this build's meta — absent fields are simply omitted from the
+      # fingerprint rather than guessed, so the string stays whatever the backend can tell us.
+      #
+      # UPDATE THIS IN THE SAME EDIT AS THE MODEL. A stale value here is loud
+      # (an alert), which is the entire point — the previous failure was silent.
+      model_fingerprint: "params=7518069290;vocab=262144"
       fast_path_reserve_slots: 1    # 2026-07-29: 0(default)->1. THE lever for this endpoint's
                                     # bursty tail. With reserve 0, background_cap_slots collapses
                                     # to background_floor_slots = max(1, int(slots*0.20)) — which is
@@ -407,6 +423,21 @@ models:
     slots: 6
     timeout_floor_s: 180
     policy:
+      # The identity of the WEIGHTS behind this endpoint, checked every poll
+      # against what the backend actually reports (backend.probe_model_fingerprint).
+      # Mismatch raises the `model_fingerprint_drift` WARNING.
+      #
+      # 🚨 THIS IS THE GUARD THAT WOULD HAVE CAUGHT 2026-08-23. Every
+      # model-dependent line on this stanza — thinking_kwargs,
+      # thinking_budget_ratio, disable_any_whitespace, documented_max_num_seqs,
+      # model_family — is a claim about specific weights, and the served model
+      # id CANNOT detect the weights changing (tier3 answers to the fixed alias
+      # `llama-thinker` whatever is loaded behind it). Measured live 2026-08-24.
+      # vLLM reports the weights PATH as `/v1/models[0].root`.
+      #
+      # UPDATE THIS IN THE SAME EDIT AS THE MODEL. A stale value here is loud
+      # (an alert), which is the entire point — the previous failure was silent.
+      model_fingerprint: "/srv/models/deepseek-v4-flash-0731"
       # Which chat-template variable switches REASONING on this model. Read by
       # llmproxy/config.py EndpointConfig.thinking_kwargs; the proxy injects
       # `<key>: false` here by default and a caller opts in per request with the
@@ -843,6 +874,22 @@ models:
     # inherently long-running caller (long-form authoring goes to tier3, operator decision
     # 2026-08-18), so the standard interactive/background bands apply.
     policy:
+      # The identity of the WEIGHTS behind this endpoint, checked every poll
+      # against what the backend actually reports (backend.probe_model_fingerprint).
+      # Mismatch raises the `model_fingerprint_drift` WARNING.
+      #
+      # 🚨 THIS IS THE GUARD THAT WOULD HAVE CAUGHT 2026-08-23. Every
+      # model-dependent line on this stanza — thinking_kwargs,
+      # thinking_budget_ratio, disable_any_whitespace, documented_max_num_seqs,
+      # model_family — is a claim about specific weights, and the served model
+      # id CANNOT detect the weights changing (tier3 answers to the fixed alias
+      # `llama-thinker` whatever is loaded behind it). Measured live 2026-08-24.
+      # Still the abliterated Qwen3.6-35B-A3B; note this is the number tier2-analyst USED to
+      # report, which is exactly why the two stanzas must each carry their own.
+      #
+      # UPDATE THIS IN THE SAME EDIT AS THE MODEL. A stale value here is loud
+      # (an alert), which is the entire point — the previous failure was silent.
+      model_fingerprint: "params=34660610688;vocab=248320;ftype=Q4_K - Medium"
       # Qwen3.6's template reads ONLY `enable_thinking` — measured 2026-08-24
       # against this endpoint: `enable_thinking:true` -> 2,572 chars of
       # reasoning cleanly separated into the response's reasoning field, while
@@ -1001,6 +1048,22 @@ models:
     timeout_floor_s: 120            # compromise: this endpoint serves BOTH long creative song-compose AND latency-sensitive classify/vision/tool calls. 120s min-budget; adaptive surge×size widens to the ceiling for big song-compose, and a stuck call fails in ~120s instead of 900s. (mirrors timeout_model FLOOR_S["creative"] — bump BOTH in lockstep.) The chat-loop half of this compromise left with `companion-lite` on 2026-08-19; held at 120 through the cutover so a latency reading is not confounded by two changes at once — re-derive at Phase 5.
     timeout_ceiling_s: 1800         # inherently long-running (long-form gen); a role override so the generous background band applies on EVERY tier (song-compose runs at an interactive tier). Adaptive surge×size widens up to here.
     policy:
+      # The identity of the WEIGHTS behind this endpoint, checked every poll
+      # against what the backend actually reports (backend.probe_model_fingerprint).
+      # Mismatch raises the `model_fingerprint_drift` WARNING.
+      #
+      # 🚨 THIS IS THE GUARD THAT WOULD HAVE CAUGHT 2026-08-23. Every
+      # model-dependent line on this stanza — thinking_kwargs,
+      # thinking_budget_ratio, disable_any_whitespace, documented_max_num_seqs,
+      # model_family — is a claim about specific weights, and the served model
+      # id CANNOT detect the weights changing (tier3 answers to the fixed alias
+      # `llama-thinker` whatever is loaded behind it). Measured live 2026-08-24.
+      # llama.cpp reports a `meta` block; `n_params` is the field carrying the signal — this
+      # box went 35B-A3B MoE -> dense 27B on 2026-08-19, i.e. 34660610688 -> 27320697856.
+      #
+      # UPDATE THIS IN THE SAME EDIT AS THE MODEL. A stale value here is loud
+      # (an alert), which is the entire point — the previous failure was silent.
+      model_fingerprint: "params=27320697856;vocab=248320;ftype=Q4_0"
       # Qwen3.8's template reads ONLY `enable_thinking`, same as tier2-chat —
       # measured 2026-08-24 against this endpoint: `enable_thinking:true` ->
       # 2,913 chars of reasoning in a separate field with clean `content`, while

@@ -26,6 +26,8 @@ from .config import (
     endpoint_cooldown_shadow,
     max_slots_reconcile_enabled,
     normalize_endpoint,
+    thinking_canary_enabled,
+    thinking_canary_interval_s,
 )
 from .observability import (
     AlertCondition,
@@ -39,6 +41,57 @@ if TYPE_CHECKING:
     from .state import ProxyState
 
 logger = logging.getLogger(__name__)
+
+
+def model_swap_alerts(endpoints: dict) -> list["AlertCondition"]:
+    """The two model-swap guards, as a PURE function so they can be TESTED.
+
+    Extracted rather than left inline in `evaluate_alerts`, which needs a
+    scheduler, a budget manager, a metrics registry and a queue DB before it
+    will run at all. A test that mocked all of that to reach two `if`s would
+    end up re-implementing the two `if`s instead — and a test that
+    re-implements the logic is a copy that drifts away from it. Same reasoning
+    as `backend.empty_completion_error`.
+
+    Silent whenever either side of a comparison is unknown: an undeclared
+    fingerprint, an unreachable backend, or a canary that could not complete
+    must all read as "cannot tell", never as "changed" or "broken".
+    """
+    out: list[AlertCondition] = []
+    # MODEL-SWAP DRIFT (2026-08-24, ledger `tier3-reasoning-parser-default-
+    # mismatch`). Every model-dependent declaration on a stanza —
+    # thinking_kwargs, thinking_budget_ratio, disable_any_whitespace,
+    # documented_max_num_seqs — is a claim about SPECIFIC WEIGHTS, and
+    # nothing used to notice when those weights were replaced underneath it.
+    # The 2026-08-23 tier3 cutover was invisible for a day for exactly this
+    # reason. Silent when either side is unknown: an undeclared fingerprint
+    # or an unreachable backend must read as "cannot tell", never "changed".
+    for ep_name, ep_cfg in endpoints.items():
+        declared = getattr(ep_cfg, "model_fingerprint", "")
+        found = getattr(ep_cfg, "discovered_model_fingerprint", "")
+        if declared and found and declared != found:
+            out.append(AlertCondition(
+                name="model_fingerprint_drift", severity="WARNING", triggered=True,
+                detail=(f"endpoint {ep_name} is serving {found!r} but "
+                        f"models.yaml declares {declared!r} — the weights "
+                        f"changed. RECONCILE every model-dependent policy on "
+                        f"that stanza before trusting it: thinking_kwargs, "
+                        f"thinking_budget_ratio, disable_any_whitespace, "
+                        f"documented_max_num_seqs, model_family."),
+            ))
+    # THINKING CANARY (same ledger entry). The drift alert above catches
+    # "the weights changed"; this catches "the declared switch stopped
+    # working", for any reason including a template change under the SAME
+    # weights. Only this one is evidence rather than inference — it is the
+    # one real call the declaration never had behind it.
+    for ep_name, ep_cfg in endpoints.items():
+        state = getattr(ep_cfg, "thinking_canary_state", "")
+        if state and state != "ok":
+            out.append(AlertCondition(
+                name="thinking_switch_broken", severity="WARNING", triggered=True,
+                detail=f"endpoint {ep_name}: {state}",
+            ))
+    return out
 
 
 class Health:
@@ -311,6 +364,7 @@ class Health:
                                 f"but documented --max-num-seqs={doc} — reconcile "
                                 f"models.yaml `slots` with the serve script"),
                     ))
+        alerts.extend(model_swap_alerts(self.state.config.endpoints))
         # Standing STRUCTURED-EMPTY rate alarm (2026-08-01, ledger
         # `tier3-json-object-empty-brace`). The 31-hour silent outage produced
         # NO other signal — `{}` is well-formed, so every existing emptiness /
@@ -409,6 +463,19 @@ class Health:
                             ep_name, served, ep_cfg.served_model_id or "<role>",
                         )
                         ep_cfg.served_model_id = served
+                # WHAT the backend is serving, as opposed to what it ANSWERS TO
+                # (above). The served id is an operator-chosen alias and stays
+                # put across a model swap; this does not. Cheap — same
+                # /v1/models response class the two probes above already read.
+                fp = await self.state.backend.probe_model_fingerprint(ep_cfg)
+                if fp and fp != ep_cfg.discovered_model_fingerprint:
+                    logger.info(
+                        "endpoint %s: model fingerprint = %s (was %s)",
+                        ep_name, fp, ep_cfg.discovered_model_fingerprint or "<none>",
+                    )
+                if fp:
+                    ep_cfg.discovered_model_fingerprint = fp
+            await self._maybe_run_thinking_canary(ep_name, ep_cfg)
         except Exception as exc:
             logger.debug("poller probe %s failed: %s", ep_name, exc)
         # Circuit-breaker health update (Phase 1.2). Guarded so a fault
@@ -417,6 +484,70 @@ class Health:
             await self.update_endpoint_health(ep_name, ep_cfg, probe_ok)
         except Exception as exc:  # noqa: BLE001
             logger.debug("health update %s failed: %s", ep_name, exc)
+    async def _maybe_run_thinking_canary(self, ep_name, ep_cfg) -> None:
+        """Prove the DECLARED thinking switch still works on the model that is
+        actually loaded, by making one real call.
+
+        Rate-limited hard: this costs a genuine generation, unlike every other
+        probe in the poller. It rides the existing poller rather than opening a
+        second loop on purpose — a new task would need its own liveness bit and
+        its own poisoned-tick guard, and this check is nowhere near important
+        enough to earn a new way for the proxy to die.
+
+        Never raises: the poller's own guard would survive it, but a canary that
+        can wedge discovery is worse than no canary."""
+        try:
+            if not ep_cfg.thinking_kwargs or not thinking_canary_enabled():
+                return
+            # `endpoint_healthy` already reads a PAUSED endpoint as unhealthy
+            # (a drain sets that deliberately), so this one call covers both. A
+            # drained or sick backend owes us no generation, and probing one
+            # mid-drain is how a planned maintenance window turns into an alert.
+            if not self.endpoint_healthy(ep_name):
+                return
+            now = time.monotonic()
+            if not ep_cfg.thinking_canary_checked_at:
+                # NEVER probe on the first poll after startup. Two reasons, and
+                # the second one is why this is a real design point rather than
+                # a delay for its own sake:
+                #  * a cold backend is still loading weights (tier3 takes ~6
+                #    min), so an immediate probe measures the boot, not the
+                #    template, and produces a "cannot tell" every restart;
+                #  * the poller runs inside every harness that starts a proxy,
+                #    and a probe that blocks on a stub backend turns a 1.5s e2e
+                #    suite into a 60s-per-test teardown hang. Measured: it did
+                #    exactly that before this branch existed.
+                # Arm the clock and let the next interval do the work.
+                ep_cfg.thinking_canary_checked_at = now
+                return
+            if (now - ep_cfg.thinking_canary_checked_at
+                    < thinking_canary_interval_s()):
+                return
+            ep_cfg.thinking_canary_checked_at = now
+            key = ep_cfg.thinking_kwargs[0]
+            # Nonce so the prefix cache cannot answer for the model. A probe
+            # that verifies the CACHE is a probe that passes after the thing it
+            # watches has broken.
+            nonce = f"{ep_name}-{int(now)}"
+            result = await self.state.backend.probe_thinking_switch(
+                ep_cfg, key, nonce)
+            if result is None:
+                # Could not tell (unreachable, busy, non-200). Say NOTHING —
+                # silence must never be reported as breakage.
+                ep_cfg.thinking_canary_state = ""
+                return
+            if result.get("reasoning_chars", 0) > 0:
+                ep_cfg.thinking_canary_state = "ok"
+                return
+            ep_cfg.thinking_canary_state = (
+                f"sent chat_template_kwargs {{{key}: true}} and got "
+                f"{result.get('reasoning_chars', 0)} chars of reasoning "
+                f"({result.get('content_chars', 0)} chars of content) — the "
+                f"declared switch is not switching anything on the model this "
+                f"endpoint is serving now")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("thinking canary %s failed: %s", ep_name, exc)
+
     async def capacity_poller_loop(self) -> None:
         """Periodically probe backends for slot counts and context sizes.
 

@@ -838,6 +838,111 @@ class BackendClientPool:
             pass
         return None
 
+    async def probe_model_fingerprint(self, ep_cfg: EndpointConfig) -> str | None:
+        """Probe /v1/models for a string that IDENTIFIES THE WEIGHTS, not the
+        alias the backend answers to.
+
+        🚨 WHY NOT `served_model_id`. That is what `probe_models` returns, and it
+        is USELESS for detecting a model swap: tier3 serves
+        `--served-model-name llama-thinker`, so its `id` stayed `llama-thinker`
+        straight through the 2026-08-23 Qwen3.6 -> DeepSeek-V4-Flash cutover. An
+        alert keyed on it could never have fired. Both engines do expose the real
+        thing, in different places (measured on the live backends 2026-08-24):
+
+          vLLM       data[0].root      -> "/srv/models/deepseek-v4-flash-0731"
+          llama.cpp  data[0].meta      -> {n_params, n_vocab, ftype, ...}
+
+        For llama.cpp we fold the meta into a short stable string. `n_params` is
+        the field that actually carries the signal — the boxa's 2026-08-19 swap
+        went 35B-A3B MoE -> dense 27B, i.e. 34,660,610,688 -> 27,320,697,856.
+        `ftype` is absent on some builds (tier1 has no such key), so every field
+        is optional and only the ones present are folded in; a fingerprint is
+        compared for EQUALITY against a declaration, never parsed.
+
+        Returns the fingerprint string, or None on any failure (a missing
+        fingerprint must read as "cannot tell", never as "changed" — see the
+        drift alert, which stays silent while this is None)."""
+        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        try:
+            resp = await asyncio.wait_for(client.get("/v1/models"), timeout=5.0)
+            if resp.status_code != 200:
+                return None
+            data = resp.json().get("data") or []
+            if not data or not isinstance(data[0], dict):
+                return None
+            entry = data[0]
+            root = entry.get("root")
+            if isinstance(root, str) and root.strip():
+                return root.strip()
+            meta = entry.get("meta")
+            if isinstance(meta, dict):
+                parts = []
+                for field, label in (("n_params", "params"),
+                                     ("n_vocab", "vocab"),
+                                     ("ftype", "ftype")):
+                    val = meta.get(field)
+                    if isinstance(val, bool):
+                        continue
+                    if isinstance(val, (int, float)) and val > 0:
+                        parts.append(f"{label}={int(val)}")
+                    elif isinstance(val, str) and val.strip():
+                        parts.append(f"{label}={val.strip()}")
+                if parts:
+                    return ";".join(parts)
+        except Exception:
+            pass
+        return None
+
+    async def probe_thinking_switch(
+        self, ep_cfg: EndpointConfig, key: str, nonce: str,
+    ) -> dict | None:
+        """Send ONE real chat call and report whether `key` actually switched
+        reasoning on. The canary behind the `thinking_switch_broken` alert.
+
+        🚨 THIS IS THE POINT: `policy.thinking_kwargs` is a DECLARATION, and a
+        declaration cannot notice that the model underneath it changed. That is
+        exactly how the 2026-08-23 tier3 swap went unnoticed for a day — the
+        proxy asserted a switch nobody had ever made one real call to verify.
+        The house rule is that a green suite does not mean a capability works;
+        one real call at the size you will actually send does.
+
+        Deliberately NOT routed through `call()`:
+          * it must not consume a DRR slot or queue behind live traffic — this
+            follows the same direct-client pattern as every other probe here;
+          * `call()` raises `empty_completion_error` when a response has no
+            content, and an ON-arm probe that spends its small budget entirely
+            on reasoning is a PASS for our purposes, not a backend fault.
+
+        `nonce` is folded into the prompt because a fixed probe payload would be
+        answered by the prefix cache rather than the model, and a cached answer
+        proves nothing about today's template. Returns
+        ``{"reasoning_chars": int, "content_chars": int}`` or None if the call
+        did not complete (unreachable/busy → we say nothing, never "broken")."""
+        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        payload = {
+            "model": ep_cfg.effective_model_id,
+            "messages": [{"role": "user", "content":
+                          f"In one short sentence, why is the sky blue? (ref {nonce})"}],
+            "max_tokens": 200,
+            "temperature": 0.0,
+            "chat_template_kwargs": {key: True},
+        }
+        try:
+            resp = await asyncio.wait_for(
+                client.post("/v1/chat/completions", json=payload), timeout=60.0)
+            if resp.status_code != 200:
+                return None
+            choices = resp.json().get("choices") or []
+            if not choices or not isinstance(choices[0], dict):
+                return None
+            msg = choices[0].get("message") or {}
+            reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+            content = msg.get("content") or ""
+            return {"reasoning_chars": len(reasoning),
+                    "content_chars": len(content)}
+        except Exception:
+            return None
+
     async def probe_health(self, ep_cfg: EndpointConfig) -> bool:
         """Simple health check."""
         client = self._client_for(ep_cfg.host, ep_cfg.port)

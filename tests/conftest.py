@@ -144,18 +144,49 @@ def _redirect_scratch_to_tmpfs() -> None:
 _redirect_scratch_to_tmpfs()
 
 
+#: Every ``BackendClientPool.probe_*`` method, and the value its stub returns.
+#:
+#: 🚨 THIS LIST IS LOAD-BEARING AND IT USED TO FAIL OPEN. `_no_network_probes`
+#: stubs by name, so a probe added later was simply absent and therefore NOT
+#: stubbed — it made REAL calls to real fleet hosts from a unit test. Caught
+#: 2026-08-24 when `probe_model_fingerprint` and `probe_thinking_switch`
+#: landed: the e2e suite went 1.3s -> 61-181s because the poller was dialling
+#: 10.0.0.3, and `probe_thinking_switch` would have run a real GENERATION
+#: against live tier3 from `pytest`. The tests still PASSED — only teardown
+#: timed out — which is exactly how a gap like this survives unnoticed.
+#:
+#: The list stays (blocking the transport wholesale breaks the ~84 tests that
+#: legitimately drive `call`/`stream` through a fake client), but it no longer
+#: fails open: `test_model_swap_guards.py::test_every_backend_probe_is_stubbed`
+#: asserts this covers every `probe_*` on the class, so a new probe fails a
+#: test on the day it is written.
+STUBBED_PROBES = {
+    "probe_props": None,
+    "probe_models": None,
+    "probe_vllm_capacity": None,
+    "probe_health": False,
+    "probe_model_fingerprint": None,
+    "probe_thinking_switch": None,
+}
+
+
 @pytest.fixture(autouse=True)
 def _no_network_probes(monkeypatch):
-    async def _none(self, ep_cfg):
-        return None
+    """Keep the unit suite off the network. See STUBBED_PROBES above.
 
-    async def _down(self, ep_cfg):
-        return False
+    A test that supplies its OWN fake client still exercises the real parsing
+    code: it sets `_client_for` on the pool INSTANCE, and calls the probe
+    directly rather than through the poller, so these class-level stubs are
+    bypassed exactly where they should be.
+    """
+    def _stub(value):
+        async def _probe(self, ep_cfg, *args, **kwargs):
+            return value
+        return _probe
 
-    monkeypatch.setattr(BackendClientPool, "probe_props", _none)
-    monkeypatch.setattr(BackendClientPool, "probe_models", _none)
-    monkeypatch.setattr(BackendClientPool, "probe_vllm_capacity", _none)
-    monkeypatch.setattr(BackendClientPool, "probe_health", _down)
+    for name, value in STUBBED_PROBES.items():
+        if hasattr(BackendClientPool, name):
+            monkeypatch.setattr(BackendClientPool, name, _stub(value))
     yield
 
 
