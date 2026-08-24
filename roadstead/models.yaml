@@ -915,6 +915,34 @@ models:
     kind: chat
     status: active                  # PINNED always-resident on the boxa. Standalone docker container `llamacpp-creative-boxa` (--restart always) on :9196 — no dispatcher/systemd; proxy dispatches directly, capacity self-discovered via /props. Launched by infra/nasbox-vllm-xpu/serve_creative_llamacpp.sh, which is the canonical config. Since the 2026-08-19 Phase 4 swap it runs ONE Qwen3.8-27B DENSE container (+mmproj) backing TWO lanes — `creative` (long-form/song authoring) and the `classify`/`analyst`/vision family — plus bare `tier2`. HISTORY: it backed a THIRD role, `companion-lite` (the chat loop), until Phase 3 moved that to jetty the same day; before 2026-07-11 the box ran a Trinity-Mini/Gemma-4-26B two-container split and classify lived on the anvil llama-classify.service (stopped). Not evictable (dedicated card).
     proxy_endpoint: true
+    # 🚨 NAMING — THIS ENDPOINT'S NAME IS `tier2-analyst` (the key above). The two
+    # `creative` strings below are the RETIRED name and are DELIBERATELY KEPT.
+    # Read this before "cleaning them up": each is load-bearing for a different
+    # reason, and neither is cosmetic.
+    #
+    #   endpoint_class — the proxy's endpoint IDENTITY. It is what `/v1/status`
+    #     keys, what `/v1/timeouts` reports, and what is PERSISTED into every
+    #     `proxy_completions` / `proxy_timeouts` row. Renaming it is a DATA
+    #     MIGRATION, not a rename: `usage_rates.py` must keep resolving the old
+    #     string or billing queries over historical rows raise on an unknown
+    #     endpoint (that file says so itself), this endpoint's cost history would
+    #     split across two names exactly like the real 2026-08-19 tier2-chat
+    #     split did — but here describing ONE lane, not two — and
+    #     `knowledge_store/roles.py:PRODUCTION_CHAT_CLASSES` is a hardcoded frozenset
+    #     that would silently lose a production class.
+    #   role — the PRE-DISCOVERY wire model id (`effective_model_id` =
+    #     `served_model_id or role`). The boxa container is launched `-a creative`,
+    #     so before /v1/models discovery populates `served_model_id` this is the
+    #     only correct value to send; renaming it would 400 the backend in exactly
+    #     the window where nothing else can tell you why.
+    #
+    # CONSEQUENCE, and it has already misled a session (2026-08-23): every raw
+    # proxy surface reports the RETIRED name, so anyone reading /v1/status or the
+    # timeouts ledger and repeating what it says will quote `creative`. The
+    # DISPLAY layer is already correct — `cache_stats.chat_endpoint_labels()`
+    # derives from this entry's key and yields `creative -> tier2-analyst`, which
+    # is what the Inference page shows. Pinned by
+    # `test_tier2_analyst_naming_doctrine.py`.
     endpoint_class: creative
     role: creative
     # 🚨 `tier2-analyst` MUST be listed here even though it is the entry's KEY. The proxy's
