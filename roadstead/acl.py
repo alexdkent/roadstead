@@ -260,12 +260,30 @@ class IPIdentityMap:
         acl.register("10.0.0.41", "cli-write", LLMPriority.P3_INGESTION,
                      min_timeout_s=_SMART_DEFAULT_CAP_S)
         # pool-analyst (Kestrel CTnnn, 10.0.0.23) was registered here from
-        # 2026-08-14 until the CT was DESTROYED 2026-08-20. The registration is
-        # removed with it: .23 sits inside the DHCP pool, so leaving a stale
-        # source-IP identity would silently misattribute whatever takes the
-        # address next — the same mis-claim class this fleet has hit on
-        # .12/.18/.19/.86. Traffic from a future .23 lands in `lan-generic`
-        # until something re-registers it deliberately.
+        # 2026-08-14 until the CT was DESTROYED 2026-08-20, and the registration
+        # was removed with it — exactly the doctrine this file follows every
+        # time an address is reused (.12/.18/.19/.86 mis-claim class): don't
+        # leave a stale source-IP identity for whatever takes the address next.
+        #
+        # beacon (Kestrel CTnnn, 10.0.0.23) — a DIFFERENT CT reusing the freed
+        # .23, deliberately, per docs/beacon_container_and_orchestrator_replacement_plan_2026-08.md
+        # §1/§2, Phase 0 (2026-08-23). Same situation as goose/pool/dsh above:
+        # the Beacon CLI's bundled "custom" provider is a plain OpenAI-compat
+        # client with no identity header, so without this line its traffic
+        # lands in `lan-generic` and is invisible in `proxy_completions`.
+        # min_timeout_s: identical reasoning to pool-observer/dsh above —
+        # Beacon supplies no deadline of its own (config-side
+        # request_timeout_seconds is a client socket timeout, not an
+        # X-Timeout-S header), so it gets the smart default, and the floor
+        # raises it to the cap the smart default may already reach.
+        # 🚨 .23 SITS INSIDE THE DHCP DYNAMIC POOL, protected only by the
+        # dnsmasq reservation added the same day via opnsense_netctl (see
+        # infra/firewall/host_inventory.yaml's `beacon` row). The reservation,
+        # this ACL line, and the CT are ONE UNIT — if CTnnn/beacon is ever
+        # destroyed, delete this registration with it, same as pool-analyst
+        # above and cli-read/cli-write's own warning.
+        acl.register("10.0.0.23", "beacon", LLMPriority.P3_INGESTION,
+                     min_timeout_s=_SMART_DEFAULT_CAP_S)
         # lan-generic carries the SAME floor, and that is a deliberate blunt
         # instrument, not an oversight: the mac dev host runs `pool` too and
         # lands here (only the Kestrel CT has a static registration), so flooring
