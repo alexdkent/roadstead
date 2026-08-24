@@ -535,6 +535,26 @@ class ProxyHttpHandlers:
                 snap["utilization_pct"] = round(
                     (ss_consumed / ss_available * 100) if ss_available > 0 else 0, 1,
                 )
+            # Model-swap guards (2026-08-24). Surfaced because the alerts alone
+            # are AMBIGUOUS: `model_fingerprint_drift` is silent both when the
+            # declaration matches AND when nothing was ever discovered, and
+            # those two look identical from outside. An operator reading a
+            # drift alert also wants to see BOTH sides without shelling into
+            # the container. Omitted entirely when the endpoint declares
+            # nothing, so the payload stays quiet for embed/rerank.
+            if ep_cfg.model_fingerprint or ep_cfg.discovered_model_fingerprint:
+                snap["model_fingerprint"] = {
+                    "declared": ep_cfg.model_fingerprint or None,
+                    "serving": ep_cfg.discovered_model_fingerprint or None,
+                }
+            if ep_cfg.thinking_kwargs:
+                snap["thinking"] = {
+                    "kwargs": list(ep_cfg.thinking_kwargs),
+                    # "" = not probed yet (the first poll only arms the clock);
+                    # "ok" = verified by a real call; anything else is the
+                    # failure detail the alert carries.
+                    "canary": ep_cfg.thinking_canary_state or "unverified",
+                }
             h = self.state.endpoint_health.get(ep_name, {})
             admin_paused = ep_name in self.state.paused_endpoints
             # `healthy` must reflect an ADMIN pause too. The poller STOPS probing a
