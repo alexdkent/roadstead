@@ -131,11 +131,14 @@ async def test_openai_relay_drops_usage_frame_and_keeps_done_ordering():
         resp = await svc.handle_submit(_submit_body(), _Req(), openai=True)
         frames = await _collect_stream(resp)
         assert frames[-1] == "[DONE]"
-        # Exactly the two content chunks — no synthetic usage frame leaked to
-        # a client that never asked for usage.
+        # No synthetic usage frame leaked to a client that never asked for
+        # usage — the point of this test, and unchanged.
         payload_frames = frames[:-1]
-        assert len(payload_frames) == 2
         assert all("usage" not in f for f in payload_frames)
+        # THREE payload frames, not two: this fixture's second chunk carries
+        # content AND finish_reason, and the proxy now splits that into
+        # content + an empty-delta terminal chunk (test_coalesced_finish_split.py).
+        assert len(payload_frames) == 3
     finally:
         await svc.shutdown()
 

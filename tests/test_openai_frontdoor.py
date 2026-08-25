@@ -150,12 +150,22 @@ async def test_streaming_emits_only_chunks_and_one_done():
         assert frames.count("[DONE]") == 1
         assert frames[-1] == "[DONE]"
         chunk_frames = [f for f in frames if f != "[DONE]"]
-        assert len(chunk_frames) == 2
+        # THREE, not two: this fixture's second chunk carries content AND
+        # finish_reason (the shape vLLM emits when its producer outruns the
+        # consumer), and the proxy now splits that into content + an
+        # empty-delta terminal chunk — see
+        # test_coalesced_finish_split.py for why. The property this test
+        # actually guards is unchanged: only chat.completion.chunk objects,
+        # exactly one [DONE], last.
+        assert len(chunk_frames) == 3
         for f in chunk_frames:
             obj = json.loads(f)
             assert obj["object"] == "chat.completion.chunk"
             # NO {"type":"queued"/"admitted"/...} envelope leakage
             assert "type" not in obj
+            # and no chunk carries content AND a finish_reason together
+            ch = obj["choices"][0]
+            assert not ((ch.get("delta") or {}).get("content") and ch.get("finish_reason"))
     finally:
         await svc.shutdown()
 

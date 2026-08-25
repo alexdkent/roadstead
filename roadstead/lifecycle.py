@@ -13,6 +13,7 @@ the HTTP handlers can build the OpenAI-shaped error envelope without a cycle.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -175,6 +176,75 @@ def _openai_error(
     if code:
         err["code"] = code
     return JSONResponse({"error": err}, status_code=status_code)
+
+
+def _split_coalesced_finish_chunk(parsed: dict) -> tuple[dict, dict] | None:
+    """Split a chunk that carries BOTH `delta.content` and a non-null
+    `finish_reason` into (content chunk, empty-delta terminal chunk).
+
+    Returns `None` when the chunk is not coalesced and must pass through
+    byte-identically — which is the overwhelming majority.
+
+    ## Why this exists
+
+    vLLM stamps `finish_reason` onto whatever delta the same engine iteration
+    produced, so when its producer gets ahead of the SSE consumer the final
+    content and the finish are MERGED into one chunk
+    (`RequestOutputCollector.add(..., aggregate=True)`; its docstring says so
+    outright). Measured on this fleet 2026-08-24: **30 of 34** responses.
+
+    That is schema-legal — OpenAI's OpenAPI spec makes `finish_reason` a
+    required, nullable field on EVERY choice and never ties it to `delta`
+    being empty — but it is not what OpenAI's own service emits, and a client
+    that only ever saw the reference implementation may not handle it.
+
+    One does not: the Beacon agent runtime skips its own `finish_reason`
+    capture when a content chunk's text trips an SSE-lookalike heuristic
+    (`_provider_stream_text_may_be_sse` -> `continue`, jumping over the
+    capture at the bottom of its loop). It then reads the turn as a
+    mid-stream drop, stamps it `length`, and spends a SECOND full model call
+    "continuing" an answer that was already complete. Root-caused by
+    instrumenting the running container; upstream issue #91373 is open with a
+    different (and measurably wrong) diagnosis, so there is no version to
+    upgrade to. Ledger:
+    `a-streams-finish_reason-rides-alone-on-a-chunk-nobody-misses`.
+
+    Splitting removes ONE of the two conditions that failure needs, from the
+    only side we control. It is a normalisation toward the canonical shape,
+    not a workaround pointed at one client: any consumer that handles
+    OpenAI's own output already handles what this produces.
+
+    🚨 Deliberately narrow. Tool-call deltas carry `tool_calls`, not
+    `content`, so a tool-call finish chunk is NOT split and
+    `_ToolCallStreamSanitizer`'s finalize-on-finish path is untouched.
+    `usage` stays on the content chunk so the synthetic terminal one can
+    never be mistaken for the usage chunk (`choices == []` is the documented
+    test for that, and this chunk has choices).
+    """
+    choices = parsed.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    split_needed = False
+    for ch in choices:
+        if not isinstance(ch, dict):
+            return None
+        delta = ch.get("delta")
+        content = delta.get("content") if isinstance(delta, dict) else None
+        if ch.get("finish_reason") is not None and content:
+            split_needed = True
+    if not split_needed:
+        return None
+
+    head = copy.deepcopy(parsed)
+    tail = copy.deepcopy(parsed)
+    for ch in head.get("choices", []):
+        ch["finish_reason"] = None
+    for ch in tail.get("choices", []):
+        # Mirror the shape vLLM itself emits when it has a finish with no
+        # text: an empty delta object, not a dropped key.
+        ch["delta"] = {}
+    tail.pop("usage", None)
+    return head, tail
 
 
 class Lifecycle:
@@ -1327,6 +1397,7 @@ class Lifecycle:
         # to a client and must never be collapsed.
         saw_backend_done = False
         chunks_relayed = 0
+        coalesced_splits = 0
         ttft_ms: float | None = None  # Phase 4.1 — time to first token
         # Step 4a: accumulate assistant content across chunks for end-of-stream
         # DETECTION (degeneration loop / silent grammar-drop) — gated on the flag
@@ -1471,11 +1542,28 @@ class Lifecycle:
                                     if isinstance(piece, str):
                                         accumulated_content += piece
                         if not usage_only:
-                            chunks_relayed += 1
-                            await stream_q.put({
-                                "type": "chunk",
-                                "data": event.data,
-                            })
+                            # Normalise a coalesced finish chunk into the
+                            # canonical content-then-terminal pair. `None`
+                            # (the common case) relays the ORIGINAL bytes
+                            # untouched — no reserialisation, no drift.
+                            split = (
+                                _split_coalesced_finish_chunk(event.parsed)
+                                if isinstance(event.parsed, dict) else None
+                            )
+                            if split is None:
+                                chunks_relayed += 1
+                                await stream_q.put({
+                                    "type": "chunk",
+                                    "data": event.data,
+                                })
+                            else:
+                                coalesced_splits += 1
+                                for part in split:
+                                    chunks_relayed += 1
+                                    await stream_q.put({
+                                        "type": "chunk",
+                                        "data": json.dumps(part),
+                                    })
                     elif event.event_type == "done":
                         saw_backend_done = True
                         break
@@ -1657,10 +1745,10 @@ class Lifecycle:
         logger.info(
             "LLMPROXY_STREAM_DONE endpoint=%s caller=%s request_id=%s "
             "chunks=%d ttft_ms=%.0f duration_ms=%.0f finish_reason=%s "
-            "backend_done=%s in_tokens=%d out_tokens=%d",
+            "backend_done=%s splits=%d in_tokens=%d out_tokens=%d",
             req.endpoint, req.agent_id, req.request_id, chunks_relayed,
             ttft_ms or 0.0, duration * 1000.0,
-            last_finish_reason or "ABSENT", saw_backend_done,
+            last_finish_reason or "ABSENT", saw_backend_done, coalesced_splits,
             input_tokens, output_tokens,
         )
 
