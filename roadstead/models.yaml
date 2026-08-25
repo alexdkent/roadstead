@@ -321,7 +321,14 @@ models:
     port: 9083
     backend_engine: vllm
     # `vllm-tier3.service` WRAPS the docker container (same pattern the retired
-    # vllm-thinker.service used): ExecStart=/opt/anvil-bench/serve_tier3_prod.sh,
+    # vllm-thinker.service used). VERIFIED ON THE BOX 2026-08-25:
+    #   anvil  (rank 0) vllm-tier3.service        ExecStart=/opt/tier3/serve_v4flash_head.sh
+    #   anvil2 (rank 1) vllm-tier3-worker.service ExecStart=/opt/tier3/serve_v4flash_worker.sh
+    # The head script `source`s /opt/tier3/tier3_env.sh (the vendored copy of that env
+    # file is infra/anvil/vllm/v4flash/tier3_env.sh — it is SOURCED, not the ExecStart).
+    # 🚨 This comment previously said ExecStart=/opt/anvil-bench/serve_tier3_prod.sh.
+    # That is the LAGUNA ROLLBACK script — still on disk, NOT what runs. Corrected
+    # 2026-08-25; it had contradicted the note at `slots:` further down this same stanza.
     # ExecStop=docker stop vllm-tier3.
     # ⚠️ This field must be a REAL systemd unit — the anvil telemetry collector probes it with
     # `systemctl is-active`, and build_telemetry_units() DROPS any probed role with an empty
