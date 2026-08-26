@@ -95,11 +95,14 @@ def _capture_applied_timeout():
 # ACL — the registration surface.
 # --------------------------------------------------------------------------
 
-def test_pool_and_lan_generic_carry_the_floor():
+def test_batch_harnesses_and_lan_generic_carry_the_floor():
     acl = IPIdentityMap.from_env()
-    # pool-observer (Kestrel CTnnn) and the lan-generic catch-all (which is where
-    # the mac dev host's `pool` lands) both get the 1800s floor.
-    assert acl.min_timeout_s("10.0.0.17") == _SMART_DEFAULT_CAP_S
+    # cli-read (jetty CTnnn) and the lan-generic catch-all both get the 1800s
+    # floor. Was keyed on pool-observer (Kestrel CTnnn) until 2026-08-26, when
+    # that CT was destroyed with the `pool` capability — the FLOOR is not
+    # pool's, it belongs to any agentic caller that supplies no deadline, so
+    # the assertion moved to a live one rather than being deleted.
+    assert acl.min_timeout_s("10.0.0.25") == _SMART_DEFAULT_CAP_S
     assert acl.min_timeout_s("10.0.0.50") == _SMART_DEFAULT_CAP_S
     # Kept consistent with the cap the smart default may already reach.
     assert _SMART_DEFAULT_CAP_S == 1800.0
@@ -121,7 +124,7 @@ def test_identify_tuple_shape_unchanged():
     # identify() deliberately still returns (agent_id, priority): the floor is
     # read through its own lookup so no existing call site had to widen.
     acl = IPIdentityMap.from_env()
-    assert acl.identify("10.0.0.17") == ("pool-observer", LLMPriority.P3_INGESTION)
+    assert acl.identify("10.0.0.25") == ("cli-read", LLMPriority.P3_INGESTION)
     assert acl.identify("10.0.0.9") == ("tideway", LLMPriority.P3_INGESTION)
     assert acl.identify("127.0.0.1") == ("internal", LLMPriority.P1_TURN_SUPPORT)
     assert acl.identify("8.8.8.8") is None
@@ -147,7 +150,7 @@ async def test_floor_raises_default_deadline_in_both_flag_states(smart):
     try:
         with _capture_applied_timeout() as created:
             r = await asyncio.wait_for(
-                svc.handle_submit(_submit_body(), _Req("10.0.0.17")), timeout=10.0)
+                svc.handle_submit(_submit_body(), _Req("10.0.0.25")), timeout=10.0)
             assert r.status_code == 200
             # Without the floor this would be 180.0 (flag off) / 120.0 (flag on).
             assert created[-1].timeout_s == _SMART_DEFAULT_CAP_S
@@ -165,7 +168,7 @@ async def test_explicit_caller_timeout_wins_over_the_floor(smart):
     try:
         with _capture_applied_timeout() as created:
             r = await asyncio.wait_for(
-                svc.handle_submit(_submit_body(timeout_s=45.0), _Req("10.0.0.17")),
+                svc.handle_submit(_submit_body(timeout_s=45.0), _Req("10.0.0.25")),
                 timeout=10.0)
             assert r.status_code == 200
             # A caller that states its own deadline stays authoritative — even
@@ -227,7 +230,7 @@ async def test_malformed_caller_timeout_falls_to_default_and_gets_the_floor():
             # A value we could not use is not a caller deadline — the request
             # is on the proxy's default, so the floor applies to it.
             r = await asyncio.wait_for(
-                svc.handle_submit(_submit_body(timeout_s="garbage"), _Req("10.0.0.17")),
+                svc.handle_submit(_submit_body(timeout_s="garbage"), _Req("10.0.0.25")),
                 timeout=10.0)
             assert r.status_code == 200
             assert created[-1].timeout_s == _SMART_DEFAULT_CAP_S
@@ -236,12 +239,12 @@ async def test_malformed_caller_timeout_falls_to_default_and_gets_the_floor():
 
 
 # --------------------------------------------------------------------------
-# Wire-through — the OpenAI front door (how `pool` actually arrives).
+# Wire-through — the OpenAI front door (how an agentic CLI actually arrives).
 # --------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("smart", [False, True])
-async def test_openai_door_pool_caller_gets_the_floor(smart):
+async def test_openai_door_batch_caller_gets_the_floor(smart):
     svc = ProxyService(ProxyConfig())
     svc._flags.set_many({"smart_default_timeout": smart})
     _ok_backend(svc)
@@ -251,15 +254,15 @@ async def test_openai_door_pool_caller_gets_the_floor(smart):
             body = {"model": "llama-thinker",
                     "messages": [{"role": "user", "content": "hi"}]}
             r = await asyncio.wait_for(
-                svc.handle_openai_chat(dict(body), _Req("10.0.0.17")), timeout=10.0)
+                svc.handle_openai_chat(dict(body), _Req("10.0.0.25")), timeout=10.0)
             assert r.status_code == 200
             assert created[-1].timeout_s == _SMART_DEFAULT_CAP_S
-            assert created[-1].agent_id == "pool-observer"
+            assert created[-1].agent_id == "cli-read"
 
             # An X-Timeout-S header is an explicit caller deadline -> it wins.
             r = await asyncio.wait_for(
                 svc.handle_openai_chat(
-                    dict(body), _Req("10.0.0.17", {"X-Timeout-S": "30"})),
+                    dict(body), _Req("10.0.0.25", {"X-Timeout-S": "30"})),
                 timeout=10.0)
             assert r.status_code == 200
             assert created[-1].timeout_s == 30.0

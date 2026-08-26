@@ -183,51 +183,10 @@ class IPIdentityMap:
         # thinker) behind the catch-all. Identity-only fix: same P3 tier it
         # already got via the subnet default, so QoS is unchanged. (2026-07-12)
         acl.register("10.0.0.14", "recipe-runner", LLMPriority.P3_INGESTION)
-        # pool-observer (Kestrel CTnnn, static 10.0.0.17). Identical situation to
-        # goose above: the `pool` CLI is a plain OpenAI-compat client with no
-        # identity header, so without this it lands in `lan-generic` and its
-        # traffic is invisible in `proxy_completions`. Registered in CODE, not
-        # via LLM_PROXY_ACL — container env is baked at `docker run`, so an env
-        # change would force a permission-gated full-fleet re-run for what is a
-        # one-line identity fix. Same P3 tier the subnet default already gave
-        # it, so QoS is unchanged; the point is attribution. tier3 peaks at
-        # 11/20 slots, so pool must stay deprioritizable. (2026-08-02)
-        #
-        # min_timeout_s=1800: pool supplies NO deadline, so it gets the smart
-        # default — floor(thinker 180s) x surge x size_stretch, and the stretch
-        # CLAMPS at 3.0, giving a flat 540s wall for any tier3 prompt above
-        # ~82K tokens. Measured 2026-08-03: three consecutive kills at
-        # elapsed_s=539.999 against applied_timeout_s=540.0 on a 123,466-token
-        # prompt. A `timeout_ceiling_s` in models.yaml cannot fix this — the
-        # stretch clamp binds long before any ceiling is reached, so the lever
-        # has to be a FLOOR. 1800s == _SMART_DEFAULT_CAP_S, the cap the smart
-        # default is already allowed to reach, so this raises pool to the
-        # existing ceiling rather than inventing a new bound. Extend-only and
-        # default-only: an explicit caller deadline still wins. (2026-08-03)
-        acl.register("10.0.0.17", "pool-observer", LLMPriority.P3_INGESTION,
-                     min_timeout_s=_SMART_DEFAULT_CAP_S)
-        # pool-effector (Kestrel CTnnn, static 10.0.0.20, Phase 6 of
-        # docs/pool_capability_buildout_plan_2026-08.md — not provisioned yet as of
-        # 2026-08-12, code-authored ahead of the CT existing, same as its
-        # host_inventory.yaml row). Same reasoning as pool-observer immediately
-        # above: `pool` is a plain OpenAI-compat client with no identity header, so
-        # without this its traffic lands in `lan-generic` and is invisible in
-        # `proxy_completions`. Registered SEPARATELY from pool-observer, not as a
-        # second alias of the same identity, so the effector's traffic is
-        # independently deprioritizable from the observer's the day tier3 needs to
-        # shed load from one but not the other — they are different instances with
-        # different real-world blast radii, and QoS attribution should be able to
-        # tell them apart even though today both get the same P3 tier and the same
-        # timeout floor. Same min_timeout_s reasoning as pool-observer: pool
-        # supplies no deadline of its own, so it gets the smart default, and the
-        # size_stretch clamp binds long before any per-role ceiling would — see the
-        # pool-observer comment above for the full measurement.
-        acl.register("10.0.0.20", "pool-effector", LLMPriority.P3_INGESTION,
-                     min_timeout_s=_SMART_DEFAULT_CAP_S)
         # cli-read (jetty CTnnn, static 10.0.0.25) and cli-write (jetty CTnnn,
         # static 10.0.0.41), created 2026-08-22 — see
         # docs/dsh_builder_containers_plan_2026-08.md. Same situation as goose
-        # and the pool CTs above: dsh reaches the proxy through a plain
+        # above: dsh reaches the proxy through a plain
         # OpenAI-compatible route with no identity header, so without these two
         # lines both land in `lan-generic` and are invisible in
         # `proxy_completions`. Registered in CODE, not via LLM_PROXY_ACL,
@@ -235,14 +194,13 @@ class IPIdentityMap:
         # force a permission-gated full-fleet re-run for a one-line identity fix.
         #
         # Registered SEPARATELY rather than as two aliases of one `dsh`
-        # identity, for the same reason pool-observer and pool-effector are
-        # separate: they are the READ and WRITE halves of a deliberate
+        # identity because they are the READ and WRITE halves of a deliberate
         # blast-radius split, and the day tier3 needs to shed load from the
         # write lane but not the read lane, QoS attribution has to be able to
         # tell them apart. Same P3 tier the subnet default already gave them, so
         # this changes attribution, not priority.
         #
-        # min_timeout_s: identical reasoning to pool-observer above — dsh
+        # min_timeout_s: identical reasoning to recipe-runner above — dsh
         # supplies NO deadline of its own, so it gets the smart default, whose
         # size_stretch clamp binds long before any per-role ceiling. The floor
         # raises it to the cap the smart default may already reach rather than
@@ -253,8 +211,9 @@ class IPIdentityMap:
         # dnsmasq reservations (added the same day via opnsense_netctl). If
         # either CT is ever destroyed, DELETE ITS REGISTRATION HERE TOO —
         # leaving a stale source-IP identity would silently misattribute
-        # whatever takes the address next, which is exactly why the
-        # pool-analyst entry below was removed with its CT.
+        # whatever takes the address next — which is exactly why the two pool CT
+        # registrations that used to sit here were deleted WITH their CTs on
+        # 2026-08-26, rather than left behind pointing at .17/.20.
         acl.register("10.0.0.25", "cli-read", LLMPriority.P3_INGESTION,
                      min_timeout_s=_SMART_DEFAULT_CAP_S)
         acl.register("10.0.0.41", "cli-write", LLMPriority.P3_INGESTION,
@@ -267,12 +226,12 @@ class IPIdentityMap:
         #
         # beacon (Kestrel CTnnn, 10.0.0.23) — a DIFFERENT CT reusing the freed
         # .23, deliberately, per docs/beacon_container_and_orchestrator_replacement_plan_2026-08.md
-        # §1/§2, Phase 0 (2026-08-23). Same situation as goose/pool/dsh above:
+        # §1/§2, Phase 0 (2026-08-23). Same situation as goose/dsh above:
         # the Beacon CLI's bundled "custom" provider is a plain OpenAI-compat
         # client with no identity header, so without this line its traffic
         # lands in `lan-generic` and is invisible in `proxy_completions`.
         # 🚨 INTERACTIVE, not P3 — and unlike every other LAN registration here.
-        # goose/pool/dsh are batch agentic harnesses and belong in the BACKGROUND
+        # goose/dsh are batch agentic harnesses and belong in the BACKGROUND
         # band. Beacon is NOT one of those any more: as of the 2026-08-24 cutover
         # it IS the chat brain behind the SPA and SidekickApp, so a human is sitting
         # and waiting on every one of its calls.
@@ -295,7 +254,7 @@ class IPIdentityMap:
         # times per chat turn. P1 is still INTERACTIVE, which is what buys the
         # reserved fast-path slots.
         #
-        # min_timeout_s: same reasoning as pool-observer/dsh — Beacon supplies no
+        # min_timeout_s: same reasoning as goose/dsh — Beacon supplies no
         # deadline of its own (config-side request_timeout_seconds is a client
         # socket timeout, not an X-Timeout-S header), so the floor hands it the
         # full band window. 🚨 But the number MUST track the band: the background
@@ -307,14 +266,17 @@ class IPIdentityMap:
         # dnsmasq reservation added the same day via opnsense_netctl (see
         # infra/firewall/host_inventory.yaml's `beacon` row). The reservation,
         # this ACL line, and the CT are ONE UNIT — if CTnnn/beacon is ever
-        # destroyed, delete this registration with it, same as pool-analyst
+        # destroyed, delete this registration with it, same as the pool CTs
         # above and cli-read/cli-write's own warning.
         acl.register("10.0.0.23", "beacon", LLMPriority.P1_TURN_SUPPORT,
                      min_timeout_s=_INTERACTIVE_CEILING_S)
         # lan-generic carries the SAME floor, and that is a deliberate blunt
-        # instrument, not an oversight: the mac dev host runs `pool` too and
-        # lands here (only the Kestrel CT has a static registration), so flooring
-        # only 10.0.0.17 would leave the dev host strangled at 540s. This is the
+        # instrument, not an oversight: an un-registered LAN client that supplies
+        # no deadline of its own would otherwise be strangled at 540s, and the
+        # registered identities above cannot cover a host nobody has enrolled.
+        # (Written when the mac dev host ran the `pool` CLI, which is gone as of
+        # 2026-08-26; the floor survives it because the SHAPE is not pool's —
+        # any agentic client omitting timeout_s lands here.) This is the
         # fast unblock pending the real fix in the adaptive timeout model (the
         # size_stretch clamp). Whoever narrows this later: the correct end state
         # is that the model stops emitting a deadline shorter than the work

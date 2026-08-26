@@ -1654,8 +1654,8 @@ class PersistentQueue:
             # run. Refusing is the only safe reading of "no caller".
             return []
         # `_` and `%` are LIKE wildcards, and fleet caller ids contain `_`
-        # (`pool_broker.*`). Unescaped, `pool_broker` would also match
-        # `poolXbroker` — over-matching in exactly the direction that
+        # (`dsh_write.*`). Unescaped, `dsh_write` would also match
+        # `dshXwrite` — over-matching in exactly the direction that
         # manufactures false evidence.
         esc = caller_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         rows = self._reader().execute(

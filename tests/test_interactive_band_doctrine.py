@@ -92,13 +92,13 @@ def test_the_interactive_ceiling_has_one_source_of_truth():
 def test_batch_harnesses_stay_in_the_background_band():
     """The counterweight: promoting Beacon must not drag the batch fleet with it.
 
-    goose/pool/dsh are agentic harnesses doing long unattended work. They belong
+    goose/dsh are agentic harnesses doing long unattended work. They belong
     behind interactive traffic, and `fast_path_reserve_slots` only means anything
     while something is actually reserved *from*.
     """
     acl = _acl()
     for ip, expected in (("10.0.0.14", "recipe-runner"), ("10.0.0.25", "cli-read"),
-                         ("10.0.0.41", "cli-write"), ("10.0.0.17", "pool-observer")):
+                         ("10.0.0.41", "cli-write")):
         agent_id, priority = acl.identify(ip)
         assert agent_id == expected
         assert priority not in _INTERACTIVE, (
