@@ -250,7 +250,7 @@ class IPIdentityMap:
         # P1_TURN_SUPPORT rather than P0_REALTIME deliberately: Beacon sends no
         # priority header, so EVERY call it makes takes this default, and its
         # tool ladder issues ~4 per turn. P0 is left for the genuinely
-        # latency-critical realtime lane (glasses) rather than being claimed four
+        # latency-critical realtime lane (voice) rather than being claimed four
         # times per chat turn. P1 is still INTERACTIVE, which is what buys the
         # reserved fast-path slots.
         #

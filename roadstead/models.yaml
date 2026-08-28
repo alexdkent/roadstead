@@ -790,7 +790,7 @@ models:
 
   tier2-chat:
     # ✅ LIVE AND ROUTED (Phase 3 cutover, 2026-08-19). `chat`, `nexus-chat` and
-    # `companion-lite` resolve HERE now — that is the orchestrator inner chat loop, the glasses
+    # `companion-lite` resolve HERE now — that is the orchestrator inner chat loop, the voice
     # lane and Discord's conversational turn. Bare `tier2` stayed on the analyst (see below).
     #
     # What is actually running: the SAME abliterated Qwen3.6-35B-A3B Heretic Q4_K_M that
@@ -837,7 +837,7 @@ models:
     #
     # MOVED HERE 2026-08-19 from `tier2-analyst`: `chat`, `nexus-chat` and `companion-lite`.
     # `companion-lite` carries the orchestrator inner chat loop (loop_runner.LOOP_CHAT_ROLE) AND
-    # the glasses lane (agents/glasses/service.py LLM_ROLE) — moving the ALIAS moves both without
+    # the voice lane (agents/voice/service.py LLM_ROLE) — moving the ALIAS moves both without
     # touching either call site, which is the whole point of routing by role.
     # 🚨 Bare `tier2` DELIBERATELY does NOT move (operator decision 2026-08-19). It also carries
     # discord's ATTRIBUTION/SELF_STATE/NIGHTSHIFT/ARC_MODEL_ROLE (`agents/discord/_common.py`),
@@ -914,7 +914,7 @@ models:
       structured_output: true
     purpose: |
       RESERVED. The fleet-wide conversational model — the orchestrator inner chat loop, the
-      glasses assistant lane, and Discord's conversational turns. Long-form authoring does NOT
+      voice assistant lane, and Discord's conversational turns. Long-form authoring does NOT
       come here: it goes to tier3 (operator decision 2026-08-18), which keeps this lane purely
       interactive with no 1800s jobs competing with a chat turn.
     notes: |
@@ -931,7 +931,7 @@ models:
       `roles:` list gained `tier2-chat` in the same commit — without that the fleet's whole
       conversational lane would have gone unprobed while the analyst box kept reading green.
       🚫 Do NOT pin callers to a slot via `id_slot`. Measured 2026-08-19 on the deployed config:
-      pinning the glasses lane to slot 0 gave 790 ms TTFT after a burst vs 204 ms unpinned
+      pinning the spoken lane to slot 0 gave 790 ms TTFT after a burst vs 204 ms unpinned
       (~3.9x WORSE, 14/14 pinned trials cold). llama.cpp has no server-side slot reservation,
       so a pin is a label, not an allocation. Detail: the runbook's "Reserving a slot" section.
 
@@ -1404,9 +1404,9 @@ models:
     unit: nexus-asr.service
     health_path: /health
     model_family: nemotron-3.5-asr-streaming-0.6b
-    purpose: Streaming multilingual ASR for the glasses conversation lane.
+    purpose: Streaming multilingual ASR for the spoken conversation lane.
     when_used:
-      - the Even G2 glasses lane (and the phone microphone driving the same lane)
+      - the voice lane (agents/voice), driven by the phone microphone
     fallback: null
     notes: |
       🚨 DIALLED DIRECT, not through the proxy — the lane opens a WebSocket to

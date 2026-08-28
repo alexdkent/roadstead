@@ -81,7 +81,7 @@ FLOOR_S: dict[str, float] = {
     # llama.cpp/Vulkan). NEW CLASS 2026-08-19 at the Phase 3 split: `chat`,
     # `nexus-chat` and `companion-lite` left the `creative` class for this one, so
     # normalize_endpoint() resolves all three to "tier2-chat" and THIS floor is what
-    # the orchestrator inner loop, the glasses lane and Discord chat now get.
+    # the orchestrator inner loop, the voice lane and Discord chat now get.
     # Deliberately EQUAL to creative's 120s at the cutover: the split moves aliases,
     # not callers, and changing the floor in the same commit would confound any
     # post-cutover latency reading. This lane is purely interactive (long-form

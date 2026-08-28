@@ -496,7 +496,7 @@ def build_telemetry_units(cat: Catalog | None = None, host: str = "") -> list[tu
     box (classifier shares router's E4B → excluded); media is dispatcher-managed
     (not telemetry); ``planned`` roles are excluded. Order is catalog order."""
     cat = cat or load_catalog()
-    # `stt` joined 2026-08-19 for nexus-asr, the glasses lane's streaming ASR.
+    # `stt` joined 2026-08-19 for nexus-asr, the spoken lane's streaming ASR.
     # It is a first-class always-on service on nexus with its own /health, and
     # leaving the kind out meant it could be DECLARED in the authority and still
     # never probed — declared and invisible, which is the state it shipped in
