@@ -77,6 +77,215 @@ meta:
     # OPNsense; forward + reverse DNS resolve. Runbook:
     # infra/jetty/tier2-chat/README.md
     jetty: 10.0.0.27
+
+  # =========================================================================
+  # THE PLACEMENT CHARTER — what each inference vehicle is FOR.
+  #
+  # `hosts` above says WHERE a model runs. This says WHAT A HOST IS FOR, and
+  # — the part that keeps getting re-litigated — what its spare capacity is
+  # RESERVED for. Headroom on an inference host is never "available"; it is
+  # always already spent on something (KV, a swap slot, a co-resident voice
+  # model). "Box X looks underutilized" is NOT a placement argument here, and
+  # `meta.idle_silicon` below records the accelerators that are idle ON PURPOSE
+  # so they stop being rediscovered as free capacity.
+  #
+  # ENFORCED by tests/llmproxy/test_inference_placement_doctrine.py: every live
+  # (active / on_demand) entry's host must be charter-declared, its `kind` must
+  # be admitted by that vehicle, and its `status` must be an admitted residency
+  # for that kind. Vehicles with `exclusive_roles` must hold EXACTLY those roles
+  # and nothing else.
+  #
+  # Field reference (per vehicle):
+  #   hosts           keys of meta.hosts this vehicle owns
+  #   charter         one line: the job this silicon exists to do
+  #   admits          {kind: [status, ...]} — the kinds allowed here, and at
+  #                   which residency. `active` = always-on resident;
+  #                   `on_demand` = loaded for a job, then unloaded.
+  #   exclusive_roles OPTIONAL. If present, the set of live model keys on these
+  #                   hosts must EQUAL this list — a closed appliance.
+  #   headroom_is     what the free memory/compute is already committed to.
+  #   forbids         the negative rule, in one line.
+  #
+  # TO PLACE SOMETHING NEW: find the vehicle whose charter already covers the
+  # job. If none does, that is a decision for the operator — widen a charter
+  # deliberately (and say why in `charter`), never quietly by adding a stanza.
+  # =========================================================================
+  vehicles:
+
+    tier3:
+      hosts: [anvil, anvil2]
+      charter: >-
+        The deep tier. One model — the largest and most capable the fleet can
+        self-host — served tensor-parallel across both GB10s as a SINGLE
+        appliance over the direct 200GbE ConnectX-7 DAC. Reasoning, synthesis,
+        long context, agentic loops.
+      admits:
+        chat: [active]
+      exclusive_roles: [reasoner]
+      headroom_is: >-
+        tier3's KV pool (~1.7M tokens at 1M context, gpu-memory-utilization
+        0.85). The ~242 GB across the pair is not a budget with room in it —
+        weights are 155 GiB and the rest is cache. Measured headroom under load
+        is ~8 GiB, and two hard-hangs at ~0 free needed an operator power cycle.
+      forbids: >-
+        Everything else. D6 (operator decision, 2026-08-20) makes this a
+        single-purpose appliance: nothing else may be scheduled onto either box.
+        embed/rerank/tier1/imagegen all MOVED OFF, and the media generators were
+        retired, specifically to pay for the KV above. anvil2's compute is in
+        the hardware census but is NOT available capacity.
+
+    tier2-chat:
+      hosts: [jetty]
+      charter: >-
+        The conversational lane, and only that — Sidekick's chat turn, the glasses
+        lane, Discord's chat turn. A ~30 GB MoE chosen for TTFT and tokens/s at
+        concurrency, because a human is waiting. Text only.
+      admits:
+        chat: [active]
+      exclusive_roles: [tier2-chat]
+      headroom_is: >-
+        the 448K shared KV pool across 20 slots. Slot count IS the product here:
+        this endpoint is sized for burst concurrency on a live conversation, not
+        for a high average load.
+      forbids: >-
+        Anything that adds latency or memory pressure to the chat lane. This box
+        is GO DARK / NO FALLBACK by design — chat surfaces refuse the turn rather
+        than fail over — so a co-tenant that wedges it takes every conversational
+        surface in the fleet with it. (The two dsh builder CTs are guests of the
+        Proxmox HOST, not of this GPU, and hold their own LAN addresses.)
+
+    tier2-analyst:
+      hosts: [nasbox]
+      charter: >-
+        The worker tier. A ~30 GB DENSE, natively-multimodal model on the fleet's
+        only vision-capable endpoint: extraction, classification, all document and
+        photo vision, long-form authoring (songs, DJ patter), and the agent work
+        that can afford to wait. Also the automatic tier3 failover target for
+        agents opted in via `degrade_ok`.
+      admits:
+        chat: [active]
+      exclusive_roles: [tier2-analyst]
+      headroom_is: >-
+        4 slots at 256K context with q8_0 KV and MTP speculative decoding.
+        `slots x (1 + n_draft) <= 8` is a CORRECTNESS bound on ggml-SYCL's
+        MMVQ_MAX_BATCH_SIZE, not a capacity choice — you cannot buy concurrency
+        here by raising --parallel. `fast_path_reserve_slots: 2` reserves half
+        the box for the classify/vision family.
+      forbids: >-
+        A second resident model on the boxa, and any workload that competes with
+        the vision projector. This is the fleet's SLOWEST generative tier on
+        decode (~38 tok/s at c1) — deliberately, because it is the dense
+        multimodal one. Do not place a latency-sensitive job here to "spread
+        load"; that is what tier2-chat is for.
+
+    tier1:
+      hosts: [kestrel-perception]
+      charter: >-
+        The decision BEFORE the work — cheap, fast classification, tool routing
+        and short-context calls on a ~4B dense model, co-resident with the fleet's
+        text-to-speech voices on one small dedicated card. Both jobs are chosen
+        for being cheap and never contending.
+      admits:
+        chat: [active]
+        tts: [active]
+      exclusive_roles: [router, classifier, tts]
+      headroom_is: >-
+        the co-residency margin between the LLM and TTS on a 12 GB A2000. It has
+        already been spent once: a retired OCR unit left enabled here held 1516
+        MiB — exactly the margin tier1 needed — and OOM-crash-looped it 86 times
+        after the next reboot.
+      forbids: >-
+        A third resident model. Also do not "use up" tier1's unclaimed
+        capability (Gemma-4-E4B is natively multimodal with a 128K context; we
+        serve it text-only at 16K) — that headroom is what keeps it cheap and
+        non-contending, which is the entire role.
+
+    nexus:
+      hosts: [nexus]
+      charter: >-
+        Two jobs. (1) ALWAYS-ON RETRIEVAL AND PERCEPTION — embed, rerank, OCR
+        and streaming ASR: small, latency-bounded services that every other tier
+        depends on and that must fail independently of the CUDA stack. (2) THE
+        ON-DEMAND SWAP POOL — image generation, 3D-print mesh generation and
+        future GPU-assisted work that is NOT needed continuously, brokered as
+        leases by nexus-dispatcher (:9201) with lazy weight load and idle
+        unload. It is also the fleet's experimentation box.
+      admits:
+        embed: [active]
+        rerank: [active]
+        ocr: [active]
+        stt: [active]
+        media: [on_demand]
+      headroom_is: >-
+        THE PRODUCT. Free memory on nexus is not slack — it is the swap pool
+        that lets an on-demand service load its weights at all. Measured: with a
+        122B resident, moving a 7 GB image checkpoint onto the GPU took ~700
+        SECONDS instead of seconds. That contention is why the 122B was removed
+        outright rather than kept cold.
+      forbids: >-
+        Any always-on resident LLM (note `chat` is absent from `admits` above),
+        and any always-on service that is not retrieval or perception. This is
+        the box builders most often propose as "underutilized" — it is
+        deliberately kept with room to swap. EXPERIMENTS are welcome and run
+        UNREGISTERED; the moment something earns a stanza in this file it is a
+        fleet service and needs a charter that admits it. Note also that nexus
+        already carries four mutually-incompatible venvs (embed / rerank / OCR /
+        imagegen) — a fifth tenant is a fifth dependency tree, not just memory.
+
+    kestrel-speech:
+      hosts: [kestrel-speech]
+      charter: >-
+        The speech + audio-media edge — batch speech-to-text (CPU), diarization
+        and DJ stem separation on the Iris Xe iGPU. Not an LLM vehicle; listed so
+        the charter covers every host in meta.hosts.
+      admits:
+        stt: [active]
+        stream: [active]
+        diarize: [on_demand]
+      headroom_is: >-
+        CPU for parakeet (STT runs on the CPU here, not the iGPU) and the iGPU
+        for the on-demand audio jobs.
+      forbids: >-
+        LLM serving. The Iris Xe is ~2.3 TFLOPS with no tensor units; it is a
+        media accelerator, not an inference tier.
+
+  # =========================================================================
+  # KNOWN-IDLE SILICON — deliberately unused, do not "discover" it.
+  #
+  # These accelerators show up in the hardware census (docs/fleet_hardware_
+  # inventory.md) and look like free capacity. They are not proposals. Each row
+  # is a decision that was already made; reopening one is an operator call, not
+  # a builder's optimisation. Operator position (2026-08-29): the idle NPUs are
+  # accepted, and that is fine for now.
+  # =========================================================================
+  idle_silicon:
+    - what: nasbox on-package NPU (Arrow Lake AI Boost) + Arc Xe iGPU (64 EU)
+      host: nasbox
+      why_idle: >-
+        Freed by the mid-2026 workload inversion when the speech stack moved to
+        Kestrel, and left free on purpose. The hub's job is orchestration and
+        storage; its one inference role is tier2-analyst on the discrete boxa.
+        No serving stack for the NPU is worth the maintenance today.
+    - what: NVIDIA RTX 4060 Ti (8 GB)
+      host: nasbox
+      why_idle: >-
+        NOT idle — passed through to the Windows1 gaming VM. Reserved, not spare.
+        It is the single most frequently mis-proposed "free GPU" in the fleet.
+    - what: AMD Raphael iGPU (2 CU RDNA2, 2 GB carve-out)
+      host: jetty
+      why_idle: >-
+        ~0.56 TFLOPS with a 2 GB carve-out — too small to serve anything, and
+        any tenant on this box risks the go-dark chat lane.
+    - what: Grace CPU cores (20c per node) on the tier3 pair
+      host: anvil
+      why_idle: >-
+        Present in the census, unavailable by D6. Both nodes are a closed tier3
+        appliance; CPU work here competes with vLLM for the unified memory pool.
+    - what: tier1's unclaimed model capability (native image+audio input, 128K context)
+      host: kestrel-perception
+      why_idle: >-
+        Served text-only at 16K on purpose. The unused capability is what keeps
+        tier1 cheap and non-contending on a shared 12 GB card.
   # Provider context-window values preserved VERBATIM for callers/DB rows that
   # are not (yet) covered by a role entry. anthropic is the no-op v2 fallback;
   # the nexus-* legacy values are intentionally the OLD numbers — un-migrated
@@ -790,8 +999,10 @@ models:
 
   tier2-chat:
     # ✅ LIVE AND ROUTED (Phase 3 cutover, 2026-08-19). `chat`, `nexus-chat` and
-    # `companion-lite` resolve HERE now — that is the orchestrator inner chat loop, the voice
-    # lane and Discord's conversational turn. Bare `tier2` stayed on the analyst (see below).
+    # `companion-lite` resolve HERE now — that is the voice lane and Discord's conversational
+    # turn. Bare `tier2` stayed on the analyst (see below).
+    # (The orchestrator inner chat loop was the third consumer until it was DELETED on
+    # 2026-08-29; the remaining two are why this endpoint still exists.)
     #
     # What is actually running: the SAME abliterated Qwen3.6-35B-A3B Heretic Q4_K_M that
     # `tier2-analyst` serves on the boxa — no requantisation, no persona change — on jetty's
@@ -836,9 +1047,11 @@ models:
     # `tier2-analyst`; pinned by test_every_canonical_name_is_dispatchable).
     #
     # MOVED HERE 2026-08-19 from `tier2-analyst`: `chat`, `nexus-chat` and `companion-lite`.
-    # `companion-lite` carries the orchestrator inner chat loop (loop_runner.LOOP_CHAT_ROLE) AND
-    # the voice lane (agents/voice/service.py LLM_ROLE) — moving the ALIAS moves both without
-    # touching either call site, which is the whole point of routing by role.
+    # 🚨 `companion-lite` now carries exactly ONE live caller: the VOICE LANE
+    # (`agents/voice/service.py` LLM_ROLE). It also carried the orchestrator inner chat loop
+    # until that engine was deleted 2026-08-29 (orchestrator gut). Said explicitly because the
+    # old comment named the dead loop FIRST, which reads as "retire this with the loop" — it is
+    # not retired, and pulling it would silently take the voice lane's model with it.
     # 🚨 Bare `tier2` DELIBERATELY does NOT move (operator decision 2026-08-19). It also carries
     # discord's ATTRIBUTION/SELF_STATE/NIGHTSHIFT/ARC_MODEL_ROLE (`agents/discord/_common.py`),
     # song_studio and ~10 tools, all of which must stay on the analyst. Discord's CHAT turn got
