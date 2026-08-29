@@ -85,4 +85,30 @@ discord:
   #    tokens/24h, all of it extraction into durable state.
   degrade_ok: true
 
+beacon:
+  # ADDED 2026-08-29 on operator decision, the second member of this set.
+  # Beacon (Kestrel CTnnn) is the operator's own agentic chat surface, and the
+  # ask came from the failure it caused: during a tier3 outage that morning
+  # every Beacon turn was refused outright, when a smaller model would have
+  # answered. A degraded answer he can read and reply to beats no answer.
+  #  * Conversational and RETRACTABLE — the house test for what may be
+  #    softened without a code gate. The person reading the reply is the same
+  #    person who asked, in the same turn, and can undo it by replying.
+  #  * Its outward-facing ACTIONS are not gated by which model served the
+  #    turn: `agent.disabled_toolsets` (the fleet floor in
+  #    infra/beacon/config/templates/config.yaml) and `approvals.mode: smart`
+  #    both sit downstream of routing and are unchanged by a degrade. This
+  #    matters because Beacon has a terminal and a browser — the answer to
+  #    "may a smaller model drive those?" is yes ONLY because the same
+  #    approval gate stands in front of them either way.
+  #  * NOT an extraction path. Beacon writes nothing into fleet durable state;
+  #    its memory writes go through the pending-approval sidecar, which is a
+  #    human gate, not a silent one. That is what keeps it out of the
+  #    `knowledge_store` class, where the extraction rule says stay OUT.
+  # Context: tier2-analyst (`creative`) is 262,144/slot against tier3's 1M, and
+  # Beacon carries a ~49KB skills prompt — comfortably inside, but a very long
+  # session can still trip Gate 2 and be refused with `degraded_context_overflow`
+  # rather than truncated. That refusal is correct; do not "fix" it by trimming.
+  degrade_ok: true
+
 # (Other agents not listed here use AgentQuotaConfig defaults.)

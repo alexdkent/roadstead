@@ -106,6 +106,14 @@ def test_degrade_ok_reaches_agent_config():
     cfgs = load_agent_configs()
     assert cfgs["discord"].degrade_ok is True, (
         "the day-1 opt-in seed did not survive the agents.yaml parser")
+    # beacon joined the set on 2026-08-29 (operator decision, after a tier3
+    # outage refused every one of its turns). Pinned by NAME because the agent
+    # id is what Gate 1 reads: llmproxy/acl.py registers 10.0.0.23 as "beacon",
+    # and a rename there would silently opt it back out.
+    assert cfgs["beacon"].degrade_ok is True, (
+        "beacon lost its tier3 failover opt-in — during a tier3 outage every "
+        "Beacon turn goes back to a hard 503 instead of degrading to "
+        "tier2-analyst")
     # Default-deny is the property that matters most, so assert it on a real
     # agent that IS in the file (i.e. the parser ran for it) rather than on an
     # absent key, which would pass even if the parser were dead.
