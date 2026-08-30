@@ -1653,8 +1653,13 @@ models:
     role: flux1-imagegen
     aliases: [flux1-imagegen, anvil-imagegen, nexus-imagegen]
     # 2026-07-31 Phase E: MOVED anvil -> nexus (ROCm/gfx1151), unit `nexus-imagegen`.
-    # The `anvil-imagegen` alias and anvil's unit are kept: that service is still running
-    # as the ROLLBACK until every checkpoint is verified on nexus.
+    # anvil's copy was DELETED with its 166 GB of weights — it is not a rollback target.
+    # The `anvil-imagegen` alias is nevertheless KEPT (2026-08-30): it is DATA, not a name.
+    # It is still the tenant key `anvil_dispatcher`'s MODEL_REGISTRY brokers the GPU slot
+    # under, and health-verifier's catalog-drift scenario reconciles against it. Dropping it here
+    # while the dispatcher side is unrenamed would break that join, so both sides move
+    # together or not at all — the package/dir/deploy-path rename of 2026-08-30 deliberately
+    # stopped short of it.
     host: nexus
     port: 9210
     backend_engine: shim
@@ -1672,7 +1677,7 @@ models:
     fallback: null
     notes: |
       Hosts ~150 swappable checkpoints behind one FastAPI — the per-checkpoint
-      sub-registry lives in infra/anvil/anvil_imagegen/models.yaml (a finer
+      sub-registry lives in infra/imagegen/models.yaml (a finer
       granularity; NOT folded into this authority). On nexus that sub-registry is
       /opt/imagegen/registry.yaml (25 rows, 16 with weights present) plus
       /opt/imagegen/loras.yaml (103 LoRAs).
