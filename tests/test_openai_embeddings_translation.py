@@ -34,7 +34,7 @@ import struct
 
 import pytest
 
-from originfleet.llmproxy.http_handlers import (
+from roadstead.http_handlers import (
     _embedding_texts,
     _encode_embedding,
     _estimated_embed_tokens,

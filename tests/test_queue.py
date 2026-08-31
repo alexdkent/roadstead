@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import queue as _queue
 
-from originfleet.llmproxy.queue import PersistentQueue
+from roadstead.queue import PersistentQueue
 
 
 def _pc(pq, rid, status="ok", in_tok=10, out_tok=5, dur=1.0, qw=2.0):
@@ -162,7 +162,7 @@ def test_load_context_overflows_windows_out_stale_rows(tmp_path):
     # overflow aggregate as a live /v1/status signal — only rows whose last_at
     # is within the 48h window load into the shadow.
     import time
-    from originfleet.llmproxy.queue import _CONTEXT_OVERFLOW_SEED_WINDOW_S
+    from roadstead.queue import _CONTEXT_OVERFLOW_SEED_WINDOW_S
     pq = PersistentQueue(str(tmp_path / "q.db"))
     pq.record_context_overflow("creative", "callerOld", 8000)
     pq.record_context_overflow("thinker", "callerFresh", 16000)
@@ -248,7 +248,7 @@ def test_recover_queued_drops_stream_rows(tmp_path):
     """Phase 2 hardening: a queued STREAMING request recovered after a restart
     has no SSE consumer (it died with the old process) — recovery must DROP it,
     not re-dispatch into a permanent scheduler-slot leak. Sync rows recover."""
-    from originfleet.llmproxy.scheduler import QueuedRequest
+    from roadstead.scheduler import QueuedRequest
 
     pq = PersistentQueue(str(tmp_path / "q.db"))
     sync_req = QueuedRequest.create(

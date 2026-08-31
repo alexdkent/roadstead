@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from originfleet.llmproxy.grammar import (
+from roadstead.grammar import (
     MAX_REPETITION_THRESHOLD,
     normalize,
     normalize_and_validate,
@@ -165,7 +165,7 @@ def test_all_production_grammars_normalize_to_valid():
     test-gbnf-validator via scripts/gbnf_align_check.py (re-run on binary
     upgrade)."""
     import pathlib
-    root = pathlib.Path(__file__).resolve().parents[2] / "originfleet"
+    root = pathlib.Path(__file__).resolve().parents[1] / "originfleet"
     gbnfs = sorted(root.rglob("*.gbnf"))
     assert len(gbnfs) >= 13, f"expected >=13 grammars, found {len(gbnfs)}"
     failures = []

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import pytest
 
-from originfleet.llmproxy import cache_stats, model_catalog, usage_rates
+from roadstead import cache_stats, model_catalog, usage_rates
 
 NAME = "tier2-analyst"
 

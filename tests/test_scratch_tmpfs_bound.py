@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import time
 
-from tests.llmproxy.conftest import _PRUNE_MIN_AGE_S, _prune_stale_scratch
+from tests.conftest import _PRUNE_MIN_AGE_S, _prune_stale_scratch
 
 
 def _make_root(basetemp, name: str, *, locked: bool, age_s: float):

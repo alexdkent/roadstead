@@ -11,11 +11,11 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-service = importlib.import_module("originfleet.llmproxy.service")
-correction = importlib.import_module("originfleet.llmproxy.correction")
+service = importlib.import_module("roadstead.service")
+correction = importlib.import_module("roadstead.correction")
 C = correction.Correction  # shadow-egress logic moved here in de-monolith Step 3
 
 # Tiny object-root grammar: {"x": "<str>"}. verify_conformance derives root key

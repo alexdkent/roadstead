@@ -26,11 +26,11 @@ import json
 
 import pytest
 
-from originfleet.llmproxy.constants import (
+from roadstead.constants import (
     _EST_IN_RESIDUAL_UNDERCOUNT,
     _STREAM_PREFILL_FLOOR_TOK_S,
 )
-from originfleet.llmproxy.cost_model import estimate_input_tokens
+from roadstead.cost_model import estimate_input_tokens
 
 # The two inputs the floor is derived from, per constants.py.
 _SLOW_END_PREFILL_TOK_S = 729.0   # tier3 at 578K, models.yaml tier3 stanza
@@ -117,7 +117,7 @@ def test_ttft_allowance_covers_the_measured_worst_case():
     The regression this pins is the ORIGINAL defect: a live 123,466-token prompt
     aborted at 145.078s under the old fictional 1000 tok/s assumption.
     """
-    from originfleet.llmproxy.constants import _STREAM_TTFT_DEADLINE_S
+    from roadstead.constants import _STREAM_TTFT_DEADLINE_S
 
     # est_in as the estimator would report it for a real 578K-token prompt.
     est_in_for_578k = 578_000 / _EST_IN_RESIDUAL_UNDERCOUNT

@@ -31,7 +31,7 @@ without that, the sparse top in-bucket falls through to the ``tier`` aggregate
 
 from __future__ import annotations
 
-from originfleet.llmproxy.timeout_model import (
+from roadstead.timeout_model import (
     TimeoutModel,
     _IN_EDGES,
     _bucket,
@@ -250,7 +250,7 @@ def test_the_guard_is_bounded_work():
     """The guard re-queries every LOWER (in, out) cell on every advice call;
     the coarse ladder levels are memoised, but the lattice itself must stay
     small."""
-    from originfleet.llmproxy.timeout_model import _OUT_EDGES
+    from roadstead.timeout_model import _OUT_EDGES
 
     assert (len(_IN_EDGES) + 1) * (len(_OUT_EDGES) + 1) <= 64, (
         "the in x out lattice grew past a sane per-request lookup budget")

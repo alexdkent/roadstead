@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from originfleet.llmproxy import cache_stats as cs
+from roadstead import cache_stats as cs
 
 
 def test_prompt_text_shapes():

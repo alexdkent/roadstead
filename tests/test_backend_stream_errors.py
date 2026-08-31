@@ -14,13 +14,13 @@ import asyncio
 import httpx
 import pytest
 
-from originfleet.llmproxy.backend import (
+from roadstead.backend import (
     BackendClientPool,
     BackendError,
     BackendTimeout,
     BackendUnavailable,
 )
-from originfleet.llmproxy.config import EndpointConfig
+from roadstead.config import EndpointConfig
 
 EP = EndpointConfig(endpoint_class="chat", role="thinker", host="h", port=1234)
 

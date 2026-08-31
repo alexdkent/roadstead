@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from originfleet.llmproxy.config import DEFAULT_ENDPOINTS, EndpointConfig, PriorityBand
-from originfleet.llmproxy.scheduler import Scheduler
+from roadstead.config import DEFAULT_ENDPOINTS, EndpointConfig, PriorityBand
+from roadstead.scheduler import Scheduler
 
 
 def _ep(max_slots: int, reserve: int, cap: int = 0) -> EndpointConfig:

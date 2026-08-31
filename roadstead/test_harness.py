@@ -6,9 +6,9 @@ Three modes:
   3. **ab** — A/B backend comparison using recorded corpus
 
 Usage:
-    python -m originfleet.llmproxy test sim all_agents_burst
-    python -m originfleet.llmproxy test replay --hours 4 --compress 8 --endpoint thinker
-    python -m originfleet.llmproxy test ab --hours 4 --endpoint thinker --shadow-host 10.0.0.3 --shadow-port 9084
+    python -m roadstead test sim all_agents_burst
+    python -m roadstead test replay --hours 4 --compress 8 --endpoint thinker
+    python -m roadstead test ab --hours 4 --endpoint thinker --shadow-host 10.0.0.3 --shadow-port 9084
 """
 
 from __future__ import annotations

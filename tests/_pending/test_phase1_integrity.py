@@ -22,23 +22,23 @@ from types import SimpleNamespace
 import pytest
 
 from originfleet.framework.nexus_errors import is_deferrable_llm_error
-from originfleet.llmproxy.backend import (
+from roadstead.backend import (
     BackendError,
     BackendResponse,
     BackendUnavailable,
 )
-from originfleet.llmproxy.config import (
+from roadstead.config import (
     DEFAULT_ENDPOINTS,
     EndpointConfig,
     PriorityBand,
     ProxyConfig,
 )
-from originfleet.llmproxy.scheduler import (
+from roadstead.scheduler import (
     DispatchDecision,
     QueuedRequest,
     Scheduler,
 )
-from originfleet.llmproxy.service import ProxyService
+from roadstead.service import ProxyService
 
 
 _COMPLETION = {

@@ -27,9 +27,9 @@ import pytest
 # per-ship in_container_tollgate via `-m 'not heavy'` (see pyproject `heavy`).
 pytestmark = pytest.mark.heavy
 
-from originfleet.llmproxy import correction as correction_mod
-from originfleet.llmproxy.backend import BackendUnavailable
-from tests.llmproxy.fake_backend import (
+from roadstead import correction as correction_mod
+from roadstead.backend import BackendUnavailable
+from tests.fake_backend import (
     FAULT_FINISH_LENGTH,
     FAULT_PHANTOM_TOOL_CALLS,
     FAULT_SCHEMA_INVALID,

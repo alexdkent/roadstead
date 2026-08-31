@@ -11,8 +11,8 @@ import json
 
 import pytest
 
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import ProxyService
+from roadstead.config import ProxyConfig
+from roadstead.service import ProxyService
 
 
 class _FakeRequest:
@@ -67,7 +67,7 @@ async def test_valid_multiline_grammar_normalized_in_place():
     }
     # No backend in test → dispatch will fail, but grammar processing happens
     # first and mutates payload. We assert the mutation, not the dispatch.
-    from originfleet.llmproxy.scheduler import QueuedRequest
+    from roadstead.scheduler import QueuedRequest
     req = QueuedRequest.create(
         agent_id="knowledge", endpoint="thinker", priority="P1_TURN_SUPPORT",
         call_site="knowledge.extract_entities", payload_type="chat_completion",
@@ -82,7 +82,7 @@ async def test_valid_multiline_grammar_normalized_in_place():
 @pytest.mark.asyncio
 async def test_no_grammar_passes_through():
     svc = _svc()
-    from originfleet.llmproxy.scheduler import QueuedRequest
+    from roadstead.scheduler import QueuedRequest
     req = QueuedRequest.create(
         agent_id="sidekick", endpoint="gemma", priority="P1_TURN_SUPPORT",
         call_site="sidekick.proxy_client", payload_type="chat_completion",
@@ -93,7 +93,7 @@ async def test_no_grammar_passes_through():
 
 def test_grammar_result_cached():
     svc = _svc()
-    from originfleet.llmproxy.scheduler import QueuedRequest
+    from roadstead.scheduler import QueuedRequest
     payload = {
         "messages": [{"role": "user", "content": "x"}],
         "extra_body": {"grammar": 'root ::= "x"\n'},

@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import pytest
 
-from originfleet.llmproxy.timeout_model import TimeoutModel, _OUT_EDGES
+from roadstead.timeout_model import TimeoutModel, _OUT_EDGES
 
 
 def _model(**kw) -> TimeoutModel:

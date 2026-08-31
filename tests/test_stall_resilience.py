@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 
-from originfleet.llmproxy.observability import (
+from roadstead.observability import (
     MetricsSample,
     RollingMetrics,
     check_alerts,
@@ -231,7 +231,7 @@ def test_callsite_too_tight_groups_by_call_site():
 def test_timeout_below_recommended_ratio():
     # The best_effort tag: an applied deadline under half the recommended time is
     # a sub-floor give-up; anything else (incl. missing/zero inputs) is genuine.
-    from originfleet.llmproxy.lifecycle import _timeout_below_recommended
+    from roadstead.lifecycle import _timeout_below_recommended
     assert _timeout_below_recommended(0.9, 60000) is True    # greeter ~0.9s vs 60s
     assert _timeout_below_recommended(3.0, 60000) is True    # sidekick.extract ~3s vs 60s
     assert _timeout_below_recommended(45.0, 60000) is False  # 45s vs 60s — fair time
@@ -245,7 +245,7 @@ def test_intertoken_gap_constant_present():
     # The mid-stream no-progress watchdog must be wired (extends the
     # first-token-only TTFT watchdog). The streaming path (and its constant)
     # moved to the Lifecycle collaborator in de-monolith Step 3.
-    from originfleet.llmproxy import lifecycle
+    from roadstead import lifecycle
     assert lifecycle._STREAM_INTERTOKEN_GAP_S > 0
 
 
@@ -254,9 +254,9 @@ def test_intertoken_gap_constant_present():
 import asyncio
 import pytest
 
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.scheduler import QueuedRequest
-from originfleet.llmproxy.service import ProxyService
+from roadstead.config import ProxyConfig
+from roadstead.scheduler import QueuedRequest
+from roadstead.service import ProxyService
 
 
 @pytest.mark.asyncio

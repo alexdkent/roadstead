@@ -11,11 +11,11 @@ import time
 
 import pytest
 
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.queue import PersistentQueue
-from originfleet.llmproxy.service import ProxyService
-from originfleet.llmproxy.sse_hub import DROP_SENTINEL, SSEHub
-from originfleet.llmproxy.usage_rates import cloud_cost_usd, cloud_rate
+from roadstead.config import ProxyConfig
+from roadstead.queue import PersistentQueue
+from roadstead.service import ProxyService
+from roadstead.sse_hub import DROP_SENTINEL, SSEHub
+from roadstead.usage_rates import cloud_cost_usd, cloud_rate
 
 
 # ----- queue: non-LLM ingest + rollups -----
@@ -290,8 +290,8 @@ async def test_calls_log_409_for_llm_class_endpoints():
     duplicates a natively-recorded row (the 2026-06-11 rerank double-count
     arrived as kind='external' + endpoint='rerank') — refuse it regardless of
     the kind label. Genuine non-LLM units still ingest."""
-    from originfleet.llmproxy.config import ProxyConfig
-    from originfleet.llmproxy.service import ProxyService
+    from roadstead.config import ProxyConfig
+    from roadstead.service import ProxyService
 
     svc = ProxyService(ProxyConfig())
     for ep in ("rerank", "bge-reranker", "nexus-rerank", "embed",

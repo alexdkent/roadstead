@@ -37,10 +37,10 @@ import json
 
 import pytest
 
-from originfleet.llmproxy.backend import BackendStreamEvent
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.lifecycle import _split_coalesced_finish_chunk as split
-from originfleet.llmproxy.service import ProxyService
+from roadstead.backend import BackendStreamEvent
+from roadstead.config import ProxyConfig
+from roadstead.lifecycle import _split_coalesced_finish_chunk as split
+from roadstead.service import ProxyService
 
 
 # ------------------------------------------------------- the pure splitter

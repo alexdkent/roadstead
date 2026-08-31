@@ -39,9 +39,9 @@ import json
 
 import pytest
 
-from originfleet.llmproxy.backend import BackendStreamEvent
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import ProxyService
+from roadstead.backend import BackendStreamEvent
+from roadstead.config import ProxyConfig
+from roadstead.service import ProxyService
 
 
 class _Req:
@@ -214,7 +214,7 @@ async def test_every_stream_logs_one_accountable_line(caplog):
     svc._backend.stream = _backend(emit_finish=True, emit_done=True)
     await svc.startup()
     try:
-        with caplog.at_level("INFO", logger="originfleet.llmproxy.lifecycle"):
+        with caplog.at_level("INFO", logger="roadstead.lifecycle"):
             resp = await svc.handle_submit(_body(), _Req(), openai=True)
             await _collect(resp)
         lines = [r.getMessage() for r in caplog.records
@@ -237,7 +237,7 @@ async def test_an_absent_finish_reason_is_named_in_the_log(caplog):
     svc._backend.stream = _backend(emit_finish=False, emit_done=False)
     await svc.startup()
     try:
-        with caplog.at_level("INFO", logger="originfleet.llmproxy.lifecycle"):
+        with caplog.at_level("INFO", logger="roadstead.lifecycle"):
             resp = await svc.handle_submit(_body(), _Req(), openai=True)
             await _collect(resp)
         msgs = [r.getMessage() for r in caplog.records]

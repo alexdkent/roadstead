@@ -57,16 +57,16 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from originfleet.llmproxy.config import (
+from roadstead.config import (
     AgentQuotaConfig,
     EndpointConfig,
     ProxyConfig,
     load_agent_configs,
     normalize_endpoint,
 )
-from originfleet.llmproxy.__main__ import build_app
+from roadstead.__main__ import build_app
 
-from tests.llmproxy.fake_backend import FAULT_CAPACITY_DESYNC, FakeBackend, FakeBackendServer
+from tests.fake_backend import FAULT_CAPACITY_DESYNC, FakeBackend, FakeBackendServer
 
 SRC = normalize_endpoint("thinker")     # tier3
 TGT = normalize_endpoint("creative")    # tier2-analyst (the boxa)
@@ -94,7 +94,7 @@ async def journey(caplog) -> AsyncIterator[dict]:
     tier2-analyst fake — unused by this journey, but must resolve to
     something so config construction doesn't 404 on itself.
     """
-    caplog.set_level(logging.WARNING, logger="originfleet.llmproxy.failover")
+    caplog.set_level(logging.WARNING, logger="roadstead.failover")
     fake_thinker = FakeBackendServer(FakeBackend(served_model_id="llama-thinker-live")).start()
     fake_creative = FakeBackendServer(FakeBackend(served_model_id="qwen3-creative-live")).start()
     try:
@@ -164,7 +164,7 @@ async def _status(client: httpx.AsyncClient) -> dict:
 
 async def test_tier3_failover_full_journey(journey, caplog):
     """The whole D2 arc, in order, over the real seams."""
-    caplog.set_level(logging.WARNING, logger="originfleet.llmproxy.failover")
+    caplog.set_level(logging.WARNING, logger="roadstead.failover")
     client = journey["client"]
     svc = journey["svc"]
     fake_thinker = journey["fake_thinker"]

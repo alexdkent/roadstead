@@ -30,11 +30,11 @@ import time
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-correction = importlib.import_module("originfleet.llmproxy.correction")
-config = importlib.import_module("originfleet.llmproxy.config")
+correction = importlib.import_module("roadstead.correction")
+config = importlib.import_module("roadstead.config")
 C = correction.Correction
 
 SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}

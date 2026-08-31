@@ -23,11 +23,11 @@ import time
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-service = importlib.import_module("originfleet.llmproxy.service")
-correction = importlib.import_module("originfleet.llmproxy.correction")
+service = importlib.import_module("roadstead.service")
+correction = importlib.import_module("roadstead.correction")
 C = correction.Correction  # degeneration guard moved here in de-monolith Step 3
 
 # A repetition loop: the same 6-word shingle dominates the whole output.
@@ -81,7 +81,7 @@ def _req():
     # Phase 5 accounting fields (metrics sample + corrected-row persist).
     r.agent_id = "sidekick"
     r.priority = importlib.import_module(
-        "originfleet.llmproxy.config").LLMPriority.P2_POST_TURN
+        "roadstead.config").LLMPriority.P2_POST_TURN
     r.session_id = None
     r.turn_id = None
     r.caller_id = None

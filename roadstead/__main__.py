@@ -1,6 +1,6 @@
 """Entry point for the LLM proxy service.
 
-    python -m originfleet.llmproxy [--port 42161]
+    python -m roadstead [--port 42161]
 
 Runs as a standalone Starlette/uvicorn process.
 """
@@ -28,7 +28,7 @@ from .hooks import set_degradation_sink
 from .routes import make_routes
 from .service import _DRAIN_DEADLINE_S, ProxyService
 
-logger = logging.getLogger("originfleet.llmproxy")
+logger = logging.getLogger("roadstead")
 
 # Server-side idle keepalive close (seconds). Raised from uvicorn's DEFAULT 5s
 # (2026-07-06 — regression_ledger: llmproxy-keepalive-disconnect): 5s coincided
@@ -199,8 +199,8 @@ def main() -> None:
 
 
 def _test_cli() -> None:
-    """Entry point for `python -m originfleet.llmproxy test ...`."""
-    p = argparse.ArgumentParser(prog="originfleet.llmproxy test")
+    """Entry point for `python -m roadstead test ...`."""
+    p = argparse.ArgumentParser(prog="roadstead test")
     sub = p.add_subparsers(dest="mode", required=True)
 
     sim_p = sub.add_parser("sim", help="Discrete-event simulation")

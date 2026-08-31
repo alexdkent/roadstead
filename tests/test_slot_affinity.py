@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from originfleet.llmproxy.config import EndpointConfig, PriorityBand
+from roadstead.config import EndpointConfig, PriorityBand
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +77,7 @@ def test_no_live_endpoint_uses_slot_affinity():
     future llama.cpp endpoint stays a one-line yaml change. This test asserts the
     live state so that turning it on somewhere is a DELIBERATE, visible edit.
     """
-    from originfleet.llmproxy.config import DEFAULT_ENDPOINTS
+    from roadstead.config import DEFAULT_ENDPOINTS
     enabled = [n for n, ep in DEFAULT_ENDPOINTS.items() if ep.slot_affinity]
     assert enabled == [], (
         f"{enabled} now set slot_affinity. That is fine — but it is llama.cpp-only "

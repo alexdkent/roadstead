@@ -35,10 +35,10 @@ import logging
 
 import pytest
 
-from originfleet.llmproxy.backend import BackendResponse, BackendStreamEvent
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.scheduler import QueuedRequest
-from originfleet.llmproxy.service import ProxyService
+from roadstead.backend import BackendResponse, BackendStreamEvent
+from roadstead.config import ProxyConfig
+from roadstead.scheduler import QueuedRequest
+from roadstead.service import ProxyService
 
 
 class _Req:

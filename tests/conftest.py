@@ -33,7 +33,7 @@ import time
 
 import pytest
 
-from originfleet.llmproxy.backend import BackendClientPool
+from roadstead.backend import BackendClientPool
 
 
 # --- tmpfs redirect for test scratch (SQLite fsync avoidance) --------------
@@ -202,5 +202,5 @@ def _fast_retry_backoff(monkeypatch):
     the module global at call time, so patching the module attribute takes
     effect. Doctrine: shrink the corpus/waits, never raise the budget."""
     monkeypatch.setattr(
-        "originfleet.llmproxy.lifecycle._RETRY_BACKOFF_S", 0.02, raising=False)
+        "roadstead.lifecycle._RETRY_BACKOFF_S", 0.02, raising=False)
     yield

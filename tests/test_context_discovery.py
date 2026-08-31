@@ -11,8 +11,8 @@ this could wrongly reject requests that actually fit.
 """
 from __future__ import annotations
 
-from originfleet.llmproxy.config import EndpointConfig
-from originfleet.llmproxy.health import Health
+from roadstead.config import EndpointConfig
+from roadstead.health import Health
 
 
 def _ep(max_slots: int = 4) -> EndpointConfig:

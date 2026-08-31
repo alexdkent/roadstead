@@ -35,11 +35,11 @@ import pytest
 # per-ship in_container_tollgate via `-m 'not heavy'` (see pyproject `heavy`).
 pytestmark = pytest.mark.heavy
 
-from originfleet.llmproxy.backend import extract_cached_tokens
-from originfleet.llmproxy.queue import PersistentQueue
-from originfleet.llmproxy.timeout_model import normalize_endpoint
+from roadstead.backend import extract_cached_tokens
+from roadstead.queue import PersistentQueue
+from roadstead.timeout_model import normalize_endpoint
 
-from tests.llmproxy.fake_backend import _OMIT_USAGE, _UNSET  # noqa: F401  (imported for parity/clarity)
+from tests.fake_backend import _OMIT_USAGE, _UNSET  # noqa: F401  (imported for parity/clarity)
 
 
 # --------------------------------------------------------------------------- #

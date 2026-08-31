@@ -40,12 +40,12 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-config = importlib.import_module("originfleet.llmproxy.config")
-correction = importlib.import_module("originfleet.llmproxy.correction")
-model_catalog = importlib.import_module("originfleet.llmproxy.model_catalog")
+config = importlib.import_module("roadstead.config")
+correction = importlib.import_module("roadstead.correction")
+model_catalog = importlib.import_module("roadstead.model_catalog")
 C = correction.Correction
 
 BARE = {"type": "json_object"}
@@ -297,7 +297,7 @@ def test_unstripped_request_does_not_claim_the_flag():
 def test_queued_request_carries_the_field():
     """It must be a real dataclass field, not an attribute the guard invents —
     the WAL-recovery path rebuilds QueuedRequest from the DB."""
-    scheduler = importlib.import_module("originfleet.llmproxy.scheduler")
+    scheduler = importlib.import_module("roadstead.scheduler")
     req = scheduler.QueuedRequest.create(
         agent_id="sidekick", endpoint="tier3", priority=None,
         call_site="auto_approve.critic", payload_type="chat_completion",

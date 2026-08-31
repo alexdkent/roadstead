@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import pytest
 
-from originfleet.llmproxy.backend import BackendResponse
-from originfleet.llmproxy.config import LLMPriority, ProxyConfig, normalize_endpoint
-from originfleet.llmproxy.service import ProxyService, _to_float, _to_int
-from originfleet.llmproxy import __main__ as proxy_main
+from roadstead.backend import BackendResponse
+from roadstead.config import LLMPriority, ProxyConfig, normalize_endpoint
+from roadstead.service import ProxyService, _to_float, _to_int
+from roadstead import __main__ as proxy_main
 
 
 # --- tier 1: deterministic correction ---------------------------------------
@@ -146,8 +146,8 @@ async def test_unhandled_handler_returns_500_envelope():
 import asyncio
 import json as _json
 
-from originfleet.llmproxy.service import ProxyService as _Svc
-from originfleet.llmproxy.config import ProxyConfig as _Cfg
+from roadstead.service import ProxyService as _Svc
+from roadstead.config import ProxyConfig as _Cfg
 
 
 class _LoopbackReq:
@@ -202,7 +202,7 @@ async def test_known_roles_and_aliases_pass_the_gate():
     svc._flags.set_many({"unknown_endpoint_enforce": True})
 
     async def ok_call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
-        from originfleet.llmproxy.backend import BackendResponse
+        from roadstead.backend import BackendResponse
         return BackendResponse(
             status_code=200,
             body={"choices": [{"message": {"content": "y"}, "finish_reason": "stop"}],

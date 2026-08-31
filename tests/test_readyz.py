@@ -17,9 +17,9 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from originfleet.llmproxy.__main__ import build_app
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.model_catalog import build_endpoint_kwargs
+from roadstead.__main__ import build_app
+from roadstead.config import ProxyConfig
+from roadstead.model_catalog import build_endpoint_kwargs
 
 # The proxy ACLs some routes by source IP; use the internal client tuple the
 # other proxy tests use so this exercises the real middleware rather than

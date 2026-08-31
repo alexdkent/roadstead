@@ -19,13 +19,13 @@ from typing import Iterator, List
 import httpx
 import pytest
 
-from tests.llmproxy.fake_backend import (
+from tests.fake_backend import (
     ALL_FAULTS,
     FakeBackend,
     FakeBackendServer,
     MidStreamReset,
 )
-from tests.llmproxy import fake_backend as fb
+from tests import fake_backend as fb
 
 
 @pytest.fixture
@@ -119,7 +119,7 @@ def test_meta_finish_length(server):
 
 def test_meta_degenerate_loop(server):
     # must trip the proxy's detector: 6-word shingle repeating >= 6x over >= 40 words
-    from originfleet.llmproxy.service import _is_degenerate_text
+    from roadstead.service import _is_degenerate_text
     text = _chat(server, fb.FAULT_DEGENERATE_LOOP).json()["choices"][0]["message"]["content"]
     assert _is_degenerate_text(text), "degenerate fault did not trip the real detector"
 

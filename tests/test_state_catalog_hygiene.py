@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import time
 
-from originfleet.llmproxy import model_catalog as mc
-from originfleet.llmproxy.agent_budget import BudgetManager
-from originfleet.llmproxy.config import ProxyConfig, cache_drift_alarm_enabled
-from originfleet.llmproxy.queue import PersistentQueue
-from originfleet.llmproxy.state import ProxyState
+from roadstead import model_catalog as mc
+from roadstead.agent_budget import BudgetManager
+from roadstead.config import ProxyConfig, cache_drift_alarm_enabled
+from roadstead.queue import PersistentQueue
+from roadstead.state import ProxyState
 
 
 # ---- ProxyState construction invariants (was: only exercised by a heavy e2e) --

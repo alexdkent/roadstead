@@ -3,7 +3,7 @@
 import time
 import pytest
 
-from originfleet.llmproxy.agent_budget import AgentBudget, BudgetManager
+from roadstead.agent_budget import AgentBudget, BudgetManager
 
 
 class TestAgentBudget:

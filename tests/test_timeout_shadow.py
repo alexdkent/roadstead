@@ -12,9 +12,9 @@ import time
 
 import pytest
 
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.scheduler import DispatchDecision, QueuedRequest
-from originfleet.llmproxy.service import ProxyService
+from roadstead.config import ProxyConfig
+from roadstead.scheduler import DispatchDecision, QueuedRequest
+from roadstead.service import ProxyService
 
 
 def _make_service(tmp_path) -> ProxyService:

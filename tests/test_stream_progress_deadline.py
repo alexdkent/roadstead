@@ -29,11 +29,11 @@ import time
 
 import pytest
 
-from originfleet.llmproxy import lifecycle as lifecycle_mod
-from originfleet.llmproxy.backend import BackendStreamEvent
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.scheduler import QueuedRequest
-from originfleet.llmproxy.service import ProxyService
+from roadstead import lifecycle as lifecycle_mod
+from roadstead.backend import BackendStreamEvent
+from roadstead.config import ProxyConfig
+from roadstead.scheduler import QueuedRequest
+from roadstead.service import ProxyService
 
 
 class _FakeRequest:

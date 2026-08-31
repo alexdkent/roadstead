@@ -20,20 +20,20 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-from originfleet.llmproxy import failover as failover_mod  # noqa: E402
-from originfleet.llmproxy.config import (  # noqa: E402
+from roadstead import failover as failover_mod  # noqa: E402
+from roadstead.config import (  # noqa: E402
     LLMPriority,
     load_agent_configs,
     PriorityBand,
     ProxyConfig,
     normalize_endpoint,
 )
-from originfleet.llmproxy.model_catalog import build_endpoint_kwargs, load_catalog  # noqa: E402
-from originfleet.llmproxy.scheduler import QueuedRequest  # noqa: E402
-from originfleet.llmproxy.service import ProxyService  # noqa: E402
+from roadstead.model_catalog import build_endpoint_kwargs, load_catalog  # noqa: E402
+from roadstead.scheduler import QueuedRequest  # noqa: E402
+from roadstead.service import ProxyService  # noqa: E402
 
 SRC = "thinker"      # tier3
 TGT = "creative"     # tier2-analyst

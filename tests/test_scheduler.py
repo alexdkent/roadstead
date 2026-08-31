@@ -7,10 +7,10 @@ from typing import Dict, Optional, Tuple
 
 import pytest
 
-from originfleet.llmproxy.agent_budget import BudgetManager
-from originfleet.llmproxy.config import LLMPriority, PriorityBand, ProxyConfig
-from originfleet.llmproxy.cost_model import CostModel
-from originfleet.llmproxy.scheduler import (
+from roadstead.agent_budget import BudgetManager
+from roadstead.config import LLMPriority, PriorityBand, ProxyConfig
+from roadstead.cost_model import CostModel
+from roadstead.scheduler import (
     CompletionRecord,
     QueuedRequest,
     Scheduler,

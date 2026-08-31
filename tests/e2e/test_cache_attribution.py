@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from originfleet.llmproxy.backend import extract_cached_tokens
+from roadstead.backend import extract_cached_tokens
 
 
 # --------------------------------------------------------------------------- #

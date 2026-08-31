@@ -24,11 +24,11 @@ import json
 
 import pytest
 
-from originfleet.llmproxy import scheduler as _sched
-from originfleet.llmproxy.backend import BackendResponse
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.constants import _DEFAULT_TIMEOUT_S
-from originfleet.llmproxy.service import ProxyService
+from roadstead import scheduler as _sched
+from roadstead.backend import BackendResponse
+from roadstead.config import ProxyConfig
+from roadstead.constants import _DEFAULT_TIMEOUT_S
+from roadstead.service import ProxyService
 
 
 class _Req:

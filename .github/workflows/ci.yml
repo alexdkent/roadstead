@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is what the origin deployment runs; 3.12 guards forward drift.
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Import standalone
+        # Proves the sever holds: the package must import with no host application present.
+        run: |
+          python -c "
+          import roadstead.scheduler, roadstead.cost_model, roadstead.timeout_model
+          import roadstead.correction, roadstead.lifecycle, roadstead.health
+          import roadstead.hooks, roadstead.metrics, roadstead.model_catalog
+          print('standalone import OK')
+          "
+
+      - name: No host-application imports in the library core
+        # __main__.py may carry guarded optional imports; nothing else may.
+        run: |
+          if grep -rn '^\s*from originfleet\|^\s*import originfleet' roadstead/ \
+               --include='*.py' | grep -v '^roadstead/__main__.py'; then
+            echo "::error::a library module imports the host application — the sever regressed"
+            exit 1
+          fi
+          echo "library core is clean"
+
+      - name: Test
+        run: pytest -q --timeout=120

@@ -21,13 +21,13 @@ import json
 
 import pytest
 
-from originfleet.llmproxy.backend import (
+from roadstead.backend import (
     BackendError,
     BackendResponse,
     BackendUnavailable,
 )
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import _EMPTY_RESCUE_MIN_TOKENS, ProxyService
+from roadstead.config import ProxyConfig
+from roadstead.service import _EMPTY_RESCUE_MIN_TOKENS, ProxyService
 
 
 class _Req:

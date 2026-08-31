@@ -7,9 +7,9 @@ import time
 
 import pytest
 
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.queue import PersistentQueue
-from originfleet.llmproxy.test_harness import (
+from roadstead.config import ProxyConfig
+from roadstead.queue import PersistentQueue
+from roadstead.test_harness import (
     ABReport,
     ABResult,
     ProxyTestHarness,

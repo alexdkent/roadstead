@@ -2,7 +2,7 @@
 
 import pytest
 
-from originfleet.llmproxy.cost_model import (
+from roadstead.cost_model import (
     CostModel,
     EndpointCostModel,
     EWMATracker,

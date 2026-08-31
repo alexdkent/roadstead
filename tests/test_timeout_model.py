@@ -8,8 +8,8 @@ check that every endpoint class has a floor.
 
 from __future__ import annotations
 
-from originfleet.llmproxy.config import DEFAULT_ENDPOINTS
-from originfleet.llmproxy.timeout_model import (
+from roadstead.config import DEFAULT_ENDPOINTS
+from roadstead.timeout_model import (
     FLOOR_S,
     TimeoutModel,
     _bucket,
@@ -146,7 +146,7 @@ def test_timeout_floor_yaml_sync():
     different floor than the server enforces. This test caught the inert-yaml
     bug where classify 45→180 / composer 180→360 (commit 35df6545) were bumped
     in the yaml but never took effect. Bump BOTH in lockstep; this pins it."""
-    from originfleet.llmproxy.model_catalog import build_class_floors
+    from roadstead.model_catalog import build_class_floors
 
     yaml_floors = build_class_floors()
     assert yaml_floors, "models.yaml declares no timeout_floor_s — regression"
@@ -163,7 +163,7 @@ def test_timeout_floor_yaml_sync():
 
 # ----- adaptive load × size uplift + split ceilings (2026-07-05) -----
 
-from originfleet.llmproxy.timeout_model import (  # noqa: E402
+from roadstead.timeout_model import (  # noqa: E402
     _BACKGROUND_CEILING_S,
     _INTERACTIVE_CEILING_S,
     _SIZE_STRETCH_REF_TOKENS,
@@ -249,7 +249,7 @@ def test_ceiling_yaml_sync():
     timeout_ceiling_s so the interactive band can't strangle them. This pins
     that the yaml field is wired through build_class_ceilings (mirrors the
     timeout_floor_yaml_sync doctrine)."""
-    from originfleet.llmproxy.model_catalog import build_class_ceilings
+    from roadstead.model_catalog import build_class_ceilings
 
     ceilings = build_class_ceilings()
     assert ceilings, "models.yaml declares no timeout_ceiling_s — regression"

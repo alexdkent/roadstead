@@ -18,9 +18,9 @@ import json
 import pytest
 
 from originfleet.framework.token_budget import is_context_overflow_error
-from originfleet.llmproxy.backend import BackendResponse
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import ProxyService
+from roadstead.backend import BackendResponse
+from roadstead.config import ProxyConfig
+from roadstead.service import ProxyService
 
 
 class _Req:

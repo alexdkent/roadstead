@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from originfleet.llmproxy.observability import RequestLogger, RequestLogRecord
+from roadstead.observability import RequestLogger, RequestLogRecord
 
 
 def _rec(status: str) -> RequestLogRecord:
@@ -24,7 +24,7 @@ def _rec(status: str) -> RequestLogRecord:
 
 def test_ok_is_silent_failures_warn(tmp_path, caplog):
     rl = RequestLogger(str(tmp_path / "req.jsonl"))
-    with caplog.at_level(logging.WARNING, logger="originfleet.llmproxy.observability"):
+    with caplog.at_level(logging.WARNING, logger="roadstead.observability"):
         rl.log(_rec("ok"))
         rl.log(_rec("cancelled"))   # benign client disconnect — silent in text log
         rl.log(_rec("error"))

@@ -11,13 +11,13 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
 # Import the modules under test (package import so relative imports resolve).
-service = importlib.import_module("originfleet.llmproxy.service")
-config = importlib.import_module("originfleet.llmproxy.config")
-correction = importlib.import_module("originfleet.llmproxy.correction")
+service = importlib.import_module("roadstead.service")
+config = importlib.import_module("roadstead.config")
+correction = importlib.import_module("roadstead.correction")
 C = correction.Correction
 
 

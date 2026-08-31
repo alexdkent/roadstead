@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import pytest
 
-from originfleet.llmproxy import model_catalog
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.lifecycle import _carries_image
+from roadstead import model_catalog
+from roadstead.config import ProxyConfig
+from roadstead.lifecycle import _carries_image
 
 
 # --------------------------------------------------------------- 1. detector
@@ -162,7 +162,7 @@ def _image_body(endpoint: str) -> dict:
 
 @pytest.mark.asyncio
 async def test_image_to_a_blind_endpoint_is_counted_and_refused_when_armed():
-    from originfleet.llmproxy.service import ProxyService
+    from roadstead.service import ProxyService
 
     svc = ProxyService(ProxyConfig())
     blind = next(n for n, e in svc._state.config.endpoints.items() if not e.vision)
@@ -201,7 +201,7 @@ async def test_the_gate_is_shadow_by_default():
     """Unarmed, it must COUNT without changing behaviour — an enforcement that
     arrives with the telemetry would take a working caller down the moment a
     models.yaml stanza forgot to declare vision."""
-    from originfleet.llmproxy.service import ProxyService
+    from roadstead.service import ProxyService
 
     svc = ProxyService(ProxyConfig())
     blind = next(n for n, e in svc._state.config.endpoints.items() if not e.vision)

@@ -28,10 +28,10 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from originfleet.llmproxy.config import EndpointConfig, ProxyConfig
-from originfleet.llmproxy.__main__ import build_app
+from roadstead.config import EndpointConfig, ProxyConfig
+from roadstead.__main__ import build_app
 
-from tests.llmproxy.fake_backend import FakeBackend, FakeBackendServer
+from tests.fake_backend import FakeBackend, FakeBackendServer
 
 
 # Loopback client for the ASGI transport → ACL "internal" identity.

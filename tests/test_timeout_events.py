@@ -15,9 +15,9 @@ import time
 
 import pytest
 
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.scheduler import DispatchDecision, QueuedRequest
-from originfleet.llmproxy.service import ProxyService
+from roadstead.config import ProxyConfig
+from roadstead.scheduler import DispatchDecision, QueuedRequest
+from roadstead.service import ProxyService
 
 
 class _FakeRequest:
@@ -234,7 +234,7 @@ def test_report_surfaces_callers_and_context(tmp_path):
 
 def test_migration_upgrades_old_timeouts_table(tmp_path):
     import sqlite3
-    from originfleet.llmproxy.queue import PersistentQueue
+    from roadstead.queue import PersistentQueue
 
     db = str(tmp_path / "old.db")
     c = sqlite3.connect(db)

@@ -13,7 +13,7 @@ import sys
 
 _spec = importlib.util.spec_from_file_location(
     "thinker_bench",
-    pathlib.Path(__file__).resolve().parents[2]
+    pathlib.Path(__file__).resolve().parents[1]
     / "originfleet" / "scripts" / "thinker_bench.py",
 )
 tb = importlib.util.module_from_spec(_spec)

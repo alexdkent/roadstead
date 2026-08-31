@@ -32,12 +32,12 @@ import pytest
 # per-ship in_container_tollgate via `-m 'not heavy'` (see pyproject `heavy`).
 pytestmark = pytest.mark.heavy
 
-from tests.llmproxy.fake_backend import (
+from tests.fake_backend import (
     FAULT_DEGENERATE_LOOP,
     FAULT_MID_STREAM_RESET,
     FAULT_TRUNCATED_TOOL_CALLS,
 )
-from originfleet.llmproxy.correction import Correction
+from roadstead.correction import Correction
 
 FLAG = "COLLECTIVE_PROXY_UNIFORM_CORRECTION"
 

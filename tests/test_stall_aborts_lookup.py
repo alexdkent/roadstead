@@ -21,8 +21,8 @@ import json
 
 import pytest
 
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import ProxyService
+from roadstead.config import ProxyConfig
+from roadstead.service import ProxyService
 
 
 class _FakeRequest:
@@ -242,7 +242,7 @@ async def test_route_returns_the_rows_not_merely_a_200(tmp_path):
 @pytest.mark.asyncio
 async def test_route_is_registered_on_the_real_app(tmp_path):
     """A handler nobody can reach is a module that was written and never called."""
-    from originfleet.llmproxy.routes import make_routes
+    from roadstead.routes import make_routes
 
     paths = {r.path for r in make_routes(_svc(tmp_path))}
     assert "/v1/timeouts/stalls" in paths

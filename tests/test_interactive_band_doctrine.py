@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import pytest
 
-from originfleet.llmproxy.acl import IPIdentityMap
-from originfleet.llmproxy.config import LLMPriority, ProxyConfig
-from originfleet.llmproxy.constants import (
+from roadstead.acl import IPIdentityMap
+from roadstead.config import LLMPriority, ProxyConfig
+from roadstead.constants import (
     _INTERACTIVE_CEILING_S,
     _SMART_DEFAULT_CAP_S,
 )

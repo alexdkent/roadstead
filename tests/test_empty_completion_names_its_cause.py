@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import pytest
 
-from originfleet.llmproxy.backend import empty_completion_error
+from roadstead.backend import empty_completion_error
 
 
 def _gate(content, reasoning, finish, output_tokens, role="llama-thinker"):

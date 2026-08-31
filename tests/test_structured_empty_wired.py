@@ -15,10 +15,10 @@ import json
 
 import pytest
 
-from originfleet.llmproxy import observability as obs
-from originfleet.llmproxy.backend import BackendResponse
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import ProxyService
+from roadstead import observability as obs
+from roadstead.backend import BackendResponse
+from roadstead.config import ProxyConfig
+from roadstead.service import ProxyService
 
 
 class _LoopbackRequest:

@@ -24,13 +24,13 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-backend = importlib.import_module("originfleet.llmproxy.backend")
-config = importlib.import_module("originfleet.llmproxy.config")
-model_catalog = importlib.import_module("originfleet.llmproxy.model_catalog")
-correction = importlib.import_module("originfleet.llmproxy.correction")
+backend = importlib.import_module("roadstead.backend")
+config = importlib.import_module("roadstead.config")
+model_catalog = importlib.import_module("roadstead.model_catalog")
+correction = importlib.import_module("roadstead.correction")
 C = correction.Correction
 
 _norm = backend._normalize_chat_payload

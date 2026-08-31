@@ -30,13 +30,13 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-correction = importlib.import_module("originfleet.llmproxy.correction")
-lp_obs = importlib.import_module("originfleet.llmproxy.observability")
+correction = importlib.import_module("roadstead.correction")
+lp_obs = importlib.import_module("roadstead.observability")
 fw_obs = importlib.import_module("originfleet.framework.observability")
-hooks = importlib.import_module("originfleet.llmproxy.hooks")
+hooks = importlib.import_module("roadstead.hooks")
 C = correction.Correction
 
 

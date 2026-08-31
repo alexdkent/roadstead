@@ -34,13 +34,13 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-backend = importlib.import_module("originfleet.llmproxy.backend")
-config = importlib.import_module("originfleet.llmproxy.config")
-health = importlib.import_module("originfleet.llmproxy.health")
-model_catalog = importlib.import_module("originfleet.llmproxy.model_catalog")
+backend = importlib.import_module("roadstead.backend")
+config = importlib.import_module("roadstead.config")
+health = importlib.import_module("roadstead.health")
+model_catalog = importlib.import_module("roadstead.model_catalog")
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +262,7 @@ def test_every_backend_probe_is_stubbed_in_the_unit_suite():
     goes stale silently is worse than no guard. Now a new probe fails HERE, on
     the day it is written, with a message saying what to do.
     """
-    from tests.llmproxy.conftest import STUBBED_PROBES
+    from tests.conftest import STUBBED_PROBES
 
     # Deliberately NOT stubbed, and this predates 2026-08-24 — the coverage
     # test found them, it did not create them. Both are driven only by tests

@@ -23,12 +23,12 @@ import contextlib
 
 import pytest
 
-from originfleet.llmproxy import scheduler as _sched
-from originfleet.llmproxy.acl import IPIdentityMap
-from originfleet.llmproxy.backend import BackendResponse
-from originfleet.llmproxy.config import LLMPriority, ProxyConfig
-from originfleet.llmproxy.constants import _DEFAULT_TIMEOUT_S, _SMART_DEFAULT_CAP_S
-from originfleet.llmproxy.service import ProxyService
+from roadstead import scheduler as _sched
+from roadstead.acl import IPIdentityMap
+from roadstead.backend import BackendResponse
+from roadstead.config import LLMPriority, ProxyConfig
+from roadstead.constants import _DEFAULT_TIMEOUT_S, _SMART_DEFAULT_CAP_S
+from roadstead.service import ProxyService
 
 # The smart default for "chat" (-> the creative endpoint class) on a cold model.
 # Both it and the flat default are far below the 1800s floor, so the floor is

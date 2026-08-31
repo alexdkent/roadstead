@@ -18,12 +18,12 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from originfleet.llmproxy import backend as backend_mod
-from originfleet.llmproxy.backend import (
+from roadstead import backend as backend_mod
+from roadstead.backend import (
     BackendClientPool,
     BackendUnavailable,
 )
-from originfleet.llmproxy.config import EndpointConfig
+from roadstead.config import EndpointConfig
 
 
 def _thinker_cfg(max_slots=32) -> EndpointConfig:

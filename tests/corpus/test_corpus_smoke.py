@@ -17,7 +17,7 @@ import json
 
 import pytest
 
-from tests.llmproxy.corpus.schemas import (
+from tests.corpus.schemas import (
     CHAT_LOOP_CASES,
     STRUCTURED_CASES,
     StructuredCase,

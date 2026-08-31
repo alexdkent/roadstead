@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 
-from originfleet.llmproxy.backend import (
+from roadstead.backend import (
     _THINKING_BUDGET_CEILING,
     _THINKING_BUDGET_FLOOR,
     _apply_thinking_token_budget,
@@ -149,7 +149,7 @@ def test_the_models_yaml_key_reaches_endpoint_config():
     the value, `EndpointConfig` keeps the default, and the cap simply never applies
     while the config looks correct.
     """
-    from originfleet.llmproxy import config
+    from roadstead import config
 
     ep = config.DEFAULT_ENDPOINTS[config.normalize_endpoint("tier3")]
     assert hasattr(ep, "thinking_budget_ratio"), (
@@ -168,7 +168,7 @@ def test_no_other_endpoint_declares_a_ratio_it_cannot_honour():
     stray declaration on tier2 would not degrade it — it would break every thinking
     call to it. Today exactly one backend is launched with the flag.
     """
-    from originfleet.llmproxy import config
+    from roadstead import config
 
     declared = {name for name, ep in config.DEFAULT_ENDPOINTS.items()
                 if getattr(ep, "thinking_budget_ratio", 0)}

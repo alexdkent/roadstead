@@ -22,10 +22,10 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-correction = importlib.import_module("originfleet.llmproxy.correction")
+correction = importlib.import_module("roadstead.correction")
 C = correction.Correction
 
 FLAG = "COLLECTIVE_PROXY_UNIFORM_CORRECTION"

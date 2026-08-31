@@ -18,13 +18,13 @@ import asyncio
 
 import pytest
 
-from originfleet.llmproxy.timeout_model import normalize_endpoint
+from roadstead.timeout_model import normalize_endpoint
 
 # Exhaustive ProxyService-spinning adversarial matrix — deselected from the
 # per-ship in_container_tollgate via `-m 'not heavy'` (see pyproject `heavy`).
 pytestmark = pytest.mark.heavy
 
-from tests.llmproxy.fake_backend import (
+from tests.fake_backend import (
     FAULT_HTTP_400,
     FAULT_HTTP_500,
     FAULT_MID_STREAM_RESET,
@@ -200,7 +200,7 @@ async def test_sync_timeout_counts_toward_cooldown(proxy, monkeypatch):
     disabled here (ratio 0.0 can never be met) to keep this focused on the thing
     it actually tests: that the call site is WIRED. The exclusion's own behaviour
     is asserted by test_sub_floor_timeout_excluded_from_cooldown_e2e below."""
-    import originfleet.llmproxy.lifecycle as _lc
+    import roadstead.lifecycle as _lc
     monkeypatch.setattr(_lc, "_COOLDOWN_BEST_EFFORT_RATIO", 0.0)
     monkeypatch.setenv(SHADOW, "1")
     monkeypatch.setenv(ALLOWED, "2")
@@ -312,7 +312,7 @@ def test_record_dispatch_failure_fail_open(monkeypatch, exc):
 
     monkeypatch.setenv(ENFORCE, "1")
     monkeypatch.setenv(ALLOWED, "2")
-    Health = importlib.import_module("originfleet.llmproxy.health").Health
+    Health = importlib.import_module("roadstead.health").Health
     state = types.SimpleNamespace(
         endpoint_failure_times={}, endpoint_cooldown_until={},
         endpoint_cooldown_trips={}, paused_endpoints=set(), endpoint_health={},
@@ -336,10 +336,10 @@ def test_record_dispatch_failure_broken_state_never_crashes_dispatch(monkeypatch
     here we assert the classification short-circuit protects the common path: a
     4xx exits before ANY state access."""
     import importlib
-    from originfleet.llmproxy.backend import BackendError
+    from roadstead.backend import BackendError
 
     monkeypatch.setenv(ENFORCE, "1")
-    Health = importlib.import_module("originfleet.llmproxy.health").Health
+    Health = importlib.import_module("roadstead.health").Health
     h = Health(object())  # no dicts at all
     # 4xx classified out before touching state → no AttributeError.
     h.record_dispatch_failure("chat", BackendError(404, "nope"))

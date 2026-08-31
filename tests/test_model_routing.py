@@ -13,10 +13,10 @@ import logging
 
 import pytest
 
-from originfleet.llmproxy.backend import _normalize_chat_payload
-from originfleet.llmproxy.config import EndpointConfig, ProxyConfig
-from originfleet.llmproxy.scheduler import QueuedRequest
-from originfleet.llmproxy.service import ProxyService
+from roadstead.backend import _normalize_chat_payload
+from roadstead.config import EndpointConfig, ProxyConfig
+from roadstead.scheduler import QueuedRequest
+from roadstead.service import ProxyService
 
 
 def _svc() -> ProxyService:

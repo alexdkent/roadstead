@@ -31,7 +31,7 @@ import pytest
 import yaml
 
 _HERE = Path(__file__).resolve()
-_REPO_ROOT = _HERE.parents[3]                       # .../OriginFleet
+_REPO_ROOT = _HERE.parents[1]                       # .../OriginFleet
 _MODELS_YAML = _REPO_ROOT / "originfleet" / "originfleet" / "llmproxy" / "models.yaml"
 
 #: Statuses that describe a model actually placed on hardware today.

@@ -13,8 +13,8 @@ import time
 
 import pytest
 
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import ProxyService
+from roadstead.config import ProxyConfig
+from roadstead.service import ProxyService
 
 
 def _seed_completions(conn: sqlite3.Connection, n: int = 20) -> None:

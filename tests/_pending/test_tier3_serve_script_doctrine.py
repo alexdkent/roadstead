@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[1]
 VLLM_DIR = REPO / "infra" / "anvil" / "vllm"
 LAGUNA_SCRIPT = VLLM_DIR / "serve_tier3_prod.sh"
 ENV_SCRIPT = VLLM_DIR / "v4flash" / "tier3_env.sh"
@@ -313,10 +313,10 @@ def test_co_hosts_survives_into_the_catalog(tier3: dict) -> None:
     the declaration actually reaches ModelEntry rather than only existing in YAML."""
     import sys
     from pathlib import Path
-    root = Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[1]
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    from originfleet.llmproxy import model_catalog
+    from roadstead import model_catalog
 
     entry = model_catalog.load_catalog().entry("tier3")
     assert entry is not None, "tier3 did not resolve in the catalog"

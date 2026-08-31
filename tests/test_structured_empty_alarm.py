@@ -21,11 +21,11 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-obs = importlib.import_module("originfleet.llmproxy.observability")
-health_mod = importlib.import_module("originfleet.llmproxy.health")
+obs = importlib.import_module("roadstead.observability")
+health_mod = importlib.import_module("roadstead.health")
 
 W = obs.STRUCTURED_EMPTY_WINDOW_S
 FLOOR = obs.STRUCTURED_EMPTY_MIN_SAMPLES

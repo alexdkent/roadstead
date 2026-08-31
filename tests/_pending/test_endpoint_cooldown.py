@@ -36,11 +36,11 @@ import time
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-health_mod = importlib.import_module("originfleet.llmproxy.health")
-backend_mod = importlib.import_module("originfleet.llmproxy.backend")
+health_mod = importlib.import_module("roadstead.health")
+backend_mod = importlib.import_module("roadstead.backend")
 Health = health_mod.Health
 BackendError = backend_mod.BackendError
 BackendTimeout = backend_mod.BackendTimeout

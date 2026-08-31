@@ -12,9 +12,9 @@ import json
 
 import pytest
 
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.flags import DEFAULT_FLAGS, RuntimeFlags
-from originfleet.llmproxy.service import ProxyService
+from roadstead.config import ProxyConfig
+from roadstead.flags import DEFAULT_FLAGS, RuntimeFlags
+from roadstead.service import ProxyService
 
 
 class _Req:

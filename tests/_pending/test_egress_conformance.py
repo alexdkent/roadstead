@@ -15,7 +15,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-_REPO_C2 = Path(__file__).resolve().parents[2]              # <repo>/originfleet
+_REPO_C2 = Path(__file__).resolve().parents[1]              # <repo>/originfleet
 
 
 def _load(name: str, rel: str):

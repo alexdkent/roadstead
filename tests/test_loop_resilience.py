@@ -20,9 +20,9 @@ import json
 
 import pytest
 
-from originfleet.llmproxy.backend import BackendResponse
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import ProxyService
+from roadstead.backend import BackendResponse
+from roadstead.config import ProxyConfig
+from roadstead.service import ProxyService
 
 
 class _FakeRequest:

@@ -17,9 +17,9 @@ import json
 import pytest
 
 from originfleet.framework.nexus_errors import is_deferrable_llm_error
-from originfleet.llmproxy.backend import BackendError, BackendResponse
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import ProxyService
+from roadstead.backend import BackendError, BackendResponse
+from roadstead.config import ProxyConfig
+from roadstead.service import ProxyService
 
 
 class _Req:
@@ -141,7 +141,7 @@ async def test_proxy_timeout_coded():
         # Slow enough to outlive the caller's 0.3s deadline, short enough that
         # shutdown's drain isn't held to its 30s straggler deadline.
         await asyncio.sleep(1.2)
-        from originfleet.llmproxy.backend import BackendTimeout
+        from roadstead.backend import BackendTimeout
         raise BackendTimeout("late")
 
     svc._backend.call = never_returns

@@ -13,7 +13,7 @@ import threading
 
 import pytest
 
-from originfleet.llmproxy.queue import PersistentQueue
+from roadstead.queue import PersistentQueue
 
 
 def _make_started_queue(tmp_path) -> PersistentQueue:

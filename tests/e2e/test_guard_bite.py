@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import pytest
 
-from originfleet.llmproxy import correction as correction_mod
-from originfleet.llmproxy import service as service_mod  # noqa: F401
-from originfleet.llmproxy.service import _is_degenerate_text
+from roadstead import correction as correction_mod
+from roadstead import service as service_mod  # noqa: F401
+from roadstead.service import _is_degenerate_text
 
-from tests.llmproxy.fake_backend import FAULT_DEGENERATE_LOOP
+from tests.fake_backend import FAULT_DEGENERATE_LOOP
 
 
 async def test_degeneration_guard_present_corrects(proxy):

@@ -67,13 +67,13 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import httpx
 import pytest
 
-from originfleet.llmproxy.__main__ import build_app
+from roadstead.__main__ import build_app
 
 # Reuse the exact Phase-T e2e construction so capture-mode proxies are identical
 # to the ``proxy`` fixture used in assert-mode (no drift between the two paths).
-from tests.llmproxy.e2e.conftest import ProxyHarness, _repointed_config
-from tests.llmproxy.fake_backend import FakeBackend, FakeBackendServer
-from tests.llmproxy.corpus.schemas import _CHAT_CASE_D
+from tests.e2e.conftest import ProxyHarness, _repointed_config
+from tests.fake_backend import FakeBackend, FakeBackendServer
+from tests.corpus.schemas import _CHAT_CASE_D
 
 
 _BASELINE_PATH = Path(__file__).parent / "golden" / "behavior_baseline.json"

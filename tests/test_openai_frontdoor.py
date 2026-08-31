@@ -17,13 +17,13 @@ import json
 
 import pytest
 
-from originfleet.llmproxy.backend import (
+from roadstead.backend import (
     BackendError,
     BackendResponse,
     BackendStreamEvent,
 )
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.service import ProxyService, _ToolCallStreamSanitizer
+from roadstead.config import ProxyConfig
+from roadstead.service import ProxyService, _ToolCallStreamSanitizer
 
 
 # A docker-bridge IP → ACL "internal" identity (so handle_openai_chat's

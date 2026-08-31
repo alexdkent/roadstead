@@ -11,13 +11,13 @@ This is the test that would have caught the original bug.
 
 from __future__ import annotations
 
-from originfleet.llmproxy.backend import (
+from roadstead.backend import (
     _needs_alternation_fix,
     _normalize_chat_payload,
     _normalize_strict_alternation,
     _translate_anthropic_image_blocks,
 )
-from originfleet.llmproxy.coalesce import DeterministicCache
+from roadstead.coalesce import DeterministicCache
 
 
 # --- backend normalization ---
@@ -512,7 +512,7 @@ def test_ab_harness_normalizes_before_shadow_dispatch():
     backend gets system+grammar, matching what the proxy sends primary.
     Without this, shadow comparisons are invalid."""
     import inspect
-    from originfleet.llmproxy import test_harness
+    from roadstead import test_harness
     src = inspect.getsource(test_harness.ProxyTestHarness._ab_one)
     assert "_normalize_chat_payload" in src, (
         "A/B path must apply _normalize_chat_payload to the shadow payload"

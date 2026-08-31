@@ -7,12 +7,12 @@
 
 from __future__ import annotations
 
-from originfleet.llmproxy import coalesce
-from originfleet.llmproxy.agent_budget import BudgetManager
-from originfleet.llmproxy.config import EndpointConfig, ProxyConfig
-from originfleet.llmproxy.cost_model import CostModel
-from originfleet.llmproxy.queue import PersistentQueue
-from originfleet.llmproxy.scheduler import CompletionRecord, Scheduler
+from roadstead import coalesce
+from roadstead.agent_budget import BudgetManager
+from roadstead.config import EndpointConfig, ProxyConfig
+from roadstead.cost_model import CostModel
+from roadstead.queue import PersistentQueue
+from roadstead.scheduler import CompletionRecord, Scheduler
 
 
 def test_default_timeout_s_removed():

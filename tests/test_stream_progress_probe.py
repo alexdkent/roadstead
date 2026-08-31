@@ -34,10 +34,10 @@ import time
 
 import pytest
 
-from originfleet.llmproxy import lifecycle as lifecycle_mod
-from originfleet.llmproxy.backend import BackendClientPool, BackendStreamEvent
-from originfleet.llmproxy.config import EndpointConfig, ProxyConfig
-from originfleet.llmproxy.service import ProxyService
+from roadstead import lifecycle as lifecycle_mod
+from roadstead.backend import BackendClientPool, BackendStreamEvent
+from roadstead.config import EndpointConfig, ProxyConfig
+from roadstead.service import ProxyService
 
 
 async def _none(*a, **k):

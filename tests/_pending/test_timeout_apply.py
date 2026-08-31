@@ -292,7 +292,7 @@ def test_keepalive_invariant_client_below_server():
     """The client must retire idle connections BEFORE the proxy does, so a POST
     never reuses a server-closed keepalive socket (the RemoteProtocolError race).
     Pins client keepalive_expiry < server timeout_keep_alive with real margin."""
-    from originfleet.llmproxy.__main__ import PROXY_SERVER_KEEPALIVE_S
+    from roadstead.__main__ import PROXY_SERVER_KEEPALIVE_S
     assert _CLIENT_KEEPALIVE_EXPIRY_S < PROXY_SERVER_KEEPALIVE_S
     # margin must exceed plausible clock/RTT jitter, not just be positive
     assert PROXY_SERVER_KEEPALIVE_S - _CLIENT_KEEPALIVE_EXPIRY_S >= 5.0

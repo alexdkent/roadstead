@@ -15,10 +15,10 @@ import json
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # originfleet/
 sys.path.insert(0, str(REPO))
 
-service = importlib.import_module("originfleet.llmproxy.service")
+service = importlib.import_module("roadstead.service")
 San = service._ToolCallStreamSanitizer
 
 
@@ -191,7 +191,7 @@ def test_trailing_usage_frame_passes_through_untouched():
     must fast-path it — same object back, no rebuild — including right after a
     tool-call stream where slots were finalized by the finish chunk."""
     import json as _json
-    from originfleet.llmproxy.service import _ToolCallStreamSanitizer
+    from roadstead.service import _ToolCallStreamSanitizer
 
     s = _ToolCallStreamSanitizer()
     open_call = _json.dumps({"choices": [{"index": 0, "delta": {"tool_calls": [

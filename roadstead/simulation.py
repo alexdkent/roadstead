@@ -5,9 +5,9 @@ request streams.  No actual LLM backends needed — request durations
 are drawn from the cost model or scenario-specified distributions.
 
 Usage:
-    python -m originfleet.llmproxy.simulation stress all_agents_burst
-    python -m originfleet.llmproxy.simulation stress --all
-    python -m originfleet.llmproxy.simulation sweep --param thinker.max_slots --range 2,6 --scenario one_agent_flood
+    python -m roadstead.simulation stress all_agents_burst
+    python -m roadstead.simulation stress --all
+    python -m roadstead.simulation sweep --param thinker.max_slots --range 2,6 --scenario one_agent_flood
 """
 
 from __future__ import annotations

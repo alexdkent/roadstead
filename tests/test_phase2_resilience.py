@@ -18,12 +18,12 @@ import time
 
 import pytest
 
-from originfleet.llmproxy.backend import BackendResponse
-from originfleet.llmproxy.config import ProxyConfig
-from originfleet.llmproxy.observability import check_alerts, RollingMetrics
-from originfleet.llmproxy.queue import PersistentQueue
-from originfleet.llmproxy.scheduler import QueuedRequest
-from originfleet.llmproxy.service import ProxyService
+from roadstead.backend import BackendResponse
+from roadstead.config import ProxyConfig
+from roadstead.observability import check_alerts, RollingMetrics
+from roadstead.queue import PersistentQueue
+from roadstead.scheduler import QueuedRequest
+from roadstead.service import ProxyService
 
 
 class _FakeRequest:

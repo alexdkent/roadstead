@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import httpx
 
-from originfleet.llmproxy.backend import _transport_timeout
+from roadstead.backend import _transport_timeout
 
 
 def test_a_short_deadline_keeps_the_historic_read_floor():

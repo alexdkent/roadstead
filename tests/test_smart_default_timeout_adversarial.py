@@ -31,15 +31,15 @@ import pytest_asyncio
 # ProxyService-spinning E2E — keep out of the per-ship fast tier.
 pytestmark = pytest.mark.heavy
 
-from originfleet.llmproxy import scheduler as _sched
-from originfleet.llmproxy.__main__ import build_app
-from originfleet.llmproxy.backend import BackendResponse
-from originfleet.llmproxy.config import EndpointConfig, ProxyConfig
-from originfleet.llmproxy.constants import _DEFAULT_TIMEOUT_S, _SMART_DEFAULT_CAP_S
-from originfleet.llmproxy.service import ProxyService
-from originfleet.llmproxy.timeout_model import normalize_endpoint, resolve_ceiling_s
+from roadstead import scheduler as _sched
+from roadstead.__main__ import build_app
+from roadstead.backend import BackendResponse
+from roadstead.config import EndpointConfig, ProxyConfig
+from roadstead.constants import _DEFAULT_TIMEOUT_S, _SMART_DEFAULT_CAP_S
+from roadstead.service import ProxyService
+from roadstead.timeout_model import normalize_endpoint, resolve_ceiling_s
 
-from tests.llmproxy.fake_backend import (
+from tests.fake_backend import (
     FAULT_EMPTY_COMPLETION,
     FAULT_HTTP_503,
     FAULT_INTERTOKEN_STALL,
