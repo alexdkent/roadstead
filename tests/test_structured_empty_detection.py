@@ -36,6 +36,7 @@ sys.path.insert(0, str(REPO))
 correction = importlib.import_module("originfleet.llmproxy.correction")
 lp_obs = importlib.import_module("originfleet.llmproxy.observability")
 fw_obs = importlib.import_module("originfleet.framework.observability")
+hooks = importlib.import_module("originfleet.llmproxy.hooks")
 C = correction.Correction
 
 
@@ -262,12 +263,37 @@ def test_detector_is_total_on_garbage_input():
 
 def test_event_reaches_the_framework_degradation_seam():
     """Same seam the comment critic already uses, so it also lands on the
-    fleet-wide counter."""
+    fleet-wide counter.
+
+    Since the 2026-08-31 import sever, ``correction.py`` reports through
+    ``llmproxy.hooks.degradation`` rather than importing the framework
+    directly, and ``llmproxy/__main__.py`` registers the framework function as
+    the sink at startup. This test wires the SAME sink production wires, so it
+    still proves the event reaches the fleet-wide counter end to end."""
     fw_obs.reset_counters()
-    m = _mock_self()
-    m.detect_structured_empty(_req(BARE_STRIPPED_PAYLOAD, stripped=True),
-                              _result("{}"))
-    assert fw_obs.get_counter("llmproxy.structured_empty") == 1
+    hooks.set_degradation_sink(fw_obs.degradation)
+    try:
+        m = _mock_self()
+        m.detect_structured_empty(_req(BARE_STRIPPED_PAYLOAD, stripped=True),
+                                  _result("{}"))
+        assert fw_obs.get_counter("llmproxy.structured_empty") == 1
+    finally:
+        hooks.set_degradation_sink(None)
+
+
+def test_degradation_still_reported_with_no_sink_wired(caplog):
+    """The other half of the sever: a STANDALONE deployment registers no sink,
+    and the degradation must still be reported rather than silently dropped.
+    Pins the built-in fallback so removing it can't pass unnoticed."""
+    hooks.set_degradation_sink(None)
+    with caplog.at_level(logging.WARNING, logger=hooks.logger.name):
+        m = _mock_self()
+        m.detect_structured_empty(_req(BARE_STRIPPED_PAYLOAD, stripped=True),
+                                  _result("{}"))
+    line = "\n".join(r.getMessage() for r in caplog.records)
+    assert "DEGRADATION" in line
+    assert "component=llmproxy" in line
+    assert "reason=structured_empty" in line
 
 
 def test_event_carries_the_greppable_marker_and_caller_identity(caplog):

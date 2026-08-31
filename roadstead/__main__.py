@@ -24,6 +24,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .config import ProxyConfig, load_agent_configs
+from .hooks import set_degradation_sink
 from .routes import make_routes
 from .service import _DRAIN_DEADLINE_S, ProxyService
 
@@ -151,12 +152,30 @@ def main() -> None:
     # was already removed for. Failures still surface via our own handlers.
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
+    # ---- Host-application integration (OPTIONAL) --------------------------
+    # This entrypoint is the ONLY module in the package that knows originfleet
+    # exists, and every import below is soft: the proxy runs fully standalone
+    # without them, falling back to the built-in reporting in ``hooks.py``. A
+    # standalone deployment replaces this file wholesale and drops the block.
+    # Keep it that way — an unguarded import here re-couples the package.
+    try:
+        from originfleet.framework.observability import degradation
+        set_degradation_sink(degradation)
+    except ImportError:
+        logging.getLogger(__name__).debug(
+            "originfleet observability unavailable — degradations will be "
+            "reported via the built-in logging sink")
+
     # Emit a ship_version line on startup so the ship harness'
     # restart-phase health-poll can confirm the new build is running.
     # Same shape as originfleet.tools.llm_qos and every agent — the
     # harness greps for "[ship_version] agent=<name>" in the log.
-    from originfleet.framework.ship_version import log_ship_version
-    log_ship_version("llmproxy")
+    try:
+        from originfleet.framework.ship_version import log_ship_version
+        log_ship_version("llmproxy")
+    except ImportError:
+        logging.getLogger(__name__).debug(
+            "originfleet ship_version unavailable — no [ship_version] marker")
 
     app = build_app()
 

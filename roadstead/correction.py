@@ -37,6 +37,7 @@ from .grammar import (
     root_object_keys,
     verify_conformance,
 )
+from .hooks import degradation
 from .observability import MetricsSample, record_structured_outcome
 
 # Phase 3 schema-repair backstop deps. json-repair recovers parseable-but-not-
@@ -1758,7 +1759,6 @@ class Correction:
                 n_keys, content[:120],
             )
             try:
-                from originfleet.framework.observability import degradation
                 degradation(
                     component="llmproxy", reason="structured_empty",
                     impact="caller received a well-formed response with no "

@@ -34,7 +34,7 @@ from .observability import (
     check_alerts,
     structured_empty_alerts,
 )
-from originfleet.framework.prompt_security import record_security_event
+from .hooks import record_security_event
 
 if TYPE_CHECKING:
     from .config import EndpointConfig
@@ -752,7 +752,7 @@ class Health:
                 "cacheability card)",
                 d["call_site"], d["endpoint"], d["from"], d["to"])
             record_security_event(
-                None, logger,
+                logger,
                 event_type="llmproxy_cache_drift", severity="warning",
                 source=d["endpoint"], action=d["call_site"],
                 reason=f"prefix LCP% {d['from']}->{d['to']}",

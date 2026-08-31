@@ -376,7 +376,7 @@ class ProxyHttpHandlers:
         proxy_timeouts/_completions event tables stay the forensic system-of-
         record. Layer-split timeout counts + would-timeout% remain on
         /v1/timeouts (SQL-windowed), not here. Never raises — degrades to empty."""
-        from originfleet.framework.metrics import Metric, render_prometheus
+        from .metrics import Metric, render_prometheus
 
         now = time.monotonic()
         out: list[Metric] = []
