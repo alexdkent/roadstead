@@ -30,12 +30,11 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # repo root
 sys.path.insert(0, str(REPO))
 
 correction = importlib.import_module("roadstead.correction")
 lp_obs = importlib.import_module("roadstead.observability")
-fw_obs = importlib.import_module("originfleet.framework.observability")
 hooks = importlib.import_module("roadstead.hooks")
 C = correction.Correction
 
@@ -261,24 +260,63 @@ def test_detector_is_total_on_garbage_input():
 # The observability seam + the greppable marker
 # ---------------------------------------------------------------------------
 
-def test_event_reaches_the_framework_degradation_seam():
-    """Same seam the comment critic already uses, so it also lands on the
-    fleet-wide counter.
+def test_event_reaches_the_registered_degradation_sink():
+    """The event reaches whatever a host registered, with its payload intact.
 
-    Since the 2026-08-31 import sever, ``correction.py`` reports through
-    ``llmproxy.hooks.degradation`` rather than importing the framework
-    directly, and ``llmproxy/__main__.py`` registers the framework function as
-    the sink at startup. This test wires the SAME sink production wires, so it
-    still proves the event reaches the fleet-wide counter end to end."""
-    fw_obs.reset_counters()
-    hooks.set_degradation_sink(fw_obs.degradation)
+    Originally this registered ``originfleet.framework.observability.degradation``
+    and asserted the fleet-wide counter incremented — which needed the whole
+    monorepo present to run, and proved only that *some* call arrived. Since the
+    2026-08-31 import sever, ``correction.py`` reports through
+    ``roadstead.hooks.degradation``, and a host registers its own function there
+    at startup. A local spy is both standalone AND a stronger assertion: it pins
+    the whole shape of what crosses the seam, which is the actual contract a
+    host codes against. Counting is the host's business; *emitting* is ours.
+
+    ``component="llmproxy"`` is the wire marker the origin fleet greps for —
+    it is data, not a namespace reference, so the rename did not touch it."""
+    seen: list[dict] = []
+    hooks.set_degradation_sink(lambda **kw: seen.append(kw))
     try:
         m = _mock_self()
         m.detect_structured_empty(_req(BARE_STRIPPED_PAYLOAD, stripped=True),
                                   _result("{}"))
-        assert fw_obs.get_counter("llmproxy.structured_empty") == 1
     finally:
         hooks.set_degradation_sink(None)
+
+    assert len(seen) == 1, "exactly one degradation per empty response"
+    event = seen[0]
+    assert event["component"] == "llmproxy"
+    assert event["reason"] == "structured_empty"
+    assert "cannot tell this from a real answer" in event["impact"]
+    # The fields are what make the event actionable: without them an operator
+    # knows something returned nothing, but not who asked or which backend.
+    assert event["model"] == "thinker"
+    assert event["agent"] == "sidekick"
+    assert event["call_site"] == "auto_approve.critic"
+    assert event["stream"] is False
+    assert event["declared_schema"] is False
+
+
+def test_a_sink_that_raises_cannot_break_the_response():
+    """The seam must never be able to break a response — a host sink that
+    throws falls back to the built-in log rather than propagating. Pinned here
+    because this detector is the package's busiest caller of the seam, and the
+    failure mode it guards (a silent empty answer) is precisely the one you
+    cannot afford to have turn into a 500."""
+    def _broken(**kw):
+        raise RuntimeError("host observability is down")
+
+    hooks.set_degradation_sink(_broken)
+    try:
+        m = _mock_self()
+        res = _result("{}")
+        m.detect_structured_empty(_req(BARE_STRIPPED_PAYLOAD, stripped=True), res)
+    finally:
+        hooks.set_degradation_sink(None)
+
+    # Counted anyway, and the response is untouched.
+    assert m.state.structured_empty_total == 1
+    assert res["status"] == "ok"
 
 
 def test_degradation_still_reported_with_no_sink_wired(caplog):

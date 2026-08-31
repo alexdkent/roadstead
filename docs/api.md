@@ -52,6 +52,29 @@ caller's value, raised toward the recommendation when the model/tier/size needs 
 Deadlines are **soft** for streaming: the streaming path may extend a deadline while the backend is
 demonstrably still making decode progress, rather than killing work that is advancing.
 
+### 1.3 The keepalive ordering invariant 🚨
+
+Both ends pool HTTP connections, and **the ordering between their idle timeouts is load-bearing.**
+Whichever side expires an idle socket first is the side that closes it cleanly; if the *server* wins
+the race, a client POST can land on a socket the server has already closed and fail with
+`RemoteProtocolError("Server disconnected without sending a response.")` — a transport error for a
+request that was never attempted.
+
+| | value | where |
+|---|---|---|
+| Client `keepalive_expiry` | **4.5s** | the caller's HTTP pool (host's `_CLIENT_KEEPALIVE_EXPIRY_S`) |
+| Server `timeout_keep_alive` | **30s** | `PROXY_SERVER_KEEPALIVE_S`, env `COLLECTIVE_PROXY_SERVER_KEEPALIVE_S` |
+
+**Required: client < server, with at least 5s of margin** — enough to cover clock skew and RTT
+jitter, not merely a positive difference. The client must always retire idle connections first, so
+the proxy never yanks a socket a caller is about to reuse.
+
+Raised from uvicorn's 5s default on 2026-07-06 precisely because 5s *coincided* with the client's
+own expiry, making either side equally likely to close first under a concurrent burst.
+
+⚠️ `PROXY_SERVER_KEEPALIVE_S` is env-overridable, so this invariant can be broken from a deployment
+config without touching code. `tests/test_keepalive_invariant.py` pins the server side.
+
 ---
 
 ## 2. Error contract 🚨

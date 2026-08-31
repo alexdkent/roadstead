@@ -1,36 +1,41 @@
-# Quarantined tests — the first real task in this repo
+# Quarantined tests — Group A is done; B and C remain
 
-These fourteen files came across in the extraction but cannot run standalone yet. They are
+These fourteen files came across in the extraction but could not run standalone. They are
 **excluded from collection** (`norecursedirs` in `pyproject.toml`). None of them is dead — each needs
-a small, well-understood change. Rewriting them is Phase 1's remaining work.
+a small, well-understood change.
 
-Everything else is green: **1064 passed, 1 skipped** in a clean venv with no host application
-present.
+**Eight remain.** Everything else is green: **1127 passed, 1 skipped** in a clean venv with no host
+application present.
 
-## Group A — host-coupled seam tests (6 files)
+## ✅ Group A — host-coupled seam tests (6 files) — DONE 2026-08-31
 
-`test_structured_empty_detection.py` · `test_timeout_apply.py` · `test_phase1_integrity.py`
-`test_phase5_reliability.py` · `test_context_gate.py` · `test_error_taxonomy.py`
+`test_structured_empty_detection.py` · `test_error_taxonomy.py` · `test_context_gate.py`
+`test_phase5_reliability.py` · `test_phase1_integrity.py` · `test_timeout_apply.py`
 
-These import `originfleet.framework.*` because they assert the **contract between the proxy and its
-client** from the client's side: error-envelope deferrability, the context-overflow marker string,
-the client-side timeout-floor mirror, the `client < server` keepalive invariant.
+These imported `originfleet.framework.*` because they asserted the **contract between the proxy and
+its client** from the client's side. All six are resolved; +61 tests to the suite. How each was
+split, since the same reasoning applies to anything similar that turns up later:
 
-The extraction plan says this class of test **stays in the monorepo** as an integration test against
-the published package — and it should. But Roadstead still needs its *own* assertion of the same
-contract from the server side, or the contract is only ever checked from one end. That is the
-tautology trap: two values compared from a single source prove nothing.
+**The general fix — `tests/wire_contract.py`.** Four of the six used a host predicate as an oracle
+(`is_deferrable_llm_error`, `is_context_overflow_error`). Re-implementing that rule inside Roadstead
+and asserting it agrees with itself would be the tautology trap. Instead the marker substrings are
+now **literals transcribed from `docs/api.md`** — the boundary object both sides read and neither
+owns. Roadstead's tests pin what it *emits* against them; the monorepo's pin what its classifier
+*matches* against them. `tests/test_wire_contract.py` reads `docs/api.md` back, so the transcription
+cannot go stale silently.
 
-**So do not simply delete these.** For each, split it:
+| file | disposition |
+|---|---|
+| `test_structured_empty_detection.py` | Moved whole. Its one host test now spies on `roadstead.hooks.set_degradation_sink()` and asserts the **full event payload**, not just that a counter moved — a stronger test than the original. Gained a second: a sink that raises must not break a response. |
+| `test_error_taxonomy.py` | Moved whole, classifier oracle → `carries_deferral_marker`. |
+| `test_context_gate.py` | Moved whole, oracle → the verbatim `CONTEXT_OVERFLOW_MARKER`. |
+| `test_phase5_reliability.py` | Moved whole; two local host imports → the shared helper. |
+| `test_phase1_integrity.py` | Moved less one test. `test_proxy_error_strings_are_deferrable` exercised **no Roadstead code at all** — a hardcoded list run through the client's classifier — so it went to the monorepo. A comment in its place records where it went and which neighbours already assert the server half. |
+| `test_timeout_apply.py` | **Deleted here — belongs to the monorepo whole.** 21 tests of `ProxyLLMClient`: extend-only policy, advice fetch, pool config. The single assertion Roadstead owns (`client < server` keepalive, with margin) was rehomed as `tests/test_keepalive_invariant.py`, and the invariant it depends on is now published in `docs/api.md` §1.3 — it was undocumented, which is why it could only be checked from the client. |
 
-- the half that asserts *what Roadstead emits* (status codes, `code` values, marker strings, floor
-  values) → rewrite against `roadstead` alone and move back into `tests/`;
-- the half that asserts *what the client does with it* → leave to the monorepo.
-
-`test_structured_empty_detection.py` is the easiest and a good first one: only one of its sixteen
-tests needs the host. It asserts the degradation reaches the framework's fleet-wide counter. Rewrite
-it against `roadstead.hooks.set_degradation_sink()` with a local spy — which is a *better* test than
-the original, because it exercises the seam this package actually owns.
+🚨 **Two things must now be confirmed present in the monorepo**, or they are lost rather than moved:
+`test_proxy_error_strings_are_deferrable`, and the 20 `ProxyLLMClient` tests from
+`test_timeout_apply.py`. They were deleted here on the strength of belonging there.
 
 ## Group B — fleet-coupled tests (2 files)
 
@@ -72,3 +77,7 @@ private system's agents — same fix as `test_egress_conformance.py` in Group B.
 `tests/_pending/` is empty, this file is gone, and `norecursedirs` no longer mentions it. Anything
 that genuinely belongs to the monorepo should be **deleted here and confirmed present there** —
 not left in limbo.
+
+**Remaining: Group B (2 files) and Group C (6 files)** — 8 of the original 14. Unlike Group A, most
+of these are expected to leave rather than move: they assert facts about the origin fleet's
+deployment, which Roadstead has no opinion on. The salvageable parts are named above.

@@ -6,7 +6,7 @@ Covers:
   1.2 circuit breaker: an unhealthy backend fast-fails interactive submits and
       defers background.
   1.3 transient retry/defer: unreachable/empty-completion retry within the
-      deadline; 4xx don't; the proxy's error strings classify as deferrable.
+      deadline; 4xx don't.
   1.4 band inversion: a 1-slot endpoint no longer lets queued background block
       interactive.
   1.5 slot-leak: the backend call is bounded to the caller's remaining deadline.
@@ -21,7 +21,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from originfleet.framework.nexus_errors import is_deferrable_llm_error
 from roadstead.backend import (
     BackendError,
     BackendResponse,
@@ -57,20 +56,27 @@ class _FakeRequest:
     headers: dict = {}
 
 
-# --- 1.3 deferral classifier ------------------------------------------------
-
-def test_proxy_error_strings_are_deferrable():
-    deferrable = [
-        "LLM proxy error 502: upstream",
-        "LLM proxy dispatch error: backend thinker returned empty completion",
-        "LLM proxy unreachable: connection refused",
-        "backend thinker truncated structured output (finish_reason=length)",
-        "backend thinker unavailable (circuit open)",
-    ]
-    for msg in deferrable:
-        assert is_deferrable_llm_error(ConnectionError(msg)) is True, msg
-    # A genuine content/request error stays NON-deferrable.
-    assert is_deferrable_llm_error(ValueError("invalid request: bad field")) is False
+# --- 1.3 deferral classifier — LEFT TO THE MONOREPO -------------------------
+#
+# ``test_proxy_error_strings_are_deferrable`` lived here. It listed five message
+# shapes and asserted the host's ``is_deferrable_llm_error`` returned True for
+# each. That is a test of the CLIENT's classifier over a hardcoded list — it
+# exercises no Roadstead code at all — so under the split rule in
+# ``tests/_pending/README.md`` it belongs to the monorepo, as an integration
+# test against the published package. It is deliberately not reproduced here.
+#
+# Nothing was lost on this side. The server half — that Roadstead still EMITS
+# those wordings — is asserted from real service behaviour by its neighbours
+# rather than from a literal list:
+#
+#   "circuit open"                -> test_circuit_open_fast_fails_interactive
+#   "truncated structured output" -> test_structured_truncation_fails_loud
+#   "backpressure"                -> tests/test_error_taxonomy.py
+#
+# Two of the five ("LLM proxy error <status>: ...", "LLM proxy unreachable: ...")
+# are prefixes the CLIENT constructs around the envelope. The proxy never emits
+# them, so there is nothing on this side to assert them against; see
+# ``tests/wire_contract.py``.
 
 
 # --- 1.4 band inversion on a 1-slot endpoint --------------------------------
