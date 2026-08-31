@@ -106,7 +106,7 @@ def test_resolved_endpoint_flows_into_queued_request():
         "payload": {"model": "qwen-analyst", "messages": []},
     }
     req = QueuedRequest.create(
-        agent_id="orchestrator", endpoint=svc._resolve_endpoint(body),
+        agent_id="notifier", endpoint=svc._resolve_endpoint(body),
         priority="P4_HYGIENE", call_site="orchestrator.autonomous_chat-agent.reflect",
         payload_type="chat_completion", payload=body["payload"],
     )

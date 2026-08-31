@@ -36,11 +36,12 @@ sidekick:
   weight: 2.0
   max_balance_ss: 120.0
 
-orchestrator:
-  # The inner tool-calling loop behind live user turns (companion streams,
-  # 4.5K req/wk, several calls per turn). Same interactive privilege as sidekick;
-  # the larger balance absorbs a multi-iteration turn without DRR throttling
-  # mid-conversation.
+notifier:
+  # Renamed from `orchestrator` 2026-08-30 (F1). The inner tool-calling loop
+  # this block was sized for died with the 2026-08-29 gut — the agent is now a
+  # notification + action bus and makes essentially no LLM calls. The weights
+  # are left at their old values deliberately: re-sizing a DRR share is a
+  # behaviour change, not a rename, and an idle caller costs nothing.
   weight: 2.0
   max_balance_ss: 120.0
 
