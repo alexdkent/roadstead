@@ -75,6 +75,47 @@ pass on an empty set — assert a minimum count before reporting success.
 
 ---
 
+## SIGTERM's two shutdown budgets are serial, not nested
+
+**Symptom.** The origin knowledge layer contradicted itself: one source said SIGTERM runs a clean
+bounded drain, another said it hangs behind slow in-flight requests and SIGKILL is correct. Both
+turn out to be describing the same behaviour from different ends.
+
+**Root cause.** Measured with `tools/sigterm_drain_probe.py` (2026-08-31, three runs, ±0.05s):
+
+| in-flight state | SIGTERM → exit | budgets + completions persisted |
+|---|---|---|
+| idle | **0.19s** | n/a |
+| one dispatch finishing inside the drain | **7.67s** | yes |
+| one dispatch outlasting the drain | **78.25s** | yes |
+
+uvicorn's `timeout_graceful_shutdown` does **not** bound `ProxyService.shutdown`. It bounds the
+in-flight HTTP *connections*; only once it expires does uvicorn send `lifespan.shutdown`, and at
+*that* point the app's own `_DRAIN_DEADLINE_S` drain begins. uvicorn never bounds the lifespan
+shutdown at all. The log timestamps show it exactly: `draining 1 in-flight dispatch(es) (≤30s)` is
+emitted ~48s after the signal, and `drain deadline hit` exactly 30.000s after that.
+
+So the worst case is the **sum**, `timeout_graceful_shutdown + _DRAIN_DEADLINE_S + close-tail`
+(≈78s observed), not the larger of the two. The comment at `__main__.py` reasons the other way —
+"uvicorn's budget MUST exceed drain + close-tail (+margin) or it hard-kills the process mid-flush" —
+which assumes a nesting that does not hold. The margin is real but it is not doing what it says.
+
+**Guard.** SIGTERM **is** the correct signal and the question is closed: the drain completes, and it
+persists the DRR budget row and the completion row even for a straggler it had to cancel — exactly
+what SIGKILL would lose. But the drain is slow enough to matter:
+
+- 🚨 **A container stop-grace-period must be ≥90s.** `docker stop`'s default 10s window truncates
+  the drain in every non-idle case; `stop_grace_period: 90s` (compose) or `--stop-timeout 90`.
+  This is the item that was load-bearing and unresolved.
+- Re-run `tools/sigterm_drain_probe.py` if either budget changes — the two are independent knobs
+  that look coupled.
+- **Open, and belongs in the monorepo** (behavioural, so not fixable here under the authority rule):
+  the caller of the straggler receives a raw `500 Internal Server Error` at the 48s mark, not the
+  proxy's clean JSON error envelope — uvicorn cancels the handler task, which bypasses the
+  `exception_handlers` backstop in `build_app`.
+
+---
+
 ## The extraction's own near-miss: a commit that imported files it did not contain
 
 **Symptom.** The origin repo's `main` briefly held an `ImportError` — four edited modules were

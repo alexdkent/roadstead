@@ -23,9 +23,11 @@ classifiers = [
 # Deliberately few. Adding one is a decision, not a convenience — see CLAUDE.md.
 dependencies = [
   "httpx>=0.27",
-  # Upper bound is LOAD-BEARING: Starlette 1.0 removed the on_startup/on_shutdown
-  # constructor args this app uses. Migrating to lifespan= lifts it.
-  "starlette>=0.37,<1.0",
+  # The <1.0 upper bound was lifted on 2026-08-31 by migrating build_app from
+  # on_startup=/on_shutdown= (removed in Starlette 1.0) to lifespan=. Verified
+  # green on both 0.52.1 and 1.6.0: 1066 passed, 1 skipped, each run. Do not
+  # re-add a bound without recording what breaks above it.
+  "starlette>=0.37",
   "uvicorn>=0.30",
   "PyYAML>=6.0",
   "jsonschema>=4.20",

@@ -40,12 +40,12 @@ both are soft.
 - **The suite is green standalone: 1064 passed, 1 skipped**, in a clean venv with no `originfleet`
   on the path and no fleet, network or backend required.
 
-### One real finding from the standalone build
+### One real finding from the standalone build — since resolved
 
-`starlette` is pinned **`<1.0`** and the bound is load-bearing: Starlette 1.0 removed the
-`on_startup`/`on_shutdown` constructor arguments this app uses. Installing unpinned produced **142
-identical collection errors**. Migrating to `lifespan=` is what lifts the pin, and it is a good
-early task — small, self-contained, and it removes a ceiling on a core dependency.
+`starlette` *was* pinned **`<1.0`**, and the bound was load-bearing: Starlette 1.0 removed the
+`on_startup`/`on_shutdown` constructor arguments this app used, so installing unpinned produced
+**142 identical collection errors**. Migrating `build_app` to `lifespan=` lifted the pin the same
+day — see "What is left → Immediate → 2" below.
 
 ---
 
@@ -57,7 +57,13 @@ early task — small, self-contained, and it removes a ceiling on a core depende
    README explains each and why deleting them would be wrong. This is the highest-value next task:
    6 are contract tests whose *server-side half* Roadstead genuinely needs, and 8 are fleet-coupled
    doctrine tests that mostly belong back in the monorepo.
-2. **Migrate off `on_startup`/`on_shutdown` to `lifespan=`**, then drop the starlette upper bound.
+2. ~~**Migrate off `on_startup`/`on_shutdown` to `lifespan=`**, then drop the starlette upper
+   bound.~~ ✅ **done 2026-08-31.** `build_app` now takes `lifespan=`; the `<1.0` bound is gone.
+   Verified green on both the pinned 0.52.1 and the unpinned 1.6.0 — 1066 passed, 1 skipped each.
+   `tests/test_lifespan_wiring.py` is new: nothing previously exercised the lifespan protocol at all
+   (every other test calls `svc.startup()`/`svc.shutdown()` directly and drives the app through
+   `httpx.ASGITransport`, which skips it), so the wiring could have been unhooked with the whole
+   suite still green. It was mutation-checked — remove `lifespan=` and both new tests fail.
 3. **Finish `api.md`** — two sections are marked INCOMPLETE: the nested `/v1/fleet/*` analytics
    schemas, and a spot-check for delegator-signature drift between `service.py` and
    `http_handlers.py`.
@@ -103,9 +109,20 @@ on cutover.
 
 ## Open questions inherited
 
-1. **SIGTERM vs SIGKILL for shutdown** — the origin knowledge layer contradicts itself. Load-bearing
-   once containerised, because `docker stop` sends SIGTERM then hard-kills after 10s. Resolve by
-   experiment.
+1. ~~**SIGTERM vs SIGKILL for shutdown**~~ ✅ **resolved by experiment, 2026-08-31.** SIGTERM is
+   correct — the drain persists DRR budgets and completions even for a straggler it cancels, which
+   SIGKILL loses. But it is slower than the code implies: uvicorn's `timeout_graceful_shutdown` and
+   the app's `_DRAIN_DEADLINE_S` are **serial, not nested** (uvicorn bounds the in-flight
+   *connections*, then sends `lifespan.shutdown`, and never bounds the lifespan shutdown at all), so
+   the worst case is their sum — **78.25s measured** against a 48s budget that reads as if it covered
+   everything. **A container stop-grace-period must be ≥90s.** Re-runnable:
+   `tools/sigterm_drain_probe.py`; full write-up in `ledger.md`.
+
+   One thing it turned up is **behavioural, so it belongs upstream, not here**: the caller of a
+   cancelled straggler gets a raw `500 Internal Server Error` at the 48s mark rather than the proxy's
+   clean JSON error envelope, because uvicorn cancels the handler task and bypasses the
+   `exception_handlers` backstop. Also worth reconsidering upstream: the comment deriving
+   `timeout_graceful_shutdown` from `_DRAIN_DEADLINE_S` reasons from a nesting that does not exist.
 2. **Catalog placement** — Roadstead currently owns `models.yaml` and its reader. The host keeps its
    own copy; there is deliberately **zero build-time coupling** between them during the dual-track
    period. Revisit only at cutover.

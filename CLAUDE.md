@@ -68,10 +68,18 @@ This is the single most dangerous thing to get wrong, and **nothing in the suite
   scheduler or budget state.** Connections are never shared across threads.
 
 Shut down with **SIGTERM**, which runs a bounded drain (≤30s) that finishes in-flight work, flushes
-the write queue, and persists DRR budgets. ⚠️ The monorepo's knowledge layer contradicts itself on
-this point (one source says SIGTERM hangs behind slow in-flight requests and SIGKILL is correct).
-**This is an open question — resolve it by experiment before containerising**, because `docker stop`
-sends SIGTERM then hard-kills after 10s, which would silently lose the drain.
+the write queue, and persists DRR budgets. The monorepo's knowledge layer contradicted itself here;
+**settled by experiment on 2026-08-31** (`tools/sigterm_drain_probe.py`, full result in
+`docs/ledger.md`). Both halves were right about different things: SIGTERM is correct — the drain
+persists the DRR budget row and the completion row even for a straggler it cancels, which is exactly
+what SIGKILL loses — *and* it really can hang, for longer than the code's own comment implies.
+
+🚨 **The two shutdown budgets are serial, not nested.** uvicorn's `timeout_graceful_shutdown` bounds
+the in-flight HTTP *connections*; only when it expires does uvicorn send `lifespan.shutdown`, and
+only then does `ProxyService.shutdown`'s `_DRAIN_DEADLINE_S` drain begin. uvicorn never bounds the
+lifespan shutdown at all. Worst case is their **sum** — 78.25s measured, against a 48s budget that
+reads as though it covers everything. **Any container stop-grace-period must be ≥90s**; `docker
+stop`'s default 10s truncates the drain in every non-idle case.
 
 ---
 
@@ -142,6 +150,7 @@ roadstead/          the package (34 modules)
   hooks.py          the integration seam (see below)
   __main__.py       entrypoint
 tests/              the suite (~107 files) + fake_backend.py + corpus/
+tools/              off-default-path experiments (real processes, real signals)
 docs/               specs, plan, evaluation, ledger
 ```
 
