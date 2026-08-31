@@ -46,8 +46,8 @@ outside Kubernetes, and none at all that does the last two.
 |---|---|
 | 0 · Sever host-application imports | ✅ done |
 | 1 · Standalone repo, namespace, packaging | ✅ done |
-| 2 · Standalone test harness | 🔨 backends ~80% covered, callers ~50% |
-| 3 · Parity + stabilisation | not started |
+| 2 · Standalone test harness | ✅ done |
+| 3 · Parity + stabilisation | 🔨 next |
 | 4 · Cutover | deferred |
 | 5 · Publish | deferred |
 

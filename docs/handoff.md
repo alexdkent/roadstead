@@ -124,21 +124,34 @@ mislead you" below — only the fleet-specific assertion left.
 
 The one assertion salvaged out of `test_timeout_apply.py` is `tests/test_keepalive_invariant.py`.
 
-### Phase 2 — the harness
+### Phase 2 — the harness ✅ **done 2026-08-31**
 
-Backends are ~80% covered and callers ~50%. The main work is **promotion and packaging, not
-invention**:
+All three items. Suite 1064 at extraction → **1267 passed**, 1 skipped, 6 deselected.
 
-- **Promote `tests/fake_backend.py` to a first-class module.** For a gateway whose thesis is
-  capacity-aware admission, *"here is a programmable backend that lies about its capacity on
-  demand"* is a product feature, not test scaffolding. It already emulates both engine shapes and a
-  per-request fault library including `capacity_desync`.
-- **Add a real-engine wire-fidelity test** — a compose file running one small real `llama-server`,
-  purely to catch the day an engine changes its `/props` shape. Slow, few tests, off the default
-  path.
-- **Client-contract tests** for the error envelope, the deferrability substrings and the
-  timeout-floor mirror — currently only asserted from the host's side, which is the tautology trap
-  (two values compared from one source prove nothing).
+- ~~**Promote `tests/fake_backend.py` to a first-class module.**~~ → **`roadstead.testing`**. It
+  ships. `tests/test_testing_module_is_public.py` proves it imports from the installed distribution
+  in a subprocess with the repo off `sys.path`, and pins `__all__` against the module and
+  `ALL_FAULTS` against the `FAULT_*` constants. `_UNSET`/`_OMIT_USAGE` gained public spellings
+  (`USAGE_DEFAULT`/`OMIT_USAGE`) — a shipped module should not make callers import underscored
+  sentinels — with the old names kept as aliases.
+- ~~**Add a real-engine wire-fidelity test.**~~ → **`tests/wire_fidelity/`**. Built around a sharper
+  framing than "a second suite": the fake backend is a *claim* about how real engines behave, so
+  `conformance.py` states the south-face contract once and **both** the fake (every run) and a real
+  `llama-server` (`-m wire_fidelity`) are held to it. ⚠️ **The real-engine half has never been
+  executed** — no Docker on the machine it was written on. See its README; the image tag and env
+  names are unverified.
+- ~~**Client-contract tests.**~~ Error envelope and deferrability substrings landed in Phase 1 with
+  `tests/wire_contract.py`. The **timeout-floor mirror** is now
+  `tests/test_timeout_floor_contract.py`, and closing it needed `docs/api.md` §1.4, which did not
+  exist: the endpoint the client mirrors a floor *from* was undocumented, which is precisely why
+  mirroring was the only option. §1.4 now publishes the fallback floor and both ceilings, and
+  documents that `source == "floor"` means `recommended_timeout_s` **is** the floor — so a client
+  can ask instead of mirroring.
+
+**Two findings recorded rather than fixed** (see "Open questions" below): the fake's `/props`
+`n_ctx` fidelity gap, and the fact that per-class floors are deliberately absent from §1.4 as
+deployment data — with a test that fails if anyone tabulates them into a document headed for
+publication.
 
 ### Phase 3 — parity, then the deferred phases
 
@@ -179,6 +192,16 @@ on cutover.
    clean JSON error envelope, because uvicorn cancels the handler task and bypasses the
    `exception_handlers` backstop. Also worth reconsidering upstream: the comment deriving
    `timeout_graceful_shutdown` from `_DRAIN_DEADLINE_S` reasons from a nesting that does not exist.
-2. **Catalog placement** — Roadstead currently owns `models.yaml` and its reader. The host keeps its
+2. **The fake backend's `/props` `n_ctx` units** — new 2026-08-31. `health.py` reads
+   `default_generation_settings.n_ctx` as PER-SLOT and divides top-level `props["n_ctx"]` by the
+   slot count, i.e. reads it as an AGGREGATE — while noting it is "unconfirmed whether it's ever
+   populated as an aggregate". `roadstead.testing` emits the **same number in both places**, which
+   cannot be right for both readings. Nothing breaks today (the reader prefers the former and never
+   reaches the fallback), so the fallback is simply emulated wrongly. Deliberately not "fixed" in
+   the fake — that would make the fake authoritative over the engine. Settled by running
+   `tests/wire_fidelity/test_real_engine.py::test_record_the_n_ctx_units` against a real
+   `llama-server`; documented on the default path meanwhile.
+
+3. **Catalog placement** — Roadstead currently owns `models.yaml` and its reader. The host keeps its
    own copy; there is deliberately **zero build-time coupling** between them during the dual-track
    period. Revisit only at cutover.

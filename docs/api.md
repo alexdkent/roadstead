@@ -78,6 +78,57 @@ config without touching code. `tests/test_keepalive_invariant.py` pins the serve
 
 ---
 
+### 1.4 `GET /v1/timeout-advice` — and the floor a client must not mirror wrong
+
+Query: `model` (**required**; role names are normalized, so `llama-thinker` and `thinker` are the
+same endpoint), `priority` (name or number, default `P1_TURN_SUPPORT`), `est_in`, `est_out`.
+Unknown `model` or `priority` → **400**, and the `model` error lists the known endpoints.
+
+| field | type | meaning |
+|---|---|---|
+| `model` | string | The **normalized** endpoint, not the name you asked with. |
+| `priority` | string | The resolved band name. |
+| `est_in`, `est_out` | int | Echo of the query. |
+| `min_ms`, `median_ms`, `p95_ms` | float | The measured latency distribution for the resolved cell. |
+| `recommended_ms` | float | The recommendation, after load and size uplift. |
+| `recommended_timeout_s` | int | `ceil(recommended_ms / 1000)`. **This is the number to use.** |
+| `sample_count` | int | Samples behind it. `0` means the floor answered. |
+| `source` | string | Which fallback level produced it — see below. |
+| `surge`, `size_stretch`, `ceiling_s` | float | The uplift factors and the resolved ceiling. Observability; present only when the uplift succeeded. |
+
+**`source` names the fallback level**, narrowest first: `cell` (this exact
+priority × input-size × output-size cell) → `tier_out` → `tier` → `endpoint` → **`floor`**.
+
+#### The floor, and why a client should ask rather than mirror
+
+Every endpoint class has a **floor**: `recommended_timeout_s` is never below it, however thin the
+evidence. A thin sample must not produce a dangerously low deadline.
+
+🚨 **`source == "floor"` means `recommended_timeout_s` *is* the floor for that class.** That is the
+supported way to learn a floor over the wire — query a cold cell and read the number. A client that
+instead keeps its own copy of the floor table has taken on a **mirror it must keep in sync by hand**,
+and a copy that drifts makes the client's honour-a-sub-floor-deadline decision disagree with what the
+server enforces.
+
+Two values are contract for any client that does mirror:
+
+| | value | |
+|---|---|---|
+| Fallback floor, unknown endpoint class | **60.0s** | `_DEFAULT_FLOOR_S` |
+| Ceiling, interactive (P0/P1/P2) | **600.0s** | |
+| Ceiling, background (P3/P4) | **1800.0s** | |
+
+The per-class floors are **not** listed here on purpose: they are deployment data, seeded from
+`models.yaml` `timeout_floor_s`, and differ per fleet. Ask the endpoint.
+
+The resolved ceiling is always lifted to at least the class floor, so a ceiling can never strangle a
+call below the deadline the model already guarantees.
+
+`tests/test_timeout_floor_contract.py` pins this side of it.
+
+---
+
+
 ## 2. Error contract 🚨
 
 ### 2.1 Codes

@@ -49,6 +49,18 @@ CLIENT_KEEPALIVE_EXPIRY_S = 4.5
 #: positive difference. A margin of zero is what caused the original race.
 KEEPALIVE_MIN_MARGIN_S = 5.0
 
+#: ``docs/api.md`` §1.4 — the floor applied to an endpoint class the timeout
+#: model has never heard of. A client that mirrors the floor table rather than
+#: asking ``/v1/timeout-advice`` needs this exact number, and a drifted copy
+#: makes its honour-a-sub-floor-deadline decision disagree with the server.
+TIMEOUT_FALLBACK_FLOOR_S = 60.0
+
+#: ``docs/api.md`` §1.4 — the per-caller-class ceilings on the adaptive
+#: recommendation. Published because a client sizing its own retry budget needs
+#: to know the recommendation cannot exceed them.
+TIMEOUT_CEILING_INTERACTIVE_S = 600.0
+TIMEOUT_CEILING_BACKGROUND_S = 1800.0
+
 #: The contract document these constants are transcribed from.
 API_DOC = Path(__file__).resolve().parents[1] / "docs" / "api.md"
 
