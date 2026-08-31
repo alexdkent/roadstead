@@ -104,15 +104,75 @@ which assumes a nesting that does not hold. The margin is real but it is not doi
 persists the DRR budget row and the completion row even for a straggler it had to cancel — exactly
 what SIGKILL would lose. But the drain is slow enough to matter:
 
-- 🚨 **A container stop-grace-period must be ≥90s.** `docker stop`'s default 10s window truncates
-  the drain in every non-idle case; `stop_grace_period: 90s` (compose) or `--stop-timeout 90`.
-  This is the item that was load-bearing and unresolved.
+- 🚨 **A container stop-grace-period must be ≥90s.** No longer derived — **measured**, in a real
+  container on a real Docker daemon (`tools/docker_stop_probe/`, 2026-08-31):
+
+  | `docker stop` | in flight | outcome | persisted |
+  |---|---|---|---|
+  | `-t 10` (**the default**) | work outlasting the drain | **SIGKILL, exit 137** at 10.08s | **budgets 0, completions 0 — everything lost** |
+  | `-t 10` (the default) | 5s of work | clean, 2.88s | budgets 1, completions 1 |
+  | `-t 90` | work outlasting the drain | clean, **78.31s** | budgets 1, completions 1 |
+
+  Two things worth staring at. The default **works when the proxy is quiet** — which is exactly how
+  it will be tested, and exactly why the failure would first appear under load, in production, with
+  no alarm. And in the killed case the log stops after uvicorn's `Shutting down`: SIGKILL landed
+  while it was still waiting on the connection, so the app's shutdown handler **never ran at all** —
+  no drain, no flush, no budget persistence.
+
+  78.31s in a container against 78.25s bare-process: the two agree to 0.06s, so the cost is the
+  drain itself and not container overhead. Set `stop_grace_period: 90s` (compose) or
+  `--stop-timeout 90`. `Dockerfile` carries the requirement as a label so the image documents it.
 - Re-run `tools/sigterm_drain_probe.py` if either budget changes — the two are independent knobs
   that look coupled.
 - **Open, and belongs in the monorepo** (behavioural, so not fixable here under the authority rule):
   the caller of the straggler receives a raw `500 Internal Server Error` at the 48s mark, not the
   proxy's clean JSON error envelope — uvicorn cancels the handler task, which bypasses the
   `exception_handlers` backstop in `build_app`.
+
+---
+
+## The fake backend was more generous than any real engine
+
+**Symptom.** None — and that is the point. Capacity discovery worked against the fake and would have
+kept working after a "simplification" that broke it against every real backend.
+
+**Root cause.** `roadstead.testing`'s `/props` published a superset of what llama.cpp actually
+returns. Measured against a real `llama-server` (b5350) at `--ctx-size 8192 --parallel 4`
+(`tests/wire_fidelity/`, 2026-08-31), the whole top level is:
+
+    bos_token · build_info · chat_template · default_generation_settings
+    eos_token · modalities · model_path · total_slots
+
+So a current build publishes **no top-level `n_ctx`**, **no
+`default_generation_settings.n_parallel`**, and **no `slots` list** — three fields the fake was
+emitting. Consequences, in order of how much they matter:
+
+1. **`health.py` prefers `default_generation_settings.n_parallel` and falls back to `total_slots`.
+   Only the fallback exists on a real engine.** Against the old fake the preferred field was always
+   present, so the path real discovery entirely depends on was never exercised. Deleting it as
+   redundant would have left the suite green and broken capacity discovery in production.
+2. The **top-level `n_ctx` question is settled, and neither candidate answer was right.** `health.py`
+   divides it by the slot count (i.e. reads it as an aggregate) with a comment conceding it is
+   "unconfirmed whether it's ever populated as an aggregate". It is not populated at all. The
+   fallback is dead code against a current build, kept for older ones. The fake had been emitting it
+   with the same value as the per-slot field, which cannot be right under either reading.
+3. `default_generation_settings.n_ctx` reported **2048** at `--ctx-size 8192 --parallel 4` —
+   **per-slot confirmed** on a build 611 versions newer than the one the original note was written
+   against. The guard against re-dividing it holds.
+4. `/v1/models` differs per engine more than the fake did: llama.cpp returns the **full GGUF path**
+   as `id`, **no `root`**, **no `max_model_len`**, and a `meta` block
+   (`n_params`/`n_vocab`/`n_ctx_train`/…). So `probe_model_fingerprint`'s `root` path is vLLM-only
+   and its `meta` fallback is the one that carries llama.cpp — and the fake, emitting neither, had
+   never exercised either.
+
+Also confirmed: `finish_reason` really does ride alone on a terminal chunk with an empty delta.
+
+**Guard.** `roadstead.testing` now defaults to the verified narrow shape and emits `/v1/models`
+per-engine, so the fake is as stingy as the real thing — a fake being *more* generous than reality is
+the dangerous direction, because it makes a passing test the reason a real path is never run. The old
+superset survives as `props_profile="legacy"` for builds that do publish those fields.
+`tests/wire_fidelity/` holds one contract that both the fake (every run) and a real engine (opt-in)
+must satisfy, so the next divergence fails there.
 
 ---
 

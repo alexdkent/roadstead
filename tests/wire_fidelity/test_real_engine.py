@@ -95,31 +95,56 @@ def test_generation_settings_n_ctx_is_per_slot_not_aggregate(base_url):
         f"default_generation_settings.n_ctx is wrong for this build.")
 
 
-def test_record_the_n_ctx_units(base_url, record_property):
-    """Settle the open question `health.py` flags as "unconfirmed".
+def test_top_level_n_ctx_is_absent_not_an_aggregate(base_url):
+    """The open question, settled 2026-08-31 — and settled differently than
+    either candidate answer.
 
-    The top-level `props["n_ctx"]` is divided by the slot count on the fallback
-    path, i.e. assumed to be an aggregate — with a comment saying it is
-    unconfirmed whether any build populates it that way. The fake backend emits
-    the SAME value in both places, which cannot be right for both readings.
+    `health.py` reads `default_generation_settings.n_ctx` as-is (per-slot) but
+    DIVIDES a top-level `props["n_ctx"]` by the slot count, i.e. reads it as an
+    aggregate, while noting it is "unconfirmed whether it's ever populated as an
+    aggregate". The answer from b5350 is that **it is not populated at all** —
+    there is no top-level `n_ctx` key. The fallback is dead code against a
+    current build, kept only for older ones.
 
-    This does not assert a preference. It records what a real engine actually
-    does, so the answer comes from the engine rather than from the fake.
+    That also settled the fake's fidelity gap: it was emitting a field the real
+    engine does not have. `roadstead.testing` now defaults to this narrow shape.
+
+    🚨 If this ever fails because a top-level `n_ctx` reappeared, do NOT assume
+    the divide-by-slots reading is right. Print the value and compare it against
+    --ctx-size and --parallel first: at 8192/4, an aggregate reads 8192 and a
+    per-slot reads 2048, and the divide would quarter every multi-slot endpoint.
     """
-    if not _launched_by_compose():
-        pytest.skip("needs the known --ctx-size/--parallel from compose.yaml")
     props = wire.check_props_shape(base_url)
-    top = props.get("n_ctx")
     gen = (props.get("default_generation_settings") or {}).get("n_ctx")
-    record_property("top_level_n_ctx", top)
-    record_property("generation_settings_n_ctx", gen)
-    print(f"\n/props n_ctx units, --ctx-size {COMPOSE_CTX_SIZE} "
-          f"--parallel {COMPOSE_PARALLEL}:\n"
-          f"  top-level n_ctx                        = {top}\n"
-          f"  default_generation_settings.n_ctx      = {gen}\n"
-          f"  => top-level is "
-          f"{'AGGREGATE' if top == COMPOSE_CTX_SIZE else 'PER-SLOT' if top == EXPECTED_PER_SLOT else 'NEITHER — investigate'}")
+    top = props.get("n_ctx")
+    print(f"\n/props at --ctx-size {COMPOSE_CTX_SIZE} --parallel {COMPOSE_PARALLEL}:"
+          f"\n  top-level n_ctx                   = {top!r}"
+          f"\n  default_generation_settings.n_ctx = {gen!r}"
+          f"\n  top-level keys                    = {sorted(props)}")
     assert gen == EXPECTED_PER_SLOT, "the per-slot field is the load-bearing one"
+    assert "n_ctx" not in props, (
+        f"a top-level n_ctx has reappeared ({top!r}). health.py would DIVIDE it "
+        f"by {COMPOSE_PARALLEL}; if it is really an aggregate that is correct, "
+        f"and if it is per-slot that quarters the endpoint's context. Read the "
+        f"docstring before changing anything.")
+
+
+def test_slot_count_comes_from_total_slots_not_n_parallel(base_url):
+    """Capacity discovery PREFERS `default_generation_settings.n_parallel` and
+    falls back to `total_slots`. b5350 publishes only the latter — so the
+    fallback is not a legacy nicety, it is the ONLY path that works against a
+    current engine. Deleting it would leave the suite green (the fake used to
+    publish both) and break real discovery.
+    """
+    props = wire.check_props_shape(base_url)
+    gen = props.get("default_generation_settings") or {}
+    assert gen.get("n_parallel") is None, (
+        "b5350 did not publish default_generation_settings.n_parallel; if a "
+        "build now does, the preference order in health.py starts mattering")
+    assert isinstance(props.get("total_slots"), int), (
+        "total_slots is gone AND n_parallel was never there — capacity "
+        "discovery has no source and silently keeps the configured value")
+    assert wire.discovered_slots(props) == COMPOSE_PARALLEL
 
 
 def test_models_publishes_a_served_id(base_url):

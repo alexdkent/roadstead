@@ -45,7 +45,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from roadstead.service import _DRAIN_DEADLINE_S  # noqa: E402
-from tests.fake_backend import FAULT_TIMEOUT, FakeBackend, FakeBackendServer  # noqa: E402
+from roadstead.testing import FAULT_TIMEOUT, FakeBackend, FakeBackendServer  # noqa: E402
 
 # The child is written out at run time rather than kept as a second file: it is
 # not importable code, it is the experiment's subject.

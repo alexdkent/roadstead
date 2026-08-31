@@ -63,6 +63,21 @@ def check_models(base_url: str, *, expect_max_model_len: bool) -> dict[str, Any]
             f"vLLM must publish data[0].max_model_len as a positive int — it is "
             f"the ONLY capacity fact vLLM exposes, and probe_vllm_capacity "
             f"returns None without it: {entry!r}")
+    else:
+        assert "max_model_len" not in entry, (
+            f"llama.cpp published max_model_len ({entry.get('max_model_len')!r}). "
+            f"Verified absent on b5350 — if a build has started publishing it, "
+            f"probe_vllm_capacity could now succeed against a llama.cpp "
+            f"endpoint, which is a routing question, not a free upgrade.")
+
+    # probe_model_fingerprint identifies the WEIGHTS, not the alias — an alias
+    # can be repointed without changing. It prefers `root` and falls back to a
+    # digest of `meta`. At least one must be present or model-swap detection is
+    # blind on this backend.
+    assert entry.get("root") or isinstance(entry.get("meta"), dict), (
+        f"neither data[0].root nor data[0].meta is present, so "
+        f"probe_model_fingerprint returns None and a silent weight swap under "
+        f"a stable served name cannot be detected: {sorted(entry)}")
     return entry
 
 

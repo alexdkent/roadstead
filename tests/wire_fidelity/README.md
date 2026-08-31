@@ -42,34 +42,52 @@ file. The launch-config-dependent tests (per-slot context, the `n_ctx` units)
 need to know `--ctx-size` and `--parallel`; they skip against an arbitrary
 engine rather than guessing.
 
-## ⚠️ Status: authored, never executed
+## Status: executed 2026-08-31 ✅
 
-**Written 2026-08-31 on a machine with no Docker. The compose file has not been
-brought up and `test_real_engine.py` has never run against a real engine.**
-Treat the image tag, the env-var names (`LLAMA_ARG_*`) and the model repo as
-*plausible and unverified*; the first person with a Docker daemon should expect
-to correct them. The assertions in `conformance.py` are firmer — they are
-derived from the fields Roadstead actually reads, and they already run green
-against the fake on every suite run.
+Run against a real `llama-server` (**b5350**, Qwen2.5-0.5B-Instruct Q8_0, `--ctx-size 8192
+--parallel 4`) on the `roadstead` dev box. **6 passed.** Two guesses in the original compose file
+were wrong and are now corrected against the live registry:
 
-## The open question this exists to settle
+| was | is | how it failed |
+|---|---|---|
+| `ghcr.io/ggml-org/llama.cpp:server-b4739` | `…:server-b5350` | tag does not exist |
+| `ggml-org/Qwen2.5-0.5B-Instruct-Q8_0-GGUF` | `Qwen/Qwen2.5-0.5B-Instruct-GGUF:q8_0` | repo does not exist — and the container reports it as *"model is private or does not exist; if you are accessing a gated model, please provide a valid HF token"*, which reads like an auth problem and is not one |
 
-`health.py` reads two different context fields with two different unit
-assumptions:
+## What a real engine actually publishes
 
-- `default_generation_settings.n_ctx` — taken **as-is**, per-slot. Confirmed
-  live: `--ctx-size 131072 --parallel 4` reports `32768` there.
-- top-level `props["n_ctx"]` — **divided** by the slot count, i.e. assumed to be
-  an aggregate. The comment in `health.py` says outright it is "unconfirmed
-  whether it's ever populated as an aggregate".
+`/props`, whole top level:
 
-The fake emits the **same number in both places**, which cannot be correct for
-both readings. Nothing breaks today because the reader prefers the first and
-never reaches the fallback — but the fallback is emulated wrongly, and a test
-that exercised it against the fake would be checking a fiction.
+```
+bos_token · build_info · chat_template · default_generation_settings
+eos_token · modalities · model_path · total_slots
+```
 
-`test_record_the_n_ctx_units` prints what a real engine puts in each. It
-deliberately does not assert a preference: the answer should come from the
-engine, not from the fake. Once it has been run, record the result in
-`docs/ledger.md` and either fix the fake or delete
-`test_the_fakes_top_level_n_ctx_is_a_known_fidelity_gap`.
+| field | value | |
+|---|---|---|
+| `default_generation_settings.n_ctx` | **2048** | 8192/4 → **per-slot confirmed**, on a build 611 versions newer than the note that first established it |
+| `total_slots` | 4 | the only slot source that exists |
+| `default_generation_settings.n_parallel` | **absent** | …and it is what `health.py` *prefers* |
+| top-level `n_ctx` | **absent** | not an aggregate; not anything |
+| `slots` | **absent** | |
+
+`/v1/models` `data[0]`: `id` is the **full GGUF path** (a deployment sets a friendly name with
+`-a`), `meta` = `{vocab_type, n_vocab, n_ctx_train, n_embd, n_params, size}`, and **no `root`**, **no
+`max_model_len`** — both vLLM-only.
+
+Streaming: `finish_reason` **rides alone on a terminal chunk with an empty delta**, as the correction
+layer assumes.
+
+## The open question, settled — and not the way either answer expected
+
+`health.py` divides a top-level `props["n_ctx"]` by the slot count, i.e. reads it as an aggregate,
+while conceding it is "unconfirmed whether it's ever populated as an aggregate". **It is not
+populated at all.** That fallback is dead code against a current build.
+
+The sharper finding is the one next to it: the fake was publishing `n_parallel`, which a real engine
+does not, and `health.py` *prefers* `n_parallel` over `total_slots`. So the fallback that real
+discovery entirely depends on **was never exercised by any test**. Deleting it as redundant would
+have kept the suite green and broken production capacity discovery.
+
+`roadstead.testing` now defaults to the verified narrow shape. The old superset is
+`props_profile="legacy"`, kept so the aggregate fallback stays drivable for older builds. Full
+write-up in `docs/ledger.md`.

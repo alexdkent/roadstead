@@ -160,6 +160,23 @@ class FakeBackend:
     served_model_id: str = "fake-model"
     props_n_parallel: int = 4
     props_n_ctx: int = 32768
+    # Which /props SHAPE to publish. Verified against a real llama-server
+    # (b5350) on 2026-08-31 — see tests/wire_fidelity/README.md.
+    #
+    #   "modern" (default) — what a current build ACTUALLY publishes:
+    #       total_slots, and default_generation_settings.n_ctx (per-slot).
+    #       It does NOT publish default_generation_settings.n_parallel, a
+    #       `slots` list, or a top-level n_ctx. 🚨 That matters: capacity
+    #       discovery PREFERS n_parallel and only falls back to total_slots, so
+    #       with the old superset shape the fallback a real engine actually
+    #       depends on was never exercised. Anyone "simplifying" that fallback
+    #       away would have kept a green suite and broken real discovery.
+    #
+    #   "legacy" — the superset this fake published before the shape was
+    #       verified: every field at once. Kept so a build that does publish
+    #       n_parallel or a top-level n_ctx can still be emulated, not because
+    #       any observed engine emits all of it.
+    props_profile: str = "modern"
     max_model_len: int = 40960
     # prefix-cache counters exposed on /metrics (vLLM shape)
     prefix_cache_hits: int = 0
@@ -582,24 +599,65 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
 
     # ---- capacity / discovery probes ------------------------------------- #
     async def props(request: Request) -> Response:
+        if controller.props_profile == "legacy":
+            # Every field at once. NB the top-level n_ctx carries the SAME value
+            # as the per-slot one, which cannot be right for both readings —
+            # capacity discovery divides the top-level by the slot count. It is
+            # preserved verbatim only so a test can drive the legacy branch;
+            # a real engine has not been observed publishing it at all.
+            return JSONResponse({
+                "default_generation_settings": {
+                    "n_parallel": controller.props_n_parallel,
+                    "n_ctx": controller.props_n_ctx,
+                },
+                "total_slots": controller.props_n_parallel,
+                "slots": [{} for _ in range(controller.props_n_parallel)],
+                "n_ctx": controller.props_n_ctx,
+            })
+        # "modern": the verified b5350 shape. Deliberately NARROW — the point of
+        # a fake is to be as stingy as the real thing, not as generous as the
+        # reader can cope with.
         return JSONResponse({
             "default_generation_settings": {
-                "n_parallel": controller.props_n_parallel,
                 "n_ctx": controller.props_n_ctx,
             },
             "total_slots": controller.props_n_parallel,
-            "slots": [{} for _ in range(controller.props_n_parallel)],
-            "n_ctx": controller.props_n_ctx,
+            "build_info": "fake-backend",
+            "model_path": f"/fake/{controller.served_model_id}.gguf",
         })
 
     async def models(request: Request) -> Response:
-        return JSONResponse({
-            "object": "list",
-            "data": [{
-                "id": controller.served_model_id, "object": "model",
-                "max_model_len": controller.max_model_len,
-            }],
-        })
+        # Per-engine, verified 2026-08-31. The two shapes differ in exactly the
+        # fields the proxy reads, and emitting the union would let a probe pass
+        # here that cannot pass against the real thing:
+        #
+        #   max_model_len — vLLM ONLY. It is the sole capacity fact vLLM
+        #       publishes, which is why vLLM concurrency stays config-seeded.
+        #       llama.cpp does not have it (b5350 confirmed); a fake that
+        #       offered it anyway would let probe_vllm_capacity "succeed"
+        #       against a llama.cpp endpoint.
+        #   root          — vLLM ONLY: the weights path, which is what
+        #       probe_model_fingerprint prefers because a served alias can be
+        #       repointed at different weights without changing.
+        #   meta          — llama.cpp ONLY: {n_params, n_vocab, ...}, the
+        #       fingerprint FALLBACK. Real values below are the shape b5350
+        #       returns, so the fallback is exercised rather than assumed.
+        entry: Dict[str, Any] = {
+            "id": controller.served_model_id, "object": "model",
+        }
+        if controller.engine == "vllm":
+            entry["max_model_len"] = controller.max_model_len
+            entry["root"] = f"/srv/models/{controller.served_model_id}"
+        else:
+            entry["meta"] = {
+                "vocab_type": 2,
+                "n_vocab": 151936,
+                "n_ctx_train": 32768,
+                "n_embd": 896,
+                "n_params": 630167424,
+                "size": 669763072,
+            }
+        return JSONResponse({"object": "list", "data": [entry]})
 
     async def metrics(request: Request) -> Response:
         lines = [

@@ -61,35 +61,57 @@ def test_props_capacity_is_discoverable():
         srv.stop()
 
 
-def test_the_fakes_top_level_n_ctx_is_a_known_fidelity_gap():
-    """🚨 A gap recorded, not papered over.
+def test_the_default_props_shape_matches_the_verified_real_one():
+    """Resolved 2026-08-31 against a real llama-server (b5350).
 
-    The fake emits `props_n_ctx` at BOTH `default_generation_settings.n_ctx`
-    (which Roadstead reads as PER-SLOT) and top-level `n_ctx` (which Roadstead
-    divides by the slot count, i.e. reads as an AGGREGATE). The same number
-    cannot be both. Nothing breaks today because the reader prefers the former
-    and never reaches the fallback — but a test that exercised the fallback
-    against this fake would compute 32768/4 = 8192 and call it per-slot, while
-    the fake also claims per-slot is 32768.
+    This test used to document a gap: the fake emitted the same number at both
+    `default_generation_settings.n_ctx` (read as PER-SLOT) and top-level
+    `n_ctx` (DIVIDED by the slot count, i.e. read as an aggregate), which cannot
+    be right for both. The real engine settled it more sharply than expected —
+    it publishes **neither** a top-level `n_ctx` nor a `n_parallel` nor a
+    `slots` list. The fake was simply more generous than reality.
 
-    It is NOT "fixed" here by making the top level an aggregate, because
-    `health.py` says outright that it is "unconfirmed whether it's ever
-    populated as an aggregate" by a real build. Inventing a shape for the fake
-    would make the fake authoritative over the engine, which is backwards.
-
-    `test_real_engine.py::test_record_the_n_ctx_units` is what settles it. Until
-    it has been run against a real `llama-server`, this test documents the
-    inconsistency so nobody builds on either reading.
+    🚨 Being more generous is the dangerous direction. Capacity discovery
+    PREFERS `default_generation_settings.n_parallel` and falls back to
+    `total_slots`; the real engine only has the latter. Under the old shape the
+    fallback that real discovery entirely depends on was never exercised, so
+    deleting it would have left the suite green and broken discovery in
+    production.
     """
     srv = FakeBackendServer(FakeBackend(props_n_parallel=4, props_n_ctx=32768)).start()
     try:
         props = wire.check_props_shape(srv.url)
         assert props["default_generation_settings"]["n_ctx"] == 32768
-        assert props["n_ctx"] == 32768, (
-            "the fake's top-level n_ctx changed — if this was a deliberate "
-            "fidelity fix, it needs evidence from a real engine, and this test "
-            "plus the note in tests/wire_fidelity/README.md should be updated")
-        assert props["n_ctx"] // wire.discovered_slots(props) != 32768, (
-            "the two readings coincide, so the gap this test documents is gone")
+        assert props["total_slots"] == 4
+        for absent in ("n_ctx", "slots"):
+            assert absent not in props, (
+                f"the fake publishes top-level {absent!r}, which llama.cpp "
+                f"b5350 does not — re-verify against a real engine before "
+                f"widening the shape")
+        assert "n_parallel" not in props["default_generation_settings"], (
+            "the fake publishes default_generation_settings.n_parallel, which "
+            "b5350 does not — restoring it hides the total_slots fallback that "
+            "real capacity discovery depends on")
+        # And the narrow shape still yields the right answers.
+        assert wire.discovered_slots(props) == 4
+        assert wire.discovered_context_per_slot(props) == (
+            32768, "default_generation_settings.n_ctx")
+    finally:
+        srv.stop()
+
+
+def test_the_legacy_profile_still_drives_the_aggregate_fallback():
+    """`health.py` keeps a top-level-`n_ctx` fallback for "older/different
+    builds". No observed engine publishes it, so it can only be exercised
+    deliberately — which is what the legacy profile is for. Without this the
+    fallback would be untestable through the fake and quietly rot."""
+    srv = FakeBackendServer(FakeBackend(
+        props_n_parallel=4, props_n_ctx=32768, props_profile="legacy")).start()
+    try:
+        props = wire.check_props_shape(srv.url)
+        assert props["n_ctx"] == 32768
+        assert props["default_generation_settings"]["n_parallel"] == 4
+        assert len(props["slots"]) == 4
+        assert wire.discovered_slots(props) == 4
     finally:
         srv.stop()

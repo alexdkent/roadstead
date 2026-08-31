@@ -17,13 +17,19 @@ services:
     # Pinned, not :latest. The whole point is to notice when an engine changes
     # its wire shape — a floating tag would make the change invisible by
     # arriving silently, and an unreproducible failure is not an alarm.
-    image: ghcr.io/ggml-org/llama.cpp:server-b4739
+    image: ghcr.io/ggml-org/llama.cpp:server-b5350
     ports:
       - "18080:8080"
     environment:
       # A small instruct model: this exercises WIRE SHAPE, not quality, so the
-      # smallest thing that answers is the right choice. Pulled on first run.
-      LLAMA_ARG_HF_REPO: "ggml-org/Qwen2.5-0.5B-Instruct-Q8_0-GGUF"
+      # smallest thing that answers is the right choice. Pulled on first run
+      # (~0.5GB) into the named volume below, so later runs start in seconds.
+      #
+      # `repo:quant` selects one file from a multi-quant repo. Verified against
+      # the live registry 2026-08-31 — an invented repo id fails the container
+      # with "model is private or does not exist", which reads like an auth
+      # problem and is not one.
+      LLAMA_ARG_HF_REPO: "Qwen/Qwen2.5-0.5B-Instruct-GGUF:q8_0"
       LLAMA_ARG_CTX_SIZE: "8192"
       LLAMA_ARG_N_PARALLEL: "4"
       LLAMA_ARG_HOST: "0.0.0.0"

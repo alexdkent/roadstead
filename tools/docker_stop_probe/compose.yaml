@@ -1,0 +1,34 @@
+# `docker stop` against a Roadstead container with work in flight.
+#
+#   docker compose -f tools/docker_stop_probe/compose.yaml build
+#   docker compose -f tools/docker_stop_probe/compose.yaml up -d
+#   # ... then time `docker stop` at various -t values; see probe.sh
+#
+# 🚨 `internal: true` is a SAFETY GUARD, not a tidiness choice. It gives the
+# container no route off the host, so even a mistake in the entrypoint's
+# repointing cannot reach a real inference backend. The timeout and cost models
+# persist what they learn from measured latency, so contaminating a production
+# proxy's estimates has no clean rollback and raises no alarm.
+
+services:
+  probe:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: roadstead:probe
+    entrypoint: ["python", "/probe/entrypoint.py"]
+    volumes:
+      - ./entrypoint.py:/probe/entrypoint.py:ro
+      - probe-data:/data
+    environment:
+      PROBE_HOLD_S: "${PROBE_HOLD_S:-120}"
+    networks: [isolated]
+    # Deliberately NOT set here: the correct value is the thing being measured.
+    # Pass it explicitly with `docker stop -t N`.
+
+networks:
+  isolated:
+    internal: true
+
+volumes:
+  probe-data:

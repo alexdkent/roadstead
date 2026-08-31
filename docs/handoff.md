@@ -192,15 +192,14 @@ on cutover.
    clean JSON error envelope, because uvicorn cancels the handler task and bypasses the
    `exception_handlers` backstop. Also worth reconsidering upstream: the comment deriving
    `timeout_graceful_shutdown` from `_DRAIN_DEADLINE_S` reasons from a nesting that does not exist.
-2. **The fake backend's `/props` `n_ctx` units** — new 2026-08-31. `health.py` reads
-   `default_generation_settings.n_ctx` as PER-SLOT and divides top-level `props["n_ctx"]` by the
-   slot count, i.e. reads it as an AGGREGATE — while noting it is "unconfirmed whether it's ever
-   populated as an aggregate". `roadstead.testing` emits the **same number in both places**, which
-   cannot be right for both readings. Nothing breaks today (the reader prefers the former and never
-   reaches the fallback), so the fallback is simply emulated wrongly. Deliberately not "fixed" in
-   the fake — that would make the fake authoritative over the engine. Settled by running
-   `tests/wire_fidelity/test_real_engine.py::test_record_the_n_ctx_units` against a real
-   `llama-server`; documented on the default path meanwhile.
+2. ~~**The fake backend's `/props` `n_ctx` units**~~ ✅ **resolved 2026-08-31**, against a real
+   `llama-server` (b5350) — and not the way either candidate answer expected. There is **no
+   top-level `n_ctx`** on a current build, so `health.py`'s divide-by-slots fallback is dead code
+   rather than wrong. The sharper finding sat next to it: the fake also published
+   `default_generation_settings.n_parallel`, which a real engine does not, and `health.py` *prefers*
+   it over `total_slots` — so the fallback real discovery entirely depends on was **never exercised
+   by any test**. `roadstead.testing` now defaults to the verified narrow shape. Full write-up in
+   `ledger.md`; measurements in `tests/wire_fidelity/README.md`.
 
 3. **Catalog placement** — Roadstead currently owns `models.yaml` and its reader. The host keeps its
    own copy; there is deliberately **zero build-time coupling** between them during the dual-track

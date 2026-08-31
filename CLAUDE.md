@@ -78,8 +78,13 @@ what SIGKILL loses — *and* it really can hang, for longer than the code's own 
 the in-flight HTTP *connections*; only when it expires does uvicorn send `lifespan.shutdown`, and
 only then does `ProxyService.shutdown`'s `_DRAIN_DEADLINE_S` drain begin. uvicorn never bounds the
 lifespan shutdown at all. Worst case is their **sum** — 78.25s measured, against a 48s budget that
-reads as though it covers everything. **Any container stop-grace-period must be ≥90s**; `docker
-stop`'s default 10s truncates the drain in every non-idle case.
+reads as though it covers everything.
+
+🚨 **Any container stop-grace-period must be ≥90s.** Measured in a real container
+(`tools/docker_stop_probe/`): at `docker stop`'s **default 10s** with work in flight, the proxy is
+**SIGKILLed with zero budget and zero completion rows persisted** — the shutdown handler never runs
+at all. With `-t 90` the same case exits cleanly at 78.31s with both persisted. The default *works
+while the proxy is quiet*, which is how it will be tested and why it would first fail under load.
 
 ---
 
