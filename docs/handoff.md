@@ -54,7 +54,7 @@ day — see "What is left → Immediate → 2" below.
 ### Immediate
 
 1. ~~**Empty `tests/_pending/`** — 14 quarantined files.~~ ✅ **done 2026-08-31.** The directory
-   and its README are gone and `norecursedirs` no longer mentions it. Suite 1064 → **1196 passed**.
+   and its README are gone and `norecursedirs` no longer mentions it. Suite 1064 → **1196 passed** at that point (1234 after item 3).
    Full disposition below, because six files left this repo and that record must outlive the README
    that used to hold it.
 2. ~~**Migrate off `on_startup`/`on_shutdown` to `lifespan=`**, then drop the starlette upper
@@ -64,9 +64,24 @@ day — see "What is left → Immediate → 2" below.
    (every other test calls `svc.startup()`/`svc.shutdown()` directly and drives the app through
    `httpx.ASGITransport`, which skips it), so the wiring could have been unhooked with the whole
    suite still green. It was mutation-checked — remove `lifespan=` and both new tests fail.
-3. **Finish `api.md`** — two sections are marked INCOMPLETE: the nested `/v1/fleet/*` analytics
-   schemas, and a spot-check for delegator-signature drift between `service.py` and
-   `http_handlers.py`.
+3. ~~**Finish `api.md`** — two INCOMPLETE sections.~~ ✅ **done 2026-08-31.** Both closed, and
+   neither by prose alone:
+
+   - **`/v1/fleet/*` analytics schemas** chased to column level as §3.1, and pinned by
+     `tests/test_fleet_analytics_schema.py`, which drives the real producers against a seeded
+     `queue.db` and **reads §3.1 back**, comparing table-by-table in both directions. An added,
+     renamed or dropped field now fails the suite instead of silently breaking a dashboard. It was
+     mutation-tested — and the first version was caught being weaker than it claimed: pooling the
+     fields of every table under a heading let a deleted `calls[].p95` pass because
+     `by_endpoint_1h[]` happened to document a field of the same name. Compare shape to shape.
+   - **Delegator-signature drift** audited by AST: **30 delegators, 30 identical signatures, zero
+     drift** — the stated contract holds. Now enforced by `tests/test_delegator_signatures.py`
+     rather than re-asserted by hand.
+
+   Two things the audit turned up and the doc now records: `usage_rollup`'s p50/p95 **include queue
+   wait** while `fleet_activity`'s `p95` does not (so the two are not comparable, which nothing said);
+   and all three producers return a **narrower shape** when the DB is unopened — no `now`, no
+   `today_start` — so a consumer that assumes those keys `KeyError`s rather than degrading.
 
 ### The `tests/_pending/` disposition (2026-08-31)
 
