@@ -19,13 +19,13 @@ from typing import Iterator, List
 import httpx
 import pytest
 
-from tests.fake_backend import (
+from roadstead.testing import (
     ALL_FAULTS,
     FakeBackend,
     FakeBackendServer,
     MidStreamReset,
 )
-from tests import fake_backend as fb
+from roadstead.testing import fake_backend as fb
 
 
 @pytest.fixture

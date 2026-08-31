@@ -61,8 +61,30 @@ python3.11 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 ```
 
 The suite needs **no fleet, no network and no inference backend** — it runs against
-`tests/fake_backend.py`, a Starlette app served by real uvicorn on a real socket, which emulates
-both llama.cpp and vLLM wire shapes plus a library of backend pathologies selectable per request.
+`roadstead.testing`, described below.
+
+## A programmable backend, in the box
+
+`roadstead.testing` ships the fake backend the suite runs on, because for a gateway whose thesis is
+capacity-aware admission control, *a backend that lies about its capacity on demand* is a capability
+rather than test scaffolding — and it is not something you can ask a real GPU for.
+
+```python
+from roadstead.testing import FakeBackend, FakeBackendServer, FAULT_CAPACITY_DESYNC
+
+server = FakeBackendServer(FakeBackend(engine="vllm")).start()
+server.controller.set_fault(FAULT_CAPACITY_DESYNC, 2)   # accepts 2, 503s the rest,
+                                                        # while /props claims otherwise
+```
+
+It is a real Starlette app under real uvicorn on a real socket — so real `httpx` and real SSE framing
+are exercised, not a mock transport. It speaks both llama.cpp and vLLM wire shapes across
+`/v1/chat/completions`, `/embed`, `/rerank`, `/props`, `/v1/models`, `/metrics` and `/health`, and
+serves twenty-odd south-face pathologies on command: truncated and invalid JSON, empty completions,
+degenerate repetition, schema violations, phantom and truncated tool calls, partial and interleaved
+SSE frames, TTFT and inter-token stalls, mid-stream resets, and capacity desync.
+
+It is also the executable form of §4 of `docs/api.md` — what Roadstead requires *of a backend*.
 
 ## Documentation
 

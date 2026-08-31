@@ -29,7 +29,7 @@ pytestmark = pytest.mark.heavy
 
 from roadstead import correction as correction_mod
 from roadstead.backend import BackendUnavailable
-from tests.fake_backend import (
+from roadstead.testing import (
     FAULT_FINISH_LENGTH,
     FAULT_PHANTOM_TOOL_CALLS,
     FAULT_SCHEMA_INVALID,

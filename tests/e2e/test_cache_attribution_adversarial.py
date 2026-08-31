@@ -39,7 +39,7 @@ from roadstead.backend import extract_cached_tokens
 from roadstead.queue import PersistentQueue
 from roadstead.timeout_model import normalize_endpoint
 
-from tests.fake_backend import _OMIT_USAGE, _UNSET  # noqa: F401  (imported for parity/clarity)
+from roadstead.testing import OMIT_USAGE, USAGE_DEFAULT  # noqa: F401  (imported for parity/clarity)
 
 
 # --------------------------------------------------------------------------- #
@@ -243,7 +243,7 @@ async def test_sync_seam_hostile_never_500_or_leak(proxy):
         proxy.controller.usage_override = ov
         r = await proxy.chat("hi", model="chat", timeout_s=30)
         assert r.status_code == 200, f"usage_override={ov!r} failed the completion"
-    proxy.controller.usage_override = _UNSET
+    proxy.controller.usage_override = USAGE_DEFAULT
     # absent usage entirely (llama.cpp-ish) via the existing no_usage fault
     r = await proxy.chat("hi", model="chat", fault="no_usage", timeout_s=30)
     assert r.status_code == 200
@@ -300,7 +300,7 @@ async def test_stream_seam_hostile_never_leak(proxy):
         "prompt_tokens": 12, "completion_tokens": 3, "prompt_tokens_details": [1, 2]}
     frames2 = await proxy.stream_frames("a b c", model="chat", timeout_s=30)
     assert frames2
-    proxy.controller.usage_override = _UNSET
+    proxy.controller.usage_override = USAGE_DEFAULT
     proxy.svc._queue_db.flush(timeout=5.0)
     assert proxy.total_in_flight() == 0, "hostile stream usage leaked a slot"
 

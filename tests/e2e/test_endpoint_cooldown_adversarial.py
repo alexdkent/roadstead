@@ -24,7 +24,7 @@ from roadstead.timeout_model import normalize_endpoint
 # per-ship in_container_tollgate via `-m 'not heavy'` (see pyproject `heavy`).
 pytestmark = pytest.mark.heavy
 
-from tests.fake_backend import (
+from roadstead.testing import (
     FAULT_HTTP_400,
     FAULT_HTTP_500,
     FAULT_MID_STREAM_RESET,

@@ -39,7 +39,7 @@ from roadstead.constants import _DEFAULT_TIMEOUT_S, _SMART_DEFAULT_CAP_S
 from roadstead.service import ProxyService
 from roadstead.timeout_model import normalize_endpoint, resolve_ceiling_s
 
-from tests.fake_backend import (
+from roadstead.testing import (
     FAULT_EMPTY_COMPLETION,
     FAULT_HTTP_503,
     FAULT_INTERTOKEN_STALL,

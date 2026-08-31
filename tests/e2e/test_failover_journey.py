@@ -66,7 +66,7 @@ from roadstead.config import (
 )
 from roadstead.__main__ import build_app
 
-from tests.fake_backend import FAULT_CAPACITY_DESYNC, FakeBackend, FakeBackendServer
+from roadstead.testing import FAULT_CAPACITY_DESYNC, FakeBackend, FakeBackendServer
 
 SRC = normalize_endpoint("thinker")     # tier3
 TGT = normalize_endpoint("creative")    # tier2-analyst (the boxa)

@@ -1,8 +1,9 @@
-"""Programmable fake inference backend for the LLM-proxy Phase-T harness.
+"""Programmable fake inference backend — a shipped capability, not test scaffolding.
 
-This is the single most-reused asset in the LLMProxy v2 test plan. It is an
-ASGI (Starlette) app that faithfully mimics **every south-face surface the proxy
-calls** — for both wire shapes the proxy speaks:
+Promoted out of ``tests/fake_backend.py`` on 2026-08-31 (see
+``roadstead/testing/__init__.py`` for why). It is an ASGI (Starlette) app that
+faithfully mimics **every south-face surface the proxy calls** — for both wire
+shapes the proxy speaks:
 
   POST /v1/chat/completions   (sync JSON + streaming SSE)   — llama.cpp & vLLM
   POST /embed                 (embeddings shim)
@@ -31,9 +32,13 @@ an in-process ``MockTransport`` for the mid-stream/reset/interleaved-frame fault
 A ``MockTransport`` handler (:func:`mock_transport_handler`) is also exported for
 pure-unit cases that don't need a socket.
 
-Kept dependency-free beyond Starlette/uvicorn/httpx (all already fleet deps) and
-Python-3.9-safe (``from __future__ import annotations``) so it runs both on the dev
-Mac and in-container.
+Kept dependency-free beyond Starlette/uvicorn/httpx — all already declared
+package dependencies, so importing this adds nothing to the dependency set.
+🚨 Keep it that way: this module is now public surface, and a new import here is
+a new import for everyone who installs Roadstead.
+
+Nothing in the library core imports it. It loads only when asked for by name, so
+a production deployment never pays for it.
 """
 
 from __future__ import annotations
@@ -110,12 +115,21 @@ STREAM_ONLY_FAULTS: Tuple[str, ...] = (
 )
 
 
-# Sentinels for the Phase-2a adversarial usage-shape knobs (below). ``_UNSET``
-# = "use the normal happy-path usage block"; ``_OMIT_USAGE`` = "emit no usage
+# Sentinels for the adversarial usage-shape knobs (below). ``USAGE_DEFAULT``
+# = "use the normal happy-path usage block"; ``OMIT_USAGE`` = "emit no usage
 # block at all". Distinct objects so ``None`` remains a legal override value
-# (an explicit ``usage: null``).
-_UNSET: Any = object()
-_OMIT_USAGE: Any = object()
+# (an explicit ``usage: null``) — which is the whole point: a backend that sends
+# ``"usage": null`` and one that sends no ``usage`` key are different bugs.
+#
+# Public names since the 2026-08-31 promotion out of tests/: a caller of a
+# shipped module should not have to import underscore-prefixed sentinels to use
+# a documented knob. ``_UNSET``/``_OMIT_USAGE`` remain as aliases — they are the
+# spelling in this module's own history and in any monorepo copy.
+USAGE_DEFAULT: Any = object()
+OMIT_USAGE: Any = object()
+
+_UNSET = USAGE_DEFAULT
+_OMIT_USAGE = OMIT_USAGE
 
 
 class MidStreamReset(RuntimeError):

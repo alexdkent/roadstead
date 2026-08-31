@@ -31,7 +31,7 @@ import pytest_asyncio
 from roadstead.config import EndpointConfig, ProxyConfig
 from roadstead.__main__ import build_app
 
-from tests.fake_backend import FakeBackend, FakeBackendServer
+from roadstead.testing import FakeBackend, FakeBackendServer
 
 
 # Loopback client for the ASGI transport → ACL "internal" identity.

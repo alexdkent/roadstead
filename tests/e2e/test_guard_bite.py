@@ -19,7 +19,7 @@ from roadstead import correction as correction_mod
 from roadstead import service as service_mod  # noqa: F401
 from roadstead.service import _is_degenerate_text
 
-from tests.fake_backend import FAULT_DEGENERATE_LOOP
+from roadstead.testing import FAULT_DEGENERATE_LOOP
 
 
 async def test_degeneration_guard_present_corrects(proxy):

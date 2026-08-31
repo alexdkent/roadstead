@@ -148,8 +148,9 @@ roadstead/          the package (34 modules)
   backend.py        south face: the HTTP client to inference engines
   model_catalog.py  reads models.yaml — the naming/capability authority
   hooks.py          the integration seam (see below)
+  testing/          SHIPPED test doubles — the programmable fake backend
   __main__.py       entrypoint
-tests/              the suite (~107 files) + fake_backend.py + corpus/
+tests/              the suite + corpus/ (GBNF fixtures, north-face, schemas)
 tools/              off-default-path experiments (real processes, real signals)
 docs/               specs, plan, evaluation, ledger
 ```
@@ -171,11 +172,19 @@ remove.
   `json_repair`.
 - `pip install -e '.[dev]'` then `pytest`. No fleet, no network, no backends required — the suite
   runs entirely against `tests/fake_backend.py`.
-- **`tests/fake_backend.py` is the most reused asset in the repo.** A Starlette app under real
-  uvicorn on a real socket (so real `httpx` and real SSE framing are exercised, not a
+- **`roadstead.testing` is the most reused asset in the repo, and it ships.** A Starlette app under
+  real uvicorn on a real socket (so real `httpx` and real SSE framing are exercised, not a
   `MockTransport`), emulating both engine shapes and a library of south-face pathologies selectable
   per-request via an `X-Fault` header — including `capacity_desync`, which accepts N concurrent and
-  503s beyond while `/props` lies about capacity.
+  503s beyond while `/props` lies about capacity. It was `tests/fake_backend.py` until 2026-08-31;
+  promoted because for a gateway whose thesis is capacity-aware admission, a backend that lies about
+  its capacity on demand is a capability, not furniture.
+
+  🚨 **It is public surface now.** A new import in it is a new import for everyone who installs
+  Roadstead — keep it to Starlette/uvicorn/httpx, which are already dependencies. Nothing in the
+  library core imports it, so a production deployment never pays for it. `__all__` and the fault
+  library are pinned against each other by `tests/test_testing_module_is_public.py`, which also
+  proves the import works from outside the repo.
 
 ## 🚨 Before this repo goes public
 
