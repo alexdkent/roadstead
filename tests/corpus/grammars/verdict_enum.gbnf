@@ -1,0 +1,10 @@
+# A closed enum of quoted strings at the root — no object.
+#
+# ⚠️ Keep this fixture: it pins a real best-effort LIMITATION of
+# grammar.root_object_keys, which scans the root RHS for `\"name\"` literals and
+# cannot tell an enum VALUE from an object KEY. It therefore reports
+# ["pass", "fail", "unknown"] here, and verify_conformance takes its object
+# branch on a grammar that has no object. That is documented behaviour, not a
+# bug to fix blind — the check is explicitly structural rather than a full GBNF
+# parse. See freeform_string.gbnf for a root that genuinely reports no keys.
+root ::= "\"pass\"" | "\"fail\"" | "\"unknown\""

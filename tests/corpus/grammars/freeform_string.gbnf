@@ -1,0 +1,5 @@
+# A bare JSON string root — the genuine non-object case. root_object_keys finds
+# nothing, so verify_conformance can only fence-check and forbid-field-check.
+# That branch is otherwise untested.
+root ::= "\"" char* "\""
+char ::= [^"\\] | "\\" ["\\/bfnrt]

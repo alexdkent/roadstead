@@ -55,7 +55,9 @@ roadstead = ["*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = ["_pending"]
+# NB: no `norecursedirs` — it was ["_pending"], which silently OVERRODE pytest's
+# own defaults (.git, build, dist, *.egg…). The quarantine is gone; leaving the
+# key would keep that override for nothing.
 asyncio_mode = "auto"
 timeout = 60
 filterwarnings = ["ignore::DeprecationWarning"]

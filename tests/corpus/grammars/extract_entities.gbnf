@@ -1,0 +1,10 @@
+# Array-of-objects extraction. The multi-line-rule-body shape that produced the
+# newline-mid-sequence failure class in production, written the way normalize()
+# has to accept it.
+root ::= "{" ws "\"entities\"" ws ":" ws entities ws "}"
+entities ::= "[" ws ( entity ( ws "," ws entity )* )? ws "]"
+entity ::= "{" ws "\"name\"" ws ":" ws string ws "," ws "\"kind\"" ws ":" ws kind ws "}"
+kind ::= "\"person\"" | "\"place\"" | "\"org\""
+string ::= "\"" char* "\""
+char ::= [^"\\] | "\\" ["\\/bfnrt]
+ws ::= [ \t\n]*

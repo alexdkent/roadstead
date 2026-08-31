@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[1]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # repo root
 sys.path.insert(0, str(REPO))
 
 from roadstead import failover as failover_mod  # noqa: E402

@@ -1,0 +1,14 @@
+# An action-proposal object: the shape a tool-using agent emits when it decides
+# what to do next. Vendored as a REPRESENTATIVE fixture — the original lived in
+# a fleet agent's tree and the tests that use it are about grammar conformance,
+# not about that agent.
+#
+# Exercises the egress silent-drop check: an object root whose top-level keys
+# are recoverable by grammar.root_object_keys, a closed enum, and a nested
+# object value.
+root ::= "{" ws "\"action\"" ws ":" ws action ws "," ws "\"params\"" ws ":" ws params ws "," ws "\"why\"" ws ":" ws string ws "}"
+action ::= "\"comment\"" | "\"approve\"" | "\"reject\"" | "\"defer\""
+params ::= "{" ws "}"
+string ::= "\"" char* "\""
+char ::= [^"\\] | "\\" ["\\/bfnrt]
+ws ::= [ \t\n]*
