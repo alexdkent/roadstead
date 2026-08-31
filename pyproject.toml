@@ -61,3 +61,14 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 timeout = 60
 filterwarnings = ["ignore::DeprecationWarning"]
+# `wire_fidelity` needs a real inference engine, so it is deselected by default
+# and skips cleanly anyway when none is reachable. Run it with
+#   pytest -m wire_fidelity tests/wire_fidelity/
+# See tests/wire_fidelity/README.md.
+addopts = "-m 'not wire_fidelity'"
+markers = [
+  "wire_fidelity: needs a REAL inference engine (see tests/wire_fidelity/)",
+  # Pre-existing and previously unregistered, which cost 8 PytestUnknownMark
+  # warnings on every run. Registering it changes no selection.
+  "heavy: slower adversarial/E2E tests; still on the default path",
+]

@@ -1,0 +1,42 @@
+# One small real llama-server, purely so `test_real_engine.py` has an engine to
+# interrogate. Not a deployment example — see docs/corpus_and_scrub_plan.md; the
+# real fleet's topology is not described here and should not be added.
+#
+#   docker compose -f tests/wire_fidelity/compose.yaml up -d
+#   ROADSTEAD_WIRE_FIDELITY_URL=http://127.0.0.1:18080 \
+#   ROADSTEAD_WIRE_FIDELITY_COMPOSE=1 \
+#       pytest -m wire_fidelity tests/wire_fidelity/
+#   docker compose -f tests/wire_fidelity/compose.yaml down
+#
+# 🚨 --ctx-size and --parallel below are LOAD-BEARING: test_real_engine.py
+# derives the expected per-slot context from them (8192 / 4 = 2048). Change one,
+# change COMPOSE_CTX_SIZE / COMPOSE_PARALLEL there too.
+
+services:
+  llama:
+    # Pinned, not :latest. The whole point is to notice when an engine changes
+    # its wire shape — a floating tag would make the change invisible by
+    # arriving silently, and an unreproducible failure is not an alarm.
+    image: ghcr.io/ggml-org/llama.cpp:server-b4739
+    ports:
+      - "18080:8080"
+    environment:
+      # A small instruct model: this exercises WIRE SHAPE, not quality, so the
+      # smallest thing that answers is the right choice. Pulled on first run.
+      LLAMA_ARG_HF_REPO: "ggml-org/Qwen2.5-0.5B-Instruct-Q8_0-GGUF"
+      LLAMA_ARG_CTX_SIZE: "8192"
+      LLAMA_ARG_N_PARALLEL: "4"
+      LLAMA_ARG_HOST: "0.0.0.0"
+      LLAMA_ARG_PORT: "8080"
+    volumes:
+      - llama-models:/root/.cache/llama.cpp
+    healthcheck:
+      # First run downloads weights; give it room rather than failing the run.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
+
+volumes:
+  llama-models:
