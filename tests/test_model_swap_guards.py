@@ -34,7 +34,7 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]  # originfleet/
+REPO = Path(__file__).resolve().parents[1]  # repo root
 sys.path.insert(0, str(REPO))
 
 backend = importlib.import_module("roadstead.backend")

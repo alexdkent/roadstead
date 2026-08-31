@@ -28,6 +28,7 @@ from roadstead.observability import (
 )
 from roadstead.queue import PersistentQueue
 from roadstead.service import ProxyService
+from tests.wire_contract import carries_deferral_marker
 
 
 class _FakeRequest:
@@ -310,7 +311,6 @@ def _ibody():  # interactive (P0) thinker request
 
 @pytest.mark.asyncio
 async def test_operator_pause_drains_then_resume_restores():
-    from originfleet.framework.nexus_errors import is_deferrable_llm_error
     svc = ProxyService(ProxyConfig())
     _stub_probes(svc)
     await svc.startup()
@@ -329,7 +329,7 @@ async def test_operator_pause_drains_then_resume_restores():
         assert r.status_code == 503
         err = json.loads(r.body.decode())["error"]
         assert "maintenance" in err
-        assert is_deferrable_llm_error(ConnectionError(err)), err
+        assert carries_deferral_marker(err), err
 
         # RESUME restores health (poller takes back over)
         resp2 = await svc.handle_admin_endpoint_pause(
@@ -396,7 +396,6 @@ async def test_operator_pause_alerts_drained_not_outage():
 
 @pytest.mark.asyncio
 async def test_drain_503_body_is_deferrable():
-    from originfleet.framework.nexus_errors import is_deferrable_llm_error
     import json as _json
     svc = ProxyService(ProxyConfig())
     _stub_probes(svc)
@@ -408,7 +407,7 @@ async def test_drain_503_body_is_deferrable():
         err = _json.loads(resp.body.decode())["error"]
         # A streaming/sync caller wraps this body; it MUST classify deferrable so
         # a turn caught mid-SIGTERM defers instead of surfacing a hard error.
-        assert is_deferrable_llm_error(ConnectionError(err)), err
+        assert carries_deferral_marker(err), err
     finally:
         svc._draining.clear()
         await svc.shutdown()

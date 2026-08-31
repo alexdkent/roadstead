@@ -1,0 +1,7 @@
+# A BOUNDED repetition, deliberately well under MAX_REPETITION_THRESHOLD. The
+# over-threshold form is a validator failure case and is pinned inline in
+# test_grammar_authority.py; this is the legal counterpart.
+root ::= "[" ws ( item ( ws "," ws item ){0,31} )? ws "]"
+item ::= "\"" char* "\""
+char ::= [^"\\] | "\\" ["\\/bfnrt]
+ws ::= [ \t\n]*

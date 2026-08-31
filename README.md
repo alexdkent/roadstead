@@ -45,8 +45,8 @@ outside Kubernetes, and none at all that does the last two.
 | Phase | |
 |---|---|
 | 0 · Sever host-application imports | ✅ done |
-| 1 · Standalone repo, namespace, packaging | 🔨 in progress |
-| 2 · Standalone test harness | backends ~80% covered, callers ~50% |
+| 1 · Standalone repo, namespace, packaging | ✅ done |
+| 2 · Standalone test harness | 🔨 backends ~80% covered, callers ~50% |
 | 3 · Parity + stabilisation | not started |
 | 4 · Cutover | deferred |
 | 5 · Publish | deferred |

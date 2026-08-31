@@ -13,6 +13,8 @@ import logging
 import os
 import signal
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 os.environ.setdefault("COLLECTIVE_AGENT_NAME", "llmproxy")
 
@@ -116,10 +118,36 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
 
     svc = ProxyService(config)
     routes = make_routes(svc)
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+        """Startup/shutdown wiring, as an ASGI lifespan context manager.
+
+        Replaced the ``on_startup=``/``on_shutdown=`` constructor arguments on
+        2026-08-31: Starlette 1.0 removed them, and the upper bound that kept
+        this working was a ceiling on a core dependency. Semantics are
+        unchanged — ``svc.startup()`` runs once before the first request,
+        ``svc.shutdown()`` runs the bounded drain on ``lifespan.shutdown``,
+        which is what uvicorn sends on SIGTERM.
+
+        The ``finally`` is deliberate and is NOT what ``on_shutdown`` did: if
+        the lifespan task is cancelled rather than shut down cleanly,
+        ``on_shutdown`` handlers never ran at all, so the drain was skipped
+        outright. Here it at least starts — ``_draining`` is set and the
+        scheduler stops admitting before the first ``await`` can re-raise the
+        cancellation. A startup failure still propagates without running
+        shutdown, exactly as before, because the ``try`` is entered after
+        ``svc.startup()`` returns.
+        """
+        await svc.startup()
+        try:
+            yield
+        finally:
+            await svc.shutdown()
+
     app = Starlette(
         routes=routes,
-        on_startup=[svc.startup],
-        on_shutdown=[svc.shutdown],
+        lifespan=lifespan,
         # Robustness backstop: malformed JSON → 400; any other uncaught route
         # exception → logged clean 500 (never a raw ASGI 500). Per-field
         # coercions (priority/timeout_s/query-params) are handled at the source;

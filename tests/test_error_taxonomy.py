@@ -1,12 +1,28 @@
 """M2 — structured error taxonomy: machine-readable ``code`` on every proxy
 error envelope, with the LOAD-BEARING deferrable substrings preserved.
 
-The fleet's deferral classifier (`framework.nexus_errors.is_deferrable_llm_error`)
-sniffs error TEXT — these tests use the real classifier as the oracle so any
-drift between proxy wording and classifier markers fails here, not in
-production. Each error path asserts:
-  1. the new ``code`` field (additive, machine-readable),
-  2. the classifier's verdict on the message (deferrable vs surface).
+Each error path asserts two things:
+  1. the ``code`` field (additive, machine-readable),
+  2. that the message carries — or pointedly does not carry — the marker
+     substrings that decide whether a caller defers or surfaces the error.
+
+**Why this is not a tautology.** Deferral classification does not live in the
+proxy: callers match SUBSTRINGS of the error message, historically in the
+host's ``framework/nexus_errors.py``. The original version of this file
+imported that classifier and used it as an oracle, which is exactly why it
+could not run standalone. Importing Roadstead's own copy of the rule and
+asserting it agrees with itself would prove nothing — two values compared from
+one source (``tests/_pending/README.md``).
+
+So the markers live in ``tests/wire_contract.py`` as literals transcribed from
+the shared boundary object, ``docs/api.md`` §2.2 — read that module's docstring
+for the full reasoning. This file pins the SERVER side to them; the monorepo's
+integration test pins the CLIENT side to the same literals. Drift on either side
+then fails on that side, which is the whole point.
+
+The one assertion genuinely left to the monorepo is marked inline: that a 502
+envelope becomes deferrable via the ``LLM proxy error 502`` prefix, because the
+client constructs that prefix — the proxy never emits it.
 """
 
 from __future__ import annotations
@@ -16,11 +32,10 @@ import json
 
 import pytest
 
-from originfleet.framework.nexus_errors import is_deferrable_llm_error
 from roadstead.backend import BackendError, BackendResponse
 from roadstead.config import ProxyConfig
 from roadstead.service import ProxyService
-
+from tests.wire_contract import carries_deferral_marker
 
 class _Req:
     class _Client:
@@ -39,9 +54,6 @@ def _body(endpoint="llama-thinker", **payload_extra):
     }
 
 
-def _classifier_says_defer(message: str) -> bool:
-    return is_deferrable_llm_error(ConnectionError(message))
-
 
 @pytest.mark.asyncio
 async def test_draining_is_deferrable_with_code():
@@ -51,7 +63,7 @@ async def test_draining_is_deferrable_with_code():
     body = json.loads(resp.body)
     assert resp.status_code == 503
     assert body["code"] == "draining"
-    assert _classifier_says_defer(body["error"])  # "backpressure" marker
+    assert carries_deferral_marker(body["error"])  # "backpressure"
 
 
 @pytest.mark.asyncio
@@ -63,7 +75,7 @@ async def test_circuit_open_and_paused_are_deferrable_with_codes():
     body = json.loads(resp.body)
     assert resp.status_code == 503
     assert body["code"] == "circuit_open"
-    assert _classifier_says_defer(body["error"])  # "circuit open" marker
+    assert carries_deferral_marker(body["error"])  # "circuit open"
 
     # Operator drain reads as draining, still deferrable.
     svc._endpoint_health["thinker"]["healthy"] = True
@@ -72,7 +84,7 @@ async def test_circuit_open_and_paused_are_deferrable_with_codes():
     body = json.loads(resp.body)
     assert resp.status_code == 503
     assert body["code"] == "draining"
-    assert _classifier_says_defer(body["error"])  # "backpressure" marker
+    assert carries_deferral_marker(body["error"])  # "backpressure"
 
 
 @pytest.mark.asyncio
@@ -84,7 +96,7 @@ async def test_backpressure_shed_is_deferrable_with_code():
     assert resp.status_code == 429
     assert body["code"] == "backpressure"
     assert resp.headers.get("retry-after")
-    assert _classifier_says_defer(body["error"])
+    assert carries_deferral_marker(body["error"])
 
 
 @pytest.mark.asyncio
@@ -95,9 +107,10 @@ async def test_invalid_grammar_is_not_deferrable_and_coded():
     body = json.loads(resp.body)
     assert resp.status_code == 422
     assert body["code"] == "invalid_grammar"
-    # Deterministic request error: the message must NOT trip the deferral
-    # classifier (a defer-loop on a static grammar never converges).
-    assert not _classifier_says_defer(body.get("detail", "") + body.get("error", ""))
+    # Deterministic request error: the message must NOT carry a deferral
+    # marker (a defer-loop on a static grammar never converges).
+    assert not carries_deferral_marker(
+        body.get("detail", ""), body.get("error", ""))
 
 
 @pytest.mark.asyncio
@@ -108,7 +121,7 @@ async def test_unknown_endpoint_enforce_404_not_deferrable():
     body = json.loads(resp.body)
     assert resp.status_code == 404
     assert body["code"] == "unknown_endpoint"
-    assert not _classifier_says_defer(body["error"])
+    assert not carries_deferral_marker(body["error"])
 
 
 @pytest.mark.asyncio
@@ -126,9 +139,11 @@ async def test_backend_error_envelope_coded_and_deferrable_via_status():
         assert resp.status_code == 502
         assert body["status"] == "error"
         assert body["code"] == "backend_error"
-        # The CLIENT-side mapping makes a 502 envelope deferrable via the
-        # "LLM proxy error 502" prefix — pin that contract end to end.
-        assert _classifier_says_defer(f"LLM proxy error 502: {json.dumps(body)}")
+        # LEFT TO THE MONOREPO: a 502 envelope becomes deferrable via the
+        # client-constructed "LLM proxy error 502: ..." prefix. The proxy never
+        # emits that prefix, so there is nothing here to assert it against —
+        # asserting it from this side would only restate the client's own rule.
+        # What IS ours is the status and the code, above.
     finally:
         await svc.shutdown()
 

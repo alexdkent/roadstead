@@ -29,7 +29,7 @@ library core, routed through a new `hooks.py` integration seam and a vendored `m
 30 modules now import nothing outside the package; `__main__.py` holds the only host imports and
 both are soft.
 
-**Phase 1 — mostly done, and it works.**
+**Phase 1 — done.** (Completed 2026-08-31; the three items below were what remained.)
 
 - Extracted with `git filter-repo`, **not** copied: 282 commits preserved, reaching back to
   `9b11729` (2026-05-27, *"centralized LLM scheduler proxy — DRR scheduling, priority bands"*).
@@ -40,12 +40,12 @@ both are soft.
 - **The suite is green standalone: 1064 passed, 1 skipped**, in a clean venv with no `originfleet`
   on the path and no fleet, network or backend required.
 
-### One real finding from the standalone build
+### One real finding from the standalone build — since resolved
 
-`starlette` is pinned **`<1.0`** and the bound is load-bearing: Starlette 1.0 removed the
-`on_startup`/`on_shutdown` constructor arguments this app uses. Installing unpinned produced **142
-identical collection errors**. Migrating to `lifespan=` is what lifts the pin, and it is a good
-early task — small, self-contained, and it removes a ceiling on a core dependency.
+`starlette` *was* pinned **`<1.0`**, and the bound was load-bearing: Starlette 1.0 removed the
+`on_startup`/`on_shutdown` constructor arguments this app used, so installing unpinned produced
+**142 identical collection errors**. Migrating `build_app` to `lifespan=` lifted the pin the same
+day — see "What is left → Immediate → 2" below.
 
 ---
 
@@ -53,14 +53,76 @@ early task — small, self-contained, and it removes a ceiling on a core depende
 
 ### Immediate
 
-1. **Empty `tests/_pending/`** — 14 quarantined files, each needing a small understood change. Its
-   README explains each and why deleting them would be wrong. This is the highest-value next task:
-   6 are contract tests whose *server-side half* Roadstead genuinely needs, and 8 are fleet-coupled
-   doctrine tests that mostly belong back in the monorepo.
-2. **Migrate off `on_startup`/`on_shutdown` to `lifespan=`**, then drop the starlette upper bound.
-3. **Finish `api.md`** — two sections are marked INCOMPLETE: the nested `/v1/fleet/*` analytics
-   schemas, and a spot-check for delegator-signature drift between `service.py` and
-   `http_handlers.py`.
+1. ~~**Empty `tests/_pending/`** — 14 quarantined files.~~ ✅ **done 2026-08-31.** The directory
+   and its README are gone and `norecursedirs` no longer mentions it. Suite 1064 → **1196 passed** at that point (1234 after item 3).
+   Full disposition below, because six files left this repo and that record must outlive the README
+   that used to hold it.
+2. ~~**Migrate off `on_startup`/`on_shutdown` to `lifespan=`**, then drop the starlette upper
+   bound.~~ ✅ **done 2026-08-31.** `build_app` now takes `lifespan=`; the `<1.0` bound is gone.
+   Verified green on both the pinned 0.52.1 and the unpinned 1.6.0 — 1066 passed, 1 skipped each.
+   `tests/test_lifespan_wiring.py` is new: nothing previously exercised the lifespan protocol at all
+   (every other test calls `svc.startup()`/`svc.shutdown()` directly and drives the app through
+   `httpx.ASGITransport`, which skips it), so the wiring could have been unhooked with the whole
+   suite still green. It was mutation-checked — remove `lifespan=` and both new tests fail.
+3. ~~**Finish `api.md`** — two INCOMPLETE sections.~~ ✅ **done 2026-08-31.** Both closed, and
+   neither by prose alone:
+
+   - **`/v1/fleet/*` analytics schemas** chased to column level as §3.1, and pinned by
+     `tests/test_fleet_analytics_schema.py`, which drives the real producers against a seeded
+     `queue.db` and **reads §3.1 back**, comparing table-by-table in both directions. An added,
+     renamed or dropped field now fails the suite instead of silently breaking a dashboard. It was
+     mutation-tested — and the first version was caught being weaker than it claimed: pooling the
+     fields of every table under a heading let a deleted `calls[].p95` pass because
+     `by_endpoint_1h[]` happened to document a field of the same name. Compare shape to shape.
+   - **Delegator-signature drift** audited by AST: **30 delegators, 30 identical signatures, zero
+     drift** — the stated contract holds. Now enforced by `tests/test_delegator_signatures.py`
+     rather than re-asserted by hand.
+
+   Two things the audit turned up and the doc now records: `usage_rollup`'s p50/p95 **include queue
+   wait** while `fleet_activity`'s `p95` does not (so the two are not comparable, which nothing said);
+   and all three producers return a **narrower shape** when the DB is unopened — no `now`, no
+   `today_start` — so a consumer that assumes those keys `KeyError`s rather than degrading.
+
+### The `tests/_pending/` disposition (2026-08-31)
+
+Eight of the fourteen moved into `tests/` intact or nearly so; six left. The recurring lesson: most
+were not coupled to the host at all — they were coupled to a *path* that assumed a monorepo checkout,
+reaching into the host's tree for files that are now this repo's own.
+
+**Moved in (8).** `test_structured_empty_detection` · `test_error_taxonomy` · `test_context_gate` ·
+`test_phase5_reliability` · `test_phase1_integrity` (less one test) · `test_egress_conformance` ·
+`test_grammar_authority` · `test_endpoint_cooldown` · `test_thinking_option`
+
+Two new shared assets came out of it:
+
+- **`tests/wire_contract.py`** — the marker substrings and keepalive figures as literals transcribed
+  from `docs/api.md`, so the two ends of a client/server contract can each be pinned without either
+  asserting its own rule back at itself. `tests/test_wire_contract.py` reads the doc back so the
+  transcription cannot rot silently.
+- **`tests/corpus/grammars/`** — six vendored GBNF fixtures covering the shapes real callers send
+  (object root, array-of-objects, mixed types with an optional field, bounded repetition, bare enum,
+  non-object root). Replaces a scan of a private system's agent tree. `test_grammar_authority` now
+  asserts the corpus **by name**, not by count, so a swapped fixture cannot keep the number up while
+  dropping a shape — the ledger's "refuse to pass on an empty set", tightened.
+
+🚨 **Six things left this repo and must be confirmed present in the monorepo, or they are lost
+rather than moved:**
+
+| what | why it left |
+|---|---|
+| `test_timeout_apply.py` (20 of 21 tests) | `ProxyLLMClient` internals — extend-only policy, advice fetch, pool config. Host code end to end. |
+| `test_proxy_error_strings_are_deferrable` (from `test_phase1_integrity`) | A hardcoded list run through the client's classifier. Exercised no Roadstead code at all. |
+| `test_thinker_bench.py` | Drives a benchmark script that lives in the monorepo. |
+| `test_tier3_serve_script_doctrine.py` | Pins vendored vLLM launch scripts that exist only on a fleet host. |
+| `test_inference_placement_doctrine.py` | The host/vehicle placement charter — which machine runs what. Roadstead has no opinion. |
+| `test_tier2_analyst_naming_doctrine.py` | The `creative` retired-name coupling as it appears in the *real* fleet's catalog. |
+
+The last three also **interact with the scrub** (`corpus_and_scrub_plan.md` S2): they assert facts
+about the real `models.yaml`, so keeping them here would have blocked turning it into an example.
+The `creative` naming invariant itself is still recorded in `CLAUDE.md` and in "Things that will
+mislead you" below — only the fleet-specific assertion left.
+
+The one assertion salvaged out of `test_timeout_apply.py` is `tests/test_keepalive_invariant.py`.
 
 ### Phase 2 — the harness
 
@@ -103,9 +165,20 @@ on cutover.
 
 ## Open questions inherited
 
-1. **SIGTERM vs SIGKILL for shutdown** — the origin knowledge layer contradicts itself. Load-bearing
-   once containerised, because `docker stop` sends SIGTERM then hard-kills after 10s. Resolve by
-   experiment.
+1. ~~**SIGTERM vs SIGKILL for shutdown**~~ ✅ **resolved by experiment, 2026-08-31.** SIGTERM is
+   correct — the drain persists DRR budgets and completions even for a straggler it cancels, which
+   SIGKILL loses. But it is slower than the code implies: uvicorn's `timeout_graceful_shutdown` and
+   the app's `_DRAIN_DEADLINE_S` are **serial, not nested** (uvicorn bounds the in-flight
+   *connections*, then sends `lifespan.shutdown`, and never bounds the lifespan shutdown at all), so
+   the worst case is their sum — **78.25s measured** against a 48s budget that reads as if it covered
+   everything. **A container stop-grace-period must be ≥90s.** Re-runnable:
+   `tools/sigterm_drain_probe.py`; full write-up in `ledger.md`.
+
+   One thing it turned up is **behavioural, so it belongs upstream, not here**: the caller of a
+   cancelled straggler gets a raw `500 Internal Server Error` at the 48s mark rather than the proxy's
+   clean JSON error envelope, because uvicorn cancels the handler task and bypasses the
+   `exception_handlers` backstop. Also worth reconsidering upstream: the comment deriving
+   `timeout_graceful_shutdown` from `_DRAIN_DEADLINE_S` reasons from a nesting that does not exist.
 2. **Catalog placement** — Roadstead currently owns `models.yaml` and its reader. The host keeps its
    own copy; there is deliberately **zero build-time coupling** between them during the dual-track
    period. Revisit only at cutover.

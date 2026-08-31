@@ -1,0 +1,7 @@
+# Mixed value types plus an OPTIONAL trailing field — the shape that catches a
+# validator too eager about required sequences.
+root ::= "{" ws "\"answer\"" ws ":" ws string ws "," ws "\"score\"" ws ":" ws number ( ws "," ws "\"notes\"" ws ":" ws string )? ws "}"
+number ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )?
+string ::= "\"" char* "\""
+char ::= [^"\\] | "\\" ["\\/bfnrt]
+ws ::= [ \t\n]*

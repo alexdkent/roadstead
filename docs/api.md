@@ -1,7 +1,8 @@
 # Roadstead API specification
 
-**Status:** v0.1 — the load-bearing contracts, verified against source on 2026-08-31. Two areas are
-marked **INCOMPLETE** below and need filling before anyone builds against this.
+**Status:** v0.1 — the load-bearing contracts, verified against source on 2026-08-31. The two areas
+previously marked INCOMPLETE are now filled (§3.1 and §5), and both are pinned by tests that read
+this document back, so it fails the suite rather than rotting.
 
 This document is the **shared boundary object** between Roadstead and any host application. During
 the dual-track period (see `handoff.md`) it is a *forward* contract: it records what must not drift
@@ -51,6 +52,29 @@ caller's value, raised toward the recommendation when the model/tier/size needs 
 
 Deadlines are **soft** for streaming: the streaming path may extend a deadline while the backend is
 demonstrably still making decode progress, rather than killing work that is advancing.
+
+### 1.3 The keepalive ordering invariant 🚨
+
+Both ends pool HTTP connections, and **the ordering between their idle timeouts is load-bearing.**
+Whichever side expires an idle socket first is the side that closes it cleanly; if the *server* wins
+the race, a client POST can land on a socket the server has already closed and fail with
+`RemoteProtocolError("Server disconnected without sending a response.")` — a transport error for a
+request that was never attempted.
+
+| | value | where |
+|---|---|---|
+| Client `keepalive_expiry` | **4.5s** | the caller's HTTP pool (host's `_CLIENT_KEEPALIVE_EXPIRY_S`) |
+| Server `timeout_keep_alive` | **30s** | `PROXY_SERVER_KEEPALIVE_S`, env `COLLECTIVE_PROXY_SERVER_KEEPALIVE_S` |
+
+**Required: client < server, with at least 5s of margin** — enough to cover clock skew and RTT
+jitter, not merely a positive difference. The client must always retire idle connections first, so
+the proxy never yanks a socket a caller is about to reuse.
+
+Raised from uvicorn's 5s default on 2026-07-06 precisely because 5s *coincided* with the client's
+own expiry, making either side equally likely to close first under a concurrent burst.
+
+⚠️ `PROXY_SERVER_KEEPALIVE_S` is env-overridable, so this invariant can be broken from a deployment
+config without touching code. `tests/test_keepalive_invariant.py` pins the server side.
 
 ---
 
@@ -112,8 +136,118 @@ readiness-critical endpoints), and the `/v1/fleet/*` analytics family.
 🚨 **`/v1/status` and `/metrics` have external consumers** — in the origin fleet a gateway, a
 ground-truth verifier and a web UI all read them. Treat their top-level key names as public API.
 
-**INCOMPLETE:** the nested response schemas for the `/v1/fleet/*` analytics routes (`fleet_activity`,
-`savings_summary`, `usage_rollup`) were not chased to column level. Fill before publishing.
+### 3.1 `/v1/fleet/*` analytics — response schemas
+
+Chased to column level 2026-08-31. Every field below is pinned by
+`tests/test_fleet_analytics_schema.py`, which drives the real producers against a seeded
+`queue.db` and reads **this section** back — so an added, renamed or dropped field fails the suite
+rather than silently breaking a dashboard.
+
+All three run **off the event loop** via `asyncio.to_thread` (§5c): a heavy `GROUP BY` over the
+whole-fleet completions table must never stall scheduling under a hot dashboard.
+
+🚨 **These read `proxy_completions`, so every window is bounded by `completions_retention_s`**
+(default 30 days). "Total" means *total retained*, not total ever.
+
+#### `GET /v1/fleet/activity` → `fleet_activity(window_s, bin_s)`
+
+Query: `window` (default `24h`, clamped to 24h), `bin` (defaults from the window).
+
+| field | type | meaning |
+|---|---|---|
+| `window_s` | int | Echo of the resolved window. |
+| `bin_s` | int | Echo of the resolved bin width. |
+| `now` | float | Server wall-clock at computation. ⚠️ **Absent when the DB is unopened** — see the note below. |
+| `calls` | list | One entry per time bin, ascending by `ts`. |
+| `by_endpoint_1h` | list | Per-endpoint breakdown over the last hour, by descending `n`, **capped at 16 rows**. |
+
+`calls[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `ts` | int | Bin start, epoch seconds (floor of `completed_at` to `bin_s`). |
+| `n` | int | Completions in the bin. |
+| `fails` | int | Of those, `status != 'ok'`. |
+| `tokens_in` | int | Summed `input_tokens`, nulls as 0. |
+| `tokens_out` | int | Summed `output_tokens`, nulls as 0. |
+| `p95` | float | p95 of `duration_s * 1000`, **milliseconds**, 1dp. `0.0` when the bin has no latencies — not null. |
+
+`by_endpoint_1h[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `endpoint` | string | Endpoint class as persisted. |
+| `n` | int | Completions in the last hour. |
+| `fails` | int | Of those, `status != 'ok'`. |
+| `p95` | float | Milliseconds, 1dp. |
+
+#### `GET /v1/fleet/savings` → `savings_summary(today_start)`
+
+Query: `since` (epoch seconds; digits only, else the local midnight is used).
+
+**Cloud-equivalent cost avoided by running locally** — money *not spent*, not money spent. The proxy
+only sees local traffic.
+
+| field | type | meaning |
+|---|---|---|
+| `today_usd` | float | Summed across endpoints, 2dp. |
+| `total_usd` | float | All retained completions, 2dp. |
+| `today_tokens_in` | int | |
+| `today_tokens_out` | int | |
+| `total_tokens_in` | int | |
+| `total_tokens_out` | int | |
+| `today_start` | int | The boundary actually used — echo it rather than recomputing midnight client-side. |
+| `by_endpoint` | list | Descending by `total_usd`. |
+
+`by_endpoint[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `endpoint` | string | |
+| `today_usd` | float | 4dp — the per-row precision is finer than the 2dp totals. |
+| `total_usd` | float | 4dp. |
+| `tokens_in` | int | **Total** retained, not today. |
+| `tokens_out` | int | **Total** retained, not today. |
+
+#### `GET /v1/usage` → `usage_rollup(dimension, hours)`
+
+Query: `by` ∈ `agent` \| `call_site` \| `endpoint` \| `provider` (anything else → `agent`);
+`hours` (default 24, **capped at 168**).
+
+The HTTP envelope wraps the rows:
+
+| field | type | meaning |
+|---|---|---|
+| `dimension` | string | The resolved `by` value. |
+| `hours` | float | The resolved, capped window. |
+| `rows` | list | Descending by `requests`. |
+
+`rows[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `key` | string | The dimension value. Falls back to **`"—"` (em dash)** on a NULL — *not* `null` and *not* `""`. Defensive only: `agent_id`, `endpoint` and `call_site` are all `NOT NULL` in `proxy_completions`, so nothing written through `persist_complete` / `persist_external_call` can reach it. It becomes load-bearing the day a migration makes one of them nullable. |
+| `requests` | int | |
+| `ok` | int | |
+| `errors` | int | `requests - ok`. |
+| `tokens_in` | int | |
+| `tokens_out` | int | |
+| `cost_usd` | float | 4dp. Cloud-equivalent **avoided**. Grouped by `(dim, endpoint)` and summed up, so a caller spanning endpoints is charged each endpoint's own rate. |
+| `p50_ms` | float | 1dp, over `duration_s * 1000 + queue_wait_ms` — **includes queue wait**, unlike `fleet_activity`'s `p95`. |
+| `p95_ms` | float | 1dp, same basis. |
+
+#### ⚠️ The unopened-DB shapes are narrower
+
+With no DB connection each producer returns an early-out that is **not** the full shape:
+
+| producer | degraded shape |
+|---|---|
+| `fleet_activity` | `window_s`, `bin_s`, `calls`, `by_endpoint_1h` — **no `now`** |
+| `savings_summary` | `today_usd`, `total_usd`, `by_endpoint` — **no token totals, no `today_start`** |
+| `usage_rollup` | `[]` |
+
+A consumer that assumes `now` or `today_start` is always present will `KeyError` rather than degrade.
+Documented because it is easy to hit in a test double and never in production.
 
 ---
 
@@ -193,7 +327,9 @@ the fourteen error codes, the deferrability mechanism and its marker substrings,
 context-overflow marker verbatim, backend dispatch paths, the capacity-discovery asymmetry, and the
 metric-name prefixes.
 
-**Not verified / INCOMPLETE:**
-1. Nested response schemas for `/v1/fleet/*` analytics (§3).
-2. Delegator-signature drift between `service.py` and `http_handlers.py` — the audit relied on a
-   stated identical-signature contract without opening `service.py`. Spot-check before publishing.
+**Previously INCOMPLETE — both closed 2026-08-31:**
+1. ~~Nested response schemas for `/v1/fleet/*` analytics.~~ Chased to column level in §3.1 and
+   pinned by `tests/test_fleet_analytics_schema.py`, which reads this document back.
+2. ~~Delegator-signature drift between `service.py` and `http_handlers.py`.~~ Audited by AST:
+   **30 delegators, 30 identical signatures, zero drift** — the stated contract holds. Now
+   continuously enforced by `tests/test_delegator_signatures.py` rather than re-asserted by hand.

@@ -36,11 +36,15 @@ import time
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]  # originfleet/
-sys.path.insert(0, str(REPO))
-
 health_mod = importlib.import_module("roadstead.health")
 backend_mod = importlib.import_module("roadstead.backend")
+# ``lifecycle.py`` is read as SOURCE by the structural sweep below. The path
+# used to be spelled out relative to a monorepo checkout, reaching into the host
+# application's tree — the only reason this file could not run standalone. It is
+# derived from the imported module now, so it cannot go stale again and cannot
+# silently read the wrong tree.
+LIFECYCLE_SRC = Path(importlib.import_module("roadstead.lifecycle").__file__)
+
 Health = health_mod.Health
 BackendError = backend_mod.BackendError
 BackendTimeout = backend_mod.BackendTimeout
@@ -299,7 +303,7 @@ def test_both_flags_off_still_noop_for_best_effort(monkeypatch):
 
 def test_every_backend_timeout_handler_passes_best_effort():
     import ast
-    src = (REPO / "originfleet" / "llmproxy" / "lifecycle.py").read_text()
+    src = LIFECYCLE_SRC.read_text()
     tree = ast.parse(src)
     offenders, checked = [], 0
     for node in ast.walk(tree):

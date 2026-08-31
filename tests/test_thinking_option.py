@@ -11,14 +11,18 @@ import sys
 import types
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]  # originfleet/
-sys.path.insert(0, str(REPO))
-
 # Import the modules under test (package import so relative imports resolve).
 service = importlib.import_module("roadstead.service")
 config = importlib.import_module("roadstead.config")
 correction = importlib.import_module("roadstead.correction")
 C = correction.Correction
+
+# ``lifecycle.py`` is read as SOURCE by the structural sweep below. The path
+# used to be spelled out relative to a monorepo checkout, reaching into the host
+# application's tree — the only reason this file could not run standalone. It is
+# derived from the imported module now, so it cannot go stale again and cannot
+# silently read the wrong tree.
+LIFECYCLE_SRC = Path(importlib.import_module("roadstead.lifecycle").__file__)
 
 
 def _req(payload, *, stream=False, ptype="chat_completion", endpoint="thinker",
@@ -347,7 +351,7 @@ def _lifecycle_calls(fn_name):
     """Names of `self.correction.<x>(...)` calls made directly inside the named
     method of lifecycle.py (not nested defs)."""
     import ast
-    src = (REPO / "originfleet" / "llmproxy" / "lifecycle.py").read_text()
+    src = LIFECYCLE_SRC.read_text()
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == fn_name:
             out = set()

@@ -17,10 +17,15 @@ import json
 
 import pytest
 
-from originfleet.framework.token_budget import is_context_overflow_error
 from roadstead.backend import BackendResponse
 from roadstead.config import ProxyConfig
 from roadstead.service import ProxyService
+
+# The original test imported the client's ``is_context_overflow_error`` and used
+# it as an oracle, which is what coupled this file to the monorepo. The marker is
+# now a literal transcribed from docs/api.md §2.2 — see tests/wire_contract.py
+# for why that is a stronger pin than importing either side's own rule.
+from tests.wire_contract import CONTEXT_OVERFLOW_MARKER
 
 
 class _Req:
@@ -83,10 +88,11 @@ async def test_enforce_422_with_chunker_marker_and_code():
     body = json.loads(resp.body)
     assert resp.status_code == 422
     assert body["code"] == "context_overflow"
-    # The message must trip the chunkers' canonical overflow detector, exactly
-    # like the backend's own overflow 400 does — otherwise the gate would
-    # REGRESS chunking callers.
-    assert is_context_overflow_error(ValueError(body["error"]))
+    # The message must carry the canonical overflow marker the chunkers match,
+    # exactly like the backend's own overflow 400 does — otherwise the gate
+    # would REGRESS chunking callers: they would see a hard 422 where they used
+    # to see something they knew how to re-chunk and retry.
+    assert CONTEXT_OVERFLOW_MARKER in body["error"], body["error"]
 
 
 @pytest.mark.asyncio
@@ -177,3 +183,4 @@ async def test_non_chat_and_unknown_context_skip_the_gate():
         assert "tier2-chat" not in svc._context_overflows
     finally:
         await svc.shutdown()
+
