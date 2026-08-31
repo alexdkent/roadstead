@@ -8,7 +8,8 @@ and a vLLM tensor-parallel pair across heterogeneous hardware, **without Kuberne
 OpenAI-compatible on the front, model-authoritative on the back.
 
 > ⚠️ **Pre-release, and private.** Extracted from a production monorepo on 2026-08-31 and still
-> stabilising. The in-situ original remains authoritative for behaviour — see `CLAUDE.md`. This
+> stabilising. It is an independent project rather than a replacement for its origin — expect it to
+> become a superset, and expect occasional deliberate breaks (`docs/compatibility.md`). This
 > repository must not be made public until the scrub in `docs/corpus_and_scrub_plan.md` is complete.
 
 ## Why it exists
@@ -47,9 +48,12 @@ outside Kubernetes, and none at all that does the last two.
 | 0 · Sever host-application imports | ✅ done |
 | 1 · Standalone repo, namespace, packaging | ✅ done |
 | 2 · Standalone test harness | ✅ done |
-| 3 · Parity + stabilisation | 🔨 next |
-| 4 · Cutover | deferred |
-| 5 · Publish | deferred |
+| 3 · Soak + hardening | 🔨 next |
+| 4 · Scrub, then publish | gated on the scrub |
+
+Parity against the origin copy, and the cutover it existed to make safe, were **removed from the
+plan on 2026-08-31** when the project stopped being tied to its origin. A parity gate on a
+deliberate superset fails on every improvement.
 
 Plan and current state: **`docs/handoff.md`**.
 

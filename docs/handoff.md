@@ -17,8 +17,11 @@ adopt one of them. The answer was no — nothing in the field satisfies the requ
 its capabilities have no counterpart anywhere surveyed. That decision record is `evaluation.md`, and
 it is worth reading because it is also the clearest statement of what this project is *for*.
 
-**The origin copy remains live and authoritative for behaviour.** See the authority rule in
-`CLAUDE.md`. Structural work here is this repo's own; behavioural change is not.
+**Roadstead is no longer tied to that origin (2026-08-31).** It is not a 1:1 replacement and is not
+trying to become one — it will become a superset and may occasionally break exact backward
+compatibility on purpose. Behavioural fixes land *here*, with no round-trip. The monorepo remains
+useful as **evidence, not authority**: it serves real traffic and can measure things a fake backend
+cannot. See `CLAUDE.md` and `compatibility.md`.
 
 ---
 
@@ -153,11 +156,40 @@ All three items. Suite 1064 at extraction → **1267 passed**, 1 skipped, 6 dese
 deployment data — with a test that fails if anyone tabulates them into a document headed for
 publication.
 
-### Phase 3 — parity, then the deferred phases
+### Phase 3 — soak and hardening 🔨 **next**
 
-Golden-oracle parity against the origin copy, then soak. Cutover (Phase 4) and publication
-(Phase 5) are explicitly deferred and gated separately — publishing is gated on churn settling, not
-on cutover.
+Reshaped 2026-08-31. The phase was *"golden-oracle parity against the origin copy, then soak"*.
+**Parity is deleted, and so is the Phase 4 cutover it existed to make safe** — a parity gate on a
+deliberate superset fails on every improvement, so it would have measured the wrong thing and
+punished the right work. Whether the monorepo ever adopts this package is now its own integration
+question, not a phase of this project.
+
+Soak survives, and the case for it got *stronger*, not weaker. Nothing about it was ever about the
+origin: it is about whether this software is sound over time. What it has to catch:
+
+- 🚨 **The concurrency invariant** — single event loop, no locks, exactly one writer thread. It is
+  the most dangerous thing in the codebase and **nothing in the suite guards it** (`CLAUDE.md`).
+  Sustained concurrent load is the only thing that would surface a violation. Until now "differs
+  from the monorepo" was an implicit backstop for this whole class of bug; dropping parity removes
+  it, which is precisely why soak is now the replacement rather than a nice-to-have.
+- **Growth over time** — WAL and `queue.db` size under the retention sweeps, RSS, the DRR budget
+  table, `proxy_completions` under a realistic mix.
+- **State that survives restarts** — budget drift across repeated SIGTERM/start cycles, the drain
+  under load (measured once, at `tools/docker_stop_probe/`; not yet measured *repeatedly*).
+- **Model convergence** — cost-model EWMA calibration and timeout-model p99 estimates settling to
+  something sane rather than drifting, over hours rather than a test's seconds.
+- **Circuit-breaker flap** — an endpoint that is intermittently unhealthy must not oscillate.
+
+The material already exists: `roadstead.testing` can hold, stall, 503 and desync on demand, and
+`roadstead/simulation.py` + `test_harness.py` came across in the extraction. The work is a
+long-running driver and something that watches, not new fault machinery.
+
+### Phase 4 — the scrub, then publish
+
+Now the horizon, and the scrub is the real blocker rather than a footnote. `models.yaml` is still a
+real hardware inventory and `10.0.0.x` topology is still in the working tree **and in all 283
+commits**. Read `corpus_and_scrub_plan.md` before changing repository visibility; the history
+rewrite is a second `git filter-repo` pass and must be done last.
 
 ---
 
@@ -187,11 +219,12 @@ on cutover.
    everything. **A container stop-grace-period must be ≥90s.** Re-runnable:
    `tools/sigterm_drain_probe.py`; full write-up in `ledger.md`.
 
-   One thing it turned up is **behavioural, so it belongs upstream, not here**: the caller of a
-   cancelled straggler gets a raw `500 Internal Server Error` at the 48s mark rather than the proxy's
-   clean JSON error envelope, because uvicorn cancels the handler task and bypasses the
-   `exception_handlers` backstop. Also worth reconsidering upstream: the comment deriving
+   Two things it turned up were parked as "belongs upstream" under the old authority rule and are
+   now **ours to fix**: the caller of a cancelled straggler gets a raw `500 Internal Server Error`
+   at the 48s mark rather than the proxy's clean JSON error envelope (uvicorn cancels the handler
+   task, bypassing the `exception_handlers` backstop), and the comment deriving
    `timeout_graceful_shutdown` from `_DRAIN_DEADLINE_S` reasons from a nesting that does not exist.
+   Neither is urgent; both are now unblocked.
 2. ~~**The fake backend's `/props` `n_ctx` units**~~ ✅ **resolved 2026-08-31**, against a real
    `llama-server` (b5350) — and not the way either candidate answer expected. There is **no
    top-level `n_ctx`** on a current build, so `health.py`'s divide-by-slots fallback is dead code
@@ -201,6 +234,15 @@ on cutover.
    by any test**. `roadstead.testing` now defaults to the verified narrow shape. Full write-up in
    `ledger.md`; measurements in `tests/wire_fidelity/README.md`.
 
-3. **Catalog placement** — Roadstead currently owns `models.yaml` and its reader. The host keeps its
-   own copy; there is deliberately **zero build-time coupling** between them during the dual-track
-   period. Revisit only at cutover.
+3. **Catalog placement** — Roadstead owns `models.yaml` and its reader. There was deliberately zero
+   build-time coupling to the monorepo's copy during the dual-track period, and with the dual track
+   gone the two are simply separate files in separate projects. The open question is no longer
+   *where the catalog lives* but **what ships**: the schema is Roadstead's contract, the data is a
+   private fleet's. `corpus_and_scrub_plan.md` S2 (ship `models.yaml.example`) is the answer, and it
+   is now on the critical path rather than deferred.
+
+4. **The `n_parallel` preference order** — new 2026-08-31, and newly actionable. `health.py` prefers
+   `default_generation_settings.n_parallel` over `total_slots`, but a current llama.cpp publishes
+   only the latter. The preference is harmless (the fallback fires) but it is backwards relative to
+   measured reality, and it hid a coverage hole for months. Worth reordering — with a test that
+   fails if a build ever publishes both and they disagree.

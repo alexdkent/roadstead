@@ -25,31 +25,42 @@ Four things make it different from every gateway surveyed in `docs/evaluation.md
 
 ---
 
-## 🚨 Provenance and the authority rule — READ THIS FIRST
+## Provenance — and why the authority rule is GONE
 
-This code was extracted on 2026-08-31 from a live monorepo (`OriginFleet`, private), where it runs
-in production as the Python package `originfleet.llmproxy` (on disk:
-`originfleet/originfleet/llmproxy/`). **That in-situ copy is still live, still under development,
-and is AUTHORITATIVE FOR BEHAVIOUR.**
+This code was extracted on 2026-08-31 from a private monorepo (`OriginFleet`), where it still runs
+in production as `originfleet.llmproxy`. The history here is the real thing — 282 commits going back
+to `9b11729` (2026-05-27, *"centralized LLM scheduler proxy — DRR scheduling, priority bands"*),
+extracted with `git filter-repo` rather than copied, so `git log`/`git blame` on any line still
+reaches its original rationale. **Use that.** It is the best documentation this project has.
 
-The history here is the real thing — 282 commits going back to `9b11729` (2026-05-27, *"centralized
-LLM scheduler proxy — DRR scheduling, priority bands"*), extracted with `git filter-repo` rather
-than copied, so `git log`/`git blame` on any line still reaches its original rationale.
+🚨 **For a few hours on 2026-08-31 this file said the monorepo copy was AUTHORITATIVE FOR BEHAVIOUR
+and told you not to fix behaviour here. That rule is retired.** If you are reading a cached summary,
+an old branch, or a stale sibling document that still says it, ignore it.
 
-Until the extraction plan's Phase 3 exit criterion is met:
+**Roadstead is an independent project.** It is not a 1:1 replacement for the in-situ copy and is not
+trying to become one — it will rapidly become a superset, and it may occasionally break exact
+backward compatibility on purpose. There is no parity gate, no cutover to plan, and no re-sync
+obligation in either direction.
 
-- **Behavioural fixes land in the monorepo first**, then come here on a deliberate re-sync.
-- **Do not "fix" a behaviour here unilaterally.** If something looks wrong, it is more likely a
-  deliberate workaround whose reason is recorded below or in `docs/ledger.md` than a bug.
-- Structural work — packaging, namespace, harness, CI, docs — is this repo's own and does not need
-  to go through the monorepo.
+What that changes, concretely:
 
-Divergence is the main risk this project carries. Keep re-syncs deliberate and reviewed.
+- **Fix behaviour here.** Bugs get fixed in this repo. No round-trip.
+- **But look before you fix.** The reason the old rule existed is still half-true: a surprising
+  amount of this code is a deliberate workaround for measured engine behaviour, not an oversight.
+  The findings below and `docs/ledger.md` exist so you can tell the difference. If a thing looks
+  wrong and has no recorded reason, it is probably wrong — fix it.
+- **The monorepo is evidence, not authority.** It serves real traffic; this repo serves a fake
+  backend. When it reports something (a defect rate over 5,460 real responses, a live `/props`
+  shape), that is data we cannot generate here and it is worth having. It carries no obligation and
+  gates nothing.
+- **Breaking changes are allowed, and must be recorded.** See `docs/compatibility.md`: the wire
+  contract in `docs/api.md` is the stable surface, everything else is internal, and every break goes
+  in `CHANGELOG.md` with its reason. "Occasionally, deliberately, written down" — not "freely".
 
 **What does NOT apply here.** This repo has no access to and no dependency on: the fleet's agents,
-`ship.sh`, `cexec`, the `.claude/skills/` layer, the regression ledger, or any fleet host. If a
-comment or docstring references one of those, it is a leftover from extraction — the reference is
-dead, but the *reasoning* it points at is usually still valid. Don't delete the reasoning.
+`ship.sh`, `cexec`, the `.claude/skills/` layer, the monorepo's regression ledger, or any fleet host.
+If a comment or docstring references one of those, it is a leftover from extraction — the reference
+is dead, but the *reasoning* it points at is usually still valid. Don't delete the reasoning.
 
 ---
 

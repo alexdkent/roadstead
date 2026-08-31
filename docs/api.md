@@ -4,10 +4,19 @@
 previously marked INCOMPLETE are now filled (§3.1 and §5), and both are pinned by tests that read
 this document back, so it fails the suite rather than rotting.
 
-This document is the **shared boundary object** between Roadstead and any host application. During
-the dual-track period (see `handoff.md`) it is a *forward* contract: it records what must not drift
-on either side so that a future cutover stays possible. It is not describing a live integration —
-the monorepo currently runs its own in-situ copy and does not call this package.
+This document is Roadstead's **public contract** — the surface `docs/compatibility.md` marks 🔒
+stable. Everything else in the package is internal and may change without notice; changing anything
+here is a breaking change and needs a `CHANGELOG.md` entry, **even when the behaviour is unchanged**
+(§2.2 explains why rewording an error message counts).
+
+🚨 **It is executable, not decorative.** `tests/test_wire_contract.py`,
+`tests/test_fleet_analytics_schema.py`, `tests/test_timeout_floor_contract.py` and
+`tests/test_keepalive_invariant.py` read this file back and fail when the code and the document
+disagree. You cannot quietly drift from it.
+
+It was written as a *forward* contract for a cutover to the origin monorepo. That cutover was
+removed from the plan on 2026-08-31; the document outlived its original purpose because a gateway
+needs a published contract regardless of who is on the other end.
 
 > 🚨 **The most important thing in this document is §2.** The proxy's error *codes* are not the
 > contract that callers actually depend on — the human-readable **marker substrings** are, because

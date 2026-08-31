@@ -11,10 +11,16 @@ Importing Roadstead's own copy of the rule instead would be worse than useless:
 asserting that one source agrees with itself proves nothing. That is the
 tautology trap the quarantine README names.
 
-So the markers live here as literals transcribed from ``docs/api.md`` — the
-shared boundary object, which both sides read and neither side owns. Roadstead's
-tests pin what it EMITS against them; the monorepo's integration tests pin what
-its classifier MATCHES against them. Drift on either side fails on that side.
+So the markers live here as literals transcribed from ``docs/api.md``, which is
+Roadstead's published contract rather than a copy of anyone's implementation.
+These tests pin what Roadstead EMITS against it; a caller pins what its
+classifier MATCHES against it. Neither side reads the other's code, so neither
+can drift silently into agreement with itself.
+
+(The caller in question was the origin monorepo, and this file was written while
+the two projects were coupled. Roadstead became independent on 2026-08-31 — see
+``docs/compatibility.md`` — which changes nothing here: a published contract
+checked from the emitting side is the right shape whoever is consuming it.)
 
 **The one thing that could rot** is this file itself: a literal transcribed by
 hand goes stale the day someone edits the contract without editing the copy.

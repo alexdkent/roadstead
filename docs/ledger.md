@@ -124,10 +124,11 @@ what SIGKILL would lose. But the drain is slow enough to matter:
   `--stop-timeout 90`. `Dockerfile` carries the requirement as a label so the image documents it.
 - Re-run `tools/sigterm_drain_probe.py` if either budget changes — the two are independent knobs
   that look coupled.
-- **Open, and belongs in the monorepo** (behavioural, so not fixable here under the authority rule):
-  the caller of the straggler receives a raw `500 Internal Server Error` at the 48s mark, not the
-  proxy's clean JSON error envelope — uvicorn cancels the handler task, which bypasses the
-  `exception_handlers` backstop in `build_app`.
+- **Open, and ours to fix.** The caller of the straggler receives a raw `500 Internal Server Error`
+  at the 48s mark, not the proxy's clean JSON error envelope — uvicorn cancels the handler task,
+  which bypasses the `exception_handlers` backstop in `build_app`. Parked as "belongs upstream"
+  while the origin monorepo was authoritative for behaviour; that rule was retired 2026-08-31 and
+  this is now simply an open bug here.
 
 ---
 
