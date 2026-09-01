@@ -277,6 +277,8 @@ class EnrichedApi:
                 input_usd_per_mtok=price.input_usd_per_mtok,
                 output_usd_per_mtok=price.output_usd_per_mtok,
                 real_cost=price.real,
+                price_source=price.source,
+                price_detail=price.detail,
             ))
         out.sort(key=lambda f: f.endpoint)
         return out

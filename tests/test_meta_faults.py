@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Iterator, List
 
 import httpx
@@ -72,6 +73,79 @@ def test_every_fault_is_meta_covered():
     covered = set(_COVERED)
     missing = set(ALL_FAULTS) - covered
     assert not missing, f"faults with no meta-test: {sorted(missing)}"
+
+
+def test_every_fault_is_driven_through_the_proxy():
+    """🚨 The second half, and the one this file could not see.
+
+    Everything above proves a fault is EMITTED. That is necessary and not
+    sufficient: a fault nothing drives through Roadstead is a pathology the
+    fake can produce and the proxy has never been asked to survive, and it
+    looks identical to a covered one from in here — `ALL_FAULTS` is full, every
+    meta-test is green, and the fault library reads as an asset that is
+    partly furniture.
+
+    It found `slow_drain` on its first run: emitted, meta-asserted, and driven
+    through the proxy by nothing at all. It was the false-positive control for
+    the stall watchdogs — the case that tells "slow" from "stopped" — and its
+    absence meant nothing checked that a healthy slow stream survives.
+
+    🚨 This file is EXCLUDED from the scan, and that exclusion is the whole
+    guard. Every fault appears here by construction, so counting these files
+    makes the assertion vacuous in exactly the way it is meant to detect.
+
+    Read by AST rather than by grep: a fault is referenced as `fb.FAULT_X`, as a
+    bare `FAULT_X`, or as its own string value, and a substring sweep over the
+    values alone matches prose — `"timeout"` and `"none"` are ordinary words.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+    values = {getattr(fb, n): n for n in dir(fb)
+              if n.startswith("FAULT_") and isinstance(getattr(fb, n), str)}
+    # The files whose job is to enumerate the library rather than to use it.
+    excluded = {Path(__file__).resolve(),
+                root / "tests" / "test_testing_module_is_public.py"}
+
+    driven: set[str] = set()
+    for path in sorted(root.glob("tests/**/*.py")):
+        if path.resolve() in excluded:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:            # not ours to police
+            continue
+        for node in ast.walk(tree):
+            name = None
+            if isinstance(node, ast.Attribute):
+                name = node.attr
+            elif isinstance(node, ast.Name):
+                name = node.id
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                name = values.get(node.value)
+            if name and name.startswith("FAULT_") and hasattr(fb, name):
+                driven.add(getattr(fb, name))
+
+    undriven = sorted(set(ALL_FAULTS) - driven - set(_NOT_DRIVEN))
+    assert not undriven, (
+        "these faults are emitted by the fake and meta-asserted here, but no "
+        "test drives them through the proxy — so nothing knows how Roadstead "
+        f"behaves when they happen: {undriven}. Write that test, or add the "
+        "fault to _NOT_DRIVEN with the reason it needs none.")
+
+    # A `_NOT_DRIVEN` entry that has since grown a test is a stale excuse, and
+    # excuses are how an allowlist stops meaning anything.
+    stale = sorted(set(_NOT_DRIVEN) & driven)
+    assert not stale, (
+        f"_NOT_DRIVEN still excuses {stale}, which a test now drives — drop the "
+        "entry")
+
+
+#: Faults that deliberately need no proxy-level test, each with the reason the
+#: absence is CORRECT rather than merely current. 🚨 Empty as of 2026-09-01, and
+#: that is the point: it is here so a future exemption has to be argued in
+#: writing rather than taken by leaving a fault out of the suite.
+_NOT_DRIVEN: dict[str, str] = {}
 
 
 # --------------------------------------------------------------------------- #

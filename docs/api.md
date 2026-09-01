@@ -312,6 +312,14 @@ Every route is gated exactly like the OpenAI doors (§1.5). `/rs/v1/models` is a
 map of the fleet — slot counts, occupancy, health and prices — and an unenrolled
 caller has no more business reading that than dispatching to it.
 
+🚨 **The `price` block has ONE shape on every route that carries it** — the five
+fields tabled in §1.7.3, on a `/rs/v1/models` row, in a `/rs/v1/plan` estimate
+and inside `attribution.cost`. Until 2026-09-01 the models row carried three of
+the five, silently: a client with one typed view for the price read `source` and
+`detail` as empty for every endpoint, which is the field that says whether a
+price was published by the provider or imputed by us. Two spellings of the same
+object is the gap `docs/ledger.md` is mostly made of.
+
 #### 1.7.1 Declaring what you want: intent, or a pin
 
 A request must declare at least one of `intent`, `model`, `requires` or
@@ -413,7 +421,10 @@ never has to tell Roadstead's fields from the model's.
     "requested": "reasoning", "resolved": "tier3", "endpoint": "tier3",
     "substituted": false, "substitution": null,
     "provider": "large-box", "engine": "vllm", "model": "...",
-    "cost": {"spent_usd": 0.0, "avoided_usd": 0.0031, "price": {"...": "..."}}
+    "cost": {"spent_usd": 0.0, "avoided_usd": 0.0031,
+             "price": {"input_usd_per_mtok": 0.8, "output_usd_per_mtok": 2.4,
+                       "real": false, "source": "imputed",
+                       "detail": "usage_rates class tier3"}}
   },
   "timing": {
     "queue_wait_ms": 3.1, "backend_latency_ms": 2210.0, "ttft_ms": null,
@@ -434,6 +445,9 @@ never has to tell Roadstead's fields from the model's.
 | `attribution.model` | The model the backend is serving, as discovery found it — not the class, and not what was asked for. |
 | `attribution.cost.spent_usd` | **An invoice.** Non-zero only for a real (remote) price. |
 | `attribution.cost.avoided_usd` | **A saving.** What renting the same class of model would have cost. |
+| `attribution.cost.price.real` | 🚨 `true` = an invoice, `false` = a cost avoided. The one bit that says which kind of money the two fields above are. |
+| `attribution.cost.price.source` | `provider` (the backend published it) \| `config` (an operator declared it) \| `imputed` (`usage_rates.py`'s avoided-cost model). The first two are real money. **Where the number came from, not how recent it is** — a published price and an imputed one can be equal and still mean different things. |
+| `attribution.cost.price.detail` | Free-text provenance for a readout. Never parse it. |
 | `timing.ttft_ms` | `null` for a non-streaming call — there is no first token to time, and `0` would read as an instantaneous one. |
 | `timing.deadline_source` | `caller` when you supplied `deadline_s`, `computed` when Roadstead chose it. A behaviour difference, not a label: a computed deadline is a soft budget the streaming path may extend while tokens are still arriving; a supplied one is a hard wall. |
 | `timing.predicted_ms` | What the timeout model expected. `null` when the evidence is too thin. |

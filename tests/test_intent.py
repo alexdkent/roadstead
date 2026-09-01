@@ -315,3 +315,25 @@ def test_the_shipped_catalog_can_satisfy_every_chat_profile():
         f"the shipped catalog cannot serve {unservable} — a built-in profile "
         f"that no shipped endpoint satisfies is a vocabulary that does not work "
         f"out of the box")
+
+
+# ---------------------------------------------------------------------------
+# The one literal this module duplicates on purpose
+# ---------------------------------------------------------------------------
+
+def test_the_default_price_source_matches_the_one_spend_owns():
+    """🚨 `ModelFacts.price_source` defaults to the string `spend.py` calls
+    `SOURCE_IMPUTED`, spelled as a literal because `intent.py` imports nothing
+    from the package and keeping it that way is worth more than sharing a
+    constant. That trade is only safe with a pin: an unpinned duplicate is the
+    "second place deciding" shape, and here the drift would be silent — a row
+    on `GET /rs/v1/models` claiming a provenance no reader recognises, on the
+    field that separates a real invoice from an avoided cost.
+    """
+    from roadstead.intent import ModelFacts
+    from roadstead.spend import SOURCE_IMPUTED
+
+    assert ModelFacts(endpoint="x").price_source == SOURCE_IMPUTED
+    # …and the default agrees with the other half of the same claim: imputed is
+    # not money, which is exactly what `real_cost=False` says.
+    assert ModelFacts(endpoint="x").real_cost is False

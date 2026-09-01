@@ -91,14 +91,30 @@ def test_the_legacy_markers_are_still_published(doc):
 
 
 def test_the_routes_are_published(doc):
+    """🚨 Matched as a whole TOKEN, not as a substring.
+
+    `assert route in doc` was the version, and renaming `/rs/v1/chat` to
+    `/rs/v1/chats` throughout the document left it green — the old name is a
+    prefix of the new one, so the substring is still there. A pin that cannot
+    see a route renamed by extension is not pinning the route.
+
+    The delimiter is a negative lookahead rather than the backtick the
+    error-code and legacy-marker pins use, because a route is written both bare
+    (`` `/rs/v1/chat` ``) and with its verb (`` `POST /rs/v1/chat` ``), so there
+    is no leading backtick to match against. What has to be true is that the
+    name ENDS where it ends.
+    """
     for route in (W.ROUTE_MODELS, W.ROUTE_PLAN, W.ROUTE_CHAT):
-        assert route in doc, f"docs/api.md no longer publishes {route}"
+        assert re.search(re.escape(route) + r"(?![A-Za-z0-9_/-])", doc), (
+            f"docs/api.md no longer publishes {route}")
 
 
 def test_the_enrichment_headers_are_published(doc):
+    """Delimited for the reason above: `X-Roadstead-Endpoint` is a prefix of
+    any longer name somebody might rename it to."""
     for header in (W.HEADER_REQUEST_ID, W.HEADER_ENDPOINT,
                    W.HEADER_DEADLINE_S, W.HEADER_DEADLINE_SOURCE):
-        assert header in doc, f"docs/api.md no longer publishes {header}"
+        assert f"`{header}`" in doc, f"docs/api.md no longer publishes {header}"
 
 
 def test_the_client_keepalive_still_satisfies_the_ordering_invariant(doc):

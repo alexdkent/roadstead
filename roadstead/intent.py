@@ -235,6 +235,21 @@ class ModelFacts:
     #: local endpoint they are internally charged for, and the money question is
     #: the same one either way.
     real_cost: bool = False
+    #: ``TokenPrice.source`` / ``.detail`` — WHERE the price came from, and the
+    #: free-text provenance behind it. Carried so that `GET /rs/v1/models`
+    #: publishes the same price block a chat envelope does; the SDK has one
+    #: `Price` view for both, and until 2026-09-01 this row was missing two of
+    #: its five fields, so `ModelInfo.price.source` read empty for every
+    #: endpoint. `source` is the field that separates a price the provider
+    #: PUBLISHED from one we imputed — the same "measured or guessed"
+    #: distinction the management plane reports for slot counts, and the one a
+    #: caller choosing where to send work most needs.
+    #:
+    #: 🚨 Spelled here as a literal because this module imports nothing from the
+    #: package and that is worth more than sharing a constant. The default is
+    #: `spend.SOURCE_IMPUTED`, and `test_intent.py` pins the two together.
+    price_source: str = "imputed"
+    price_detail: str = ""
 
     @property
     def free_slots(self) -> int:
@@ -276,6 +291,8 @@ class ModelFacts:
                 # that adds the two columns together has the bug that module
                 # exists to prevent.
                 "real": self.real_cost,
+                "source": self.price_source,
+                "detail": self.price_detail,
             },
         }
 

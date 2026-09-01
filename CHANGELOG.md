@@ -8,6 +8,41 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — the blocking client leaked connections and hung after `close()`
+
+Landed 2026-09-01. `roadstead.client.RoadsteadClient` — exported, documented, and until now never
+constructed by a single test. The async class had two files of coverage; its blocking wrapper had
+none, and the wrapper is where the hard part lives: a private event loop on a worker thread with
+async generators pumped across it.
+
+- **Abandoning a stream leaked the connection.** `break`-ing out of `for frame in
+  client.stream(...)` left the async generator to be finalized by the GC on a thread with no running
+  loop, so the `async with` around the HTTP response never unwound and the connection was never
+  released. It announced itself only as `Exception ignored in: <async_generator ...>`, which nothing
+  reads. Streams are now unwound on the loop that owns them, and `close()` drains the ones it handed
+  out before stopping that loop.
+- **Any call after `close()` blocked forever**, waiting on a future a stopped loop will never
+  resolve. It now refuses with a sentence, which is what the module docstring already promised.
+- `close()` is idempotent, and the "you are inside a running loop" refusal no longer trails a
+  `RuntimeWarning: coroutine '_make_async' was never awaited`.
+
+No wire change; a caller who never abandoned a stream and never used a closed client is unaffected.
+
+### Changed — the enriched `price` block has ONE shape on every route
+
+Landed 2026-09-01. **Additive.** `GET /rs/v1/models` was emitting three of the price block's five
+fields, where a chat envelope and a plan estimate emit all five. A client with one typed view for
+"a price" — which is what the shipped SDK has — read `source` and `detail` as empty for every
+endpoint. `source` is the field that separates a price the provider **published** from one Roadstead
+**imputed**, which is the same measured-or-guessed distinction the management plane reports for slot
+counts, and the one a caller choosing where to send work most needs.
+
+Found by a new guard that extracts every field `roadstead/client/_models.py` reads and walks each
+one against a response a real server produced — the client-side twin of the UI's `pick()` guard, and
+for the same reason: a renamed or never-sent field reads as `""` forever and nothing raises. The
+block's five fields are now published in `docs/api.md` §1.7.3 instead of being elided as
+`{"...": "..."}`, which is why the drift was invisible.
+
 ### Changed — 🚨 BREAKING and security-relevant: an address no longer grants admin
 
 Landed 2026-09-01. **The admin plane now requires BOTH a reachable address and an `admin`-scoped

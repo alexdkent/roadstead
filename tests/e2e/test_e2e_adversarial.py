@@ -38,6 +38,7 @@ from roadstead.testing import (
     FAULT_NO_USAGE,
     FAULT_PARTIAL_SSE,
     FAULT_PHANTOM_TOOL_CALLS,
+    FAULT_SLOW_DRAIN,
     FAULT_TIMEOUT,
     FAULT_TRUNCATED_JSON,
     FAULT_TTFT_STALL,
@@ -177,6 +178,54 @@ async def test_stream_stall_aborts_cleanly(proxy, fault):
     frames = await proxy.stream_frames("a b c", fault=fault, fault_arg=2.0,
                                        timeout_s=0.5)
     assert isinstance(frames, list)
+    await _assert_no_leak(proxy)
+
+
+async def test_a_merely_slow_stream_is_not_mistaken_for_a_stalled_one(proxy):
+    """🚨 The FALSE-POSITIVE control for everything above it.
+
+    `FAULT_SLOW_DRAIN` is a valid stream emitted slowly: every token arrives,
+    none of them late. The two tests above prove the watchdogs fire; nothing
+    proved they stay quiet, and a watchdog that cannot tell "slow" from
+    "stopped" kills healthy work on exactly the backend that is already
+    struggling. `lifecycle.py`'s progress probe exists for this case —
+    "a silent-but-alive stream is not killed" — and it had no test.
+
+    The gap between tokens is what must be measured, not the total: this stream
+    takes far longer end to end than the 0.5s deadline that correctly cuts a
+    stalled one, and must still be served in full.
+
+    Until 2026-09-01 `slow_drain` was the one entry in `ALL_FAULTS` that no test
+    drove through the proxy — emitted and meta-asserted, never handled. See
+    `test_meta_faults.test_every_fault_is_driven_through_the_proxy`.
+    """
+    import time
+    gap_s = 0.12
+    t0 = time.monotonic()
+    frames = await proxy.stream_frames("a b c", fault=FAULT_SLOW_DRAIN,
+                                       fault_arg=gap_s)
+    elapsed = time.monotonic() - t0
+    # 🚨 The fault must actually have FIRED. A fake that ignored `fault_arg`
+    # would make everything below a test of the happy path wearing a slow
+    # stream's name — the guardrail-on-the-guardrail argument
+    # `test_meta_faults.py` is built on, applied where the proxy is in the loop.
+    assert elapsed >= gap_s * 2, (
+        f"the stream came back in {elapsed:.2f}s, so it was never slow — this "
+        f"test proves nothing about the watchdogs")
+    content = ""
+    for raw in frames:
+        if raw == "[DONE]":
+            continue
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        ch = obj.get("choices") or []
+        if ch:
+            content += (ch[0].get("delta") or {}).get("content") or ""
+    assert "echo: a b c" in content, (
+        f"a slow but healthy stream was truncated — the stall watchdog is "
+        f"measuring elapsed time rather than the inter-token gap: {content!r}")
     await _assert_no_leak(proxy)
 
 
