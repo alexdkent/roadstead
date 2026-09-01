@@ -41,6 +41,7 @@ from roadstead.backend import BackendStreamEvent
 from roadstead.config import ProxyConfig
 from roadstead.lifecycle import _split_coalesced_finish_chunk as split
 from roadstead.service import ProxyService
+from roadstead.enriched import WIRE_OPENAI
 
 
 # ------------------------------------------------------- the pure splitter
@@ -166,7 +167,7 @@ async def test_no_client_ever_receives_content_and_finish_on_one_chunk():
     svc._backend.stream = _backend(_coalesced(content=" data"), plain)
     await svc.startup()
     try:
-        resp = await svc.handle_submit(_body(), _Req(), openai=True)
+        resp = await svc.handle_submit(_body(), _Req(), wire=WIRE_OPENAI)
         frames = [f for f in await _collect(resp) if f != "[DONE]"]
         for f in frames:
             ch = json.loads(f)["choices"][0]
@@ -192,7 +193,7 @@ async def test_a_plain_content_chunk_is_relayed_byte_identical():
                                                  "finish_reason": "stop"}]}, plain)
     await svc.startup()
     try:
-        resp = await svc.handle_submit(_body(), _Req(), openai=True)
+        resp = await svc.handle_submit(_body(), _Req(), wire=WIRE_OPENAI)
         frames = await _collect(resp)
         assert plain in frames, frames
     finally:

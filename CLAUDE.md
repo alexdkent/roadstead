@@ -76,9 +76,18 @@ is dead, but the *reasoning* it points at is usually still valid. Don't delete t
 
 ---
 
-## 🚨 The concurrency invariant — NOT guarded by any test
+## 🚨 The concurrency invariant — now guarded, and still the most dangerous thing here
 
-This is the single most dangerous thing to get wrong, and **nothing in the suite will catch you.**
+**Guarded as of 2026-09-01** (Workstream F), after being unguarded for the whole of this repo's
+life. `tests/loop_affinity.py` arms it — it wraps the mutating methods of every single-loop object
+and records the thread — and `tests/e2e/test_soak.py` runs sustained overlapping load with it armed,
+asserting thread affinity, slot conservation, DRR budget conservation, ledger conservation, and that
+every request was answered. One test in that file mutates DRR budget state from a second thread **on
+purpose**, so the guard is observed going red from inside the suite forever rather than once.
+`tools/soak.py` is the unbounded version, for what accumulates over minutes.
+
+🚨 **A guard is not a licence.** The rules below are unchanged, and the soak catches a violation only
+on a path the load actually reaches — which is most of them, but not the one you are about to add.
 
 - **Single event loop. No locks** on in-memory scheduler / budget / cache state. That is only safe
   because there is exactly one thread mutating it.
@@ -167,13 +176,16 @@ without new, backend-correct A/B evidence.
 ## Layout
 
 ```
-roadstead/          the package (34 modules + providers/)
+roadstead/          the package (36 modules + providers/ + client/)
   scheduler.py      DRR + priority bands + admission        — pure computation, no I/O
   cost_model.py     slot-second cost, EWMA-calibrated       — pure computation, no I/O
   timeout_model.py  learned latency → recommended deadline  — pure computation, no I/O
   spend.py          prices, per-caller spend, thresholds    — pure computation, no I/O
+  intent.py         a declared capability → an endpoint     — pure computation, no I/O
   correction.py     the output-integrity layer
   lifecycle.py      admission → dispatch → streaming → timeout recording
+  enriched.py       north face TWO: /rs/v1 (see below)
+  http_handlers.py  north face ONE: the OpenAI doors, admin, analytics
   health.py         capacity discovery, circuit breaker, drain
   queue.py          durable event log + THE single writer thread
   identity.py       who is calling: API keys first, acl.py as second factor
@@ -181,14 +193,15 @@ roadstead/          the package (34 modules + providers/)
   providers/        south face ENGINES: llama.cpp | vllm | openrouter (see below)
   model_catalog.py  reads models.yaml — providers + endpoints (see below)
   hooks.py          the integration seam (see below)
+  client/           SHIPPED client SDK for /rs/v1 — imports NOTHING from the server
   testing/          SHIPPED test doubles — the programmable fake backend
   __main__.py       entrypoint
-tests/              the suite + corpus/ (GBNF fixtures, north-face, schemas)
-tools/              off-default-path experiments (real processes, real signals)
+tests/              the suite + corpus/ + loop_affinity.py (arms the invariant above)
+tools/              off-default-path experiments (real processes, real signals, soak)
 docs/               specs, plan, evaluation, ledger
 ```
 
-The four `pure computation, no I/O` modules are the crown jewels and the easiest to test — keep
+The five `pure computation, no I/O` modules are the crown jewels and the easiest to test — keep
 them that way.
 
 **`models.yaml` has two sections, and the split is load-bearing.** `providers:` is *how to reach a
@@ -238,6 +251,42 @@ direction. `tests/test_provider_interface.py` fails if such a comparison reappea
 Providers are **stateless singletons** shared across every endpoint on the single loop — per-request
 state on one is a data race no test here would catch. An unknown engine string resolves to
 llama.cpp, deliberately: that is what `!= "vllm"` always did.
+
+🚨 **TWO north faces, and enrichment never crosses between them.** `/v1/*` is OpenAI-compatible and
+strictly so; `/rs/v1/*` (`enriched.py`) is Roadstead's own, with its own version because the other
+one is versioned by OpenAI. A client that validates against OpenAI's schema must not break because
+it pointed here, and *"we only added fields"* is not a defence — strict validators reject unknown
+keys. So the OpenAI body is byte-identical and its enrichment rides in four `X-Roadstead-*` response
+headers, which carry only what admission had already settled: a streaming response's headers are on
+the wire before a failover the enriched `done` frame can still report. **`POST /v1/submit` is gone**
+(`docs/api.md` §1.9 maps it field by field).
+
+🚨 **Resolution is not substitution, and `intent.py` is where that line is drawn.** A caller declares
+a capability and Roadstead owns the choice of model; a `model` is a *pin* and is a constraint on
+routing, refused rather than quietly served from next door when it cannot be met. An intent landing
+on an endpoint the caller never named is the job being done — reporting it as a substitution would
+make `substituted: true` fire on every intent-routed call and mean nothing. Only a *later* move,
+failover or spill, is disclosed as one. Two ranking rules are doctrine and each has a test observed
+going red: **a real-cost endpoint sorts last under every preference** (otherwise "intent" is a back
+door around the whole spill doctrine and traffic leaves the machine on the ordinary path), and **an
+endpoint with no latency samples sorts as SLOW** (the obvious ascending sort prefers the backend we
+know least about *because* we know least about it). Profiles are expressed in declared capabilities,
+never endpoint names — one that named classes would be a third routing table to keep in step with
+`models.yaml`.
+
+🚨 **A request may DECLINE a substitution; it may never grant itself one.** `substitution: {degrade,
+spill}` narrows what the operator granted, and both gates take the **AND** — an `or` there would let
+a caller award itself a permission its operator withheld, which is the self-asserted `agent_id` bug
+in a different costume, and for spill the consequence is money. Declining is a DEFER, not an error:
+the request keeps its place and is served locally.
+
+🚨 **`roadstead.client` imports nothing from the server, and that is a rule with a test.** Two
+reasons, and the second is the one that would be lost silently: a consumer sending an HTTP request
+should not be installing Starlette, uvicorn, PyYAML and jsonschema; and a client that read the
+server's own constants would agree with it *by construction* and could never catch a drift. Its
+contract literals are transcribed from `docs/api.md` and checked against the document — the same
+two-ended pin `tests/wire_contract.py` uses from the emitting side. It also classifies errors on the
+`code` with §2.2's marker substrings as a fallback, which is the migration §2.2 asked for.
 
 🚨 **Identity is a credential first and an address second, and the precedence is doctrine.**
 `identity.py` resolves every request to a `Principal` — `agent_id` (the DRR fair-share key, quota
@@ -315,6 +364,12 @@ remove.
   library core imports it, so a production deployment never pays for it. `__all__` and the fault
   library are pinned against each other by `tests/test_testing_module_is_public.py`, which also
   proves the import works from outside the repo.
+
+- **`roadstead.client` is the second shipped sub-package**, and its boundary is tighter: **httpx and
+  the stdlib, and nothing from the server**, enforced by AST in `tests/test_client_sdk.py`. It is
+  what another project installs to speak `/rs/v1`, and it must be importable in an environment that
+  has none of the server's dependencies — a subprocess test blocks Starlette, uvicorn, PyYAML,
+  jsonschema and json_repair and requires it to import anyway.
 
 ## 🚨 Before this repo goes public
 

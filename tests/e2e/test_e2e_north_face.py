@@ -81,8 +81,8 @@ async def test_north_face_case_handled_and_no_leak(proxy, case: NorthFaceCase):
 
 # --- payload-shape gate (Phase-1 north-face hardening) -----------------------
 # The flipped fuzz guard (test_north_face_500_gaps_phase1) covers the OpenAI
-# door + the non-dict-element branch. These pin the OTHER door (internal
-# /v1/submit envelope) and the "messages is not a list" branch, and assert the
+# door + the non-dict-element branch. These pin the OTHER door (the enriched
+# /rs/v1/chat envelope) and the "messages is not a list" branch, and assert the
 # typed taxonomy code — so a regression that only broke one door is caught.
 
 @pytest.mark.parametrize("bad_messages", [
@@ -92,8 +92,8 @@ async def test_north_face_case_handled_and_no_leak(proxy, case: NorthFaceCase):
     [{"role": "user", "content": "ok"}, 7],  # one bad element among good
 ])
 async def test_submit_door_rejects_malformed_messages(proxy, bad_messages):
-    resp = await proxy.client.post("/v1/submit", json={
-        "agent_id": "t", "endpoint": "chat", "priority": "P3_INGESTION",
+    resp = await proxy.client.post("/rs/v1/chat", json={
+        "model": "chat", "priority": "P3_INGESTION",
         "call_site": "north_face", "payload_type": "chat_completion",
         "payload": {"messages": bad_messages, "max_tokens": 8},
     })
@@ -109,8 +109,8 @@ async def test_submit_door_accepts_valid_and_absent_messages(proxy):
     for payload in ({"messages": [{"role": "user", "content": "hi"}],
                      "max_tokens": 8},
                     {"prompt": "hi", "max_tokens": 8}):
-        resp = await proxy.client.post("/v1/submit", json={
-            "agent_id": "t", "endpoint": "chat", "priority": "P3_INGESTION",
+        resp = await proxy.client.post("/rs/v1/chat", json={
+            "model": "chat", "priority": "P3_INGESTION",
             "call_site": "north_face", "payload_type": "chat_completion",
             "payload": payload,
         })

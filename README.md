@@ -69,15 +69,16 @@ standalone copy of the proxy it came from.
 
 **Where it is going** (`docs/roadmap.md`):
 
-| | |
-|---|---|
-| **North face** | OpenAI-compatible, strictly — plus an enriched Roadstead API carrying live model information, computed deadlines, priority and attribution |
-| **Model abstraction** | Callers declare intent (`reasoning`, `fast-chat`, `vision`); Roadstead owns the choice. Concrete pins honoured, substitution opt-in and always disclosed |
-| **South face** | Modular providers: llama.cpp and vLLM local, OpenRouter and others remote |
-| **Capacity** | One admission decision, three outcomes — dispatch locally, **spill** to a remote provider, or defer |
-| **Identity** | API keys as the fair-share, quota and budget key |
-| **Cost** | Token and spend accounting, with thresholds that **degrade rather than reject** |
-| **Operations** | Eventually a management interface for running it standalone |
+| | | |
+|---|---|---|
+| **North face** | OpenAI-compatible, strictly — plus the enriched Roadstead API at `/rs/v1` carrying live model information, computed deadlines, priority and attribution | ✅ |
+| **Model abstraction** | Callers declare intent (`reasoning`, `fast-chat`, `vision`); Roadstead owns the choice. Concrete pins honoured, substitution opt-in and always disclosed | ✅ |
+| **South face** | Modular providers: llama.cpp and vLLM local, OpenRouter and others remote | ✅ |
+| **Capacity** | One admission decision, three outcomes — dispatch locally, **spill** to a remote provider, or defer | ✅ |
+| **Identity** | API keys as the fair-share, quota and budget key | ✅ |
+| **Cost** | Token and spend accounting, with thresholds that **degrade rather than reject** | ✅ |
+| **Hardening** | The concurrency invariant armed and asserted under sustained load | ✅ |
+| **Operations** | A management interface for running it standalone | planned |
 
 Parity against the origin copy, and the cutover it existed to make safe, were **removed from the
 plan on 2026-08-31**: a parity gate on a deliberate superset fails on every improvement.
@@ -91,6 +92,36 @@ python3.11 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 The suite needs **no fleet, no network and no inference backend** — it runs against
 `roadstead.testing`, described below.
+
+### Two doors
+
+**OpenAI-compatible**, for anything that already speaks it:
+
+```sh
+curl localhost:42100/v1/chat/completions -H 'Authorization: Bearer $KEY' \
+  -d '{"model": "tier2", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+**The enriched API**, for callers that want what OpenAI's shape cannot carry — declare what you need
+rather than which box, and be told what actually served you:
+
+```python
+from roadstead.client import AsyncRoadsteadClient
+
+async with AsyncRoadsteadClient("http://localhost:42100", api_key=KEY) as rs:
+    plan = await rs.plan(intent="reasoning", est_in=8_000)
+    print(plan.endpoint, plan.recommended_deadline_s, plan.estimated_usd)
+
+    result = await rs.chat(intent="reasoning",
+                           messages=[{"role": "user", "content": "..."}])
+    print(result.content)
+    print(result.attribution.endpoint,      # what actually served
+          result.attribution.substituted,   # and whether that differed
+          result.timing.queue_wait_ms,      # how long it waited for a slot
+          result.usage.slot_seconds)        # what it cost in the unit of fairness
+```
+
+The SDK ships in the package and imports nothing from the server — httpx and the stdlib only.
 
 ## Who is calling — API keys
 
@@ -203,7 +234,7 @@ It is also the executable form of §4 of `docs/api.md` — what Roadstead requir
 | | |
 |---|---|
 | `CLAUDE.md` | Orientation, the concurrency invariant, and the engine-behaviour findings that explain why the code is shaped the way it is. **Read before changing anything.** |
-| `docs/api.md` | The four API surfaces: north face, error contract, admin/control plane, and what Roadstead requires *of a backend*. |
+| `docs/api.md` | The API surfaces: both north faces, the error contract, the admin/control plane, what Roadstead requires *of a backend*, and the client SDK. |
 | `docs/roadmap.md` | **What is being built and why.** Start here for direction. |
 | `docs/compatibility.md` | What is stable, what is not, and how to break something on purpose. |
 | `docs/history.md` | Closed record of the extraction — where the code came from and what that cost. |

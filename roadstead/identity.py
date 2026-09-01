@@ -11,7 +11,10 @@ an authentication:
   compiled into it (scrub item S1);
 * the **request body**, on a bare ``/v1/submit``, where ``agent_id`` was simply
   whatever the caller wrote. That door had no access control at all, so any
-  caller could claim any identity — including one with a better DRR weight.
+  caller could claim any identity — including one with a better DRR weight. (It
+  was gated by this module in 2026-09-01's Workstream B and **removed entirely**
+  in Workstream C; the enriched ``/rs/v1`` door reads no identity from the body
+  at all, which is the end state this was heading for.)
 
 This module makes an **API key** the identity, and demotes the address to an
 optional second factor. Concretely:
@@ -72,7 +75,7 @@ logger = logging.getLogger(__name__)
 #: Where a caller may present its key. ``Authorization: Bearer <key>`` is first
 #: because it is what every OpenAI client already sends — an existing client
 #: needs its ``api_key`` set and nothing else. ``X-API-Key`` exists for callers
-#: that are not speaking the OpenAI dialect at all (a bare ``/v1/submit``).
+#: that are not speaking the OpenAI dialect at all (the enriched ``/rs/v1``).
 _BEARER_PREFIX = "bearer "
 
 
@@ -517,9 +520,9 @@ class IdentityResolver:
     """Resolves a request to a :class:`Principal`, or to a :class:`Denial`.
 
     The one place that knows the precedence between a credential and an address.
-    Everything else — the two OpenAI doors, ``/v1/submit``, the admin surfaces,
-    the deadline floor — asks this and reads the answer off the principal, so a
-    future third factor lands here and nowhere else.
+    Everything else — the two OpenAI doors, the three ``/rs/v1`` routes, the
+    admin surfaces, the deadline floor — asks this and reads the answer off the
+    principal, so a future third factor lands here and nowhere else.
     """
 
     def __init__(

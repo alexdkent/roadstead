@@ -10,9 +10,9 @@ here is a breaking change and needs a `CHANGELOG.md` entry, **even when the beha
 (§2.2 explains why rewording an error message counts).
 
 🚨 **It is executable, not decorative.** `tests/test_wire_contract.py`,
-`tests/test_fleet_analytics_schema.py`, `tests/test_timeout_floor_contract.py` and
-`tests/test_keepalive_invariant.py` read this file back and fail when the code and the document
-disagree. You cannot quietly drift from it.
+`tests/test_fleet_analytics_schema.py`, `tests/test_timeout_floor_contract.py`,
+`tests/test_keepalive_invariant.py`, `tests/test_spend.py` and `tests/test_client_sdk.py` read this
+file back and fail when the code and the document disagree. You cannot quietly drift from it.
 
 It was written as a *forward* contract for a cutover to the origin monorepo. That cutover was
 removed from the plan on 2026-08-31; the document outlived its original purpose because a gateway
@@ -27,8 +27,11 @@ needs a published contract regardless of who is on the other end.
 
 ## 1. North face — the client-facing surface
 
-Routes are registered in one place: `routes.make_routes()` (`routes.py:138-183`). There is no legacy
-duplicate table.
+Routes are registered in one place: `routes.make_routes()`. There is no legacy duplicate table.
+
+**There are two north faces.** `/v1/*` is OpenAI-compatible and strictly so; `/rs/v1/*` is the
+enriched Roadstead API (§1.7), with its own version because the other one is versioned by OpenAI.
+§1.1–§1.4 below describe the OpenAI door.
 
 ### 1.1 Request fields beyond the OpenAI API
 
@@ -146,7 +149,7 @@ and the budget holder.** It is established in one of three ways, in strict prece
 |---|---|---|
 | 1 | **API key** — `Authorization: Bearer <key>` (what an OpenAI client already sends) or `X-API-Key: <key>` | authenticated |
 | 2 | **Source address** — an operator registration in `ROADSTEAD_ACL` | a weak second factor: it identifies a *host*, and several callers may share one |
-| 3 | **`agent_id` in the body** — `/v1/submit` only | a claim, honoured only where nothing stronger contradicts it |
+| 3 | ~~**`agent_id` in the body**~~ | **Gone.** It was reachable only on `/v1/submit`, which was removed in Workstream C (§1.9). No door reads an identity from a request body; a caller cannot name its own fair-share key at all. |
 
 A key carries its own default `priority`, an optional `min_timeout_s` deadline floor, and an
 optional `admin` scope, so all four facts travel with the caller rather than with the machine it
@@ -164,8 +167,11 @@ Three rules, each of which is a decision rather than an implementation detail:
    world over a credential nobody chose.
 3. 🚨 **A key overrides a body-declared `agent_id`; an address only fills in one the body omitted.**
    A verified credential is a stronger statement about who is calling than anything in the body.
+   *(Kept as doctrine although row 3 is now empty: it is the rule that decides what a future body
+   field, or a third identity factor, may and may not override — and it is the reason removing the
+   body claim was safe rather than the reason it stopped mattering.)*
 
-**Every door is gated**, `/v1/submit` included. Out of the box, loopback and docker-internal
+**Every door is gated**, the three `/rs/v1` routes included. Out of the box, loopback and docker-internal
 addresses resolve to the identity `internal` and everything else is refused — default-deny, and the
 local-first case needs no configuration at all. `ROADSTEAD_REQUIRE_API_KEY=1` additionally refuses
 any request that presents no key.
@@ -201,6 +207,244 @@ bounded by what is free and by DRR fairness.
 
 A caller cannot observe its own demotion in a response; it is reported to the operator through the
 degradation seam (§5) once per caller per day, and shown on `/v1/status` under `spend`.
+
+### 1.7 The enriched API — `/rs/v1/*` 🚨
+
+**Two north faces, and they are versioned separately.** `/v1/*` is
+OpenAI-compatible and is versioned by OpenAI; `/rs/v1/*` is Roadstead's own and is
+versioned by us. Pinning them together would mean either following somebody
+else's version number or publishing a `/v2/chat/completions` that is not
+OpenAI's v2.
+
+🚨 **Enrichment never appears inside an OpenAI-shaped body.** A client that
+validates against OpenAI's schema must not break because it pointed at
+Roadstead, and "we only *added* fields" is not a defence: strict validators
+reject unknown keys, and lenient ones hand the extra key to a caller that then
+depends on it from a server that is not us. Everything the OpenAI door can carry
+rides in response headers (§1.8); everything else lives here.
+
+| Route | Purpose |
+|---|---|
+| `GET /rs/v1/models` | What can serve me, what can it do, what is it like *now*, what does it cost. |
+| `POST /rs/v1/plan` | Where would this go, how long should I allow, what would it cost — **without dispatching**. |
+| `POST /rs/v1/chat` | The enriched call. |
+
+Every route is gated exactly like the OpenAI doors (§1.5). `/rs/v1/models` is a
+map of the fleet — slot counts, occupancy, health and prices — and an unenrolled
+caller has no more business reading that than dispatching to it.
+
+#### 1.7.1 Declaring what you want: intent, or a pin
+
+A request declares **one or both** of:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `intent` | string | A capability **profile** — `fast-chat`, `chat`, `reasoning`, `vision`, `tools`, `structured`, `long-context`, `embed`, `rerank`. Roadstead owns the choice of model, provider and moment. |
+| `model` | string | A **pin**: an endpoint class, role or alias. A constraint on routing, not a different API. |
+| `requires` | [string] | Capabilities that must be declared on whatever serves: `vision`, `reasoning`, `streaming`, `tool_calling`, `structured_output`. Composes on top of the profile's own. |
+| `kind` | string | `chat` \| `embed` \| `rerank`. Defaults from the profile, else `chat`. |
+| `min_context` | int | Minimum context window, tokens. |
+| `prefer` | string | How to order candidates: `balanced` (default), `latency`, `capacity`, `context`, `cost`. An explicit value beats the profile's. |
+
+`GET /rs/v1/models` publishes the profile table under `intents` rather than
+asking a caller to read our source for it. ⚠️ **The table is built in today** —
+a deployment cannot yet add or override a profile without editing the package,
+which is an open item in `docs/roadmap.md` under Workstream C. The route
+publishes it anyway, because the day it becomes configurable a caller that had
+been hard-coding our list would break, and one that had been asking would not.
+
+🚨 **There is deliberately no `quality` preference.** A gateway cannot measure
+model quality, and a key spelled `quality` that resolved to "the one with the
+biggest context" would be read by a caller as a promise about answers. Every
+name above is something the proxy actually observes.
+
+Two resolution rules are doctrine:
+
+1. 🚨 **A real-cost endpoint sorts last under every preference.** Local capacity
+   is the design center and remote capacity is *overflow*. If an intent could
+   prefer a remote endpoint because it happened to be faster or emptier, traffic
+   would leave the machine on the ordinary path rather than only when local
+   capacity said no, and the operator would find out on an invoice. A remote
+   endpoint is reachable through an intent only when **no local candidate
+   satisfies the requirements at all** — which is what "overflow" means.
+2. 🚨 **An endpoint with no latency samples is treated as slow, not fast.**
+   `typical_ms` is reported as `null` when unmeasured. Ranking it first would be
+   preferring a backend *because* there is no evidence about it.
+
+A declaration nothing can satisfy is a **`404 unknown_endpoint`** carrying
+`considered` — the near-misses and why each failed. It is never served from
+whatever was nearest: a pin at a text-only endpoint with `requires: ["vision"]`
+is a contradiction, and answering it from the vision model next door would be a
+substitution the caller could not detect.
+
+#### 1.7.2 Prioritisation and the deadline
+
+| Field | Type | Effect |
+|---|---|---|
+| `priority` | enum \| int | The band, as on the OpenAI door. Wins over `interactive`, because it says strictly more. |
+| `interactive` | bool | The first-class spelling of what `priority` has always encoded and never named: whether somebody is waiting. `true` → `P1_TURN_SUPPORT`, `false` → `P3_INGESTION`. |
+| `deadline_s` | float | The enriched spelling of `timeout_s`. **Usually omit it** — §1.2. |
+| `substitution` | object | `{"degrade": bool, "spill": bool}`. See §1.7.4. |
+| `call_site`, `session_id`, `turn_id`, `caller_id`, `request_id` | string | Attribution and correlation. |
+| `payload` | object | **The model request itself** — messages, `max_tokens`, `tools`, `response_format`, `stream`. |
+
+🚨 **The split between the envelope and `payload` is the contract.** Routing
+declarations outside, the model request inside. That is what lets `deadline_s`
+exist at all without being forwarded to a backend that would reject the unknown
+field — the failure mode `/v1/submit` had to pop `timeout_s` out of the body to
+avoid.
+
+#### 1.7.3 The response
+
+Four blocks, plus the backend's own body **nested** under `response` so a caller
+never has to tell Roadstead's fields from the model's.
+
+```json
+{
+  "status": "ok",
+  "request_id": "req_...",
+  "response": { "...the backend's OpenAI-shaped body, untouched..." },
+  "attribution": {
+    "requested": "reasoning", "resolved": "tier3", "endpoint": "tier3",
+    "substituted": false, "substitution": null,
+    "provider": "large-box", "engine": "vllm", "model": "...",
+    "cost": {"spent_usd": 0.0, "avoided_usd": 0.0031, "price": {"...": "..."}}
+  },
+  "timing": {
+    "queue_wait_ms": 3.1, "backend_latency_ms": 2210.0, "ttft_ms": null,
+    "total_ms": 2213.1, "deadline_s": 180.0,
+    "deadline_source": "computed", "predicted_ms": 2400.0
+  },
+  "usage": {"input_tokens": 812, "output_tokens": 410, "slot_seconds": 1.02}
+}
+```
+
+| field | meaning |
+|---|---|
+| `attribution.requested` | The caller's **own words** — the intent profile, or the pin as written (an alias stays the alias). |
+| `attribution.resolved` | The endpoint resolution chose, before any substitution. |
+| `attribution.endpoint` | The endpoint that **actually served**. |
+| `attribution.substituted` | True exactly when `resolved != endpoint`. |
+| `attribution.substitution` | `failover` \| `spill` \| `null`. |
+| `attribution.model` | The model the backend is serving, as discovery found it — not the class, and not what was asked for. |
+| `attribution.cost.spent_usd` | **An invoice.** Non-zero only for a real (remote) price. |
+| `attribution.cost.avoided_usd` | **A saving.** What renting the same class of model would have cost. |
+| `timing.ttft_ms` | `null` for a non-streaming call — there is no first token to time, and `0` would read as an instantaneous one. |
+| `timing.deadline_source` | `caller` when you supplied `deadline_s`, `computed` when Roadstead chose it. A behaviour difference, not a label: a computed deadline is a soft budget the streaming path may extend while tokens are still arriving; a supplied one is a hard wall. |
+| `timing.predicted_ms` | What the timeout model expected. `null` when the evidence is too thin. |
+| `usage.slot_seconds` | Backend occupancy — **the unit of DRR fairness**, and the number that explains scheduling in a way token counts cannot. |
+
+🚨 **`spent_usd` and `avoided_usd` are never summed.** Both are USD and nothing
+else distinguishes them; exactly one is non-zero per call, and which one is a
+property of the price rather than of the endpoint. §1.6.
+
+🚨 **The response carries no priority, no band and no queue position.** §1.6: a
+caller cannot observe its own spend demotion. Publishing the effective priority
+would turn a threshold that "never rejects" into one every client could detect
+and branch on, which is a rejection with extra steps. The absence is the
+contract, not an omission — `tests/e2e/test_enriched_api.py` fails if one
+appears.
+
+**Errors** keep `code` and `error` at the top level, with the §2.1 spellings
+verbatim: the enriched API is a new shape, not a new taxonomy, and §2.2's marker
+substrings live in `error`.
+
+#### 1.7.4 Substitution: opt-in, narrowable, always disclosed
+
+Two independent permissions, granted per identity in the agents config:
+
+| | question | granted by | triggered by |
+|---|---|---|---|
+| **degrade** | this backend is DOWN — may a smaller model answer? | `degrade_ok` | health |
+| **spill** | this backend is FULL — may we pay somebody else to answer now? | `spill_ok` | occupancy |
+
+🚨 **Neither defaults from the other**, and one endpoint can want both. A caller
+whose work may be answered by a smaller *local* model may still be one whose
+prompts must never leave; the reverse is just as common.
+
+A request may send `substitution: {"degrade": false, "spill": false}`.
+
+🚨 **This NARROWS and never widens.** Both gates take the AND with the
+operator's opt-in, so `true` grants nothing on its own. A request that could
+grant itself either would let a caller award itself a permission its operator
+withheld — and for spill the consequence is money spent on somebody's behalf
+without their say-so. The useful direction is the other one: one confidential
+prompt on an identity that is otherwise happy to spill. Declining is a **defer**,
+not an error — the request keeps its place and is served locally when a slot
+frees.
+
+🚨 **Resolution is not substitution.** An intent that lands on an endpoint the
+caller never named is Roadstead doing the job it was asked to do; nothing was
+promised and nothing was swapped. Only a *later* move — failover or spill — is
+reported as a substitution. Conflating them would make `substituted: true` fire
+on every intent-routed call and therefore mean nothing.
+
+#### 1.7.5 Streaming
+
+`payload.stream: true`. SSE, with typed frames:
+
+| frame | when |
+|---|---|
+| `accepted` | Once, first. Carries `attribution` and `timing` for the endpoint **admission chose**. |
+| `admitted` | A scheduling marker; ignorable. |
+| `chunk` | `data` is the backend's raw OpenAI `chat.completion.chunk` JSON, byte-identical. |
+| `done` | Once, last. `attribution`, `timing`, `usage`. |
+| `error` | Terminal instead of `done`; carries `code` and `error`. |
+
+🚨 **The `done` frame's attribution is the authoritative one.** Failover and
+spill both move a request *after* `accepted` is on the wire, so a caller that
+trusted the opening frame would be told the endpoint we intended rather than the
+one that answered. The enriched stream never emits `[DONE]`.
+
+---
+
+### 1.8 Enrichment on the OpenAI door 🚨
+
+The OpenAI body stays byte-identical (§1.7). What can be said in headers is:
+
+| header | meaning |
+|---|---|
+| `X-Roadstead-Request-Id` | Correlates with `/v1/timeouts`, the completion row and the logs. |
+| `X-Roadstead-Endpoint` | The endpoint admission chose. |
+| `X-Roadstead-Deadline-S` | The deadline actually applied. |
+| `X-Roadstead-Deadline-Source` | `caller` \| `computed` — see §1.7.3. |
+
+🚨 **Only what is known before the body starts.** A streaming response's headers
+are on the wire before the first token, so a later failover or spill cannot be
+reflected in them. That is a real limit of the header channel and it is why the
+enriched API exists: a caller that must know what actually served has to ask on
+`/rs/v1`. Advertising a substitution here that a stream might contradict would
+be worse than advertising nothing.
+
+A response carrying none of these did not come from Roadstead. Treat their
+absence as "not ours", never as a default.
+
+---
+
+### 1.9 Migrating off `/v1/submit`
+
+**`POST /v1/submit` was removed** (Workstream C; `CHANGELOG.md`). It carried no
+intent vocabulary, no attribution and no timing, and each of those would have had
+to be bolted onto a shape never designed to hold them. `/rs/v1/chat` is its
+replacement, and the map is mechanical:
+
+| `/v1/submit` | `/rs/v1/chat` |
+|---|---|
+| `agent_id` | **Gone.** Identity is the API key, or the source address — §1.5. A body could claim any `agent_id`, including one with a better DRR weight. |
+| `endpoint` | `model` (a pin) — or drop it and send `intent`. |
+| `payload` | `payload`, unchanged. |
+| `timeout_s` / `X-Timeout-S` | `deadline_s` — and usually: omit it, §1.2. |
+| `priority` | `priority`, or `interactive: true`/`false`. |
+| `call_site`, `session_id`, `turn_id`, `caller_id`, `request_id` | Unchanged. |
+| `payload_type` | Unchanged (`chat_completion` \| `embedding` \| `rerank`). |
+| response `queue_wait_ms`, `backend_latency_ms` | `timing.*` |
+| response `estimated_cost_ss` | `usage.slot_seconds` |
+| response `response`, `status`, `request_id`, `code`, `error` | Unchanged. |
+| response `degraded`, `degraded_from` | `attribution.substituted` / `.substitution` / `.resolved` — which now also cover spill. |
+| stream frame `queued` | `accepted`, and it carries attribution. |
+| stream frame `done` fields | `timing`, `usage`, `attribution`. |
+
+`roadstead.client` (§7) speaks this API and is the shortest path across.
 
 
 ## 2. Error contract 🚨
@@ -272,6 +516,10 @@ runs on.
 Open surfaces: `GET /v1/status` (per-endpoint health, capacity, reliability counters),
 `GET /v1/timeouts`, `GET /metrics` (Prometheus), `GET /health`, `GET /readyz` (fails closed on
 readiness-critical endpoints), and the `/v1/fleet/*` analytics family.
+
+The three `/rs/v1` routes are **not** open — they are gated like the inference doors (§1.7).
+`GET /rs/v1/models` in particular is a map of the fleet: slot counts, live occupancy, health and
+prices. An unenrolled caller has no more business reading that than dispatching to it.
 
 🚨 **`/v1/status` and `/metrics` have external consumers** — in the origin fleet a gateway, a
 ground-truth verifier and a web UI all read them. Treat their top-level key names as public API.
@@ -498,6 +746,53 @@ Default is a WARNING log in a grep-able shape. Everything else in the package re
 
 ---
 
+## 7. The client SDK — `roadstead.client`
+
+Ships inside the package, the same way `roadstead.testing` does, and is what
+another project installs to speak §1.7.
+
+```python
+from roadstead.client import AsyncRoadsteadClient
+
+async with AsyncRoadsteadClient("http://proxy:42100", api_key=KEY) as rs:
+    plan = await rs.plan(intent="reasoning", est_in=8_000)
+    result = await rs.chat(intent="reasoning",
+                           messages=[{"role": "user", "content": "..."}])
+    print(result.content, result.attribution.endpoint,
+          result.timing.queue_wait_ms)
+```
+
+`AsyncRoadsteadClient` is the implementation; `RoadsteadClient` is a blocking
+wrapper that owns a private event loop on a worker thread, so it composes with
+sync code and refuses to run inside a loop rather than deadlocking one.
+
+**Three things it does that a hand-rolled `httpx.post` would not:**
+
+🚨 **It classifies errors on the `code`.** `RoadsteadError.deferrable` reads
+§2.1's machine-readable code first and falls back to §2.2's legacy marker
+substrings only for a proxy older than the SDK. That is the migration §2.2 asks
+for — off prose-matching, without dropping it while callers are still on it.
+
+🚨 **It sets the client keepalive.** §1.3's ordering invariant is the client's
+side to get right, and the SDK sets it rather than leaving it to whoever
+configures the pool.
+
+🚨 **It keeps unknown fields.** Every typed view exposes `.raw`, so a proxy
+newer than the SDK is usable rather than lossy.
+
+**It imports nothing from the Roadstead server**, by AST-enforced rule
+(`tests/test_client_sdk.py`). Two reasons: a consumer sending an HTTP request
+should not be installing Starlette, uvicorn, PyYAML and jsonschema; and a client
+that read the server's own constants would agree with it *by construction* and
+could never catch a drift. The contract lives in `roadstead/client/_wire.py` as
+literals transcribed from **this document**, which the same test reads back —
+the two-ended pin `tests/wire_contract.py` uses from the server side.
+
+`enrichment_from(response.headers)` reads §1.8 off an OpenAI-door response, for
+callers not yet ready to move.
+
+---
+
 ## 6. Verification status
 
 **Verified against source 2026-08-31:** the route table location, the non-standard request fields,
@@ -508,6 +803,13 @@ verbatim, backend dispatch paths, the capacity-discovery asymmetry, and the metr
 restates the admin gate now that a key can carry the scope — Workstream B in `docs/roadmap.md`.
 §1.6 (spend, spill and the degrading threshold) and the price row in §4.3 are Workstream D. 🚨 §1.6
 adds **no error code**: that a spend threshold cannot produce one is the contract.
+
+**Updated 2026-09-01, Workstream C:** §1.7 (the enriched API at `/rs/v1/*`), §1.8 (enrichment
+headers on the OpenAI door), §1.9 (the `/v1/submit` migration map) and §7 (the client SDK) are new.
+🚨 §1.7 adds **no error code either** — an unresolvable intent is the existing `unknown_endpoint`,
+because a caller already classifies that and a second spelling of "nothing here can serve you" would
+buy nobody anything. `POST /v1/submit` is **removed**; §1.9 is the map and `CHANGELOG.md` carries the
+reason. Read back by `tests/test_client_sdk.py` and `tests/e2e/test_enriched_api.py`.
 
 **Previously INCOMPLETE — both closed 2026-08-31:**
 1. ~~Nested response schemas for `/v1/fleet/*` analytics.~~ Chased to column level in §3.1 and

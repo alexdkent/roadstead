@@ -26,6 +26,7 @@ import pytest
 from roadstead.backend import BackendStreamEvent
 from roadstead.config import ProxyConfig
 from roadstead.service import ProxyService
+from roadstead.enriched import WIRE_OPENAI
 
 
 class _Req:
@@ -111,7 +112,11 @@ async def test_injects_usage_and_records_tokens_internal_envelope():
 
         events = [json.loads(f) for f in frames]
         done = [e for e in events if e.get("type") == "done"][0]
-        assert done["usage"] == {"prompt_tokens": 11, "completion_tokens": 7}
+        # The enriched wire renames the OpenAI usage keys, deliberately: these
+        # are OUR measurements of the call, not a passthrough of the backend's
+        # body, and the slot-seconds beside them have no OpenAI counterpart.
+        assert done["usage"]["input_tokens"] == 11
+        assert done["usage"]["output_tokens"] == 7
         # The synthetic usage-only frame is NOT relayed as a chunk.
         chunk_data = [e["data"] for e in events if e.get("type") == "chunk"]
         assert not any('"usage"' in d and '"choices": []' in d for d in chunk_data)
@@ -128,7 +133,7 @@ async def test_openai_relay_drops_usage_frame_and_keeps_done_ordering():
     svc._backend.stream = _streaming_backend(seen)
     await svc.startup()
     try:
-        resp = await svc.handle_submit(_submit_body(), _Req(), openai=True)
+        resp = await svc.handle_submit(_submit_body(), _Req(), wire=WIRE_OPENAI)
         frames = await _collect_stream(resp)
         assert frames[-1] == "[DONE]"
         # No synthetic usage frame leaked to a client that never asked for
@@ -151,7 +156,7 @@ async def test_openai_relay_forwards_usage_when_client_asked():
     await svc.startup()
     try:
         resp = await svc.handle_submit(
-            _submit_body(stream_options={"include_usage": True}), _Req(), openai=True)
+            _submit_body(stream_options={"include_usage": True}), _Req(), wire=WIRE_OPENAI)
         frames = await _collect_stream(resp)
         assert frames[-1] == "[DONE]"
         # The client asked → the usage frame is forwarded byte-identical.
@@ -179,7 +184,7 @@ async def test_usage_on_choices_bearing_chunk_passes_through():
     svc._backend.stream = fake_stream
     await svc.startup()
     try:
-        resp = await svc.handle_submit(_submit_body(), _Req(), openai=True)
+        resp = await svc.handle_submit(_submit_body(), _Req(), wire=WIRE_OPENAI)
         frames = await _collect_stream(resp)
         # The finish chunk (with its usage) is forwarded — only the synthetic
         # EMPTY-choices frame is ever dropped.
@@ -197,7 +202,7 @@ async def test_kill_switch_disables_injection():
     svc._backend.stream = _streaming_backend(seen)
     await svc.startup()
     try:
-        resp = await svc.handle_submit(_submit_body(), _Req(), openai=True)
+        resp = await svc.handle_submit(_submit_body(), _Req(), wire=WIRE_OPENAI)
         await _collect_stream(resp)
         assert "stream_options" not in seen[0]
     finally:

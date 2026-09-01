@@ -24,12 +24,14 @@ separate rather than one flat list.
 describes is invented, and its addresses are RFC 5737 documentation addresses.
 Point ``ROADSTEAD_MODELS_YAML`` at your own file.
 
-Pure: only ``yaml``, stdlib, and ``roadstead.providers`` (which imports nothing
-back). ``config`` imports the ``build_*`` helpers from here, never the reverse.
+Pure: only ``yaml``, stdlib, ``roadstead.providers`` and ``roadstead.intent``
+(neither of which imports anything back). ``config`` imports the ``build_*``
+helpers from here, never the reverse.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,7 +39,10 @@ from typing import Any
 
 import yaml
 
+from .intent import KNOWN_CAPABILITIES
 from .providers import DEFAULT_PROVIDER, provider_for_engine
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_PATH = Path(__file__).resolve().parent / "models.yaml"
 
@@ -332,6 +337,27 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
             # CRITICAL "UNHEALTHY — 3 consecutive probe failures" every cycle.
             kw["on_demand"] = True
         # --- capabilities ---
+        # The declaration itself, carried whole. Everything below this line
+        # DERIVES a narrower fact from one of these; nothing replaces it.
+        # `kind` rides along for the same reason — see EndpointConfig.kind.
+        kw["kind"] = e.kind
+        declared = frozenset(
+            name for name, on in e.capabilities.items()
+            if on and isinstance(name, str))
+        kw["capabilities"] = declared
+        unknown = sorted(declared - KNOWN_CAPABILITIES)
+        if unknown:
+            # WARN and keep serving. The catalog is the operator's, and a
+            # capability we have not thought of yet is a thing they are allowed
+            # to write down — but the commonest reason for one is a typo
+            # (`tool_call`, `structured_outputs`), and a mistyped capability is
+            # invisible in exactly the way a dropped `policy.*` key is: the
+            # endpoint keeps working and quietly never matches the intent that
+            # was supposed to reach it.
+            logger.warning(
+                "models.yaml endpoint %r declares unknown capabilities %s — "
+                "known: %s. Kept verbatim, but no intent will match one: check "
+                "for a typo.", e.name, unknown, sorted(KNOWN_CAPABILITIES))
         if (e.capabilities.get("reasoning")
                 and not provider.descriptor.reasoning_is_switchable):
             # A reasoning model on a backend with no proxy-side kill switch

@@ -27,6 +27,13 @@ Not "anything goes" — that gives callers no signal and turns every upgrade int
 `FakeBackendServer` earns a CHANGELOG line, but its fault library and profiles are expected to grow
 and shift as real engine behaviour is measured.
 
+`roadstead.client` is the same shape with one extra rule: **its dependency set is contract too.**
+It is what another project installs to speak the enriched API, so adding an import to it is a
+breaking change for every consumer even though no signature moved — the boundary is httpx and the
+stdlib, enforced by AST in `tests/test_client_sdk.py`. Its *typed views* are expected to grow as the
+enriched envelope does, and every one exposes `.raw`, so a field this SDK has never heard of stays
+reachable rather than being silently dropped.
+
 Pre-1.0, none of this promises a deprecation *period*. It promises that a break is a decision
 somebody made and recorded, not something you discover in production.
 
@@ -37,9 +44,10 @@ somebody made and recorded, not something you discover in production.
 3. Add a `CHANGELOG.md` entry under `### Breaking` saying **what broke, what to do about it, and
    why it was worth it.** A migration note that only names the old and new spelling is not enough —
    the "why" is what stops it being re-litigated in six months.
-4. If it invalidates something in `docs/api.md`, change that in the same commit. Several tests read
+4. If it invalidates something in `docs/api.md`, change that in the same commit. Six tests read
    `docs/api.md` back and will fail if you don't (`tests/test_wire_contract.py`,
-   `tests/test_fleet_analytics_schema.py`, `tests/test_timeout_floor_contract.py`).
+   `tests/test_fleet_analytics_schema.py`, `tests/test_timeout_floor_contract.py`,
+   `tests/test_keepalive_invariant.py`, `tests/test_spend.py`, `tests/test_client_sdk.py`).
 
 That last point is the enforcement mechanism, and it is deliberate: **the contract document is
 executable**. You cannot quietly drift from it, because the suite reads it.

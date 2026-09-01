@@ -88,12 +88,22 @@ async def drive(proxy, door, *, schema=None, tools=None, tool_choice=None,
         payload["timeout_s"] = timeout_s
     if door == "openai":
         return await proxy.client.post("/v1/chat/completions", json=payload)
-    body = {"agent_id": "adv", "endpoint": "chat", "priority": "P3_INGESTION",
+    body = _rs_body(payload)
+    if timeout_s is not None:
+        body["deadline_s"] = timeout_s
+    return await proxy.client.post("/rs/v1/chat", json=body)
+
+
+def _rs_body(payload: dict) -> dict:
+    """The enriched envelope for a pinned endpoint.
+
+    `model` at the TOP level is the routing pin; the model request itself stays
+    whole inside `payload`. `agent_id` is gone — identity comes from the
+    credential or the source address now, never from the body.
+    """
+    return {"model": "chat", "priority": "P3_INGESTION",
             "call_site": "schema_adv", "payload_type": "chat_completion",
             "payload": payload}
-    if timeout_s is not None:
-        body["timeout_s"] = timeout_s
-    return await proxy.client.post("/v1/submit", json=body)
 
 
 def _body(resp, door):
@@ -249,11 +259,9 @@ async def test_bare_grammar_no_schema_repaired_parse_only(proxy, monkeypatch):
                'ws ::= [ \\t\\n]*\n')
     payload = {"model": "chat", "messages": [{"role": "user", "content": "q"}],
                "max_tokens": 16, "extra_body": {"grammar": grammar}}
-    body = {"agent_id": "adv", "endpoint": "chat", "priority": "P3_INGESTION",
-            "call_site": "schema_adv", "payload_type": "chat_completion",
-            "payload": payload}
+    body = _rs_body(payload)
     st = proxy.svc._correction.state
-    resp = await proxy.client.post("/v1/submit", json=body)
+    resp = await proxy.client.post("/rs/v1/chat", json=body)
     assert resp.status_code == 200
     assert json.loads(ok_content(resp, "internal")) == {"answer": "yes"}
     assert st.schema_repaired >= 1
@@ -407,10 +415,8 @@ async def test_non_object_declared_schema_ignored(proxy, monkeypatch):
                "max_tokens": 16,
                "response_format": {"type": "json_schema",
                                    "json_schema": {"name": "s", "schema": "not-an-object"}}}
-    body = {"agent_id": "adv", "endpoint": "chat", "priority": "P3_INGESTION",
-            "call_site": "schema_adv", "payload_type": "chat_completion",
-            "payload": payload}
-    resp = await proxy.client.post("/v1/submit", json=body)
+    body = _rs_body(payload)
+    resp = await proxy.client.post("/rs/v1/chat", json=body)
     assert resp.status_code == 200, resp.text[:200]
     assert proxy.total_in_flight() == 0
 
@@ -426,10 +432,8 @@ async def test_contradictory_response_format_and_grammar(proxy, monkeypatch):
     payload = {"model": "chat", "messages": [{"role": "user", "content": "q"}],
                "max_tokens": 16, "response_format": _rf(STRICT),
                "extra_body": {"grammar": grammar}}
-    body = {"agent_id": "adv", "endpoint": "chat", "priority": "P3_INGESTION",
-            "call_site": "schema_adv", "payload_type": "chat_completion",
-            "payload": payload}
-    resp = await proxy.client.post("/v1/submit", json=body)
+    body = _rs_body(payload)
+    resp = await proxy.client.post("/rs/v1/chat", json=body)
     assert resp.status_code in (200, 422, 502), resp.text[:200]
     assert resp.status_code != 500
     assert proxy.total_in_flight() == 0

@@ -1,7 +1,17 @@
 """Starlette route handlers for the LLM proxy.
 
+Two north faces, and the split is deliberate (``docs/api.md`` §1):
+
+  - ``/v1/*``  — OpenAI-compatible, strictly. A drop-in target for existing
+                 clients; enrichment rides in ``X-Roadstead-*`` headers and
+                 never in the body.
+  - ``/rs/v1/*`` — the enriched Roadstead API (``enriched.py``), with its own
+                 version because the other one is versioned by OpenAI.
+
 Provides:
-  - POST /v1/submit        — internal submission API
+  - GET  /rs/v1/models     — enriched catalogue: capabilities, live state, price
+  - POST /rs/v1/plan       — resolve an intent and price it, without dispatching
+  - POST /rs/v1/chat       — the enriched call
   - POST /v1/chat/completions — OpenAI-compatible (LAN consumers)
   - POST /v1/embeddings    — OpenAI-compatible embeddings
   - GET  /v1/models        — list available endpoints
@@ -28,6 +38,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from .enriched import PREFIX
+
 if TYPE_CHECKING:
     from .service import ProxyService
 
@@ -37,9 +49,16 @@ logger = logging.getLogger(__name__)
 def make_routes(svc: "ProxyService") -> list[Route]:
     """Build the Starlette route list for the proxy."""
 
-    async def handle_submit(request: Request) -> Response:
+    async def handle_rs_models(request: Request) -> Response:
+        return await svc.handle_rs_models(request)
+
+    async def handle_rs_plan(request: Request) -> Response:
         body = await request.json()
-        return await svc.handle_submit(body, request)
+        return await svc.handle_rs_plan(body, request)
+
+    async def handle_rs_chat(request: Request) -> Response:
+        body = await request.json()
+        return await svc.handle_rs_chat(body, request)
 
     async def handle_chat_completions(request: Request) -> Response:
         body = await request.json()
@@ -136,7 +155,14 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         return await svc.handle_inflight(request)
 
     return [
-        Route("/v1/submit", handle_submit, methods=["POST"]),
+        # --- the enriched north face (roadmap Workstream C) -----------------
+        # 🚨 This REPLACES the `/v1/submit` envelope, which was removed rather
+        # than deprecated: it had no intent vocabulary, no attribution and no
+        # timing, and every one of those would have had to be bolted onto a
+        # shape that was never designed to carry them. See CHANGELOG.md.
+        Route(f"{PREFIX}/models", handle_rs_models, methods=["GET"]),
+        Route(f"{PREFIX}/plan", handle_rs_plan, methods=["POST"]),
+        Route(f"{PREFIX}/chat", handle_rs_chat, methods=["POST"]),
         Route("/v1/chat/completions", handle_chat_completions, methods=["POST"]),
         Route("/v1/embeddings", handle_embeddings, methods=["POST"]),
         Route("/v1/models", handle_models, methods=["GET"]),

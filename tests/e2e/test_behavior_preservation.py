@@ -199,10 +199,17 @@ CASES: List[GoldenCase] = [
                timeout_s=0.5),
     GoldenCase("chat_stream_truncated_tool_calls", "chat", "stream",
                fault="truncated_tool_calls", content="call a tool"),
-    # ---- internal /v1/submit envelope ----
-    GoldenCase("submit_sync_happy", "submit", "sync", content="internal hi"),
-    GoldenCase("submit_sync_http_500", "submit", "sync", fault="http_500",
+    # ---- the enriched Roadstead envelope (/rs/v1/chat) ----
+    # Replaces the two `/v1/submit` cases: that door was removed with Workstream
+    # C, and these freeze its successor's envelope — attribution and timing
+    # included, because a disclosure that silently stops being emitted is the
+    # failure the whole API exists to prevent.
+    GoldenCase("rs_sync_happy", "rs", "sync", content="internal hi"),
+    GoldenCase("rs_sync_http_500", "rs", "sync", fault="http_500",
                content="internal boom"),
+    GoldenCase("rs_sync_by_intent", "rs", "sync", content="by intent",
+               extra={"intent": "chat"}),
+    GoldenCase("rs_stream_happy", "rs", "stream", content="internal stream"),
     # ---- OpenAI /v1/embeddings ----
     GoldenCase("embeddings_happy", "embeddings", "sync"),
     GoldenCase("embeddings_error", "embeddings", "sync", fault="http_500"),
@@ -263,10 +270,46 @@ def _chat_body(case: GoldenCase, *, stream: bool) -> Dict[str, Any]:
     return body
 
 
+def _rs_body(case: GoldenCase, *, stream: bool = False) -> Dict[str, Any]:
+    """The enriched envelope. Routing declaration outside, model payload inside —
+    the split that lets `deadline_s` exist without being forwarded to a backend
+    that would reject the unknown field."""
+    body: Dict[str, Any] = {
+        "model": case.submit_endpoint,
+        "priority": "P3_INGESTION",
+        "call_site": "behavior_preservation",
+        "payload": {
+            "model": case.model,
+            "messages": [{"role": "user", "content": case.content}],
+            "max_tokens": 16,
+            "stream": stream,
+        },
+    }
+    if case.extra:
+        # An `intent` case declares no pin; the extra replaces the pin rather
+        # than sitting beside it, so the resolver is genuinely exercised.
+        if "intent" in case.extra:
+            body.pop("model", None)
+        body.update(case.extra)
+    return body
+
+
 async def _drive(harness: ProxyHarness, case: GoldenCase) -> Dict[str, Any]:
     """Fire the case at the proxy front door; return the normalized record."""
     if case.fault:
         harness.controller.set_fault(case.fault, case.fault_arg, case.fault_max_hits)
+
+    if case.door == "rs" and case.mode == "stream":
+        frames: List[str] = []
+        async with harness.client.stream(
+                "POST", "/rs/v1/chat", json=_rs_body(case, stream=True)) as resp:
+            status = resp.status_code
+            async for line in resp.aiter_lines():
+                line = line.strip()
+                if line.startswith("data: "):
+                    frames.append(line[len("data: "):])
+        return {"status_code": status, "mode": "stream",
+                "frames": [_normalize_frame(f) for f in frames]}
 
     if case.door == "chat" and case.mode == "stream":
         frames: List[str] = []
@@ -284,17 +327,8 @@ async def _drive(harness: ProxyHarness, case: GoldenCase) -> Dict[str, Any]:
     if case.door == "chat":
         resp = await harness.client.post(
             "/v1/chat/completions", json=_chat_body(case, stream=False))
-    elif case.door == "submit":
-        resp = await harness.client.post("/v1/submit", json={
-            "agent_id": "golden", "endpoint": case.submit_endpoint,
-            "priority": "P3_INGESTION", "call_site": "behavior_preservation",
-            "payload_type": "chat_completion",
-            "payload": {
-                "model": case.model,
-                "messages": [{"role": "user", "content": case.content}],
-                "max_tokens": 16,
-            },
-        })
+    elif case.door == "rs":
+        resp = await harness.client.post("/rs/v1/chat", json=_rs_body(case))
     elif case.door == "embeddings":
         resp = await harness.client.post(
             "/v1/embeddings", json={"model": "bge-m3", "input": case.embed_input})
@@ -426,7 +460,11 @@ def test_baseline_covers_every_declared_case():
 async def test_capture_is_deterministic():
     """Capturing a representative case twice yields identical normalized output —
     proves no volatile field leaks past the redaction (the baseline is stable)."""
-    case = CASES_BY_ID["submit_sync_happy"]  # the case with the most volatile fields
+    # The enriched envelope, which now carries the most volatile fields: the
+    # four blocks add timing, slot-seconds and a computed cost on top of what
+    # the old submit envelope had, so if any of them leaks past the redaction
+    # this is where it shows.
+    case = CASES_BY_ID["rs_sync_happy"]
     async with _spawn_proxy() as h1:
         first = await _drive(h1, case)
         assert await _settled_no_leak(h1) == 0

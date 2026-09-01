@@ -25,6 +25,7 @@ import pytest
 
 from roadstead import model_catalog
 from roadstead.config import ProxyConfig
+from roadstead.enriched import WIRE_ENRICHED
 from roadstead.lifecycle import _carries_image
 
 
@@ -194,7 +195,7 @@ async def test_image_to_a_blind_endpoint_is_counted_and_refused_when_armed():
     # body, and a request with no source address is refused 403 — fail-closed is
     # the point. This test is about the vision gate, so give it a caller the
     # default ACL admits.
-    resp = await svc._lifecycle.handle_submit(body, _LoopbackReq(), openai=False)
+    resp = await svc._lifecycle.handle_submit(body, _LoopbackReq(), wire=WIRE_ENRICHED)
 
     assert resp.status_code == 400
     tally = svc._state.vision_capability_violations.get(resolved)

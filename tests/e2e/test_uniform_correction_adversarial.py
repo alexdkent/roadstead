@@ -6,7 +6,7 @@ in-process proxy + fake backend:
 
   * BOTH-DOORS PARITY (flag ON): the truncated-tool-call sanitizer relabels
     finish_reason -> "length" and drops the broken-JSON arg on the OpenAI door AND
-    the internal /v1/submit door identically — no divergence.
+    the enriched /rs/v1/chat door identically — no divergence.
   * DIVERGENCE (flag OFF): the OpenAI door is ALWAYS sanitized (pre-4a); only the
     internal door changes with the flag. Prove OFF leaks internally but not on
     OpenAI.
@@ -67,7 +67,7 @@ def _pin_schema_backstop_off(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 async def _submit_stream_events(proxy, *, fault=None, content="a b c", extra_payload=None):
-    """Drive the INTERNAL /v1/submit streaming door; return decoded envelope events."""
+    """Drive the ENRICHED /rs/v1/chat streaming door; return decoded envelope events."""
     if fault:
         proxy.controller.set_fault(fault, 0.0)
     payload = {
@@ -79,15 +79,14 @@ async def _submit_stream_events(proxy, *, fault=None, content="a b c", extra_pay
     if extra_payload:
         payload.update(extra_payload)
     body = {
-        "agent_id": "adv_test",
-        "endpoint": "chat",
+        "model": "chat",
         "priority": "P3_INGESTION",
         "call_site": "uc_adversarial",
         "payload_type": "chat_completion",
         "payload": payload,
     }
     events: list = []
-    async with proxy.client.stream("POST", "/v1/submit", json=body) as resp:
+    async with proxy.client.stream("POST", "/rs/v1/chat", json=body) as resp:
         async for line in resp.aiter_lines():
             line = line.strip()
             if line.startswith("data: "):
@@ -194,7 +193,7 @@ async def test_off_flag_door_divergence(proxy, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 async def test_degeneration_detected_exactly_once_both_doors(proxy, monkeypatch):
-    """Uniformity (flag ON): BOTH the internal /v1/submit door and the OpenAI door
+    """Uniformity (flag ON): BOTH the enriched /rs/v1/chat door and the OpenAI door
     get stream-side degeneration detection — exactly once each (detect-only), and
     neither leaks a slot. (One proxy spin, both doors, for tollgate budget.)"""
     monkeypatch.setenv(FLAG, "1")
@@ -259,7 +258,7 @@ async def test_grammar_stream_is_shadow_checked(proxy, monkeypatch):
 async def test_sync_door_shadow_egress_wired_through_apply(proxy, monkeypatch):
     """HARDENING guard-bite: the golden oracle can't see shadow-egress (it's
     detect-only), so a revert that drops shadow_egress_detect from Correction.apply
-    would pass the oracle. Prove END-TO-END that a real sync /v1/submit with a
+    would pass the oracle. Prove END-TO-END that a real sync /rs/v1/chat with a
     grammar + a non-conformant backend reply tallies a silent drop — i.e. apply
     actually wires the real detector into the sync door. Fails if the step is
     dropped from apply."""
@@ -272,8 +271,7 @@ async def test_sync_door_shadow_egress_wired_through_apply(proxy, monkeypatch):
     st = proxy.svc._correction.state
     st.shadow_drop.clear()
     body = {
-        "agent_id": "adv_test",
-        "endpoint": "chat",
+        "model": "chat",
         "priority": "P3_INGESTION",
         "call_site": "uc_sync_shadow",
         "payload_type": "chat_completion",
@@ -284,7 +282,7 @@ async def test_sync_door_shadow_egress_wired_through_apply(proxy, monkeypatch):
             "extra_body": {"grammar": grammar},
         },
     }
-    resp = await proxy.client.post("/v1/submit", json=body)
+    resp = await proxy.client.post("/rs/v1/chat", json=body)
     assert resp.status_code == 200
     # fake echoes 'echo: hi' — not conformant to the object-root grammar → drop.
     tally = st.shadow_drop.get("uc_sync_shadow")

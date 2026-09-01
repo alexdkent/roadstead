@@ -32,6 +32,7 @@ import pytest
 from roadstead import lifecycle as lifecycle_mod
 from roadstead.backend import BackendStreamEvent
 from roadstead.config import ProxyConfig
+from roadstead.enriched import WIRE_ENRICHED
 from roadstead.scheduler import QueuedRequest
 from roadstead.service import ProxyService
 
@@ -126,9 +127,9 @@ def _capture_streaming_requests(svc: ProxyService) -> list[QueuedRequest]:
     captured: list[QueuedRequest] = []
     orig = svc._lifecycle.handle_streaming_submit
 
-    async def tap(req, *, openai=False):
+    async def tap(req, *, wire=WIRE_ENRICHED):
         captured.append(req)
-        return await orig(req, openai=openai)
+        return await orig(req, wire=wire)
 
     svc._lifecycle.handle_streaming_submit = tap
     return captured

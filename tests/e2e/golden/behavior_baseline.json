@@ -283,11 +283,107 @@
     "mode": "sync",
     "status_code": 200
   },
-  "submit_sync_happy": {
+  "rs_stream_happy": {
+    "frames": [
+      "{\"attribution\": {\"endpoint\": \"tier2\", \"engine\": \"llama.cpp\", \"model\": \"tier2\", \"provider\": \"mid-box\", \"requested\": \"chat\", \"resolved\": \"tier2\", \"substituted\": false, \"substitution\": null}, \"request_id\": \"<rid>\", \"timing\": {\"backend_latency_ms\": 0, \"deadline_s\": 180.0, \"deadline_source\": \"computed\", \"predicted_ms\": 0, \"queue_wait_ms\": 0, \"total_ms\": 0, \"ttft_ms\": 0}, \"type\": \"accepted\"}",
+      "{\"queue_wait_ms\": 0, \"type\": \"admitted\"}",
+      "{\"data\": \"{\\\"id\\\": \\\"chatcmpl-fake\\\", \\\"object\\\": \\\"chat.completion.chunk\\\", \\\"choices\\\": [{\\\"index\\\": 0, \\\"delta\\\": {\\\"role\\\": \\\"assistant\\\"}, \\\"finish_reason\\\": null}]}\", \"type\": \"chunk\"}",
+      "{\"data\": \"{\\\"id\\\": \\\"chatcmpl-fake\\\", \\\"object\\\": \\\"chat.completion.chunk\\\", \\\"choices\\\": [{\\\"index\\\": 0, \\\"delta\\\": {\\\"content\\\": \\\"echo: \\\"}, \\\"finish_reason\\\": null}]}\", \"type\": \"chunk\"}",
+      "{\"data\": \"{\\\"id\\\": \\\"chatcmpl-fake\\\", \\\"object\\\": \\\"chat.completion.chunk\\\", \\\"choices\\\": [{\\\"index\\\": 0, \\\"delta\\\": {\\\"content\\\": \\\"internal \\\"}, \\\"finish_reason\\\": null}]}\", \"type\": \"chunk\"}",
+      "{\"data\": \"{\\\"id\\\": \\\"chatcmpl-fake\\\", \\\"object\\\": \\\"chat.completion.chunk\\\", \\\"choices\\\": [{\\\"index\\\": 0, \\\"delta\\\": {\\\"content\\\": \\\"stream \\\"}, \\\"finish_reason\\\": null}]}\", \"type\": \"chunk\"}",
+      "{\"data\": \"{\\\"id\\\": \\\"chatcmpl-fake\\\", \\\"object\\\": \\\"chat.completion.chunk\\\", \\\"choices\\\": [{\\\"index\\\": 0, \\\"delta\\\": {}, \\\"finish_reason\\\": \\\"stop\\\"}]}\", \"type\": \"chunk\"}",
+      "{\"attribution\": {\"cost\": {\"avoided_usd\": 3e-06, \"price\": {\"detail\": \"usage_rates avoided-cost for 'tier2'\", \"input_usd_per_mtok\": 0.15, \"output_usd_per_mtok\": 0.55, \"real\": false, \"source\": \"imputed\"}, \"spent_usd\": 0.0}, \"endpoint\": \"tier2\", \"engine\": \"llama.cpp\", \"model\": \"tier2\", \"provider\": \"mid-box\", \"requested\": \"chat\", \"resolved\": \"tier2\", \"substituted\": false, \"substitution\": null}, \"request_id\": \"<rid>\", \"timing\": {\"backend_latency_ms\": 0, \"deadline_s\": 180.0, \"deadline_source\": \"computed\", \"predicted_ms\": 0, \"queue_wait_ms\": 0, \"total_ms\": 0, \"ttft_ms\": 0}, \"type\": \"done\", \"usage\": {\"input_tokens\": 12, \"output_tokens\": 3, \"slot_seconds\": 0}}"
+    ],
+    "mode": "stream",
+    "status_code": 200
+  },
+  "rs_sync_by_intent": {
     "body": {
-      "backend_latency_ms": 0,
-      "estimated_cost_ss": 0,
-      "queue_wait_ms": 0,
+      "attribution": {
+        "cost": {
+          "avoided_usd": 3e-06,
+          "price": {
+            "detail": "usage_rates avoided-cost for 'tier2'",
+            "input_usd_per_mtok": 0.15,
+            "output_usd_per_mtok": 0.55,
+            "real": false,
+            "source": "imputed"
+          },
+          "spent_usd": 0.0
+        },
+        "endpoint": "tier2",
+        "engine": "llama.cpp",
+        "model": "tier2",
+        "provider": "mid-box",
+        "requested": "chat",
+        "resolved": "tier2",
+        "substituted": false,
+        "substitution": null
+      },
+      "request_id": "<rid>",
+      "response": {
+        "choices": [
+          {
+            "finish_reason": "stop",
+            "index": 0,
+            "message": {
+              "content": "echo: by intent",
+              "role": "assistant"
+            }
+          }
+        ],
+        "created": 0,
+        "id": "<id>",
+        "model": "fake-model",
+        "object": "chat.completion",
+        "usage": {
+          "completion_tokens": 3,
+          "prompt_tokens": 12,
+          "total_tokens": 15
+        }
+      },
+      "status": "ok",
+      "timing": {
+        "backend_latency_ms": 0,
+        "deadline_s": 180.0,
+        "deadline_source": "computed",
+        "predicted_ms": 0,
+        "queue_wait_ms": 0,
+        "total_ms": 0,
+        "ttft_ms": 0
+      },
+      "usage": {
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "slot_seconds": 0
+      }
+    },
+    "mode": "sync",
+    "status_code": 200
+  },
+  "rs_sync_happy": {
+    "body": {
+      "attribution": {
+        "cost": {
+          "avoided_usd": 3e-06,
+          "price": {
+            "detail": "usage_rates avoided-cost for 'tier2'",
+            "input_usd_per_mtok": 0.15,
+            "output_usd_per_mtok": 0.55,
+            "real": false,
+            "source": "imputed"
+          },
+          "spent_usd": 0.0
+        },
+        "endpoint": "tier2",
+        "engine": "llama.cpp",
+        "model": "tier2",
+        "provider": "mid-box",
+        "requested": "chat",
+        "resolved": "tier2",
+        "substituted": false,
+        "substitution": null
+      },
       "request_id": "<rid>",
       "response": {
         "choices": [
@@ -310,17 +406,66 @@
           "total_tokens": 15
         }
       },
-      "status": "ok"
+      "status": "ok",
+      "timing": {
+        "backend_latency_ms": 0,
+        "deadline_s": 180.0,
+        "deadline_source": "computed",
+        "predicted_ms": 0,
+        "queue_wait_ms": 0,
+        "total_ms": 0,
+        "ttft_ms": 0
+      },
+      "usage": {
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "slot_seconds": 0
+      }
     },
     "mode": "sync",
     "status_code": 200
   },
-  "submit_sync_http_500": {
+  "rs_sync_http_500": {
     "body": {
+      "attribution": {
+        "cost": {
+          "avoided_usd": 0.0,
+          "price": {
+            "detail": "usage_rates avoided-cost for 'tier2'",
+            "input_usd_per_mtok": 0.15,
+            "output_usd_per_mtok": 0.55,
+            "real": false,
+            "source": "imputed"
+          },
+          "spent_usd": 0.0
+        },
+        "endpoint": "tier2",
+        "engine": "llama.cpp",
+        "model": "tier2",
+        "provider": "mid-box",
+        "requested": "chat",
+        "resolved": "tier2",
+        "substituted": false,
+        "substitution": null
+      },
       "code": "backend_error",
       "error": "backend error 500: {\"error\":\"internal error (injected)\"}",
       "request_id": "<rid>",
-      "status": "error"
+      "status": "error",
+      "timing": {
+        "backend_latency_ms": 0,
+        "deadline_s": 180.0,
+        "deadline_source": "computed",
+        "predicted_ms": 0,
+        "queue_wait_ms": 0,
+        "total_ms": 0,
+        "ttft_ms": 0
+      },
+      "usage": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "slot_seconds": 0
+      }
     },
     "mode": "sync",
     "status_code": 502

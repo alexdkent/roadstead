@@ -42,6 +42,7 @@ import pytest
 from roadstead.backend import BackendStreamEvent
 from roadstead.config import ProxyConfig
 from roadstead.service import ProxyService
+from roadstead.enriched import WIRE_OPENAI
 
 
 class _Req:
@@ -122,7 +123,7 @@ async def test_missing_finish_reason_is_repaired_when_the_backend_said_done():
     svc._backend.stream = _backend(emit_finish=False, emit_done=True)
     await svc.startup()
     try:
-        resp = await svc.handle_submit(_body(), _Req(), openai=True)
+        resp = await svc.handle_submit(_body(), _Req(), wire=WIRE_OPENAI)
         frames = await _collect(resp)
         assert frames[-1] == "[DONE]", "the [DONE] sentinel must stay last"
         assert _finish_reasons(frames) == ["stop"]
@@ -145,7 +146,7 @@ async def test_a_genuinely_unterminated_stream_is_not_repaired():
     svc._backend.stream = _backend(emit_finish=False, emit_done=False)
     await svc.startup()
     try:
-        resp = await svc.handle_submit(_body(), _Req(), openai=True)
+        resp = await svc.handle_submit(_body(), _Req(), wire=WIRE_OPENAI)
         frames = await _collect(resp)
         assert _finish_reasons(frames) == []
         assert not any("proxy_synthesized_finish" in f for f in frames)
@@ -162,7 +163,7 @@ async def test_a_healthy_stream_is_untouched():
     svc._backend.stream = _backend(emit_finish=True, emit_done=True)
     await svc.startup()
     try:
-        resp = await svc.handle_submit(_body(), _Req(), openai=True)
+        resp = await svc.handle_submit(_body(), _Req(), wire=WIRE_OPENAI)
         frames = await _collect(resp)
         assert _finish_reasons(frames) == ["stop"], "exactly one finish_reason"
         assert not any("proxy_synthesized_finish" in f for f in frames)
@@ -181,7 +182,7 @@ async def test_a_content_free_stream_is_not_repaired():
     svc._backend.stream = empty
     await svc.startup()
     try:
-        resp = await svc.handle_submit(_body(), _Req(), openai=True)
+        resp = await svc.handle_submit(_body(), _Req(), wire=WIRE_OPENAI)
         frames = await _collect(resp)
         assert not any("proxy_synthesized_finish" in f for f in frames)
     finally:
@@ -215,7 +216,7 @@ async def test_every_stream_logs_one_accountable_line(caplog):
     await svc.startup()
     try:
         with caplog.at_level("INFO", logger="roadstead.lifecycle"):
-            resp = await svc.handle_submit(_body(), _Req(), openai=True)
+            resp = await svc.handle_submit(_body(), _Req(), wire=WIRE_OPENAI)
             await _collect(resp)
         lines = [r.getMessage() for r in caplog.records
                  if "LLMPROXY_STREAM_DONE" in r.getMessage()]
@@ -238,7 +239,7 @@ async def test_an_absent_finish_reason_is_named_in_the_log(caplog):
     await svc.startup()
     try:
         with caplog.at_level("INFO", logger="roadstead.lifecycle"):
-            resp = await svc.handle_submit(_body(), _Req(), openai=True)
+            resp = await svc.handle_submit(_body(), _Req(), wire=WIRE_OPENAI)
             await _collect(resp)
         msgs = [r.getMessage() for r in caplog.records]
         assert any("finish_reason=ABSENT" in m for m in msgs), msgs

@@ -110,6 +110,38 @@ class QueuedRequest:
     # Never persisted/recovered from the WAL, same as ``degraded_from`` and for
     # the same reason: a recovered request has lost its caller.
     spilled_from: str | None = None
+    # --- Workstream C: what the caller asked for, and what we chose ---------
+    #: The caller's OWN WORDS — an intent profile (``"reasoning"``), a pinned
+    #: endpoint name, or the model string an OpenAI client sent. Echoed back as
+    #: ``attribution.requested`` and never used for routing: it is what a caller
+    #: needs to recognise its own request in the answer, and an alias it used is
+    #: more recognisable to it than the class that alias resolved to.
+    requested: str = ""
+    #: The endpoint intent resolution CHOSE, before any substitution. ``endpoint``
+    #: above always names the class actually serving, so the two differ exactly
+    #: when the request was moved by failover or by spill — which is the whole
+    #: definition of ``attribution.substituted``.
+    #:
+    #: 🚨 An explicit field rather than ``degraded_from or spilled_from or
+    #: endpoint``. That expression is *correct* today and would stop being so the
+    #: first time a third mover is added, and re-deriving it at each of the three
+    #: sites that disclose substitution is the same "three answers to one
+    #: question" this repo refuses elsewhere.
+    routed_to: str = ""
+    #: Per-request NARROWING of the two substitution opt-ins. ``None`` = defer to
+    #: the agent's config, which is the only thing that can GRANT either.
+    #:
+    #: 🚨 Narrowing only, never widening, and the enforcement is an ``and``
+    #: rather than an ``or`` at both reader sites. `degrade_ok` and `spill_ok`
+    #: are the operator's answers to "may this caller be served a worse answer"
+    #: and "may we spend money on this caller's behalf"; a request that could
+    #: set either to True would let a caller grant itself a permission its
+    #: operator withheld, which is the self-asserted `agent_id` bug in a
+    #: different costume. A caller declining a permission it *was* granted is
+    #: always safe, and is exactly what a caller sending one confidential prompt
+    #: on an otherwise spill-happy identity needs.
+    allow_degrade: bool | None = None
+    allow_spill: bool | None = None
 
     @classmethod
     def create(
@@ -128,6 +160,9 @@ class QueuedRequest:
         request_id: str | None = None,
         now: float | None = None,
         deadline_is_default: bool = False,
+        requested: str = "",
+        allow_degrade: bool | None = None,
+        allow_spill: bool | None = None,
     ) -> QueuedRequest:
         # Soft-default a malformed priority to P1 (never raise on the request
         # path — a bad label must not 500 the caller's LLM call).
@@ -151,6 +186,16 @@ class QueuedRequest:
             caller_id=caller_id,
             stream=bool(payload.get("stream")),
             deadline_is_default=deadline_is_default,
+            # Falls back to the endpoint the caller named, so a caller that
+            # pinned one gets its own spelling back rather than "" — and the
+            # OpenAI doors, which have no intent vocabulary, still disclose
+            # something truthful.
+            requested=requested or str(endpoint),
+            # Set HERE, from the endpoint resolution has already settled, so
+            # every construction path records it and none can forget.
+            routed_to=ep,
+            allow_degrade=allow_degrade,
+            allow_spill=allow_spill,
         )
 
 
@@ -848,8 +893,18 @@ class Scheduler:
             return Admission.DEFER
         # Default-deny, and a stronger default-deny than `degrade_ok`: this one
         # spends money and sends the prompt off the machine. See
-        # AgentQuotaConfig.spill_ok.
+        # AgentQuotaConfig.spill_ok — AND, since Workstream C, the request's own
+        # narrowing of it. 🚨 An `and`, never an `or`: the operator GRANTS the
+        # permission and the caller may only decline it. See
+        # ``QueuedRequest.allow_spill`` for why the reverse would be the
+        # self-asserted-identity bug wearing a different hat.
         if not self._config.agent_config(req.agent_id).spill_ok:
+            return Admission.DEFER
+        if req.allow_spill is False:
+            # The caller opted this ONE request out — a confidential prompt on
+            # an identity that is otherwise happy to spill. It is not an error
+            # and not a refusal: the request simply waits for local capacity,
+            # which is the same DEFER every un-opted-in caller already gets.
             return Admission.DEFER
         if self.may_spend is not None and not self.may_spend(req.agent_id):
             # Over threshold. 🚨 DEFER, never a refusal — the request keeps its

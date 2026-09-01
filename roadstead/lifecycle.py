@@ -57,6 +57,14 @@ from .constants import (
 )
 from .correction import _EMPTY_RESCUE_MIN_TOKENS, _ToolCallStreamSanitizer
 from .cost_model import estimate_input_tokens
+from .enriched import (
+    WIRE_ENRICHED,
+    WIRE_OPENAI,
+    attribution,
+    cost_block,
+    enrichment_headers,
+    timing_block,
+)
 from .observability import MetricsSample, RequestLogRecord
 from .on_demand import OnDemandUnavailable
 from .scheduler import CompletionRecord, DispatchDecision, QueuedRequest
@@ -247,6 +255,43 @@ def _split_coalesced_finish_chunk(parsed: dict) -> tuple[dict, dict] | None:
     return head, tail
 
 
+def _enriched_done(state, req, event: dict) -> dict:
+    """The producer's flat ``done`` frame, reshaped onto the enriched wire.
+
+    The producer (``execute_streaming``) emits what it MEASURED — queue wait,
+    backend latency, TTFT, token counts — in one flat frame, and knows nothing
+    about wires. Everything below is derivation: the same four blocks the
+    non-streaming envelope carries, so a caller that handles one handles both.
+    """
+    usage = event.get("usage") or {}
+    in_tok = int(usage.get("prompt_tokens") or 0)
+    out_tok = int(usage.get("completion_tokens") or 0)
+    attrib = attribution(state, req)
+    attrib["cost"] = cost_block(state, req.endpoint, in_tok, out_tok)
+    return {
+        "type": "done",
+        "request_id": req.request_id,
+        # 🚨 Reported at the END as well as at the start, and it is the END one
+        # that is authoritative: failover and spill both move a request AFTER
+        # the `accepted` frame is on the wire. A caller that trusted the opening
+        # frame's attribution would be told the endpoint we intended rather than
+        # the one that answered — the exact silent-substitution failure this API
+        # exists to close.
+        "attribution": attrib,
+        "timing": timing_block(
+            req,
+            queue_wait_ms=event.get("queue_wait_ms") or 0.0,
+            backend_latency_ms=event.get("backend_latency_ms") or 0.0,
+            ttft_ms=event.get("ttft_ms"),
+        ),
+        "usage": {
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "slot_seconds": round(req.estimated_cost_ss, 3),
+        },
+    }
+
+
 class Lifecycle:
     """The request hot path over the shared ProxyState."""
 
@@ -284,14 +329,22 @@ class Lifecycle:
             return model_ep
         return submit_ep
     async def handle_submit(
-        self, body: dict, request: Request, *, openai: bool = False,
+        self, body: dict, request: Request, *, wire: str = WIRE_ENRICHED,
     ) -> Response:
-        # ``openai=True`` (set only by the /v1/chat/completions front door)
-        # varies ONLY the response serialization: the bare OpenAI
-        # chat.completion / chat.completion.chunk + [DONE] stream, instead of
-        # the internal submit envelope. The enqueue / scheduler / grammar /
-        # cache / DRR / telemetry path is identical. Default False keeps every
-        # agent's /v1/submit response byte-identical.
+        # 🚨 ``wire`` varies ONLY the response serialization — never a routing,
+        # admission, correction or accounting decision. Two shapes:
+        #
+        #   WIRE_OPENAI    the bare OpenAI chat.completion / chat.completion.chunk
+        #                  + [DONE] stream, set by /v1/chat/completions and
+        #                  /v1/embeddings. Enrichment rides in headers, never in
+        #                  the body — see ``enriched.ENRICHMENT_HEADERS``.
+        #   WIRE_ENRICHED  the Roadstead envelope, with its attribution and
+        #                  timing blocks. What /rs/v1/chat serves.
+        #
+        # The enqueue / scheduler / grammar / cache / DRR / telemetry path is
+        # identical for both, and keeping it that way is the whole reason this
+        # is one method with a serialization flag rather than two doors: a
+        # second hot path is a second set of admission bugs.
         if self.state.draining.is_set():
             # Phase 2.1: refuse new work while draining for shutdown so it defers
             # to the (about-to-restart) next instance instead of being dropped.
@@ -300,7 +353,7 @@ class Lifecycle:
             # and streaming clients — without it, a streaming turn caught mid-
             # SIGTERM surfaced a hard error instead of deferring cleanly.
             err = "proxy draining for shutdown — backpressure"
-            if openai:
+            if wire == WIRE_OPENAI:
                 return _openai_error(err, "backpressure", 503, code="draining")
             return JSONResponse(
                 {"status": "error", "error": err, "code": "draining"},
@@ -320,7 +373,7 @@ class Lifecycle:
         resolved = self.state.identity.resolve(request)
         if not resolved.ok:
             denial = resolved.denial
-            if openai:
+            if wire == WIRE_OPENAI:
                 return _openai_error(denial.message, denial.openai_type,
                                      denial.status, code=denial.code)
             return JSONResponse(
@@ -376,7 +429,7 @@ class Lifecycle:
             if self.state.flags.get("unknown_endpoint_enforce"):
                 err = (f"unknown endpoint {endpoint!r} — no such model/role "
                        f"(known: {sorted(self.state.config.endpoints)})")
-                if openai:
+                if wire == WIRE_OPENAI:
                     return _openai_error(
                         err, "model_not_found", 404, code="unknown_endpoint")
                 return JSONResponse(
@@ -417,7 +470,7 @@ class Lifecycle:
                     err = (f"endpoint {endpoint!r} has no vision capability — "
                            "this request carries image content and the backend "
                            "would answer 500 'image input is not supported'")
-                    if openai:
+                    if wire == WIRE_OPENAI:
                         return _openai_error(
                             err, "invalid_request_error", 400,
                             code="vision_not_supported")
@@ -504,6 +557,16 @@ class Lifecycle:
             # chose is a soft budget that token progress may extend, a deadline
             # the caller chose is a hard wall. Nothing else reads it.
             deadline_is_default=deadline_is_default,
+            # Workstream C disclosure. The enriched door supplies `requested`
+            # (an intent profile, or the endpoint the caller pinned); the OpenAI
+            # doors leave it empty and `create` falls back to the endpoint name,
+            # which is the truthful answer for a door with no intent vocabulary.
+            requested=str(body.get("requested") or ""),
+            # 🚨 NARROWING only — see QueuedRequest.allow_degrade. A body that
+            # sets either True grants nothing on its own; both gates take the
+            # AND with the operator's opt-in.
+            allow_degrade=body.get("allow_degrade"),
+            allow_spill=body.get("allow_spill"),
         )
 
         # Payload-shape gate (north-face hardening). A chat payload whose
@@ -523,7 +586,7 @@ class Lifecycle:
             ):
                 err = ("invalid request: 'messages' must be a list of "
                        "{role, content} objects")
-                if openai:
+                if wire == WIRE_OPENAI:
                     return _openai_error(
                         err, "invalid_request_error", 400,
                         code="invalid_messages")
@@ -538,7 +601,7 @@ class Lifecycle:
         if req.payload_type == "chat_completion":
             grammar_err = self.correction.process_grammar(req)
             if grammar_err is not None:
-                if openai:
+                if wire == WIRE_OPENAI:
                     return _openai_error(
                         grammar_err.get("detail", "invalid grammar"),
                         "invalid_request_error", 422, code="invalid_grammar",
@@ -591,7 +654,7 @@ class Lifecycle:
                         f"({ctx_limit}/slot on {req.endpoint}) — chunk the "
                         f"input or route to a larger-context endpoint")
                     if self.state.flags.get("context_gate_enforce"):
-                        if openai:
+                        if wire == WIRE_OPENAI:
                             return _openai_error(
                                 err, "invalid_request_error", 422,
                                 code="context_overflow")
@@ -618,7 +681,7 @@ class Lifecycle:
                     backend_latency_ms=0.0, status="ok", slot_seconds=0.0))
                 # OpenAI consumers get the bare cached completion; internal
                 # consumers get the submit envelope (unchanged).
-                if openai:
+                if wire == WIRE_OPENAI:
                     return JSONResponse(cached)
                 return JSONResponse({
                     "status": "ok",
@@ -646,7 +709,7 @@ class Lifecycle:
                 err = (f"on-demand backend {req.endpoint} could not be loaded "
                        f"— backpressure: {exc}")
                 logger.warning("on_demand ensure_loaded failed: %s", err)
-                if openai:
+                if wire == WIRE_OPENAI:
                     return _openai_error(
                         err, "backend_unavailable", 503, code="on_demand_unavailable")
                 return JSONResponse(
@@ -701,7 +764,7 @@ class Lifecycle:
                     # decide whether the opt-in set is too small.
                     self.state.failover.record_refusal(req, fplan)
                 retry_after = self.health.retry_after_s(src_ep)
-                if openai:
+                if wire == WIRE_OPENAI:
                     resp = _openai_error(err, "backend_unavailable", 503, code=code)
                 else:
                     resp = JSONResponse(
@@ -722,7 +785,7 @@ class Lifecycle:
             if snap.get("queue_by_band", {}).get(band_key, 0) >= self.state.shed_depth:
                 err = f"backpressure: {req.endpoint} {band_key} queue saturated"
                 retry_after = self.health.retry_after_s(req.endpoint)
-                if openai:
+                if wire == WIRE_OPENAI:
                     resp = _openai_error(err, "backpressure", 429, code="backpressure")
                 else:
                     resp = JSONResponse(
@@ -757,11 +820,11 @@ class Lifecycle:
 
         # Streaming vs non-streaming
         if req.stream:
-            return await self.handle_streaming_submit(req, openai=openai)
+            return await self.handle_streaming_submit(req, wire=wire)
         else:
-            return await self.handle_sync_submit(req, cache_key, openai=openai)
+            return await self.handle_sync_submit(req, cache_key, wire=wire)
     async def handle_sync_submit(
-        self, req: QueuedRequest, cache_key: str | None, *, openai: bool = False,
+        self, req: QueuedRequest, cache_key: str | None, *, wire: str = WIRE_ENRICHED,
     ) -> Response:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
@@ -782,14 +845,16 @@ class Lifecycle:
             self.state.thinking_active.pop(req.request_id, None)
             # The caller's deadline fired — work may still be in flight.
             self.record_timeout_event(req, layer="client_wait", elapsed_s=req.timeout_s)
-            if openai:
+            if wire == WIRE_OPENAI:
                 return _openai_error(
                     f"proxy timeout after {req.timeout_s:.0f}s", "proxy_timeout", 504,
                     code="proxy_timeout",
                 )
             return JSONResponse(
-                {"error": "timeout", "request_id": req.request_id,
-                 "code": "proxy_timeout"},
+                {"status": "error", "request_id": req.request_id,
+                 "code": "proxy_timeout",
+                 "error": f"proxy timeout after {req.timeout_s:.0f}s",
+                 "attribution": attribution(self.state, req)},
                 status_code=504,
             )
         finally:
@@ -799,14 +864,16 @@ class Lifecycle:
         # timeout result — already logged there; surface the same 504.
         if result.get("status") == "timeout":
             self.state.thinking_active.pop(req.request_id, None)
-            if openai:
+            if wire == WIRE_OPENAI:
                 return _openai_error(
                     f"proxy timeout after {req.timeout_s:.0f}s", "proxy_timeout", 504,
                     code="proxy_timeout",
                 )
             return JSONResponse(
-                {"error": "timeout", "request_id": req.request_id,
-                 "code": "proxy_timeout"},
+                {"status": "error", "request_id": req.request_id,
+                 "code": "proxy_timeout",
+                 "error": f"proxy timeout after {req.timeout_s:.0f}s",
+                 "attribution": attribution(self.state, req)},
                 status_code=504,
             )
 
@@ -847,21 +914,84 @@ class Lifecycle:
             self.state.cache.put(cache_key, result.get("response", {}))
 
         # OpenAI consumers get the bare chat.completion (or an OpenAI-shaped
-        # error); internal consumers get the submit envelope (unchanged).
-        if openai:
+        # error) with the enrichment in headers; enriched consumers get the
+        # Roadstead envelope. Same `result` either way — only the bytes differ.
+        if wire == WIRE_OPENAI:
             if result.get("status") == "ok":
-                return JSONResponse(result.get("response", {}))
+                return JSONResponse(result.get("response", {}),
+                                    headers=enrichment_headers(req))
             return _openai_error(
                 result.get("error", "backend error"), "backend_error", 502,
                 code="backend_error",
             )
+        return self._enriched_response(req, result)
+    def _predicted_ms(self, req: QueuedRequest) -> float | None:
+        """What the timeout model would recommend for this call, in ms.
 
-        if result.get("status") == "ok":
-            return JSONResponse(result, status_code=200)
-        result.setdefault("code", "backend_error")
-        return JSONResponse(result, status_code=502)
+        Computed on the ENRICHED wire only, at response time. It is a percentile
+        over the learned distribution — cheap, but not free, and the OpenAI hot
+        path has no way to carry the answer and so must not pay for it. Fully
+        guarded: a prediction is a nicety, and nothing about it may turn a
+        completed request into a 500.
+        """
+        try:
+            mt = req.payload.get("max_tokens") if isinstance(req.payload, dict) else None
+            est_out = mt if isinstance(mt, int) and mt > 0 else 0
+            advice = self.state.effective_timeout_advice(
+                req.endpoint, int(req.priority), req.est_input_tokens, est_out)
+            return float(advice.get("recommended_ms") or 0.0) or None
+        except Exception:  # noqa: BLE001 — observability must not break a served call
+            logger.debug("predicted_ms unavailable", exc_info=True)
+            return None
+
+    def _enriched_response(self, req: QueuedRequest, result: dict) -> Response:
+        """Serialize one finished non-streaming request onto the enriched wire.
+
+        Four blocks and nothing else: ``attribution`` (who served, and whether
+        that is who was asked for), ``timing`` (both sides of the deadline),
+        ``usage`` (tokens and the slot-seconds this call actually occupied), and
+        the backend's own ``response``.
+
+        🚨 No priority, no band, no queue position. ``docs/api.md`` §1.6: a
+        caller cannot observe its own spend demotion in a response, and every
+        one of those fields would leak it.
+        """
+        ok = result.get("status") == "ok"
+        in_tok = int(result.get("input_tokens") or 0)
+        out_tok = int(result.get("output_tokens") or 0)
+        attrib = attribution(self.state, req)
+        attrib["cost"] = cost_block(self.state, req.endpoint, in_tok, out_tok)
+        body = {
+            "status": "ok" if ok else "error",
+            "request_id": req.request_id,
+            "attribution": attrib,
+            "timing": timing_block(
+                req,
+                queue_wait_ms=result.get("queue_wait_ms") or 0.0,
+                backend_latency_ms=result.get("backend_latency_ms") or 0.0,
+                predicted_ms=self._predicted_ms(req),
+            ),
+            "usage": {
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                # The unit of fairness, published. A caller that wants to
+                # understand why it is being scheduled the way it is cannot do so
+                # from token counts — occupancy time is what DRR charges.
+                "slot_seconds": result.get("estimated_cost_ss") or 0.0,
+            },
+        }
+        if ok:
+            body["response"] = result.get("response", {})
+            return JSONResponse(body, status_code=200)
+        # 🚨 `code` and `error` keep the §2.1/§2.2 spellings verbatim: the
+        # marker substrings a caller classifies on live in `error`, and they must
+        # mean the same thing on both doors.
+        body["code"] = result.get("code") or "backend_error"
+        body["error"] = result.get("error", "backend error")
+        return JSONResponse(body, status_code=502)
+
     async def handle_streaming_submit(
-        self, req: QueuedRequest, *, openai: bool = False,
+        self, req: QueuedRequest, *, wire: str = WIRE_ENRICHED,
     ) -> Response:
         queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         self.state.pending_streams[req.request_id] = queue
@@ -885,22 +1015,32 @@ class Lifecycle:
         async def stream_generator():
             # Per-request tool-call stream sanitizer (stateful across this one
             # stream). Default: OpenAI front door only; Step-4a
-            # (uniform_correction_enabled) extends it to internal /v1/submit
-            # streams — see the gate ~45 lines below. See _ToolCallStreamSanitizer.
+            # (uniform_correction_enabled) extends it to the enriched
+            # /rs/v1/chat streams too — see the gate ~45 lines below.
+            # See _ToolCallStreamSanitizer.
             toolcall_sanitizer = _ToolCallStreamSanitizer()
-            # Internal envelope consumers get the queued marker; OpenAI
-            # consumers (goose-cli) get ONLY chat.completion.chunk frames, so
-            # the queued/admitted markers are dropped — an OpenAI client chokes
-            # parsing them.
-            if not openai:
-                yield f"data: {json.dumps({'type': 'queued', 'request_id': req.request_id})}\n\n"
+            # Enriched consumers get an opening frame naming what will serve
+            # them BEFORE the first token, which is the whole reason this door
+            # exists — a streaming caller has no headers left to read by then.
+            # OpenAI consumers (goose-cli) get ONLY chat.completion.chunk
+            # frames, so no marker is emitted at all: an OpenAI client chokes
+            # parsing one.
+            if wire != WIRE_OPENAI:
+                yield ("data: " + json.dumps({
+                    "type": "accepted",
+                    "request_id": req.request_id,
+                    "attribution": attribution(self.state, req),
+                    "timing": timing_block(
+                        req, queue_wait_ms=0.0, backend_latency_ms=0.0,
+                        predicted_ms=self._predicted_ms(req)),
+                }) + "\n\n")
 
             try:
                 while True:
                     event = await asyncio.wait_for(
                         queue.get(), timeout=consumer_wait_s,
                     )
-                    if openai:
+                    if wire == WIRE_OPENAI:
                         etype = event.get("type")
                         if etype == "chunk":
                             # event["data"] is the backend's raw OpenAI
@@ -929,18 +1069,25 @@ class Lifecycle:
                         continue
                     # Internal envelope path: re-emit every event. Under uniform
                     # correction (Step 4a), route tool-call CHUNK frames through the
-                    # SAME sanitizer the OpenAI door uses so internal /v1/submit
-                    # consumers (agents via ProxyLLMClient) get the qwen3_xml
-                    # phantom/truncated-arg fix too — not just the OpenAI door.
+                    # SAME sanitizer the OpenAI door uses, so enriched
+                    # /rs/v1/chat consumers get the qwen3_xml phantom/
+                    # truncated-arg fix too — not just the OpenAI door.
                     # Default OFF == byte-identical (internal streams emit raw).
                     if (uniform_correction_enabled()
                             and event.get("type") == "chunk" and "data" in event):
                         event = {**event, "data": toolcall_sanitizer.feed(event["data"])}
+                    if event.get("type") == "done":
+                        # Reshape the producer's flat done frame onto the
+                        # enriched wire HERE, at the serializer boundary, rather
+                        # than teaching the producer about a wire. The producer
+                        # measures; this decides how to say it — which is why
+                        # adding this API changed nothing in `execute_streaming`.
+                        event = _enriched_done(self.state, req, event)
                     yield f"data: {json.dumps(event)}\n\n"
                     if event.get("type") in ("done", "error"):
                         break
             except asyncio.TimeoutError:
-                if openai:
+                if wire == WIRE_OPENAI:
                     yield (
                         "data: "
                         + json.dumps({"error": {
@@ -969,7 +1116,13 @@ class Lifecycle:
         return StreamingResponse(
             stream_generator(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            # 🚨 The enrichment headers are on the wire BEFORE the first token,
+            # so they carry only what admission already settled — request id,
+            # the endpoint chosen, the deadline and who chose it. A later
+            # failover or spill cannot be reflected here, which is exactly why
+            # the enriched stream repeats attribution on its `done` frame.
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                     **enrichment_headers(req)},
         )
     async def scheduler_loop(self) -> None:
         """Main scheduling loop — runs dispatch on every event or interval.
@@ -1249,6 +1402,13 @@ class Lifecycle:
                 "estimated_cost_ss": round(req.estimated_cost_ss, 3),
                 "response": resp.body,
                 "status": "ok",
+                # The BACKEND's own counts, carried so the response serializer
+                # can price the call without re-deriving them from the body.
+                # 🚨 The measured numbers, never the cost model's estimate: an
+                # invoice built from our own guess would be marking our own
+                # homework (`spend.SpendLedger.charge` makes the same point).
+                "input_tokens": resp.input_tokens,
+                "output_tokens": resp.output_tokens,
             }
             # § 9.6 — an explicit degraded marker, so an opted-in caller can
             # still choose to defer its own work rather than accept a smaller
@@ -2084,7 +2244,7 @@ class Lifecycle:
 
     def resolve_default_timeout(self, endpoint: str, body: dict) -> float:
         """Deadline for a caller that supplied no ``timeout_s`` (the OpenAI door
-        + a bare ``/v1/submit``). Caller-supplied deadlines never reach here.
+        or ``/rs/v1/chat``). Caller-supplied deadlines never reach here.
 
         Flag OFF (``smart_default_timeout`` false — the default): the flat
         ``_DEFAULT_TIMEOUT_S`` (180s), byte-identical to the historical default.

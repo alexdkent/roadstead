@@ -48,7 +48,7 @@ DEFAULT_FLAGS: dict[str, bool] = {
     # default; this is the kill-switch if a backend build rejects the field.
     "inject_stream_usage": True,
     # Phase 5a — server-side smart DEFAULT deadline for callers that OMIT
-    # timeout_s (the OpenAI /v1/chat/completions door + a bare /v1/submit).
+    # timeout_s (the OpenAI /v1/chat/completions door + /rs/v1/chat).
     # False = the flat _DEFAULT_TIMEOUT_S (180s), byte-identical to the historical
     # default, while still recording a shadow tally (smart_default_shadow on
     # /v1/status) of what a data-driven default WOULD be. True = the timeout

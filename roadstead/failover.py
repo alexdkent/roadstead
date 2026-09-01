@@ -197,7 +197,20 @@ class Failover:
                 refusal_detail=(
                     f"; it is serving from {tgt} for opted-in callers, and "
                     f"agent {req.agent_id!r} is not opted in "
-                    f"(llmproxy/agents.yaml `degrade_ok`)"),
+                    f"(`degrade_ok` in the agents config)"),
+            )
+        # Workstream C: the request's own NARROWING of that opt-in. 🚨 An
+        # `and`, never an `or` — the operator grants, the caller may only
+        # decline. Refused with the same code, because from the caller's side
+        # the outcome is identical (a clean labelled 503 rather than a smaller
+        # model's answer) and a second code would ask every existing client to
+        # learn a distinction it cannot act on differently.
+        if req.allow_degrade is False:
+            return FailoverPlan(
+                refusal_code=CODE_NOT_OPTED_IN,
+                refusal_detail=(
+                    f"; it is serving from {tgt} for opted-in callers, and "
+                    f"this request declared `substitution.degrade: false`"),
             )
 
         # Gate 2 — context fit (§ 9.4). Physics, not policy: the target is a

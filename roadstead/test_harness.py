@@ -273,25 +273,29 @@ class ProxyTestHarness:
                             if str(priority) == old:
                                 priority = int(new)
 
+                    # The corpus records an endpoint CLASS, which is a pin —
+                    # replay must reproduce where the original call went, not
+                    # re-decide it against today's fleet.
                     submit = {
-                        "agent_id": rec["agent_id"],
-                        "endpoint": rec["endpoint"],
+                        "model": rec["endpoint"],
                         "priority": priority,
                         "call_site": rec["call_site"],
                         "payload_type": "chat_completion",
                         "payload": rec["payload"],
-                        "timeout_s": 300.0,
+                        "deadline_s": 300.0,
                     }
 
                     try:
                         resp = await client.post(
-                            f"{self._proxy_url}/v1/submit",
+                            f"{self._proxy_url}/rs/v1/chat",
                             json=submit,
                         )
                         result = resp.json()
                         if result.get("status") == "ok":
-                            replay_waits.append(result.get("queue_wait_ms", 0))
-                            replay_backends.append(result.get("backend_latency_ms", 0))
+                            timing = result.get("timing") or {}
+                            replay_waits.append(timing.get("queue_wait_ms", 0))
+                            replay_backends.append(
+                                timing.get("backend_latency_ms", 0))
                         else:
                             errors += 1
                     except Exception:

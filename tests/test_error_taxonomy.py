@@ -192,7 +192,16 @@ async def test_success_envelope_unchanged_no_code_key():
         assert resp.status_code == 200
         assert body["status"] == "ok"
         assert "code" not in body
-        assert set(body) == {"status", "request_id", "queue_wait_ms",
-                             "backend_latency_ms", "estimated_cost_ss", "response"}
+        assert set(body) == {"status", "request_id", "response",
+                             "attribution", "timing", "usage"}
+        # 🚨 docs/api.md §1.6: a caller cannot observe its own spend demotion in
+        # a response, so the enriched envelope publishes no band, no priority
+        # and no queue position. Any of them would make a threshold that "never
+        # rejects" into one every client could detect and branch on.
+        leaked = {"priority", "band", "queue_position", "demoted", "effective_priority"}
+        flat = json.dumps(body)
+        for key in leaked:
+            assert f'"{key}"' not in flat, (
+                f"the enriched envelope leaks {key!r} — see docs/api.md §1.6")
     finally:
         await svc.shutdown()

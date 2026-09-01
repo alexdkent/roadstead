@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from . import cache_stats
 from .config import LLMPriority, normalize_endpoint
 from .constants import _PAYLOAD_KIND
+from .enriched import WIRE_OPENAI
 from .identity import remote_ip as _remote_ip
 from .lifecycle import _openai_error
 from .observability import structured_empty_rates
@@ -225,7 +226,7 @@ class ProxyHttpHandlers:
         }
         if client_timeout is not None:
             submit_body["timeout_s"] = client_timeout
-        return await self.lifecycle.handle_submit(submit_body, request, openai=True)
+        return await self.lifecycle.handle_submit(submit_body, request, wire=WIRE_OPENAI)
     async def handle_openai_embeddings(self, body: dict, request: Request) -> Response:
         """POST /v1/embeddings — the OpenAI-compatible embeddings door.
 
@@ -238,7 +239,7 @@ class ProxyHttpHandlers:
         Before, the raw OpenAI body was forwarded verbatim, so the shim rejected every
         call for a missing ``texts`` field and the door returned 502 for its whole life.
         The bug was invisible because no fleet caller uses it — agents embed through
-        ``/v1/submit``, which already speaks ``texts`` — so this path only ever served
+        the internal door, which already spoke ``texts`` — so this path only ever served
         external OpenAI clients, and nothing in-repo exercised it.
         """
         resolved = self.state.identity.resolve(request)
@@ -280,11 +281,12 @@ class ProxyHttpHandlers:
             "payload": {"texts": texts, "input": texts},
             "timeout_s": 60.0,
         }
-        # openai=True keeps ERRORS OpenAI-shaped (the internal {status,response}
-        # envelope used to leak). Success still returns the bare BACKEND body, so the
-        # OpenAI shape is applied here rather than in the shared sync path — embeddings
-        # are the only payload_type needing it, and the chat hot path stays untouched.
-        resp = await self.lifecycle.handle_submit(submit_body, request, openai=True)
+        # WIRE_OPENAI keeps ERRORS OpenAI-shaped (the Roadstead envelope would
+        # otherwise leak out of an OpenAI door). Success still returns the bare
+        # BACKEND body, so the OpenAI shape is applied here rather than in the
+        # shared sync path — embeddings are the only payload_type needing it, and
+        # the chat hot path stays untouched.
+        resp = await self.lifecycle.handle_submit(submit_body, request, wire=WIRE_OPENAI)
         if getattr(resp, "status_code", 500) != 200:
             return resp
         try:
@@ -355,7 +357,6 @@ class ProxyHttpHandlers:
         ``context_per_slot``/``endpoint_class``/``max_slots`` are kept for the
         fleet's own consumers (Inference page, tooling).
         """
-        _EMBEDDINGS = {"embed", "rerank"}
         rows = []
         for ep_name, ep_cfg in self.state.config.endpoints.items():
             ctx = ep_cfg.context_per_slot
@@ -378,11 +379,21 @@ class ProxyHttpHandlers:
                 "role": ep_cfg.role,
                 "max_slots": ep_cfg.max_slots,
                 "context_per_slot": ctx,
+                # The catalog's own `kind:`. Published so an OpenAI client can
+                # tell a chat model from an embedder without pattern-matching
+                # the name, which is what this handler used to do internally.
+                "kind": ep_cfg.kind,
             })
         # Chat before embed/rerank; within each, largest context first. Ties
         # break on id so the order is stable across boots.
+        # 🚨 Sorted on the DECLARED kind, not on a set of endpoint names. The
+        # literal `{"embed", "rerank"}` this replaced was correct for exactly
+        # one catalog — the example one — so any deployment whose embedder was
+        # called something else silently got an embedder as `data[0]`, which is
+        # the default a client with no configured model picks up. Same rule as
+        # the engine names: branch on a declaration.
         rows.sort(key=lambda r: (
-            r["endpoint_class"] in _EMBEDDINGS,
+            r["kind"] != "chat",
             -(r["max_model_len"] or 0),
             r["id"],
         ))

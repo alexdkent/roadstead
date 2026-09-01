@@ -99,7 +99,7 @@ class _FakeRequest:
         host = "172.16.0.5"
 
     class _URL:
-        path = "/v1/submit"
+        path = "/rs/v1/chat"
 
     client = _Client()
     headers: dict = {}
@@ -141,7 +141,7 @@ async def test_unhandled_handler_returns_500_envelope():
     assert resp.status_code == 500
 
 
-# --- Phase 3 hardening: unknown-endpoint gate on /v1/submit -------------------
+# --- Phase 3 hardening: the unknown-endpoint gate ----------------------------
 
 import asyncio
 import json as _json

@@ -18,10 +18,14 @@ Real seams driven, nothing else faked:
   * tier3 is made sick the way an operator actually does it — POST
     ``/v1/admin/endpoints/tier3/pause`` (the same drain switch used for a
     live vLLM restart), not by touching ``Failover``/``ProxyState`` directly.
-  * requests are submitted through the real ``/v1/submit`` front door (the
-    internal API every agent's ``ProxyLLMClient`` actually calls), which runs
-    the full ``Lifecycle.handle_submit`` — circuit breaker, failover gates,
+  * requests are submitted through the real ``/rs/v1/chat`` front door, which
+    runs the full ``Lifecycle.handle_submit`` — circuit breaker, failover gates,
     scheduler, dispatch — exactly as production does.
+  * the two callers are told apart by API KEY, not by a body field. Since
+    Workstream B the fair-share key comes from the credential, and since C the
+    body cannot claim one at all — so the opted-in and not-opted-in identities
+    this journey turns on are established the way a deployment establishes
+    them, which is the point of an end-to-end test.
   * two independent fake backends stand in for tier3 (``tier3``) and
     tier2 (``tier2``) so a captured ``resp.model`` can only have
     come from whichever one actually served — the identical-content "echo:"
@@ -50,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import os
 import tempfile
 from typing import AsyncIterator, Dict
 
@@ -117,6 +122,12 @@ async def journey(caplog) -> AsyncIterator[dict]:
                 )
             base.endpoints = endpoints
             base.poller_interval_s = 0.05  # real poller drives the LEAVE transition
+            # Identity comes from the credential now, so the journey has to
+            # supply one. Set on os.environ (not monkeypatch) because this is a
+            # module-scoped async fixture, which pytest's function-scoped
+            # monkeypatch cannot reach.
+            os.environ["ROADSTEAD_API_KEYS"] = ",".join(
+                f"{key}={agent}:{KEY_PRIORITY}" for agent, key in KEYS.items())
             app = build_app(base)
             svc = app.state.proxy_service
 
@@ -135,6 +146,7 @@ async def journey(caplog) -> AsyncIterator[dict]:
                     "fake_thinker": fake_thinker, "fake_creative": fake_creative,
                 }
             finally:
+                os.environ.pop("ROADSTEAD_API_KEYS", None)
                 await client.aclose()
                 await svc.shutdown()
     finally:
@@ -142,10 +154,27 @@ async def journey(caplog) -> AsyncIterator[dict]:
         fake_creative.stop()
 
 
+#: One API key per caller, so identity arrives the way it does in production.
+#: `chat-assistant` carries `degrade_ok: true` in the real agents.yaml and
+#: `extractor` deliberately does not — that contrast is what this file tests.
+#:
+#: 🚨 Both keys declare P1. The band is load-bearing here and not incidental:
+#: the failover gates run only for INTERACTIVE and FOREGROUND work, because a
+#: BACKGROUND request falls through and queues to defer until the backend
+#: recovers (``lifecycle.handle_submit``) — correct behaviour, and it would make
+#: this journey hang rather than fail. A key with no declared priority defaults
+#: to P3_INGESTION, which is exactly that case.
+KEYS = {"chat-assistant": "key-chat", "extractor": "key-extract"}
+KEY_PRIORITY = "P1_TURN_SUPPORT"
+
+
+def _auth(agent: str) -> dict:
+    return {"Authorization": f"Bearer {KEYS[agent]}"}
+
+
 def _submit_body(agent: str, *, content: str = "hi", max_tokens: int = 16) -> dict:
     return {
-        "agent_id": agent,
-        "endpoint": SRC,
+        "model": SRC,
         "call_site": f"{agent}.journey",
         "payload_type": "chat_completion",
         "payload": {
@@ -171,12 +200,17 @@ async def test_tier3_failover_full_journey(journey, caplog):
     fake_creative = journey["fake_creative"]
 
     # -- 0. baseline: tier3 healthy, served directly, no degraded marker ----
-    resp = await client.post("/v1/submit", json=_submit_body("chat-assistant"))
+    resp = await client.post("/rs/v1/chat", json=_submit_body("chat-assistant"),
+                             headers=_auth("chat-assistant"))
     assert resp.status_code == 200, resp.text
     env = resp.json()
     assert env["status"] == "ok"
     assert env["response"]["model"] == "llama-thinker-live"
-    assert "degraded" not in env
+    # Attribution says so explicitly rather than by the ABSENCE of a marker:
+    # the enriched envelope always discloses, so "not substituted" is a value
+    # a caller can read rather than a key it has to notice is missing.
+    assert env["attribution"]["substituted"] is False
+    assert env["attribution"]["substitution"] is None
     assert fake_thinker.controller.requests, "baseline call never reached tier3's fake"
     assert not fake_creative.controller.requests, "baseline call leaked onto tier2"
 
@@ -189,12 +223,15 @@ async def test_tier3_failover_full_journey(journey, caplog):
 
     # -- 2. served by tier2; response labelled; resp.model correct --
     fake_creative.controller.reset()
-    resp = await client.post("/v1/submit", json=_submit_body("chat-assistant", content="degraded turn"))
+    resp = await client.post("/rs/v1/chat", json=_submit_body("chat-assistant", content="degraded turn"),
+                             headers=_auth("chat-assistant"))
     assert resp.status_code == 200, resp.text
     env = resp.json()
     assert env["status"] == "ok"
-    assert env["degraded"] is True
-    assert env["degraded_from"] == SRC
+    assert env["attribution"]["substituted"] is True
+    assert env["attribution"]["substitution"] == "failover"
+    assert env["attribution"]["resolved"] == SRC
+    assert env["attribution"]["endpoint"] == TGT
     # 🚨 the wire fact, not the intent: it must have come back FROM the
     # tier2 fake specifically, naming ITS served model.
     assert env["response"]["model"] == "qwen3-creative-live"
@@ -221,7 +258,8 @@ async def test_tier3_failover_full_journey(journey, caplog):
     # -- 4. an agent WITHOUT degrade_ok gets a clean 503 + Retry-After, ------
     #       in the SAME window (tier3 still down, still degraded) -----------
     assert svc._state.config.agent_config("extractor").degrade_ok is False
-    resp = await client.post("/v1/submit", json=_submit_body("extractor", content="not opted in"))
+    resp = await client.post("/rs/v1/chat", json=_submit_body("extractor", content="not opted in"),
+                             headers=_auth("extractor"))
     assert resp.status_code == 503, resp.text
     body = resp.json()
     assert body["code"] == "draining"  # this outage is an operator drain
@@ -239,7 +277,8 @@ async def test_tier3_failover_full_journey(journey, caplog):
     # observable cohort to drain rather than an instantaneous empty one.
     fake_creative.controller.set_fault(FAULT_CAPACITY_DESYNC, 0.5)
     inflight_task = asyncio.create_task(
-        client.post("/v1/submit", json=_submit_body("chat-assistant", content="in-flight during recovery")))
+        client.post("/rs/v1/chat", json=_submit_body("chat-assistant", content="in-flight during recovery"),
+                             headers=_auth("chat-assistant")))
     assert await _wait_until(
         lambda: svc._scheduler.degraded_inflight(SRC) >= 1, timeout_s=2.0
     ), "the held request never registered as degraded in-flight"
@@ -257,7 +296,7 @@ async def test_tier3_failover_full_journey(journey, caplog):
 
     inflight_resp = await inflight_task
     assert inflight_resp.status_code == 200
-    assert inflight_resp.json()["degraded"] is True
+    assert inflight_resp.json()["attribution"]["substituted"] is True
 
     # Drained AND past dwell -> the poller LEAVEs on its own cadence, no
     # request required to observe it (§ 9.7 — "must not require traffic").
@@ -273,10 +312,15 @@ async def test_tier3_failover_full_journey(journey, caplog):
     # Next request goes back to tier3, unlabelled.
     fake_thinker.controller.reset()
     fake_creative.controller.reset()
-    resp = await client.post("/v1/submit", json=_submit_body("chat-assistant", content="recovered turn"))
+    resp = await client.post("/rs/v1/chat", json=_submit_body("chat-assistant", content="recovered turn"),
+                             headers=_auth("chat-assistant"))
     assert resp.status_code == 200, resp.text
     env = resp.json()
-    assert "degraded" not in env
+    # Attribution says so explicitly rather than by the ABSENCE of a marker:
+    # the enriched envelope always discloses, so "not substituted" is a value
+    # a caller can read rather than a key it has to notice is missing.
+    assert env["attribution"]["substituted"] is False
+    assert env["attribution"]["substitution"] is None
     assert env["response"]["model"] == "llama-thinker-live"
     assert any(r.path == "/v1/chat/completions" for r in fake_thinker.controller.requests)
     assert not fake_creative.controller.requests, (

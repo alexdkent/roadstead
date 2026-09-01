@@ -502,7 +502,11 @@ async def test_streaming_toolcall_continuations_drop_null_name_end_to_end():
         await svc.shutdown()
 
 
-# --- regression: internal /v1/submit envelope unchanged ----------------------
+# --- the ENRICHED wire, which is the other half of the same door -------------
+# `handle_submit` is no longer a route (`/v1/submit` was removed with Workstream
+# C) but it is still the one shared hot path, and `wire=` is the only thing that
+# differs between the two north faces. These pin that the OpenAI serialization
+# above and the enriched one below really are the same request.
 
 def _submit_body(*, stream: bool = False) -> dict:
     return {
@@ -517,32 +521,48 @@ def _submit_body(*, stream: bool = False) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_internal_submit_envelope_unchanged_nonstreaming():
+async def test_enriched_envelope_nonstreaming():
     svc = await _make_started_service()
     try:
-        resp = await svc.handle_submit(_submit_body(), _FakeRequest())  # openai=False
+        resp = await svc.handle_submit(_submit_body(), _FakeRequest())  # wire=WIRE_ENRICHED
         assert resp.status_code == 200
         env = json.loads(resp.body.decode())
         assert env["status"] == "ok"
-        assert "request_id" in env and "queue_wait_ms" in env and "estimated_cost_ss" in env
-        # backend completion nested under "response" (NOT bare)
+        assert "request_id" in env
+        # The four blocks, and the backend completion still nested under
+        # "response" rather than merged into the envelope — a caller must never
+        # have to tell our fields from the model's.
         assert env["response"] == _COMPLETION
+        assert env["timing"]["queue_wait_ms"] >= 0
+        assert env["timing"]["deadline_source"] == "caller"  # timeout_s supplied
+        assert env["usage"]["slot_seconds"] >= 0
+        assert env["attribution"]["endpoint"] == "tier3"
+        assert env["attribution"]["substituted"] is False
     finally:
         await svc.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_internal_submit_envelope_unchanged_streaming():
+async def test_enriched_envelope_streaming():
     svc = await _make_started_service()
     try:
         resp = await svc.handle_submit(_submit_body(stream=True), _FakeRequest())
         frames = await _collect_stream(resp)
         objs = [json.loads(f) for f in frames if f != "[DONE]"]
         types = [o.get("type") for o in objs]
-        assert "queued" in types          # internal queued marker still emitted
+        # The opening frame names what will serve BEFORE the first token — the
+        # one thing a streaming caller cannot learn from a header, because the
+        # headers are already on the wire.
+        assert types[0] == "accepted"
+        assert objs[0]["attribution"]["endpoint"] == "tier3"
         assert "chunk" in types           # type-tagged chunk frames
         assert types[-1] == "done"        # envelope done event (NOT bare [DONE])
-        assert "[DONE]" not in frames     # internal path never emits OpenAI [DONE]
+        assert "[DONE]" not in frames     # the enriched wire never emits it
+        done = objs[-1]
+        # 🚨 Attribution is repeated on `done` and THAT one is authoritative:
+        # failover and spill both move a request after `accepted` is sent.
+        assert done["attribution"]["endpoint"] == "tier3"
+        assert done["usage"]["output_tokens"] >= 0
     finally:
         await svc.shutdown()
 

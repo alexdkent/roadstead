@@ -1,0 +1,566 @@
+"""The enriched Roadstead API — the north face that is not OpenAI's.
+
+``/rs/v1/*``. Three routes, and between them they answer the three questions a
+caller of a *capacity-aware* gateway has and cannot ask an OpenAI-shaped API:
+
+===========================  ==================================================
+``GET  /rs/v1/models``       what can serve me, what can it do, what is it like
+                             right now, and what does it cost
+``POST /rs/v1/plan``         where would this go, how long should I allow, and
+                             what would it cost — **without dispatching**
+``POST /rs/v1/chat``         do it, and tell me what actually happened
+===========================  ==================================================
+
+---
+
+## Why a second API and not more fields on the first one
+
+🚨 **Enrichment never appears inside an OpenAI-shaped body.** A client that
+validates against OpenAI's schema must not break because it pointed at
+Roadstead, and "we only *added* fields" is not a defence — strict validators
+reject unknown keys, and the ones that do not will happily hand an extra key to
+a caller that then depends on it from a server that is not us. So the OpenAI
+door stays byte-identical and its enrichment rides in ``X-Roadstead-*`` response
+headers (see ``ENRICHMENT_HEADERS``), which are ignorable by construction.
+
+Everything that does not fit in a header lives here.
+
+## The four things it carries that ``/v1/submit`` could not
+
+**Enriched model information.** Not a config readout: what an endpoint *is*
+(context, capabilities, provider, engine) and what it is *currently like* (queue
+depth, free slots, health, learned median latency), plus its price and — the
+part ``spend.py`` exists for — whether that price is an invoice or a cost
+avoided.
+
+**Timing, on both sides of the call.** Before: the recommended deadline for
+*this* call, from the learned distribution, so a caller stops guessing 180s.
+After: queue wait, TTFT, decode, total, against what was predicted.
+
+**Prioritisation as a declaration.** ``priority`` and ``interactive`` are what
+the caller states; the number is ours. That was already true and was buried in
+a body field nobody documented as intent.
+
+**Attribution.** Which endpoint served, on which provider, at what cost — and
+whether that differed from what was asked for. 🚨 A caller that did not opt into
+substitution is never silently given something else, and a caller that did is
+always told.
+
+---
+
+## The one thing deliberately NOT in the response
+
+🚨 **The effective priority, and therefore the spend demotion.** ``docs/api.md``
+§1.6: *"A caller cannot observe its own demotion in a response."* A demoted
+caller is still served, still from local capacity, and its own band is not
+information it can act on — while publishing it would turn a threshold that
+"never rejects" into one every client could detect and branch on, which is a
+rejection with extra steps. It is an operator fact and it goes to the operator,
+through the degradation seam and ``/v1/status``. So this module publishes no
+band, no priority and no queue position, and ``test_enriched_api.py`` fails if
+one appears.
+
+---
+
+## Where the work happens
+
+Almost nowhere here. ``handle_rs_chat`` resolves an intent, translates the
+enriched envelope into the internal submit dict, and hands it to
+``Lifecycle.handle_submit`` — the *same* admission, DRR, grammar, cache,
+correction and telemetry path the OpenAI doors use. A second hot path would be a
+second set of bugs, and the whole argument for one admission decision with three
+outcomes (``scheduler.Admission``) applies just as hard one layer up.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+
+from .config import LLMPriority, ROLE_TO_CLASS, normalize_endpoint
+from .cost_model import estimate_input_tokens
+from .intent import (
+    BUILTIN_PROFILES,
+    IntentError,
+    ModelFacts,
+    parse_intent,
+    resolve,
+)
+
+if TYPE_CHECKING:
+    from .health import Health
+    from .lifecycle import Lifecycle
+    from .state import ProxyState
+
+logger = logging.getLogger(__name__)
+
+#: The route prefix. Its OWN version, separate from ``/v1/*``: the OpenAI-compat
+#: surface is versioned by OpenAI and this one is versioned by us, and pinning
+#: them together would mean either following someone else's version number or
+#: publishing a ``/v2/chat/completions`` that is not OpenAI's v2.
+PREFIX = "/rs/v1"
+
+#: Which response shape ``Lifecycle.handle_submit`` serializes into. Two values,
+#: because there are two north faces; the choice varies nothing but the bytes.
+WIRE_OPENAI = "openai"
+WIRE_ENRICHED = "enriched"
+
+#: Enrichment on the OPENAI door, which may carry no extra body fields.
+#:
+#: 🚨 Only what is known *before* the body starts, because a streaming response's
+#: headers are on the wire before the first token — so the served endpoint is the
+#: one admission chose, and a later failover or spill is NOT reflected here. That
+#: is a real limit of the header channel and it is why the enriched API exists:
+#: a caller that needs to know what actually served must ask for it on ``/rs/v1``.
+#: Advertising a substitution here that a stream might contradict would be worse
+#: than advertising nothing.
+ENRICHMENT_HEADERS = {
+    "request_id": "X-Roadstead-Request-Id",
+    "endpoint": "X-Roadstead-Endpoint",
+    "deadline_s": "X-Roadstead-Deadline-S",
+    "deadline_source": "X-Roadstead-Deadline-Source",
+}
+
+
+def _error(code: str, message: str, status: int, **extra) -> JSONResponse:
+    """The enriched error envelope.
+
+    🚨 ``code`` and ``error`` stay at the TOP level and keep the exact spellings
+    ``docs/api.md`` §2.1 publishes. The enriched API is a new shape, not a new
+    taxonomy: a caller's deferrable-vs-not classification must give the same
+    answer on both doors, and §2.2's marker substrings live in ``error``.
+    """
+    return JSONResponse(
+        {"status": "error", "code": code, "error": message, **extra},
+        status_code=status)
+
+
+class EnrichedApi:
+    """``/rs/v1`` over the shared ProxyState. A translator, not a second path."""
+
+    def __init__(self, state: "ProxyState", lifecycle: "Lifecycle",
+                 health: "Health") -> None:
+        self.state = state
+        self.lifecycle = lifecycle
+        self.health = health
+
+    # ---------------------------------------------------------------- facts
+
+    def _aliases_for(self, endpoint: str) -> list[str]:
+        """Every name that resolves to ``endpoint``, so a caller can pin using
+        whichever one its config already holds instead of learning ours."""
+        return sorted({name for name, cls in ROLE_TO_CLASS.items()
+                       if cls == endpoint and name != endpoint})
+
+    def facts(self) -> list[ModelFacts]:
+        """A snapshot of every endpoint in the catalog, routed or not.
+
+        Assembled here rather than in ``intent.py`` because every line of it is a
+        lookup, and the resolver's whole value is that it does none. Cheap: all
+        in-memory reads (config, the scheduler's occupancy dicts, the health
+        map, the timeout model's aggregate, the price book), so it is safe on the
+        request path and safe on the loop.
+        """
+        from .model_catalog import load_catalog
+
+        cat = load_catalog()
+        # 🚨 The UNION, not the catalog alone. `config.endpoints` is normally
+        # derived from the catalog, but it is a plain dict a deployment (or a
+        # test) may hold entries in that the catalog never named — and an
+        # endpoint the scheduler will happily dispatch to must be reachable by
+        # intent, or it becomes capacity only a pin can find. The catalog's
+        # order is kept first so the common case reads the same.
+        names = list(cat.endpoints) + [
+            n for n in self.state.config.endpoints if n not in cat.endpoints]
+        out: list[ModelFacts] = []
+        for name in names:
+            entry = cat.endpoints.get(name)
+            ep_cfg = self.state.config.endpoints.get(name)
+            provider = cat.provider(entry.provider) if entry else None
+            snap = (self.state.scheduler.endpoint_snapshot(name)
+                    if ep_cfg is not None else
+                    {"max_slots": 0, "in_flight": 0, "queued": 0})
+            price = self.state.prices.price(name)
+            # The learned median for the endpoint as a whole — the widest cell
+            # the timeout model has, because a per-(tier, size) figure would be
+            # answering a question about a request we have not been given yet.
+            typical_ms = 0.0
+            try:
+                advice = self.state.timeout_model.advise(
+                    name, int(LLMPriority.P1_TURN_SUPPORT), 0, 0)
+                if advice.get("sample_count"):
+                    typical_ms = float(advice.get("median_ms") or 0.0)
+            except Exception:  # noqa: BLE001 — a model readout must not 500 a listing
+                typical_ms = 0.0
+            # An endpoint present in the routing table is ROUTED whatever the
+            # catalog says — the scheduler will dispatch to it, and reporting
+            # otherwise would describe a fleet Roadstead is not running.
+            routed = ep_cfg is not None if entry is None else entry.routed
+            out.append(ModelFacts(
+                endpoint=name,
+                kind=(ep_cfg.kind if ep_cfg else entry.kind if entry else "chat"),
+                provider=(entry.provider if entry else ""),
+                engine=(provider.engine if provider
+                        else ep_cfg.backend_engine if ep_cfg else ""),
+                context=(ep_cfg.context_per_slot if ep_cfg
+                         else entry.context_per_slot if entry else 0),
+                capabilities=(
+                    ep_cfg.capabilities if ep_cfg
+                    else frozenset(k for k, v in entry.capabilities.items() if v)
+                    if entry else frozenset()),
+                routed=routed,
+                # An unrouted endpoint has no health to report and no poller
+                # looking at it; calling it healthy would put a green light on a
+                # name nobody can dispatch to.
+                healthy=(self.health.endpoint_healthy(name)
+                         if routed and ep_cfg is not None else False),
+                max_slots=int(snap.get("max_slots") or 0),
+                in_flight=int(snap.get("in_flight") or 0),
+                queued=int(snap.get("queued") or 0),
+                typical_ms=typical_ms,
+                input_usd_per_mtok=price.input_usd_per_mtok,
+                output_usd_per_mtok=price.output_usd_per_mtok,
+                real_cost=price.real,
+            ))
+        out.sort(key=lambda f: f.endpoint)
+        return out
+
+    # ---------------------------------------------- GET /rs/v1/models
+
+    async def handle_rs_models(self, request: Request) -> Response:
+        """The enriched catalogue: what exists, what it can do, what it is like.
+
+        Gated like every other door. It is a map of the fleet — slot counts,
+        occupancy, health and prices — and an unenrolled caller has no more
+        business reading that than it has dispatching to it.
+        """
+        resolved = self.state.identity.resolve(request)
+        if not resolved.ok:
+            d = resolved.denial
+            return _error(d.code, d.message, d.status)
+        rows = [f.as_dict() for f in self.facts()]
+        for row in rows:
+            row["aliases"] = self._aliases_for(row["endpoint"])
+        return JSONResponse({
+            "object": "roadstead.models",
+            "models": rows,
+            # The intent vocabulary, published rather than documented — an
+            # "unknown intent" error is a poor place to learn one. Published
+            # even though the table is built in today (see intent.py): a caller
+            # that hard-codes our list breaks the day it becomes configurable,
+            # and one that asks does not.
+            "intents": [
+                {"name": p.name, "kind": p.kind,
+                 "requires": sorted(p.requires), "prefer": p.prefer,
+                 "summary": p.summary}
+                for p in sorted(BUILTIN_PROFILES.values(), key=lambda p: p.name)
+            ],
+        })
+
+    # ------------------------------------------------ POST /rs/v1/plan
+
+    async def handle_rs_plan(self, body: dict, request: Request) -> Response:
+        """Resolve an intent and price the call — without making it.
+
+        🚨 The point of this route is that it runs the SAME
+        ``intent.resolve`` the dispatching route runs, over the same facts. A
+        planner that approximated the router would be a second answer to the
+        question the router is about to answer differently, and a caller would
+        have no way to tell which one lied.
+        """
+        resolved_id = self.state.identity.resolve(request)
+        if not resolved_id.ok:
+            d = resolved_id.denial
+            return _error(d.code, d.message, d.status)
+        agent_id = resolved_id.principal.agent_id
+
+        try:
+            intent = parse_intent(body, normalize=normalize_endpoint)
+        except IntentError as exc:
+            return _error("invalid_request_error", str(exc), 400)
+
+        facts = self.facts()
+        res = resolve(intent, facts)
+        if not res.ok:
+            return _error("unknown_endpoint", res.failure_message(), 404,
+                          considered=[r.as_dict() for r in res.near_misses])
+
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+        est_in = int(body.get("est_in") or 0) or estimate_input_tokens(payload)
+        mt = payload.get("max_tokens")
+        est_out = int(body.get("est_out") or 0) or (
+            mt if isinstance(mt, int) and mt > 0 else 0)
+        priority = LLMPriority.coerce(
+            body.get("priority"), default=resolved_id.principal.priority)
+
+        advice = self.state.effective_timeout_advice(
+            res.endpoint, int(priority), est_in, est_out)
+        by_ep = {f.endpoint: f for f in facts}
+        chosen = by_ep[res.endpoint]
+        price = self.state.prices.price(res.endpoint)
+        return JSONResponse({
+            "object": "roadstead.plan",
+            "requested": intent.declared,
+            "endpoint": res.endpoint,
+            # The runners-up, in the order the router would fall through them.
+            # Publishing them is what lets a caller understand a decision rather
+            # than only receive it.
+            "alternatives": list(res.ranked[1:]),
+            "considered": [r.as_dict() for r in res.near_misses],
+            "model": chosen.as_dict(),
+            "timing": {
+                "recommended_deadline_s": advice.get("recommended_timeout_s"),
+                "predicted_ms": advice.get("recommended_ms"),
+                "median_ms": advice.get("median_ms"),
+                "p95_ms": advice.get("p95_ms"),
+                "sample_count": advice.get("sample_count"),
+                # `floor` means the deadline came from the class floor, not from
+                # evidence — see docs/api.md §1.4. Worth surfacing: a caller that
+                # sees it knows its number is a guarantee, not a measurement.
+                "source": advice.get("source"),
+            },
+            "cost": {
+                "estimated_usd": round(price.cost_usd(est_in, est_out), 6),
+                **price.as_dict(),
+            },
+            # Whether this caller may currently be substituted, so a plan can say
+            # "and if it is busy, here is what happens". Read off the same config
+            # the two gates read.
+            "substitution": self._substitution_policy(agent_id, res.endpoint),
+        })
+
+    def _substitution_policy(self, agent_id: str, endpoint: str) -> dict:
+        cfg = self.state.config.agent_config(agent_id)
+        ep_cfg = self.state.config.endpoints.get(endpoint)
+        # 🚨 Two questions, two answers, and they never default from each other:
+        # `degrade` is "this backend is DOWN, may a smaller model answer" and
+        # `spill` is "this backend is BUSY, may we pay somebody else". Reporting
+        # them as one field is the collapse CLAUDE.md warns recurs.
+        return {
+            "degrade": {
+                "allowed": bool(cfg.degrade_ok),
+                "target": (ep_cfg.failover_to if ep_cfg else "") or None,
+            },
+            "spill": {
+                "allowed": bool(cfg.spill_ok
+                                and self.state.spend_may_spill(agent_id)),
+                "target": (ep_cfg.spill_to if ep_cfg else "") or None,
+            },
+        }
+
+    # ------------------------------------------------ POST /rs/v1/chat
+
+    async def handle_rs_chat(self, body: dict, request: Request) -> Response:
+        """The enriched call. Resolves intent, then joins the one hot path."""
+        resolved_id = self.state.identity.resolve(request)
+        if not resolved_id.ok:
+            d = resolved_id.denial
+            return _error(d.code, d.message, d.status)
+        principal = resolved_id.principal
+
+        payload = body.get("payload")
+        if not isinstance(payload, dict):
+            return _error(
+                "invalid_request_error",
+                "`payload` must be an object carrying the model request "
+                "(messages, max_tokens, stream, …)", 400)
+
+        try:
+            intent = parse_intent(body, normalize=normalize_endpoint)
+        except IntentError as exc:
+            return _error("invalid_request_error", str(exc), 400)
+
+        res = resolve(intent, self.facts())
+        if not res.ok:
+            # 🚨 A refusal, never a fallback. A pin that cannot be satisfied and
+            # an intent nothing matches are both *deterministic* caller errors:
+            # serving them from whatever happened to be nearest is the silent
+            # substitution this API exists to make impossible.
+            return _error("unknown_endpoint", res.failure_message(), 404,
+                          considered=[r.as_dict() for r in res.near_misses])
+
+        try:
+            allow_degrade, allow_spill = _substitution_request(body)
+        except IntentError as exc:
+            return _error("invalid_request_error", str(exc), 400)
+
+        # The payload's own `model` is overwritten with the resolved class so
+        # ``Lifecycle.resolve_endpoint`` — which reconciles a submit endpoint
+        # against a payload model — agrees with the decision already made here
+        # rather than silently re-routing away from it. The backend never sees
+        # this value: ``backend.py`` substitutes ``effective_model_id``.
+        payload = {**payload, "model": res.endpoint}
+
+        submit: dict = {
+            "agent_id": principal.agent_id,
+            "endpoint": res.endpoint,
+            "requested": intent.declared,
+            "priority": int(_priority_for(body, principal)),
+            "call_site": str(body.get("call_site")
+                             or f"{principal.agent_id}.rs"),
+            "caller_id": body.get("caller_id") or principal.agent_id,
+            "payload_type": str(body.get("payload_type") or "chat_completion"),
+            "payload": payload,
+            "session_id": body.get("session_id"),
+            "turn_id": body.get("turn_id"),
+            "request_id": body.get("request_id"),
+            "allow_degrade": allow_degrade,
+            "allow_spill": allow_spill,
+        }
+        # `deadline_s` is the enriched spelling of `timeout_s`. Omitted entirely
+        # when the caller expressed no opinion, so the computed default applies —
+        # passing a null would look like a supplied deadline of nothing.
+        deadline = body.get("deadline_s", request.headers.get("X-Timeout-S"))
+        if deadline is not None:
+            submit["timeout_s"] = deadline
+
+        return await self.lifecycle.handle_submit(submit, request, wire=WIRE_ENRICHED)
+
+
+def _priority_for(body: dict, principal) -> LLMPriority:
+    """Priority from the caller's two declarations, identity default last.
+
+    ``interactive`` is the enriched API's first-class spelling of the thing
+    ``priority`` has always encoded and never named: whether somebody is waiting.
+    It is a coarse control on purpose — a caller that wants the precise band
+    still sends ``priority``, which wins, because it says strictly more.
+    """
+    if body.get("priority") is not None:
+        return LLMPriority.coerce(body["priority"], default=principal.priority)
+    interactive = body.get("interactive")
+    if interactive is True:
+        return LLMPriority.P1_TURN_SUPPORT
+    if interactive is False:
+        return LLMPriority.P3_INGESTION
+    return principal.priority
+
+
+def _substitution_request(body: dict) -> tuple[bool | None, bool | None]:
+    """Parse the per-request substitution narrowing.
+
+    🚨 Returns ``None`` for "not declared" and only ever narrows downstream. A
+    ``true`` here is accepted and recorded but grants nothing on its own — the
+    gates take the AND with the operator's opt-in. Accepting it rather than
+    rejecting it is deliberate: a caller that says "yes, spilling is fine by me"
+    is making a true statement about itself, and refusing the request over a
+    permission it does not control would be an error nobody can fix.
+    """
+    raw = body.get("substitution")
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        raise IntentError(
+            '`substitution` must be an object, e.g. {"degrade": false, '
+            '"spill": false}')
+    out: list[bool | None] = []
+    for key in ("degrade", "spill"):
+        val = raw.get(key)
+        if val is None:
+            out.append(None)
+        elif isinstance(val, bool):
+            out.append(val)
+        else:
+            raise IntentError(
+                f"`substitution.{key}` must be true or false, got {val!r}")
+    return out[0], out[1]
+
+
+# ---------------------------------------------------------------------------
+# Response assembly — shared by the enriched door and the OpenAI door's headers
+# ---------------------------------------------------------------------------
+
+#: What moved a request off the endpoint that was chosen for it. Two values,
+#: never one: see ``docs/api.md`` §1.6 and ``CLAUDE.md`` — failover answers "this
+#: backend is DOWN" and spill answers "this backend is FULL", and a caller reacts
+#: to them differently (one got a worse answer, one got an invoice).
+SUBSTITUTION_FAILOVER = "failover"
+SUBSTITUTION_SPILL = "spill"
+
+
+def attribution(state: "ProxyState", req) -> dict:
+    """Who served this request, and whether that is who was asked for."""
+    ep_cfg = state.config.endpoints.get(req.endpoint)
+    price = state.prices.price(req.endpoint)
+    substitution = None
+    if req.spilled_from:
+        substitution = SUBSTITUTION_SPILL
+    elif req.degraded_from:
+        substitution = SUBSTITUTION_FAILOVER
+    return {
+        "requested": req.requested,
+        "resolved": req.routed_to,
+        "endpoint": req.endpoint,
+        # Derived from the two recorded fields rather than from `substitution`
+        # being non-null, so the bool cannot drift from the label.
+        "substituted": bool(req.routed_to and req.routed_to != req.endpoint),
+        "substitution": substitution,
+        "provider": _provider_name(req.endpoint),
+        "engine": (ep_cfg.backend_engine if ep_cfg else ""),
+        # The model the BACKEND is serving, as discovery found it — not the
+        # endpoint class, and not what the caller asked for. Reading it back is
+        # the fleet's own rule for trusting a rename.
+        "model": (ep_cfg.effective_model_id if ep_cfg else ""),
+    }
+
+
+def _provider_name(endpoint: str) -> str:
+    from .model_catalog import load_catalog
+    entry = load_catalog().entry(endpoint)
+    return entry.provider if entry else ""
+
+
+def cost_block(state: "ProxyState", endpoint: str,
+               input_tokens: int, output_tokens: int) -> dict:
+    """What this call cost, in the two kinds of money that are never summed.
+
+    🚨 ``spent_usd`` is an invoice and ``avoided_usd`` is a saving. They are both
+    USD and nothing in the type system separates them, which is why
+    ``TokenPrice.real`` does — and why they are reported in two fields whose
+    values a consumer must never add. Exactly one of them is ever non-zero for a
+    given call, and which one is a property of the price, not of the endpoint.
+    """
+    price = state.prices.price(endpoint)
+    amount = round(price.cost_usd(input_tokens, output_tokens), 6)
+    return {
+        "spent_usd": amount if price.real else 0.0,
+        "avoided_usd": 0.0 if price.real else amount,
+        "price": price.as_dict(),
+    }
+
+
+def timing_block(req, *, queue_wait_ms: float, backend_latency_ms: float,
+                 ttft_ms: float | None = None,
+                 predicted_ms: float | None = None) -> dict:
+    """When things happened, against what was predicted."""
+    total = float(queue_wait_ms) + float(backend_latency_ms)
+    return {
+        "queue_wait_ms": round(float(queue_wait_ms), 1),
+        "backend_latency_ms": round(float(backend_latency_ms), 1),
+        # Null rather than 0.0 for a non-streaming call: there is no first token
+        # to time, and a zero would read as an instantaneous one.
+        "ttft_ms": (round(float(ttft_ms), 1)
+                    if ttft_ms not in (None, 0) else None),
+        "total_ms": round(total, 1),
+        "deadline_s": round(float(req.timeout_s), 3),
+        # 🚨 Which SIDE chose the deadline, which is a contract boundary rather
+        # than a detail: a caller's own deadline is a hard wall we keep to the
+        # letter, one we computed is a budget the streaming path may extend
+        # while tokens are demonstrably still arriving.
+        "deadline_source": "computed" if req.deadline_is_default else "caller",
+        "predicted_ms": (round(float(predicted_ms), 1)
+                         if predicted_ms else None),
+    }
+
+
+def enrichment_headers(req) -> dict[str, str]:
+    """The ``X-Roadstead-*`` headers for the OpenAI door. See ENRICHMENT_HEADERS."""
+    return {
+        ENRICHMENT_HEADERS["request_id"]: req.request_id,
+        ENRICHMENT_HEADERS["endpoint"]: req.endpoint,
+        ENRICHMENT_HEADERS["deadline_s"]: f"{req.timeout_s:.3f}",
+        ENRICHMENT_HEADERS["deadline_source"]: (
+            "computed" if req.deadline_is_default else "caller"),
+    }

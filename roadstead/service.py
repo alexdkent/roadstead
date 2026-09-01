@@ -82,6 +82,7 @@ from .correction import (
     _is_degenerate_text,  # noqa: F401
     _top_shingle_reps,  # noqa: F401
 )
+from .enriched import WIRE_ENRICHED, EnrichedApi
 from .failover import Failover
 from .health import Health
 from .http_handlers import (
@@ -220,6 +221,12 @@ class ProxyService:
         self._lifecycle = Lifecycle(self._state, self._correction, self._health)
         # HTTP handlers: the Starlette request surface (uses Lifecycle + Health).
         self._http = ProxyHttpHandlers(self._state, self._lifecycle, self._health)
+        # The enriched north face (/rs/v1). A SECOND collaborator rather than
+        # more methods on ProxyHttpHandlers, because it is a different contract
+        # with a different version — and because a 1400-line module that already
+        # holds the OpenAI door, the admin surface and the analytics family is
+        # not where a new API should be discovered.
+        self._enriched = EnrichedApi(self._state, self._lifecycle, self._health)
 
     # ----- lifecycle -----
 
@@ -535,21 +542,33 @@ class ProxyService:
         self._queue_db.close()  # flushes the writer queue, then closes connections
         self._request_logger.close()
 
-    # ----- handler: /v1/submit -----
+    # ----- handler: the shared submission path -----
 
     def _resolve_endpoint(self, body: dict) -> str:
         return self._lifecycle.resolve_endpoint(body)
 
     async def handle_submit(
-        self, body: dict, request: Request, *, openai: bool = False,
+        self, body: dict, request: Request, *, wire: str = WIRE_ENRICHED,
     ) -> Response:
-        # ``openai=True`` (set only by the /v1/chat/completions front door)
-        # varies ONLY the response serialization: the bare OpenAI
-        # chat.completion / chat.completion.chunk + [DONE] stream, instead of
-        # the internal submit envelope. The enqueue / scheduler / grammar /
-        # cache / DRR / telemetry path is identical. Default False keeps every
-        # agent's /v1/submit response byte-identical.
-        return await self._lifecycle.handle_submit(body, request, openai=openai)
+        """The one hot path, behind both north faces.
+
+        🚨 No longer a route. ``/v1/submit`` was removed with Workstream C; this
+        is now internal machinery that ``/rs/v1/chat`` and the two OpenAI doors
+        both translate INTO, and ``wire`` chooses which shape the answer comes
+        back in. Nothing else about it varies — see
+        ``Lifecycle.handle_submit``."""
+        return await self._lifecycle.handle_submit(body, request, wire=wire)
+
+    # ----- handler: the enriched north face (/rs/v1) -----
+
+    async def handle_rs_models(self, request: Request) -> Response:
+        return await self._enriched.handle_rs_models(request)
+
+    async def handle_rs_plan(self, body: dict, request: Request) -> Response:
+        return await self._enriched.handle_rs_plan(body, request)
+
+    async def handle_rs_chat(self, body: dict, request: Request) -> Response:
+        return await self._enriched.handle_rs_chat(body, request)
 
     def _extract_grammar(self, payload: dict) -> tuple[str | None, str | None]:
         return self._correction.extract_grammar(payload)
@@ -575,14 +594,14 @@ class ProxyService:
         return self._correction.finalize_thinking(req, result)
 
     async def _handle_sync_submit(
-        self, req: QueuedRequest, cache_key: str | None, *, openai: bool = False,
+        self, req: QueuedRequest, cache_key: str | None, *, wire: str = WIRE_ENRICHED,
     ) -> Response:
-        return await self._lifecycle.handle_sync_submit(req, cache_key, openai=openai)
+        return await self._lifecycle.handle_sync_submit(req, cache_key, wire=wire)
 
     async def _handle_streaming_submit(
-        self, req: QueuedRequest, *, openai: bool = False,
+        self, req: QueuedRequest, *, wire: str = WIRE_ENRICHED,
     ) -> Response:
-        return await self._lifecycle.handle_streaming_submit(req, openai=openai)
+        return await self._lifecycle.handle_streaming_submit(req, wire=wire)
 
     # ----- handler: OpenAI compat -----
 

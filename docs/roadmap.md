@@ -74,9 +74,9 @@ it costs — and what to do when the answer comes back malformed.**
 Enrichment never appears as extra fields inside an OpenAI-shaped body: a client that validates the
 schema must not break. Enriched data rides in response headers, or the caller uses the other API.
 
-**The enriched Roadstead API**, which supersedes today's `/v1/submit` envelope rather than extending
-it. It is designed for what a caller actually needs from a capacity-aware gateway and cannot get
-from OpenAI's shape:
+**The enriched Roadstead API** at `/rs/v1`, which superseded the `/v1/submit` envelope rather than
+extending it (**landed 2026-09-01** — Workstream C; the old door is removed). It is designed for what
+a caller actually needs from a capacity-aware gateway and cannot get from OpenAI's shape:
 
 - **enriched model information** — what is available, what it can do (context, vision, tools,
   reasoning), what it costs, and what it is *currently* like (live latency distribution, queue
@@ -93,12 +93,12 @@ from OpenAI's shape:
 **Intent preferred, concrete names honoured.** A caller declares a capability
 (`reasoning`, `fast-chat`, `vision`, `embed`) and Roadstead owns the choice of model, provider and
 moment. A caller who must pin a specific model may, and that is treated as a constraint on routing
-rather than a different API.
+rather than a different API. **Landed 2026-09-01** — see Workstream C.
 
-**Substitution is opt-in and always disclosed.** Today's `degrade_ok` generalises: a caller opts
-into being served by an alternative when its first choice is unavailable, over capacity, or over
-budget. Whatever happens, the response says what actually served it. A caller that did not opt in is
-never silently given something else.
+**Substitution is opt-in and always disclosed.** `degrade_ok` and `spill_ok` are the operator's two
+grants; a request may narrow either and never widen one. Whatever happens, the response says what
+actually served it. A caller that did not opt in is never silently given something else — and
+choosing an endpoint for an intent is *not* substitution, because nothing was promised.
 
 ### South face — modular providers
 
@@ -223,13 +223,51 @@ restarting. That belongs with **E**.
 
 ### C · The enriched API
 
-The new north face, plus model abstraction (capability aliases, honoured pins, disclosed
-substitution). Depends on **A** for model/provider information to be real rather than a config
-readout. This is where the eventual API spec deliverable comes from.
+**Landed 2026-09-01.** `/rs/v1/*` — its own version prefix, because the other north face is
+versioned by OpenAI and pinning them together would mean either following somebody else's number or
+publishing a `/v2/chat/completions` that is not OpenAI's v2. Three routes: `models` (what can serve
+me, what can it do, what is it like now, what does it cost), `plan` (where would this go, how long
+should I allow — **without dispatching**), `chat` (do it, and tell me what actually happened).
+
+- **`intent.py` is a fifth pure-computation module.** It is handed an immutable snapshot of every
+  candidate endpoint and returns which should serve and why every other could not; every lookup
+  happens in `enriched.py`, which assembles the facts. That separation is what makes routing
+  testable against a fleet that does not exist.
+- **Profiles are expressed in DECLARED CAPABILITIES, never endpoint names.** A profile table that
+  named classes would be a third routing table to keep in step with `models.yaml`, and it would
+  break on every fleet whose classes are not spelled like the example's. Which finally made
+  `tool_calling` and `structured_output` load-bearing rather than documentation — the same lesson as
+  the vision ledger entry.
+- **Two ranking rules are doctrine.** A real-cost endpoint sorts last under *every* preference, or
+  "intent" becomes a back door around the whole spill doctrine and traffic leaves the machine on the
+  ordinary path. An endpoint with no latency samples sorts as slow, or the resolver prefers the
+  backend it knows least about *because* it knows least about it.
+- **Resolution is not substitution.** An intent landing somewhere the caller never named is the job
+  being done; only a later failover or spill is disclosed as a substitution. Conflating them would
+  make `substituted: true` fire on every intent-routed call and mean nothing.
+- **Substitution narrows, never widens.** A request may decline `degrade` or `spill`; it can never
+  grant itself either, because the operator grants and the caller may only refuse. Declining is a
+  defer, not an error.
+- **Enrichment never enters an OpenAI body.** The OpenAI door gains four `X-Roadstead-*` response
+  headers and nothing else — and those carry only what admission had settled, because a streaming
+  response's headers precede a failover the enriched `done` frame can still report.
+- **`POST /v1/submit` is removed**, not deprecated. `docs/api.md` §1.9 is the field-by-field map;
+  `CHANGELOG.md` carries the reason.
+- **`roadstead.client` ships with it** — the SDK the enriched API exists to be consumed by, and the
+  migration `docs/api.md` §2.2 asked for: it classifies errors on the `code` and keeps the legacy
+  marker substrings only as a fallback. It imports nothing from the server, by AST-enforced rule, so
+  a consumer sending an HTTP request does not install Starlette — and so the contract literals it
+  holds are checked against `docs/api.md` rather than against the server, which would agree with
+  itself.
+
+**Still open in C:** the profile table is built in only — `models.yaml` has no `intents:` section
+yet, so a deployment cannot add or override a profile without editing the package. Intent resolution
+also cannot yet express a *negative* constraint ("anything but this endpoint"), which is what a
+caller working around one bad model actually wants.
 
 ### D · Spill, token management and costing
 
-**Landed 2026-09-01.** `spend.py` is a fourth pure-computation module: prices, per-caller accounting,
+**Landed 2026-09-01.** `spend.py` is the fourth pure-computation module: prices, per-caller accounting,
 and the threshold. `Scheduler._admit` returns `DISPATCH` / `SPILL` / `DEFER` — one decision, three
 outcomes, with local capacity tried first for every caller before anything about money is consulted.
 
@@ -262,12 +300,53 @@ remote providers will eventually want to choose between them.
 
 Read first, control second. After **B** and **D** exist to be managed.
 
-### Cross-cutting · Soak and hardening
+### F · Hardening — the concurrency invariant, guarded
 
-Carried over, and the case for it is unchanged: the concurrency invariant — single loop, no locks,
-one writer thread — is the most dangerous thing in the codebase and **nothing in the suite guards
-it**. Sustained concurrent load is the only thing that surfaces a violation. It also has to grow to
-cover the new surfaces, especially anything that touches remote providers over the network.
+Promoted from a cross-cutting note to a named workstream on 2026-09-01, because "cross-cutting"
+turned out to mean "nobody's", and it had been carried unchanged through four workstreams while the
+state it protects grew by two modules.
+
+**The case.** `CLAUDE.md` opens by naming the single most dangerous thing in this repo — single
+loop, no locks on scheduler / budget / cache / spend state — and, until now, said in the same
+breath that nothing in the suite guarded it. A violation does not raise. It interleaves, and the
+symptom is a DRR budget that drifts or a request served twice, weeks later and nowhere near the
+commit that caused it. Sustained concurrent load is the only thing that surfaces one.
+
+**Landed 2026-09-01 — the core.** Every guard below was observed going red by mutating the code it
+watches, which for a guard is not a nicety: an assertion about a failure that has never happened is
+indistinguishable from one that cannot fire.
+
+- **`tests/loop_affinity.py`** arms the invariant: it wraps the mutating methods of every
+  single-loop object and records `threading.get_ident()` per call, so "one thread mutates this" is
+  a checkable claim rather than a convention. Deliberately not clever — no `settrace`, no import
+  hooks, which would make a soak measure the instrumentation. It **records rather than raising in
+  place**, because a raise inside a mutation would unwind into one of the hot path's fail-open
+  guards and be swallowed, which is how a guard reads green while detecting nothing.
+- **`tests/e2e/test_soak.py`** runs sustained overlapping load — both north faces, both response
+  modes, three bands, intents and pins — and asserts five things a race would break: thread
+  affinity, slot conservation, DRR budget conservation, spend-ledger conservation, and that every
+  request got *an* answer. It also asserts the workload actually overlapped, because a concurrency
+  test that runs no concurrency passes trivially.
+- **The guard is observed going red from inside the suite, permanently.** One test does the
+  forbidden thing on purpose — mutates DRR budget state from a second thread — and requires the
+  recorder to say so. Without it, a recorder that silently stopped recording would leave the soak
+  green forever, and every other assertion in the file would be worth nothing.
+- **`tools/soak.py`** is the unbounded version — minutes of load, growth and WAL behaviour — off
+  the default path because it is an experiment rather than an assertion.
+- **`tests/test_pure_modules.py`** closes a second unguarded claim found on the way past.
+  `CLAUDE.md` calls the pure-computation modules the crown jewels and says "keep them that way";
+  nothing checked it. What purity buys is that every scheduling, costing, deadline, spend and
+  routing decision is testable against a fleet that does not exist — and the first `httpx` import
+  into one would take that away permanently while the suite stayed green. Same class of failure as
+  the vision capability nothing read: a property true when written, with no mechanism to notice the
+  commit that ends it.
+
+**Still open in F.** The soak runs against `roadstead.testing`, so it exercises concurrency and not
+*duration*: nothing yet watches memory growth, WAL size or connection-pool behaviour over hours,
+and nothing covers a **remote provider over a real network**, where the failure modes are latency
+variance and partial responses rather than contention. The shutdown budgets (`CLAUDE.md`: 78.25s
+measured against a 48s budget that reads as though it covers everything) are measured and
+documented but still not *bounded* — uvicorn never bounds the lifespan shutdown at all.
 
 ### Cross-cutting · The scrub
 
@@ -294,13 +373,13 @@ were written around real identifiers. The straggler sweep now looks for both.
 
 ## Consequences to plan for
 
-**The `/v1/submit` envelope is going away.** A planned breaking change under
-`compatibility.md`: deliberate, and recorded in `CHANGELOG.md` when it lands. The OpenAI surface is
-unaffected.
+**~~The `/v1/submit` envelope is going away.~~ Gone, 2026-09-01**, with Workstream C. Recorded in
+`CHANGELOG.md`, mapped field by field in `docs/api.md` §1.9. The OpenAI surface is unaffected, as
+planned.
 
 **`models.yaml` grows a provider dimension** and stops being a description of one fleet's hardware.
 
-**`docs/api.md` is executable** — four test files read it back and fail when code and document
+**`docs/api.md` is executable** — six test files read it back and fail when code and document
 disagree. Every change above lands with its contract, or the suite says so.
 
 **Not everything from the origin generalises.** The retired `creative` endpoint name, the
@@ -312,6 +391,9 @@ in ways the name does not suggest (`history.md`, "Things that will mislead you")
 
 ## Still open
 
+- **Where the intent vocabulary lives.** Profiles are built into `intent.py` today. A deployment
+  whose fleet has a capability the built-ins do not name has to edit the package — which is the
+  `models.yaml` argument again, one layer up.
 - **Multi-tenancy depth.** Are keys flat, or do they nest (team → key) for quota and budget
   inheritance? Flat is enough for the primary goal and probably not for the secondary one.
 - **Where cost truth lives.** Provider-reported spend vs. our own token accounting; they will

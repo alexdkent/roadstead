@@ -10,6 +10,79 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ### Breaking
 
+Landed 2026-09-01 with **Workstream C** (the enriched API) and **Workstream F** (hardening). Two of
+these touch the wire contract in `docs/api.md`; the rest are internal or additive.
+
+- **🔒 `POST /v1/submit` is REMOVED.** The enriched API at `/rs/v1/*` replaces it —
+  `docs/api.md` §1.7, with a field-by-field migration map in §1.9. *Why removed rather than
+  deprecated:* the envelope carried no intent vocabulary, no attribution and no timing, and each of
+  those would have had to be bolted onto a shape never designed to hold them — three additive
+  changes to a contract we had already decided to retire, and a second surface to keep correct
+  meanwhile. It also let the body declare `agent_id`, which Workstream B had already had to gate;
+  the enriched door takes identity only from the credential or the address, so the fair-share key
+  can no longer be named by the request at all. *Migration:* `POST /rs/v1/chat`, `endpoint` →
+  `model` (a pin) or `intent` (let Roadstead choose), `timeout_s` → `deadline_s` (and usually: omit
+  it), `agent_id` → drop it and present a key. `roadstead.client` speaks the new API and is the
+  shortest path across. The OpenAI doors are unaffected.
+- **🔒 A new north face: `/rs/v1/*`, versioned separately from `/v1/*`.** Three routes —
+  `GET /rs/v1/models`, `POST /rs/v1/plan`, `POST /rs/v1/chat`. *Why its own version:* `/v1/*` is
+  versioned by OpenAI. Sharing the number would mean either following somebody else's release
+  cadence or publishing a `/v2/chat/completions` that is not OpenAI's v2.
+- **🔒 The OpenAI door gains four `X-Roadstead-*` response headers** (§1.8) and **no body fields**.
+  *Why headers:* a client validating against OpenAI's schema must not break because it pointed at
+  Roadstead, and "we only added fields" is not a defence — strict validators reject unknown keys.
+  Additive and ignorable; listed because §1.8 is now contract.
+- **`docs/api.md` §1.7 adds NO new error code.** An intent nothing can satisfy is the existing
+  `unknown_endpoint`. A caller already classifies that, and a second spelling of "nothing here can
+  serve you" would buy nobody anything. The absence is deliberate, as it is for §1.6.
+- **`failover.py`'s degrade refusal no longer cites `llmproxy/agents.yaml`.** A dead monorepo path
+  in operator-visible error text, carried since the extraction; it now names the knob
+  (`degrade_ok`) rather than a file that does not exist here. An error-message reword is a breaking
+  change under §2.2 even when the `code` is untouched — this one carries no deferrability marker, so
+  no classifier can be affected, but it is recorded because the rule is the rule.
+
+### Added
+
+- **`roadstead.client` — a client SDK, shipped in the package**, the way `roadstead.testing` is.
+  `AsyncRoadsteadClient` (real) plus a blocking `RoadsteadClient` that owns a private loop on a
+  worker thread. Typed views over the enriched envelope, and typed errors whose `deferrable`
+  property **classifies on the `code`** with §2.2's legacy marker substrings kept only as a
+  fallback — which is the migration §2.2 asked a shipped client library to make.
+  🚨 **It imports nothing from the server**, enforced by AST: a consumer sending an HTTP request
+  should not be installing Starlette, uvicorn, PyYAML and jsonschema, and a client reading the
+  server's own constants would agree with it *by construction* and could never catch a drift. Its
+  contract literals are transcribed from `docs/api.md` and checked against it — the same two-ended
+  pin `tests/wire_contract.py` uses from the other side.
+- **Model abstraction.** A caller declares an `intent` (a capability profile) and Roadstead owns the
+  choice; a `model` is a pin and is treated as a constraint on routing. `roadstead/intent.py` is a
+  fifth pure-computation module. Two ranking rules are doctrine: a real-cost endpoint sorts last
+  under every preference (or "intent" becomes a back door around the spill doctrine), and an
+  endpoint with no latency samples sorts as slow (or the resolver prefers the backend it knows least
+  about *because* it knows least about it).
+- **Per-request substitution narrowing.** `substitution: {"degrade": false, "spill": false}`.
+  🚨 Narrows only: both gates take the AND with the operator's opt-in, so `true` grants nothing.
+  Declining is a defer, never an error.
+- **`EndpointConfig.kind` and `EndpointConfig.capabilities`**, mirrored whole from the catalog
+  stanza. This makes `tool_calling` and `structured_output` load-bearing for the first time rather
+  than documentation — the vision-ledger lesson applied to the rest of the block. A capability
+  outside the known vocabulary now warns at load instead of silently matching nothing.
+- **`GET /v1/models` gains `kind`**, and sorts on it rather than on a literal `{"embed", "rerank"}`
+  set. That set was correct for exactly one catalog — the example one — so any deployment whose
+  embedder was named something else silently got an embedder as `data[0]`, which is the default a
+  client with no configured model picks up.
+- **The concurrency invariant is guarded** (Workstream F). `tests/loop_affinity.py` arms it,
+  `tests/e2e/test_soak.py` runs sustained overlapping load and asserts thread affinity, slot
+  conservation, DRR budget conservation, ledger conservation and that every request was answered —
+  and includes a test that mutates budget state from a second thread on purpose, so the guard is
+  observed going red from inside the suite forever. `tools/soak.py` is the unbounded version.
+- **The "pure computation, no I/O" claim is guarded** (`tests/test_pure_modules.py`). `CLAUDE.md`
+  calls those five modules the crown jewels and said "keep them that way"; nothing checked it. What
+  purity buys is that every scheduling, costing, deadline, spend and routing decision is testable
+  against a fleet that does not exist — and the first `httpx` import into one would end that while
+  the suite stayed green.
+
+### Breaking — earlier
+
 Landed 2026-09-01 with Workstream B (identity and API keys), which also clears scrub items **S1** and
 **S3**. One of these touches the wire contract in `docs/api.md`; the rest are deployment surface.
 

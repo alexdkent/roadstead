@@ -83,7 +83,11 @@ async def test_stream_done_event_has_ttft():
         done = [json.loads(f) for f in frames
                 if f.startswith("{") and json.loads(f).get("type") == "done"]
         assert done, frames
-        assert "ttft_ms" in done[0] and done[0]["ttft_ms"] >= 0
+        # 🚨 TTFT lives in the `timing` block on the enriched wire, beside the
+        # queue wait and the deadline it should be read against. A bare
+        # top-level number told a caller how long the first token took without
+        # telling it how long the call was allowed to take.
+        assert done[0]["timing"]["ttft_ms"] >= 0
     finally:
         await svc.shutdown()
 

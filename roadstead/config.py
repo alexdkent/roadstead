@@ -377,6 +377,29 @@ class EndpointConfig:
     # clean, or a missing declaration becomes a 400 on a working caller. ---
     vision: bool = False
 
+    # --- what this endpoint IS, mirrored whole from the catalog stanza -------
+    #: ``chat`` | ``embed`` | ``rerank``, from the stanza's ``kind:``.
+    #:
+    #: 🚨 This exists so that nothing has to ask whether an endpoint is an
+    #: embedder by LOOKING AT ITS NAME. ``/v1/models`` sorted chat before
+    #: embeddings with a literal ``{"embed", "rerank"}`` set, which is correct
+    #: for exactly one catalog — the example one — and silently wrong for any
+    #: deployment whose embedder is called something else. Same rule as the
+    #: engine names: branch on a declaration, never on a name.
+    kind: str = "chat"
+    #: Every capability the stanza declares, verbatim, as a frozen set.
+    #:
+    #: ``vision`` and ``forces_reasoning`` above are DERIVED from two of these
+    #: and stay because they carry extra meaning the raw declaration does not
+    #: (``forces_reasoning`` is `reasoning` AND an engine with no kill switch).
+    #: This set is the declaration itself, and it is what intent resolution
+    #: matches against — which is what finally makes ``tool_calling`` and
+    #: ``structured_output`` load-bearing instead of documentation. The vision
+    #: ledger entry (`a-role-rename-carried-vision-to-a-text-only-box`) is the
+    #: whole argument: a capability nothing reads is a capability nothing
+    #: notices going wrong.
+    capabilities: frozenset[str] = frozenset()
+
     # --- on-demand lifecycle (see on_demand.OnDemandManager) ---
     # When True, this endpoint's model is NOT always-resident: before a request
     # dispatches, the proxy acquires the anvil GPU-slot dispatcher lease
@@ -594,11 +617,11 @@ def degeneration_shadow_only() -> bool:
 
 
 def uniform_correction_enabled() -> bool:
-    """Step 4a (2026-07-01): route the STREAMING + internal ``/v1/submit`` response
+    """Step 4a (2026-07-01): route the STREAMING + enriched ``/rs/v1`` response
     paths through the uniform correction layer, closing the two path-dependence
     gaps the sync path never had — (1) sanitize vLLM ``qwen3_xml`` tool-call streams
     on BOTH doors (today the ``_ToolCallStreamSanitizer`` runs only for the OpenAI
-    door; internal ``/v1/submit`` streams emit raw), and (2) run truncation +
+    door; the other door's streams emit raw), and (2) run truncation +
     degeneration DETECTION over a stream's reassembled content (a stream can't
     un-send, but it records the same tallies the sync guards do, so streaming is no
     longer a correction blind spot). Default OFF == byte-identical (only OpenAI
