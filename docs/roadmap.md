@@ -486,8 +486,13 @@ and nothing covers a **remote provider over a real network**, where the failure 
 variance and partial responses rather than contention. `tools/soak.py` is the experiment and already
 takes `--seconds` / `--concurrency` / `--stream-fraction`; what it lacks is somebody running it long
 and turning what accumulates into either a bounded assertion or a ledger entry. Two pieces of
-in-memory state landed after it and have never been soaked for duration: `rate.RateLedger.windows`
-and `AdminOverlay.audit` (bounded at 500, and the store is rewritten whole on every control action).
+in-memory state landed after it and have never been soaked for duration — and looking at the first
+of them found a bug before any soak ran. **`rate.RateLedger.windows` grew without bound**: `prune`
+existed, said in its docstring that the maintenance tick called it, and nothing did, so both dicts
+behind the rate threshold accumulated one entry per caller-supplied `agent_id` ever seen. Fixed
+2026-09-01, on wall time rather than the poller's monotonic clock (the trap one line above it), and
+the ledger is now armed in `loop_affinity` — it had been outside the guard entirely. **`AdminOverlay.audit`
+is the remaining one** (bounded at 500, and the store is rewritten whole on every control action).
 
 ### H · A read-only admin scope, and the audit trail
 

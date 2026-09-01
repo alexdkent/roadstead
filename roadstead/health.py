@@ -658,6 +658,12 @@ class Health:
         # Age out stale timeout-model samples (cheap; piggybacks the
         # poller cadence instead of a dedicated task).
         self.state.timeout_model.prune(mono)
+        # Same cadence, same reason — but NOT the same clock. The rate ledger
+        # stamps wall time, so it prunes on wall time; `prune_rate_state` owns
+        # that and says why. Without this call both of its dicts grow one entry
+        # per distinct `agent_id` ever seen, and an `agent_id` is caller-supplied
+        # on the address path.
+        self.state.prune_rate_state()
     async def compute_cache_stats(self) -> None:
         """One prefix-cache snapshot pass over the chat endpoints. For each:
         scrape vLLM /metrics prefix-cache counters (None for llama.cpp), run the

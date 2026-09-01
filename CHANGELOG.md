@@ -8,6 +8,38 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — the rate ledger grew without bound, and nothing was watching it
+
+Landed 2026-09-01. `RateLedger.prune` shipped with Workstream I carrying a docstring that said
+"Called from the maintenance tick". **Nothing called it**, in the package or anywhere else.
+
+- 🚨 **Both dicts behind the rate threshold are keyed by `agent_id`, which is a caller-supplied
+  string on the address path** (`docs/api.md` §1.5 — an address only fills in an `agent_id` the body
+  omitted, so a body may declare its own). They grew one entry per distinct name ever seen, without
+  bound, under a caller's control. `rate_demotion_noted` is the second one and the one a reader
+  forgets exists; forgetting a caller now forgets that we noted its demotion, which is also correct
+  on its own terms — it had no traffic in the window, so if it returns and crosses again the operator
+  should hear about it again.
+- 🚨 **It is pruned on WALL time, not the poller's monotonic clock**, and the call sits one line
+  below `timeout_model.prune(mono)`, which takes exactly that. `RateLedger.record` stamps
+  `time.time()`, so a monotonic `now` would compare a process uptime against epoch timestamps: the
+  cutoff lands decades before every sample, nothing is ever stale, and the call returns 0 forever
+  while looking wired. A leak fixed by a call that does nothing is worse than the leak, because the
+  call is evidence it was handled. Pinned by a test that asserts the two clocks are far apart, so it
+  cannot pass by coincidence.
+- **The ledger is now armed in `tests/loop_affinity.py`.** It was not armed at all — a whole
+  workstream's state outside the guard, while the soak reported a full method count. It has two
+  loop-side writers now (the submit path and the poller tick), which is precisely the pair that would
+  interleave if either ever moved off the loop.
+- **The threshold this feeds cannot reject**, which is why its own memory must not be a denial
+  surface either — a rate control that degrades is deliberately not a defence against a runaway
+  caller, and its bookkeeping becoming one inverts that.
+- `tests/test_rate_prune.py`. Six mutations, every guard observed going red by assertion. One first
+  SURVIVED and was a real weakness: the live-caller test asserted `prune_rate_state() == 0`, so it
+  never reached the `if dropped:` branch and proved only that a prune which does nothing changes
+  nothing. Another failed with a bare `KeyError` and was rewritten to assert first.
+
+
 ### Added — the intent vocabulary in config, and the negative constraint (Workstream C)
 
 Landed 2026-09-01. Both of C's open items, and they turned out to be one question — *who owns the

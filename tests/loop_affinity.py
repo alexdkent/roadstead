@@ -196,6 +196,10 @@ STATE_METHODS: dict[str, tuple[str, ...]] = {
     "cache": ("put",),
     # The learned latency distribution.
     "timeout_model": ("record", "prune"),
+    # Workstream I's rate window. Written on the submit path and pruned from
+    # the poller tick — two loop-side writers, which is precisely the pair that
+    # would interleave if either ever moved off the loop.
+    "rate": ("record", "forget", "prune"),
     # Workstream E. The management plane mutates all three of these from a
     # request handler, which is a NEW kind of writer: everything above is
     # written by the scheduler loop itself. The registry is read by

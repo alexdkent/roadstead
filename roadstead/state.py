@@ -454,6 +454,36 @@ class ProxyState:
         """Note one request against ``agent_id``'s rate window. On the loop."""
         self.rate.record(agent_id, time.time())
 
+    def prune_rate_state(self) -> int:
+        """Drop rate state for callers with nothing left in the window.
+
+        🚨 Both dicts, and both are keyed by ``agent_id`` — which is a
+        CALLER-SUPPLIED string on the address path (``docs/api.md`` §1.5: an
+        address only fills in an ``agent_id`` the body omitted, so a body may
+        declare its own). Without this they grow one entry per distinct name
+        ever seen, which is unbounded input under a caller's control. The
+        threshold this feeds cannot reject, so the rate ledger is *deliberately*
+        not a defence against a runaway caller — that is exactly why its own
+        memory must not be one either.
+
+        🚨 On ``time.time()``, NOT the poller's monotonic clock. ``record``
+        stamps wall time, so pruning with a monotonic ``now`` would compare a
+        process uptime against epoch timestamps: the cutoff lands decades in the
+        past, nothing is ever stale, and this returns 0 forever while looking
+        wired. Pinned by test_rate_prune.py.
+
+        Forgetting a caller also forgets that we noted its demotion today. That
+        is correct rather than convenient: it had no traffic in the window, so
+        if it comes back and crosses again the operator should be told again.
+        """
+        now = time.time()
+        dropped = self.rate.prune(now)
+        if dropped:
+            live = self.rate.windows
+            for agent_id in [a for a in self.rate_demotion_noted if a not in live]:
+                del self.rate_demotion_noted[agent_id]
+        return dropped
+
     def spend_may_spill(self, agent_id: str) -> bool:
         """Whether ``agent_id`` may currently be served by PAID remote capacity.
 
