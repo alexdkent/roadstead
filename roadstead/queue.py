@@ -914,6 +914,39 @@ class PersistentQueue:
             for r in rows
         ]
 
+    def day_spend_rollup(self, since: float) -> list[dict]:
+        """Per (caller, endpoint) token totals for completions since ``since``.
+
+        The durable half of the spend ledger. `SpendLedger` is in-memory and its
+        day bucket reset to zero on every restart, so a deploy at noon gave every
+        caller its whole daily allowance a second time — the threshold reads a
+        DAY and the process was only measuring an uptime. DRR balances have
+        survived a restart since Phase 3.4 (`load_budgets` above); this is the
+        same argument for the other per-caller quantity.
+
+        🚨 Tokens, not money. Pricing belongs to `spend.PriceBook` and must stay
+        there: a second place that turns tokens into dollars is a second place
+        for the two-kinds-of-money rule to be got wrong, and this one would have
+        no `TokenPrice.real` to carry it. Aggregated in SQL so the result is one
+        row per caller-endpoint pair rather than one per request, and it rides
+        the existing ``idx_pc_completed`` index.
+        """
+        if not self._conn:
+            return []
+        rows = self._reader().execute(
+            "SELECT agent_id, endpoint, COUNT(*) AS n, "
+            "       SUM(COALESCE(input_tokens,0)) AS tin, "
+            "       SUM(COALESCE(output_tokens,0)) AS tout "
+            "FROM proxy_completions WHERE completed_at >= ? "
+            "GROUP BY agent_id, endpoint",
+            (float(since),),
+        ).fetchall()
+        return [
+            {"agent_id": r[0], "endpoint": r[1], "requests": int(r[2] or 0),
+             "input_tokens": int(r[3] or 0), "output_tokens": int(r[4] or 0)}
+            for r in rows if r[0] and r[1]
+        ]
+
     # ----- recovery -----
 
     def recover_queued(self, now: float) -> list[QueuedRequest]:

@@ -296,12 +296,21 @@ class SpendLedger:
         output_tokens: int,
         *,
         now: float | None = None,
+        requests: int = 1,
     ) -> float:
         """Record one completion. Returns the REAL USD it cost (0.0 if free).
 
         Called from the completion path, where the token counts are the ones the
         backend reported rather than the ones we estimated — a cost model that
         billed its own estimate would be marking its own homework.
+
+        ``requests`` is how many completions these totals represent, and exists
+        for exactly one caller: startup recovery, replaying a day already on
+        disk as one aggregated row per caller-endpoint pair. It is a parameter
+        rather than a second `recover()` method so there is ONE implementation
+        of the pricing and day-rollover rules — a second copy is what
+        `cost_model.context_fit` was created to undo, and that copy had already
+        gone silently dead.
         """
         now = time.time() if now is None else now
         acct = self._agents.get(agent_id)
@@ -311,7 +320,7 @@ class SpendLedger:
         to = max(0, int(output_tokens or 0))
         acct.tokens_in += ti
         acct.tokens_out += to
-        acct.requests += 1
+        acct.requests += max(0, int(requests))
 
         price = self.prices.price(endpoint)
         amount = price.cost_usd(ti, to)
@@ -363,6 +372,17 @@ def day_bucket(now: float) -> int:
     they come to disagree at a boundary.
     """
     return int(now // _SECONDS_PER_DAY)
+
+
+def day_start(now: float) -> float:
+    """Epoch SECONDS at which the current day bucket began, UTC.
+
+    Derived from :func:`day_bucket` rather than computed alongside it, so the
+    startup query that reloads today's spend and the threshold that reads it
+    cannot disagree about where a day begins. The two would drift apart at
+    exactly one instant a day, which is the hardest possible time to notice.
+    """
+    return float(day_bucket(now) * _SECONDS_PER_DAY)
 
 
 @dataclass(frozen=True)

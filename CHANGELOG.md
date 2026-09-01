@@ -8,6 +8,51 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — today's spend survives a restart (Workstream D)
+
+Landed 2026-09-01. `SpendLedger` is in-memory and its day bucket reset to zero on every boot.
+
+🚨 **This was a correctness bug, not the acceptable simplification the roadmap had called it.** The
+old wording — "right for what it governs, whether a caller is degraded *now*" — quietly assumed *now*
+was the same length as the window the threshold reads. It is not: `daily_spend_usd` is a **day** and
+the process was measuring an **uptime**. A deploy at noon handed every caller its whole allowance a
+second time, so the more a fleet ships the less its spend cap means — worst precisely on the
+deployment where somebody set the cap deliberately. DRR balances have survived a restart since Phase
+3.4; this is the same argument about the other per-caller quantity, missed when `spend.py` landed.
+
+`startup` now replays today's rows from `proxy_completions` through the ledger's existing `charge`,
+via a new `day_spend_rollup(since)` aggregated **in SQL** — one row per caller-endpoint pair rather
+than one per request, on the existing `idx_pc_completed` index.
+
+- 🚨 **The rollup groups by endpoint as well as by caller.** Collapsing it re-prices a caller's whole
+  day at one arbitrary endpoint from the group, and for a caller spanning a cheap and an expensive
+  model that is the entire number.
+- **`charge` gained `requests=`** rather than growing a second `recover()` method, so there is ONE
+  implementation of the pricing and day-rollover rules. A second copy is what `cost_model.context_fit`
+  was created to undo, and that copy had already gone silently dead.
+- **Re-priced at TODAY's prices**, not each call's price at the time. Right for a threshold that
+  answers "is this caller degraded now", wrong for a bill — and anything billable reads
+  `proxy_completions`, which keeps the **tokens**.
+- 🚨 **The seed fails OPEN, loudly.** Refusing to boot because we cannot prove a caller crossed a
+  threshold whose entire consequence is one priority band would let a spend cap take the proxy down,
+  which is the same argument that stops it taking a *caller* down.
+- `spend.day_start` is derived from `day_bucket` so the query that reloads a day and the threshold
+  that reads one cannot disagree about where a day begins — they would drift apart at exactly one
+  instant a day.
+
+**Where cost truth lives, settled by construction.** `proxy_completions` stores **tokens, never
+dollars**, so pricing lives in one place, the ledger is a derived view rather than a second record to
+reconcile, and a provider's invoice can only ever disagree with us about *price* rather than about
+*usage*. Reconciliation against a real invoice still cannot be built here honestly — it needs a real
+billed account, and a reconciler written against an invented invoice would agree with itself and
+prove nothing.
+
+`tests/test_spend_durability.py`. Eight mutations, every guard observed going red. One first
+SURVIVED and was a real weakness: the price fixture charged every endpoint the same rate, so dropping
+the endpoint from the `GROUP BY` changed nothing — a caller spanning two prices is what makes that
+grouping observable.
+
+
 ### Removed — BREAKING: `normalize_endpoint` no longer rewrites a `nexus-` prefix
 
 Landed 2026-09-01, found by re-running the straggler sweep (`docs/corpus_and_scrub_plan.md` S5).

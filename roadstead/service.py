@@ -30,7 +30,7 @@ from .grammar import (
     root_object_keys,
     verify_conformance,
 )
-from . import cache_stats
+from . import cache_stats, spend
 from .config import (
     CLASS_TO_ROLE,
     LLMPriority,
@@ -378,6 +378,44 @@ class ProxyService:
             logger.info("budget: dropped %d idle ghost row(s) at load: %s%s",
                         len(ghost_rows), ", ".join(sorted(ghost_rows)[:10]),
                         "…" if len(ghost_rows) > 10 else "")
+
+        # Restore TODAY's spend, for the same reason the balances above are
+        # restored: a per-caller quantity a threshold reads must not reset
+        # because somebody deployed.
+        #
+        # 🚨 `daily_spend_usd` is a DAY, and the in-memory ledger was only ever
+        # measuring an UPTIME. A restart at noon handed every caller its whole
+        # allowance a second time, and the more a fleet ships the less its spend
+        # cap means — worst exactly where the cap was set deliberately.
+        #
+        # 🚨 Re-priced at TODAY's prices, not the price at the time of each
+        # call. That is correct for what this governs and would be wrong for a
+        # bill: the ledger answers "is this caller degraded right now", so it
+        # should agree with what the same traffic would cost now. Anything
+        # billable reads `proxy_completions` itself, which keeps the tokens.
+        # `docs/roadmap.md`, "Where cost truth lives".
+        try:
+            day_start = spend.day_start(time.time())
+            seeded = 0
+            for row in self._queue_db.day_spend_rollup(day_start):
+                self._state.spend.charge(
+                    row["agent_id"], row["endpoint"],
+                    row["input_tokens"], row["output_tokens"],
+                    requests=row["requests"],
+                )
+                seeded += 1
+            if seeded:
+                logger.info("spend: restored today's ledger from %d "
+                            "caller-endpoint rollup row(s)", seeded)
+        except Exception:  # noqa: BLE001 — a ledger seed must not block a boot
+            # Fail OPEN, deliberately and loudly. The alternative is refusing to
+            # start because we cannot prove a caller is over a threshold whose
+            # only consequence is one priority band — admission control is about
+            # capacity, and a spend cap must never be able to take the proxy
+            # down any more than it can take a caller offline.
+            logger.warning("spend ledger seed failed — today's spend starts at "
+                           "zero for every caller and caps will under-count "
+                           "until tomorrow", exc_info=True)
 
         # Seed the durable shadow/flip-gate evidence (audit 2026-07-02): the
         # context-overflow tally and the cache-drift dedup map used to be

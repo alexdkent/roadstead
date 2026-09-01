@@ -485,6 +485,19 @@ tokens and nothing in the type system separates them, so a `TokenPrice` carries 
 reads only the spent one** — one that counted avoided cost would throttle a caller for using
 capacity that is free and already paid for, which is local-first inverted.
 
+🚨 **Today's spend SURVIVES A RESTART, and `proxy_completions` keeps tokens rather than money.**
+`SpendLedger` is in memory, and until 2026-09-01 its day bucket reset on every boot — so
+`daily_spend_usd` was a *day* while the process was measuring an *uptime*, and a deploy at noon
+handed every caller its allowance again. `startup` replays today's rows, exactly as DRR balances have
+been restored since Phase 3.4. It is **re-priced at today's prices** (right for "is this caller
+degraded now", wrong for a bill — anything billable reads the tokens) and it **fails open, loudly**,
+because a spend cap must not be able to take the proxy down any more than it can take a caller
+offline. 🚨 The rollup groups by endpoint as well as caller: collapsing it re-prices a caller's whole
+day at one arbitrary endpoint, which for a caller spanning a cheap and an expensive model is the
+whole number. And the durable record stores **tokens, never dollars** — so pricing lives in one
+place, the ledger is a derived view rather than a second record to reconcile, and a provider's
+invoice can only ever disagree with us about price rather than about usage.
+
 🚨 **Thresholds DEGRADE, they never reject, and there is NO ERROR CODE for one.** Crossing
 `daily_spend_usd` costs a caller exactly two things: one priority band (floored at the lowest,
 however far over it is) and access to paid spill. It never costs local capacity. Admission control is

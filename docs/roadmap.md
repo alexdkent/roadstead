@@ -332,13 +332,38 @@ outcomes, with local capacity tried first for every caller before anything about
   leave the machine at our expense" are different questions and neither implies the other. Spill
   never chains.
 
-**Still open in D:** *Where cost truth lives* (below) is untouched — the ledger is our own token
-accounting, and nothing reconciles it against what a provider actually invoices. The live ledger is
-also in-memory and resets on restart, which is right for what it governs (whether a caller is
-degraded *now*) and wrong for anything an operator would want to bill on; the durable record stays in
-`queue.db`. Nothing yet spills on *cost* — the decision is capacity-triggered, so a cheaper remote
-endpoint is never preferred to an expensive local one, deliberately, but a deployment with several
-remote providers will eventually want to choose between them.
+**~~The live ledger resets on restart.~~ Fixed 2026-09-01, and it was a correctness bug rather than
+the acceptable simplification this used to call it.** The old wording — "right for what it governs,
+whether a caller is degraded *now*" — quietly assumed *now* was the same length as the window the
+threshold reads. It is not: `daily_spend_usd` is a **day** and the process was measuring an
+**uptime**, so a deploy at noon handed every caller its whole allowance a second time and the more a
+fleet ships the less its spend cap means. `startup` now replays today's rows out of
+`proxy_completions`, exactly as DRR balances have been restored since Phase 3.4 — the same argument
+about the other per-caller quantity, missed when `spend.py` landed.
+
+Two choices inside that are worth knowing. It is **re-priced at today's prices**, not at each call's
+price at the time: right for a threshold that answers "is this caller degraded now", wrong for a bill
+— and anything billable reads `proxy_completions`, which keeps the **tokens**. And the seed **fails
+open**, loudly: refusing to boot because we cannot prove a caller crossed a threshold whose whole
+consequence is one priority band would let a spend cap take the proxy down, which is the same
+argument that stops it taking a *caller* down.
+
+**Still open in D — and the two halves need different things.**
+
+- **Reconciliation against a provider's invoice cannot be built here honestly.** It needs a real
+  account with real billing, and this repo serves a fake backend; a reconciler written against an
+  invented invoice would agree with itself and prove nothing, which is the same failure as a client
+  that read the server's own constants. What *can* be settled in advance is which side is
+  authoritative, and it is now settled by construction: **`proxy_completions` keeps tokens, never
+  money**, so re-pricing is always possible and the ledger is a derived view rather than a second
+  record to reconcile. When a provider's numbers do arrive they disagree with ours about *price*, not
+  about *usage*, which is a much smaller argument.
+- **Nothing spills on cost, and that stays deliberate.** A cheaper remote endpoint must never be
+  preferred to an expensive local one, or remote capacity stops being overflow — the same doctrine
+  that makes a real-cost endpoint sort last under every intent preference. The real open question is
+  narrower than "spill on cost": with **several** remote providers, which one does an overflow go to?
+  That is ranking among remotes *after* the admission decision has already said SPILL, and it never
+  touches the local-first rule.
 
 ### E · Management interface
 
