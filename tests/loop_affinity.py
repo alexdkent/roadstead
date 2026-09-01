@@ -203,8 +203,17 @@ STATE_METHODS: dict[str, tuple[str, ...]] = {
     # from a pool thread is the exact interleaving this module exists to forbid
     # — and `management.py` states the rule (mutate on the loop, persist off
     # it). Armed so the rule is checked rather than merely written down.
-    "identity.keys": ("register", "revoke"),
-    "admin_overlay": ("add_key", "revoke_key", "set_agent"),
+    "identity.keys": ("register", "revoke", "set_expiry"),
+    # 🚨 `record` is Workstream H's audit trail and `expire_key` is Workstream
+    # I's rotation overlap, and both are mutated from a request handler like
+    # the three above. `record` is the one worth staring at: it is now written
+    # from TWO modules — `management.py` for the plane's own edits and
+    # `http_handlers.py` for the four control routes that predate it — so it is
+    # the first piece of single-loop state with more than one writing handler.
+    # The rule is unchanged (mutate on the loop, persist off it) and the lock
+    # that serialises the PERSIST moved onto the overlay for the same reason.
+    "admin_overlay": ("add_key", "revoke_key", "set_agent", "record",
+                      "expire_key"),
 }
 
 
