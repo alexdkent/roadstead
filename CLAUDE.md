@@ -427,6 +427,31 @@ contract literals are transcribed from `docs/api.md` and checked against the doc
 two-ended pin `tests/wire_contract.py` uses from the emitting side. It also classifies errors on the
 `code` with §2.2's marker substrings as a fallback, which is the migration §2.2 asked for.
 
+🚨 **THE ADMIN PLANE TAKES BOTH A NETWORK GATE AND A CREDENTIAL, and an address never grants admin.**
+Changed 2026-09-01, and it is the most security-relevant change this repo has made. Until then a
+request from **loopback presenting nothing at all** could pause a backend, re-weight a caller's quota
+or flip a runtime flag — and the audit trail recorded it as `key_id: null, source: "ip"`, the system
+saying in its own log that nobody had authenticated. It was not a bug anybody wrote: the default
+belongs to the INFERENCE door, where "already on the box" is a fair proxy for "allowed" on a
+local-first proxy, and the admin plane and then the UI were added **on the same port** and inherited
+it. A default written for one door silently governed a different one.
+
+- **Reach** is `acl.may_reach_admin`, from `ROADSTEAD_ADMIN_NETS` — 🚨 which now names who may REACH
+  the plane rather than who IS an admin. Breaking, recorded, and the same for an `:admin` flag on a
+  `ROADSTEAD_ACL` address entry. Loopback is unconditional; docker-internal is a default that naming
+  any net drops (a `/12` is a weak gate).
+- **Credential** is an `admin`-scoped key. Checked SECOND, so an off-net refusal says it is about the
+  network and no credential answers it — and a blocked address never learns whether its key was good.
+- **Bootstrap**: with no *operator* key configured, startup mints a random admin key and logs it,
+  unpersisted. 🚨 It is invisible to `KeyRegistry.configured`, so it cannot flip §1.5 rule 2 on the
+  inference door — counting it there would 401 every OpenAI client sending a placeholder header,
+  because the proxy minted a key for its own dashboard. Never open, never locked out.
+- The UI door still renders every refusal as **401 + `WWW-Authenticate`**, because a 403 gives a
+  browser no way to ask for a password.
+
+`tests/test_admin_gate.py` owns this doctrine; `tests/admin_key.py` authenticates the ~60 tests that
+are about what the plane DOES, and must never become the place the gate is tested.
+
 🚨 **Identity is a credential first and an address second, and the precedence is doctrine.**
 `identity.py` resolves every request to a `Principal` — `agent_id` (the DRR fair-share key, quota
 holder, budget holder), a default priority, an optional deadline floor, an optional admin scope —
@@ -447,10 +472,10 @@ bites, all in `docs/api.md` §1.5:
   that is not one.** `ROADSTEAD_TRUSTED_PROXIES` is empty by default, so `X-Forwarded-For` is not
   consulted at all until an operator opts in. The leftmost element — the intuitive reading — is
   precisely the part the caller wrote before any proxy appended what it observed. 🚨 And a forwarded
-  address does **not** inherit the BUILT-IN admin nets: loopback and docker-internal are auto-granted
-  admin because reaching them meant already being on the box, and a front proxy is exactly what makes
-  that untrue. `ROADSTEAD_ADMIN_NETS` and an `admin` key are unaffected — what the operator said
-  stands, what was inherited does not. An unparseable hop or a chain over 32 long resolves to
+  address does **not** inherit the BUILT-IN admin REACH nets: loopback and docker-internal are in the
+  reach set because getting to them meant already being on the box, and a front proxy is exactly what
+  makes that untrue. `ROADSTEAD_ADMIN_NETS` and an `admin` key are unaffected — what the operator
+  said stands, what was inherited does not. An unparseable hop or a chain over 32 long resolves to
   `unknown` (not an address, matches nothing, refused) rather than back to the peer, because falling
   back to the peer hands the proxy's grants to whoever sent the header.
 

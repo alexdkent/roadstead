@@ -205,31 +205,52 @@ class _IpReq:
 
 
 @_pytest.mark.asyncio
-async def test_admin_routes_deny_lan_allow_loopback(monkeypatch):
+async def test_the_admin_plane_needs_BOTH_a_reachable_address_and_a_credential(monkeypatch):
+    """🚨 The 2026-09-01 change, as an assertion. This test used to be called
+    `test_admin_routes_deny_lan_allow_loopback` and it asserted that loopback
+    with NO credential could pause a backend, set a flag and ingest a call log.
+    That was true, and it was the bug: the audit trail recorded such changes as
+    `key_id: null, source: "ip"` — the system knew nobody had authenticated.
+
+    An address is a GATE now and never a grant. Both halves must pass, and the
+    two refusals are different things:
+
+    * off-net       — 403, and no credential answers it.
+    * on-net, no credential — 403 from the scope check, answerable by presenting
+      one. Through the UI door this same denial becomes a 401 + challenge, which
+      is what makes a browser show a password box.
+    """
     monkeypatch.setenv("ROADSTEAD_ACL", _ACL)
+    monkeypatch.setenv("ROADSTEAD_API_KEYS", "sk-ops=ops:admin")
     svc = _PSvc(_PCfg())
     lan, loop = "192.0.2.42", "127.0.0.1"
+    key = {"X-API-Key": "sk-ops"}
 
-    # Pause/resume.
-    resp = await svc.handle_admin_endpoint_pause("tier1", _IpReq(lan, "POST"), pause=True)
+    # Off-net, with a VALID admin key: still refused. The gate is the network.
+    resp = await svc.handle_admin_endpoint_pause(
+        "tier1", _IpReq(lan, "POST", headers=key), pause=True)
     assert resp.status_code == 403
+
+    # On-net, no credential: refused. This is the line that used to be 200.
     resp = await svc.handle_admin_endpoint_pause("tier1", _IpReq(loop, "POST"), pause=True)
+    assert resp.status_code == 403
+
+    # On-net, with the credential: allowed.
+    resp = await svc.handle_admin_endpoint_pause(
+        "tier1", _IpReq(loop, "POST", headers=key), pause=True)
     assert resp.status_code == 200
-    await svc.handle_admin_endpoint_pause("tier1", _IpReq(loop, "POST"), pause=False)
+    await svc.handle_admin_endpoint_pause(
+        "tier1", _IpReq(loop, "POST", headers=key), pause=False)
 
-    # Flags.
-    assert (await svc.handle_admin_flags(_IpReq(lan, "GET"))).status_code == 403
-    assert (await svc.handle_admin_flags(_IpReq(loop, "GET"))).status_code == 200
-
-    # Maintenance annotate + list.
-    assert (await svc.handle_maintenance(_IpReq(lan, "POST", {"endpoint": "tier1"}))).status_code == 403
-    assert (await svc.handle_maintenance_list(_IpReq(lan, "GET"))).status_code == 403
-    assert (await svc.handle_maintenance_list(_IpReq(loop, "GET"))).status_code == 200
-
-    # calls/log ingest.
+    # Every other admin surface inherits it — the gate is one method, not a
+    # per-route decision, so this is a check that nothing bypasses it.
+    assert (await svc.handle_admin_flags(_IpReq(loop, "GET"))).status_code == 403
+    assert (await svc.handle_admin_flags(_IpReq(loop, "GET", headers=key))).status_code == 200
+    assert (await svc.handle_maintenance_list(_IpReq(loop, "GET"))).status_code == 403
+    assert (await svc.handle_maintenance_list(_IpReq(loop, "GET", headers=key))).status_code == 200
     body = {"endpoint": "whisper-1", "kind": "audio", "duration_s": 1.0}
-    assert (await svc.handle_calls_log(_IpReq(lan, "POST", body))).status_code == 403
-    assert (await svc.handle_calls_log(_IpReq(loop, "POST", body))).status_code == 200
+    assert (await svc.handle_calls_log(_IpReq(loop, "POST", body))).status_code == 403
+    assert (await svc.handle_calls_log(_IpReq(loop, "POST", body, headers=key))).status_code == 200
 
 
 @_pytest.mark.asyncio

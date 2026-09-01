@@ -52,6 +52,8 @@ from roadstead.management import PREFIX, admin_ui_enabled
 from roadstead.routes import make_routes
 from roadstead.service import ProxyService
 
+from tests.admin_key import ADMIN_HEADERS, enrol_admin
+
 _ROOT = Path(__file__).resolve().parents[1]
 UI = _ROOT / "roadstead" / "ui" / "index.html"
 
@@ -66,7 +68,7 @@ class _Req:
 
         _C.host = host
         self.client = _C()
-        self.headers = headers or {}
+        self.headers = dict(ADMIN_HEADERS) if headers is None else headers
         self.method = method
         self.query_params: dict = {}
         self.path_params = path_params or {}
@@ -92,8 +94,10 @@ def _clean_env(monkeypatch):
 
 
 def _svc(tmp_path) -> ProxyService:
-    return ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db"),
-                                    admin_store_path=str(tmp_path / "o.json")))
+    svc = ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db"),
+                                   admin_store_path=str(tmp_path / "o.json")))
+    enrol_admin(svc)
+    return svc
 
 
 # ---------------------------------------------------------------------------
@@ -468,16 +472,37 @@ def test_basic_is_ignored_entirely_when_no_keys_are_configured():
 
 
 @pytest.mark.asyncio
-async def test_an_admin_key_opens_the_door_from_anywhere_over_basic(tmp_path):
-    """The end-to-end of the choice: an operator on a machine no ACL knows,
-    behind whatever front proxy, types their admin key into the browser's
-    password box and the page loads."""
+async def test_an_admin_key_opens_the_door_from_an_ALLOWED_address_over_basic(tmp_path):
+    """🚨 This test was called `..._from_anywhere_over_basic` until 2026-09-01,
+    and "anywhere" is exactly what changed.
+
+    A credential alone used to be sufficient from any address. The admin plane
+    now takes BOTH — a network gate and a credential — because an operator asked
+    for IP control over the whole plane, and "a key works from anywhere" is the
+    property that made the plane as reachable as the inference door. What the
+    key still buys is what it always did: an operator on a machine no ACL knows
+    types it into the browser's password box, having first been ALLOWED to reach
+    the plane at all.
+
+    Both halves are asserted, and the first one is the new one.
+    """
     svc = _svc(tmp_path)
     svc._state.identity.keys.register(secret="sk-ops", agent_id="ops", admin=True,
                                       key_id="ops")
-    stranger = _Req(host="198.51.100.7")
-    assert (await svc.handle_admin_ui(stranger)).status_code == 401
-    ok = await svc.handle_admin_ui(_Req(host="198.51.100.7", headers=_basic("sk-ops")))
+    outside = "198.51.100.7"
+
+    # A valid admin key, from an address the operator has not named: refused.
+    # The UI door renders it 401 because a browser can act on that, but the
+    # refusal underneath is the network one and no password answers it.
+    denied = await svc.handle_admin_ui(_Req(host=outside, headers=_basic("sk-ops")))
+    assert denied.status_code == 401
+
+    # Once the operator names the net, the same request succeeds.
+    svc._state.acl.register_admin_net("198.51.100.0/24")
+    # `headers={}` explicitly — `_Req`'s default is an authenticated request.
+    assert (await svc.handle_admin_ui(
+        _Req(host=outside, headers={}))).status_code == 401
+    ok = await svc.handle_admin_ui(_Req(host=outside, headers=_basic("sk-ops")))
     assert ok.status_code == 200
 
 

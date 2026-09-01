@@ -28,6 +28,8 @@ from roadstead.observability import (
 )
 from roadstead.queue import PersistentQueue
 from roadstead.service import ProxyService
+
+from tests.admin_key import ADMIN_HEADERS, enrol_admin
 from tests.wire_contract import carries_deferral_marker
 
 
@@ -36,15 +38,17 @@ class _FakeRequest:
         host = "172.16.0.5"
 
     client = _Client()
-    headers: dict = {}
+    headers: dict = ADMIN_HEADERS
 
 
-class _DeniedRequest:  # public IP the ACL won't recognize → 403
+class _DeniedRequest:  # public IP, outside the admin reach set → 403
     class _Client:
         host = "8.8.8.8"
 
     client = _Client()
-    headers: dict = {}
+    # 🚨 Carries a VALID admin credential and is still refused: the reach gate
+    # is checked before any credential is read, and no credential answers it.
+    headers: dict = ADMIN_HEADERS
 
 
 async def _none(*a, **k):
@@ -71,6 +75,7 @@ def _body(stream=False, timeout_s=10.0):
 @pytest.mark.asyncio
 async def test_consumer_disconnect_cancels_producer_and_frees_slot():
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
 
     async def slow_stream(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
         # Produces indefinitely so the producer is still streaming when the
@@ -120,6 +125,7 @@ async def test_consumer_disconnect_cancels_producer_and_frees_slot():
 async def test_drain_cancels_straggler_and_counts(monkeypatch):
     monkeypatch.setattr(service_mod, "_DRAIN_DEADLINE_S", 0.1)
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     _stub_probes(svc)
     await svc.startup()
 
@@ -172,6 +178,7 @@ async def test_budget_restore_uses_configured_cap(tmp_path):
 @pytest.mark.asyncio
 async def test_circuit_recovers_on_health_even_if_discovery_fails():
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     _stub_probes(svc)
 
     async def _health_up(*a, **k):
@@ -200,6 +207,7 @@ async def test_ttft_fastfail_aborts_zero_token_hang(monkeypatch):
     # its constant now resolves in lifecycle's namespace.
     monkeypatch.setattr(lifecycle_mod, "_STREAM_TTFT_DEADLINE_S", 0.3)
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
 
     async def hang_stream(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
         await asyncio.sleep(30)   # never produces a first token
@@ -275,6 +283,7 @@ async def test_transient_retry_records_exactly_one_completion():
     # Audit guard: a transient backend error that retries-then-succeeds must
     # record the completion ONCE (the retry `continue`s without recording).
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     calls = {"n": 0}
 
     async def flaky(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
@@ -312,6 +321,7 @@ def _ibody():  # interactive (P0) tier3 request
 @pytest.mark.asyncio
 async def test_operator_pause_drains_then_resume_restores():
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     _stub_probes(svc)
     await svc.startup()
     try:
@@ -344,6 +354,7 @@ async def test_operator_pause_drains_then_resume_restores():
 @pytest.mark.asyncio
 async def test_operator_pause_is_acl_gated():
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     _stub_probes(svc)
     await svc.startup()
     try:
@@ -358,6 +369,7 @@ async def test_operator_pause_is_acl_gated():
 @pytest.mark.asyncio
 async def test_operator_pause_unknown_endpoint_404():
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     _stub_probes(svc)
     await svc.startup()
     try:
@@ -373,6 +385,7 @@ async def test_operator_pause_alerts_drained_not_outage():
     # An intentional drain surfaces as endpoint_drained (WARNING), NOT the
     # endpoint_paused (ERROR) page that signals an unexpected backend outage.
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     _stub_probes(svc)
     await svc.startup()
     try:
@@ -398,6 +411,7 @@ async def test_operator_pause_alerts_drained_not_outage():
 async def test_drain_503_body_is_deferrable():
     import json as _json
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     _stub_probes(svc)
     await svc.startup()
     try:

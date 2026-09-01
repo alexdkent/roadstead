@@ -43,7 +43,7 @@ async def test_a_key_enrolled_through_the_api_authenticates_a_real_call(proxy):
     """
     created = await proxy.client.post(
         "/rs/v1/admin/keys",
-        json={"agent_id": "e2e-batch", "priority": "P2_POST_TURN"})
+        json={"agent_id": "e2e-batch", "priority": "P2_POST_TURN"}, headers=proxy.admin)
     assert created.status_code == 201, created.text
     secret = created.json()["key"]
     key_id = created.json()["key_id"]
@@ -59,7 +59,7 @@ async def test_a_key_enrolled_through_the_api_authenticates_a_real_call(proxy):
     # then be *ignored* rather than refused — correct, disclosed, and a
     # different assertion (see the unit suite).
     keeper = await proxy.client.post("/rs/v1/admin/keys",
-                                     json={"agent_id": "e2e-keeper"})
+                                     json={"agent_id": "e2e-keeper"}, headers=proxy.admin)
     assert keeper.status_code == 201, keeper.text
 
     served = await proxy.client.post(
@@ -71,7 +71,7 @@ async def test_a_key_enrolled_through_the_api_authenticates_a_real_call(proxy):
 
     # The credential became the fair-share key, not merely an access token —
     # which is what makes it the quota holder and the budget holder too.
-    callers = (await proxy.client.get("/rs/v1/admin/callers")).json()["callers"]
+    callers = (await proxy.client.get("/rs/v1/admin/callers", headers=proxy.admin)).json()["callers"]
     mine = [c for c in callers if c["agent_id"] == "e2e-batch"]
     assert mine, "the enrolled identity never reached the scheduler's books"
     assert key_id in mine[0]["identities"]["keys"]
@@ -89,7 +89,7 @@ async def test_a_key_enrolled_through_the_api_authenticates_a_real_call(proxy):
     assert wrong.json()["error"]["code"] == "invalid_api_key"
 
     revoked = await proxy.client.request(
-        "DELETE", f"/rs/v1/admin/keys/{key_id}")
+        "DELETE", f"/rs/v1/admin/keys/{key_id}", headers=proxy.admin)
     assert revoked.status_code == 200, revoked.text
     assert revoked.json()["revoked"] == key_id
 
@@ -115,7 +115,13 @@ async def test_every_management_route_refuses_an_unenrolled_address(proxy):
                      "/rs/v1/admin/callers", "/rs/v1/admin/providers"):
             resp = await outside.get(path)
             assert resp.status_code == 403, f"{path} answered {resp.status_code}"
-            assert resp.json()["error"] == f"access denied for {_OUTSIDE[0]}"
+            # 🚨 The refusal now comes from the NETWORK gate rather than the
+            # scope check, and says so — an address outside the reach set is
+            # refused before any credential is read. Asserted on the address
+            # rather than on the whole sentence: which of the two refusals
+            # applies is `identity.py`'s to decide, and pinning the exact string
+            # here would make this test the second place that decides it.
+            assert _OUTSIDE[0] in resp.json()["error"]
         created = await outside.post("/rs/v1/admin/keys",
                                      json={"agent_id": "intruder"})
         assert created.status_code == 403, (
@@ -140,7 +146,7 @@ async def test_the_legacy_control_routes_answer_at_both_prefixes(proxy):
     """
     endpoint = next(iter(proxy.svc._config.endpoints))
 
-    paused = await proxy.client.post(f"/rs/v1/admin/endpoints/{endpoint}/pause")
+    paused = await proxy.client.post(f"/rs/v1/admin/endpoints/{endpoint}/pause", headers=proxy.admin)
     assert paused.status_code == 200, paused.text
     status = (await proxy.client.get("/v1/status")).json()
     assert status["endpoints"][endpoint].get("admin_paused") is True
@@ -148,13 +154,13 @@ async def test_the_legacy_control_routes_answer_at_both_prefixes(proxy):
     # …and undone through the OTHER spelling, which is the pair that matters:
     # an operator who paused from a dashboard and resumes from a shell must not
     # discover that the two prefixes are different systems.
-    resumed = await proxy.client.post(f"/v1/admin/endpoints/{endpoint}/resume")
+    resumed = await proxy.client.post(f"/v1/admin/endpoints/{endpoint}/resume", headers=proxy.admin)
     assert resumed.status_code == 200, resumed.text
     status = (await proxy.client.get("/v1/status")).json()
     assert not status["endpoints"][endpoint].get("admin_paused")
 
     for path in ("/rs/v1/admin/flags", "/v1/admin/flags"):
-        assert (await proxy.client.get(path)).json()["flags"]
+        assert (await proxy.client.get(path, headers=proxy.admin)).json()["flags"]
 
 
 @pytest.mark.asyncio
@@ -164,13 +170,13 @@ async def test_a_quota_edit_is_visible_to_the_next_admission_decision(proxy):
     the config object, so the assertion covers the wiring an operator sees."""
     patched = await proxy.client.patch(
         "/rs/v1/admin/callers/internal",
-        json={"spill_ok": True, "daily_spend_usd": 2.5})
+        json={"spill_ok": True, "daily_spend_usd": 2.5}, headers=proxy.admin)
     assert patched.status_code == 200, patched.text
 
     assert proxy.svc._config.agent_config("internal").spill_ok is True
     assert proxy.svc._state.spend_standing("internal").cap_usd == 2.5
 
-    callers = (await proxy.client.get("/rs/v1/admin/callers")).json()["callers"]
+    callers = (await proxy.client.get("/rs/v1/admin/callers", headers=proxy.admin)).json()["callers"]
     internal = [c for c in callers if c["agent_id"] == "internal"][0]
     assert internal["quota"]["runtime"] == {"spill_ok": True,
                                             "daily_spend_usd": 2.5}
@@ -183,7 +189,7 @@ async def test_the_providers_view_reports_a_live_endpoint_honestly(proxy):
     real socket, so `in_force` is a measured number rather than the seed. On a
     fake backend that publishes `/props`, declared and in-force should both be
     present and the endpoint should read discoverable."""
-    view = (await proxy.client.get("/rs/v1/admin/providers")).json()
+    view = (await proxy.client.get("/rs/v1/admin/providers", headers=proxy.admin)).json()
     rows = {e["endpoint"]: e for e in view["endpoints"]}
     assert rows, "the providers view returned no endpoints"
 

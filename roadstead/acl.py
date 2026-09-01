@@ -98,6 +98,23 @@ class IPIdentityMap:
         # membership here can only ever take the mutating half away. See
         # :meth:`is_admin_readonly` for why matching it WINS over a full grant.
         self._readonly_admin_nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        # 🚨 The admin-plane REACH set — see :meth:`may_reach_admin`. Loopback
+        # is unconditional (lockout), docker-internal is a default that naming
+        # any operator net drops.
+        self._loopback_nets = [ipaddress.ip_network("127.0.0.0/8"),
+                               ipaddress.ip_network("::1/128")]
+        self._docker_nets = [ipaddress.ip_network("172.16.0.0/12")]
+        self._reach_nets = list(self._loopback_nets) + list(self._docker_nets)
+
+    def _rebuild_reach(self) -> None:
+        """Called whenever an operator net is registered. Naming one drops the
+        docker default; loopback survives everything."""
+        nets = list(self._loopback_nets)
+        if self._operator_admin_nets:
+            nets += [n for n in self._operator_admin_nets if n not in self._loopback_nets]
+        else:
+            nets += self._docker_nets
+        self._reach_nets = nets
 
     def register(
         self,
@@ -136,6 +153,10 @@ class IPIdentityMap:
         self._operator_admin_nets.append(net)
         if readonly:
             self._readonly_admin_nets.append(net)
+        # The reach set is derived, never appended to directly: naming an
+        # operator net drops the docker default, and that only works if every
+        # registration recomputes rather than accumulates.
+        self._rebuild_reach()
 
     def _lookup(self, remote_ip: str) -> _Registration | None:
         """Resolve an IP to its registration, or None if unregistered.
@@ -223,6 +244,50 @@ class IPIdentityMap:
     def readonly_admin_nets(self) -> list[str]:
         """The subset of those whose grant is narrowed to reads."""
         return [str(net) for net in self._readonly_admin_nets]
+
+    def may_reach_admin(self, remote_ip: str, *, trust_builtin_nets: bool = True) -> bool:
+        """🚨 THE NETWORK GATE on the admin plane. An address may REACH it; no
+        address GRANTS it. A credential is required regardless of this answer.
+
+        This is the half of the 2026-09-01 change that is easy to get backwards.
+        Until then, ``is_admin`` below answered "is this address an admin?" and
+        the answer alone was enough to reconfigure the fleet — so a request from
+        loopback with no credential at all could flip a runtime flag, and the
+        audit trail recorded it as ``key_id: null``. That default was written
+        for the INFERENCE door, where "already on the box" is a fair proxy for
+        "allowed", and it was inherited by the CONTROL door when the admin plane
+        and then the UI were added on the same port. Nobody re-asked whether
+        being on the box should also mean being allowed to read every caller's
+        traffic and change policy.
+
+        So the two questions are now separate and BOTH must pass:
+
+        * *may this address reach the admin plane at all* — here, and
+        * *does this credential carry the admin scope* — the key registry, via
+          ``identity.IdentityResolver.admin_denial``.
+
+        Loopback is ALWAYS in the reach set and cannot be configured out. It is
+        where the startup-minted bootstrap key is usable, so removing it is a
+        lockout with no recovery that does not involve editing the environment
+        and restarting. Docker-internal is in the set by DEFAULT — a
+        containerised deployment reaches its own admin plane over the bridge —
+        but naming any net in ``ROADSTEAD_ADMIN_NETS`` drops it, because a /12
+        is a weak gate and an operator who has named their own nets has said
+        what they want.
+        """
+        try:
+            addr = ipaddress.ip_address(remote_ip)
+        except ValueError:
+            return False
+        nets = self._reach_nets if trust_builtin_nets else (
+            self._operator_admin_nets + self._loopback_nets)
+        return any(addr in net for net in nets)
+
+    def reach_nets(self) -> list[str]:
+        """The effective admin-plane reach set, for the management plane and the
+        startup log. Reported rather than inferred: an operator who cannot see
+        it has no way to tell a 403 from a typo in a CIDR."""
+        return [str(net) for net in self._reach_nets]
 
     def is_admin(self, remote_ip: str, *, trust_builtin_nets: bool = True) -> bool:
         """Admin surfaces (drain/pause, maintenance windows, runtime flags,

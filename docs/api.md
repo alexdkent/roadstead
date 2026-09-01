@@ -602,15 +602,45 @@ Deterministic 4xx are non-deferrable (the caller must change something). 429 and
 ## 3. Admin / control plane
 
 **Admin is narrower than inference, deliberately.** An operator who enrols a subnet for inference has
-said nothing about who may pause a backend fleet-wide. Two ways in: an **API key with the `admin`
-scope** (from anywhere), or a **source address** in the admin nets — loopback and docker-internal by
-default, extended by `ROADSTEAD_ADMIN_NETS`. 🚨 The **default** half of that is withdrawn from any
-request that arrived through a trusted proxy (§1.5 rule 4); what `ROADSTEAD_ADMIN_NETS` names is not.
+said nothing about who may pause a backend fleet-wide.
+
+🚨 **BOTH a network gate and a credential, as of 2026-09-01 — and this changed.** Until then an
+address could BE an admin: a request from loopback presenting nothing at all could pause a backend,
+re-weight a caller's quota or flip a runtime flag, and the audit trail recorded the change with
+`key_id: null, source: "ip"`. That default belongs to the inference door, where "already on the box"
+is a fair proxy for "allowed" on a local-first proxy; the admin plane and then the UI were added on
+the same port and inherited it without the question being re-asked. **An address is a gate now and
+never a grant.**
+
+- **Reach** — `ROADSTEAD_ADMIN_NETS` names who may reach the plane at all. Loopback is always in the
+  set and cannot be configured out (it is where the bootstrap key below is usable). Docker-internal
+  is in the set by default so a containerised deployment reaches its own plane; **naming any net
+  drops it**, because a `/12` is a weak gate and an operator who has named their own nets has said
+  what they want. 🚨 The **built-in** half is withdrawn from any request that arrived through a
+  trusted proxy (§1.5 rule 4); what `ROADSTEAD_ADMIN_NETS` names is not.
+- **Credential** — an API key with the `admin` scope, presented as `X-API-Key`, `Authorization:
+  Bearer`, or HTTP Basic with the key in the **password** half (which is what the UI uses).
+
+The network is checked **first**, so a refusal from off-net says so and no credential answers it —
+and a blocked address never learns whether the key it presented was valid.
+
+🚨 **`ROADSTEAD_ADMIN_NETS` is a BREAKING reinterpretation, not a new variable.** It used to grant
+admin to the addresses it named; it now says which addresses may reach the plane, with a credential
+still required. An `:admin` flag on a `ROADSTEAD_ACL` address entry likewise no longer grants the
+scope. Both are recorded in `CHANGELOG.md`.
+
+**Bootstrap: never open, never locked out.** If no *operator* key is configured, the process mints a
+random admin key at startup and logs it. It is not persisted — a new one is minted each boot until
+`ROADSTEAD_API_KEYS` is set — and 🚨 it does **not** make the registry "configured" for §1.5 rule 2,
+so it cannot flip the inference door's identity regime. Counting it there would 401 every OpenAI
+client that sends a placeholder `Authorization` header, because the proxy generated a key for its own
+dashboard.
 
 🚨 **An authenticated non-admin identity is refused even from a host in the admin nets.** Once a
 caller says who it is, its privileges are that identity's; inheriting the host's would mean a scoped
-key could only ever widen access and never narrow it, which makes it worthless on the machine it
-runs on.
+key could only ever widen access and never narrow it, which makes it worthless on the machine it runs
+on. Since 2026-09-01 no host confers the scope in the first place, so this holds trivially — it is
+kept stated because the property it protects is the one a future "convenience" default would break.
 
 **The management plane lives at `/rs/v1/admin/*`.** `/v1` is versioned by OpenAI (§1.7), and this is
 the surface most likely to need its own second version — it grows with the product rather than with

@@ -52,6 +52,8 @@ from roadstead.identity import (
 from roadstead.management import PREFIX
 from roadstead.service import ProxyService
 
+from tests.admin_key import ADMIN_HEADERS, enrol_admin
+
 _ROOT = Path(__file__).resolve().parents[1]
 
 #: A plausible sidecar: the proxy shares the loopback interface, which is what
@@ -71,7 +73,11 @@ class _Req:
 
         _C.host = host
         self.client = _C()
-        self.headers = headers or {}
+        # 🚨 Default to an AUTHENTICATED admin request. These tests are
+        # about what the plane does, not about who may reach it;
+        # `headers={}` still means "no credential" for the ones that
+        # care. See tests/admin_key.py.
+        self.headers = dict(ADMIN_HEADERS) if headers is None else headers
         self.method = method
         self.query_params: dict = {}
         self.path_params = path_params or {}
@@ -264,54 +270,61 @@ def test_a_trusted_proxy_that_forwards_nothing_is_still_marked_forwarded():
 # 3. Admin — the half that is a security bug rather than an inconvenience
 # ---------------------------------------------------------------------------
 
-def test_todays_grant_is_what_makes_this_dangerous():
-    """The baseline, stated so the change below reads as a change. A direct
-    loopback connection IS admin, by default, with no configuration — that is
-    the deliberate local-first posture, and it is only safe while reaching
-    loopback means already being on the machine."""
-    assert _resolver().is_admin(_Req(host=_PROXY)) is True
+def test_an_address_never_grants_admin_however_it_arrives():
+    """🚨 The baseline this file used to state has been deleted, not moved.
 
+    It read: *"a direct loopback connection IS admin, by default, with no
+    configuration — that is the deliberate local-first posture"*, and the rest
+    of this section was about the ways a reverse proxy makes that posture a lie.
+    As of 2026-09-01 the posture is gone: an address is a GATE on the admin
+    plane and never a grant, so the forwarded/direct distinction can no longer
+    hand anybody the control plane by accident.
 
-def test_a_forwarded_caller_does_not_inherit_the_builtin_admin_grant():
-    """🚨 The security bug, closed. A caller out on the internet arrives through
-    a sidecar proxy sharing loopback. Before trusted-proxy handling it resolved
-    to 127.0.0.1 and was handed the control plane; now it resolves to itself and
-    is refused."""
-    resolver = _resolver(trusted=_PROXY)
-    assert resolver.is_admin(_Req(host=_PROXY, headers=_xff(_CALLER))) is False
-
-
-def test_the_proxys_own_address_stops_being_admin_once_it_is_a_proxy():
-    """The subtler half. Even when the resolved address IS loopback — because
-    the proxy forwarded nothing, or forwarded its own address — the built-in
-    grant is gone, because 'this arrived on loopback' has stopped being a
-    statement about who is calling.
-
-    An operator who wants it back says so explicitly, which is the point: the
-    grant becomes a decision rather than an inherited default.
+    Kept as an explicit assertion because three tests below it USED to pass by
+    asserting `is False` about forwarded callers, and they would now pass for a
+    vacuous reason — every address resolves to `is_admin() is False`, so they
+    could no longer fail if the grant came back for direct connections. This one
+    fails.
     """
-    resolver = _resolver(trusted=_PROXY)
-    assert resolver.is_admin(_Req(host=_PROXY)) is False
-    assert resolver.is_admin(_Req(host=_PROXY, headers=_xff(_PROXY))) is False
+    assert _resolver().is_admin(_Req(host=_PROXY)) is False
+    assert _resolver(trusted=_PROXY).is_admin(
+        _Req(host=_PROXY, headers=_xff(_CALLER))) is False
 
     acl = IPIdentityMap()
     acl.register_admin_net(_PROXY)
-    assert _resolver(trusted=_PROXY, acl=acl).is_admin(_Req(host=_PROXY)) is True
+    assert _resolver(acl=acl).is_admin(_Req(host=_PROXY)) is False, (
+        "ROADSTEAD_ADMIN_NETS granted admin — it names who may REACH the plane")
 
 
-def test_an_operator_admin_net_still_grants_a_forwarded_address():
-    """Narrowing the BUILT-IN grant must not narrow the operator's. Somebody who
-    writes ROADSTEAD_ADMIN_NETS is naming an address on purpose, and that
-    statement is just as true through a proxy as around one."""
+def test_the_forwarding_rule_now_applies_to_REACH_instead():
+    """The rule survived the change; what it governs moved.
+
+    A forwarded address does not inherit the BUILT-IN nets, and the argument is
+    unchanged: loopback and docker-internal are in the set because reaching them
+    meant already being on the box, and a front proxy is exactly what makes that
+    untrue. It used to withhold an admin GRANT. It now withholds REACH — which
+    is a smaller thing to get wrong, because a credential is required either
+    way.
+    """
     acl = IPIdentityMap()
-    # What `ROADSTEAD_ACL='203.0.113.0/24=ops:admin'` does: an admin net alone
-    # grants no IDENTITY, and an unidentified address is refused before the
-    # admin question is reached. That is pre-existing and correct — an admin net
-    # is a narrowing of who may administer, never a way in.
-    acl.register("203.0.113.0/24", "ops", LLMPriority.P3_INGESTION)
+    # Direct: loopback is in the built-in reach set.
+    assert acl.may_reach_admin(_PROXY, trust_builtin_nets=True) is True
+    # Forwarded: the built-ins are withheld, and nothing else is configured.
+    assert acl.may_reach_admin(_CALLER, trust_builtin_nets=False) is False
+    assert acl.may_reach_admin(_PROXY, trust_builtin_nets=False) is True, (
+        "loopback is unconditional — it is where the bootstrap key is usable")
+
+
+def test_an_operator_net_still_names_a_forwarded_address():
+    """Narrowing the BUILT-IN set must not narrow the operator's. Somebody who
+    writes ROADSTEAD_ADMIN_NETS is naming an address on purpose, and that
+    statement is just as true through a proxy as around one — it is now a
+    statement about reach rather than about privilege."""
+    acl = IPIdentityMap()
     acl.register_admin_net("203.0.113.0/24")
-    resolver = _resolver(trusted=_PROXY, acl=acl)
-    assert resolver.is_admin(_Req(host=_PROXY, headers=_xff(_CALLER))) is True
+    assert acl.may_reach_admin(_CALLER, trust_builtin_nets=False) is True
+    # And naming one drops the docker default, which is a /12 and a weak gate.
+    assert acl.may_reach_admin("172.17.0.5") is False
 
 
 def test_an_admin_key_is_the_path_that_is_unaffected():
@@ -410,17 +423,25 @@ async def test_a_real_admin_route_gates_and_audits_on_the_caller(tmp_path):
     """
     svc = ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db"),
                                    admin_store_path=str(tmp_path / "o.json")))
+    enrol_admin(svc)   # the plane needs a credential; reach is what is under test
     svc._state.identity.proxies = TrustedProxies.parse(_PROXY)
     svc._state.acl.register("203.0.113.0/24", "ops", LLMPriority.P3_INGESTION)
     svc._state.acl.register_admin_net("203.0.113.0/24")
 
-    resp = await svc.handle_admin_flags(_Req(host=_PROXY, headers=_xff(_CALLER)))
+    # The credential rides WITH the forwarding headers: passing `headers=`
+    # explicitly overrides `_Req`'s authenticated default, so it has to be
+    # merged in rather than assumed.
+    resp = await svc.handle_admin_flags(
+        _Req(host=_PROXY, headers={**_xff(_CALLER), **ADMIN_HEADERS}))
     assert resp.status_code == 200
     assert svc._state.admin_ips_seen["/v1/admin/flags"] == {_CALLER}
 
     # And the caller the proxy did NOT vouch for is refused, from the same peer.
     stranger = "198.51.100.77"
-    resp = await svc.handle_admin_flags(_Req(host=_PROXY, headers=_xff(stranger)))
+    # 🚨 With a VALID admin credential, and still refused: the refusal is about
+    # the network, and no credential answers it.
+    resp = await svc.handle_admin_flags(
+        _Req(host=_PROXY, headers={**_xff(stranger), **ADMIN_HEADERS}))
     assert resp.status_code == 403
     assert stranger in json.loads(resp.body)["error"]
 
@@ -438,6 +459,7 @@ async def test_the_config_view_reports_what_is_trusted_and_what_that_changed(tmp
     """
     svc = ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db"),
                                    admin_store_path=str(tmp_path / "o.json")))
+    enrol_admin(svc)
     svc._state.identity.proxies = TrustedProxies.parse("172.18.0.0/16")
     svc._state.acl.register_admin_net("203.0.113.0/24")
 

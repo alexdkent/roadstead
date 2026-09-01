@@ -384,15 +384,30 @@ class KeyRegistry:
         # this; binding is checked by ``IdentityResolver``, which is the only
         # thing that has an address to check it against.
         self._credential: dict[str, dict] = {}
+        #: Digests of self-minted admin keys — see ``register(bootstrap=True)``.
+        self._bootstrap: set[str] = set()
 
     def __len__(self) -> int:
         return len(self._by_digest)
 
+    def is_bootstrap(self, secret: str) -> bool:
+        """Whether ``secret`` is a self-minted bootstrap key.
+
+        Takes the plaintext and hashes it here rather than exposing the digest
+        set: a management surface never emits a credential, and a digest IS a
+        working credential to anyone who can present one."""
+        return _digest(secret) in self._bootstrap
+
     @property
     def configured(self) -> bool:
-        """True once ANY key exists. Until then the registry is not in play at
-        all and a presented key is ignored — see the module docstring."""
-        return bool(self._by_digest)
+        """True once any OPERATOR key exists. Until then the registry is not in
+        play at all and a presented key is ignored — see the module docstring.
+
+        🚨 Self-minted bootstrap keys do not count. See ``register`` for why:
+        this flag governs the inference door's identity regime, and a key the
+        process generated for its own admin plane is not a statement that the
+        deployment has adopted API-key identity."""
+        return bool(set(self._by_digest) - self._bootstrap)
 
     def register(
         self,
@@ -408,6 +423,7 @@ class KeyRegistry:
         bind: "list[str] | tuple[str, ...] | None" = None,
         key_id: str | None = None,
         source: str = "file",
+        bootstrap: bool = False,
     ) -> str | None:
         """Register one key. Returns its ``key_id``, or None if it was rejected.
 
@@ -418,6 +434,18 @@ class KeyRegistry:
         or ``runtime`` — which the management plane needs in order to tell an
         operator that a key it can revoke *now* will come back on restart
         because it is also declared in the environment.
+
+        🚨 ``bootstrap=True`` marks the key the process MINTED for itself
+        because no operator key existed. It is a real credential on the admin
+        plane and it is deliberately INVISIBLE to :attr:`configured`, which is
+        the flag behind `docs/api.md` §1.5 rule 2: *with no keys configured the
+        registry is not in play, so a presented key is ignored rather than
+        refused*. Counting a self-minted key there would flip the identity
+        regime of the INFERENCE door on a fresh install — every OpenAI client
+        sends an `Authorization` header whether anybody meant it to or not, and
+        they would all start 401-ing because the proxy generated a key for its
+        own dashboard. The bootstrap key answers "who may administer this
+        process", never "has this deployment adopted API-key identity".
         """
         if bool(secret) == bool(key_sha256):
             logger.warning(
@@ -463,6 +491,8 @@ class KeyRegistry:
             source="api_key",
             key_id=label,
         )
+        if bootstrap:
+            self._bootstrap.add(digest)
         self._credential[digest] = {
             "source": source,
             "created_at": time.time(),
@@ -1133,7 +1163,15 @@ class IdentityResolver:
 
         # Rule 2: with no keys configured the registry is not in play, so a
         # placeholder Authorization header from an OpenAI client is invisible.
-        if key and self.keys.configured:
+        #
+        # 🚨 A self-minted BOOTSTRAP key is the one exception, and it has to be.
+        # The rule exists so a stray header does not 401 a caller who never
+        # meant to authenticate — it is about headers nobody chose to send. A
+        # secret that matches the key this process printed to its own log at
+        # startup is not a stray header: somebody copied it deliberately. Without
+        # this the bootstrap key would be unusable in exactly the situation it is
+        # minted for, which is a registry with no operator keys in it.
+        if key and (self.keys.configured or self.keys.is_bootstrap(key)):
             found = self.keys.lookup(key)
             if found.principal is not None:
                 bound = self._binding_denial(request, found)
@@ -1190,20 +1228,26 @@ class IdentityResolver:
             agent_id=agent_id,
             priority=priority,
             min_timeout_s=self.acl.min_timeout_s(ip),
-            # 🚨 A FORWARDED address does not inherit the BUILT-IN admin nets.
-            # Those nets are loopback and docker-internal, and the whole
-            # justification for auto-granting admin to them is that reaching
-            # them meant already being on the box. A front proxy negates that
-            # exactly: "arrived on loopback" now means "came in the front door".
-            # An operator who genuinely wants a forwarded address to be admin
-            # says so in ROADSTEAD_ADMIN_NETS — or, better, issues an admin key,
-            # which works from anywhere and is revocable.
-            admin=self.acl.is_admin(ip, trust_builtin_nets=not address.forwarded),
-            # A narrowing the operator wrote on the SAME entry that granted the
-            # scope (`=ops:admin:readonly`). It is not gated on `forwarded`: the
-            # forwarding rule above withdraws a grant, and withdrawing a
-            # narrowing would widen one.
-            admin_readonly=self.acl.is_admin_readonly(ip),
+            # 🚨 AN ADDRESS NEVER GRANTS ADMIN. Changed 2026-09-01; this used
+            # to read `self.acl.is_admin(ip, ...)` and that was the whole bug.
+            #
+            # A request from loopback with NO credential could reconfigure the
+            # fleet and read every caller's traffic, and the audit trail duly
+            # recorded the change with `key_id: null, source: "ip"` — the system
+            # knew nobody had authenticated and allowed it anyway. The default
+            # was written for the INFERENCE door, where "already on the box" is
+            # a fair proxy for "allowed"; the admin plane and then the UI were
+            # added on the same port and inherited it without the question being
+            # re-asked.
+            #
+            # The address still decides who may REACH the plane
+            # (`acl.may_reach_admin`, consulted in `admin_denial`). What it can
+            # no longer do is stand in for a credential. An operator who wants
+            # admin from somewhere issues a key: it works from anywhere, it is
+            # revocable, it expires, it can be bound to a network, and it puts a
+            # NAME in the audit trail.
+            admin=False,
+            admin_readonly=False,
             source="ip",
         ))
 
@@ -1349,6 +1393,24 @@ class IdentityResolver:
         thing to keep in step with ``routes.py``, and when it falls behind the
         failure is silent and in the widening direction.
         """
+        # 🚨 THE NETWORK GATE, first and before anything reads a credential.
+        # Both must pass: the address says who may REACH this plane, the
+        # credential says who may USE it. Checked first so a blocked network
+        # never learns whether a presented key was valid, and never gets a
+        # password box out of the UI door — the refusal is about the network and
+        # no credential can answer it.
+        address = self.client_address(request)
+        if not self.acl.may_reach_admin(
+                address.ip, trust_builtin_nets=not address.forwarded):
+            return Denial(
+                code="access_denied",
+                status=403,
+                message=(
+                    f"the admin plane is not reachable from {address.ip}. This "
+                    f"is a NETWORK refusal and no credential answers it: add "
+                    f"the address to ROADSTEAD_ADMIN_NETS, which names who may "
+                    f"reach the plane rather than who is an admin"),
+            )
         resolved = self.resolve(request)
         if not resolved.ok:
             return resolved.denial

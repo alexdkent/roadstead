@@ -16,6 +16,8 @@ from roadstead.config import ProxyConfig
 from roadstead.flags import DEFAULT_FLAGS, RuntimeFlags
 from roadstead.service import ProxyService
 
+from tests.admin_key import ADMIN_HEADERS, enrol_admin
+
 
 class _Req:
     def __init__(self, host="127.0.0.1", method="GET", body=None):
@@ -25,7 +27,7 @@ class _Req:
         _Client.host = host
         self.client = _Client()
         self.method = method
-        self.headers: dict = {}
+        self.headers: dict = dict(ADMIN_HEADERS)
         self._body = body
 
     async def json(self):
@@ -95,6 +97,7 @@ def test_unknown_key_in_file_ignored(tmp_path):
 async def test_handler_get_and_post_roundtrip(tmp_path):
     cfg = ProxyConfig(runtime_flags_path=str(tmp_path / "flags.json"))
     svc = ProxyService(cfg)
+    enrol_admin(svc)
 
     resp = await svc.handle_admin_flags(_Req(method="GET"))
     assert resp.status_code == 200
@@ -108,6 +111,7 @@ async def test_handler_get_and_post_roundtrip(tmp_path):
 
     # Persisted: a new service instance over the same path sees the flip.
     svc2 = ProxyService(ProxyConfig(runtime_flags_path=str(tmp_path / "flags.json")))
+    enrol_admin(svc2)
     assert svc2._flags.get("context_gate_enforce") is True
 
 
@@ -115,6 +119,7 @@ async def test_handler_get_and_post_roundtrip(tmp_path):
 async def test_handler_rejects_bad_input_and_denies_unknown_ip(tmp_path):
     cfg = ProxyConfig(runtime_flags_path=str(tmp_path / "flags.json"))
     svc = ProxyService(cfg)
+    enrol_admin(svc)
 
     resp = await svc.handle_admin_flags(_Req(method="POST", body={"typo": True}))
     assert resp.status_code == 400
@@ -131,6 +136,7 @@ async def test_handler_rejects_bad_input_and_denies_unknown_ip(tmp_path):
 @pytest.mark.asyncio
 async def test_status_exposes_flags_and_admin_audit():
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     # One admin hit so the audit map is non-empty.
     await svc.handle_admin_flags(_Req(method="GET"))
 

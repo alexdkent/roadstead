@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import secrets
 import os
 import time
 import uuid
@@ -308,8 +309,66 @@ class ProxyService:
 
     # ----- lifecycle -----
 
+    def _mint_bootstrap_admin_key(self) -> str | None:
+        """🚨 Never leave the admin plane open, and never lock an operator out.
+
+        As of 2026-09-01 an address does not grant admin: the plane takes a
+        network gate AND a credential. That closes a real hole — a request from
+        loopback with no credential could previously reconfigure the fleet — but
+        it creates a bootstrap problem, because a fresh install has no keys and
+        would therefore have no way to reach its own dashboard.
+
+        So: if no OPERATOR key is configured, mint one, register it as a
+        ``bootstrap`` key and print it. The pattern is Jupyter's and Grafana's,
+        and it has the property both alternatives lack — there is never an
+        unauthenticated admin plane, and there is never an unreachable one.
+
+        Three things about the key, each deliberate:
+
+        * **It is admin-only and does not persist.** A new one is minted every
+          boot until an operator configures a real key. A credential that
+          survives a restart without anybody having written it down is a
+          credential nobody rotates.
+        * **It does not make the registry "configured".** ``KeyRegistry`` keeps
+          bootstrap digests out of that flag, because it governs the INFERENCE
+          door's identity regime (`docs/api.md` §1.5 rule 2). Counting a
+          self-minted key there would start 401-ing every OpenAI client that
+          sends a placeholder ``Authorization`` header — the exact failure rule
+          2 exists to prevent, triggered by the proxy generating a key for its
+          own dashboard.
+        * **It is logged once, at WARNING.** It is a live admin credential in a
+          log file, which is a real cost; the alternative is an operator who
+          cannot get in. The message says how to stop it being minted.
+        """
+        keys = self._state.identity.keys
+        if keys.configured:
+            return None
+        secret = "rs-boot-" + secrets.token_urlsafe(24)
+        keys.register(secret=secret, agent_id="bootstrap-admin", admin=True,
+                      key_id="bootstrap", source="runtime", bootstrap=True)
+        reach = ", ".join(self._state.acl.reach_nets())
+        logger.warning(
+            "\n"
+            "  ================================================================\n"
+            "  No API keys are configured, so a BOOTSTRAP ADMIN KEY was minted:\n"
+            "\n"
+            "      %s\n"
+            "\n"
+            "  Use it as the PASSWORD in the admin UI's login box (any\n"
+            "  username), or as X-API-Key / Bearer on %s/admin.\n"
+            "  It is NOT saved and a new one is minted on every restart.\n"
+            "  Set ROADSTEAD_API_KEYS to issue your own and stop this.\n"
+            "  The admin plane is reachable from: %s\n"
+            "  ================================================================",
+            secret, "/rs/v1",
+            reach or "(nothing — check ROADSTEAD_ADMIN_NETS)")
+        # Returned so a test can drive the real path with it. Logged and
+        # returned, never stored in plaintext — the registry keeps the digest.
+        return secret
+
     async def startup(self) -> None:
         """Initialize cost model, recover queue, start scheduler loop."""
+        self._mint_bootstrap_admin_key()
         # Admission timeouts (queued past deadline) were previously a
         # silent drop — wire the callback so they're logged + the caller
         # is released promptly instead of waiting out its own deadline.

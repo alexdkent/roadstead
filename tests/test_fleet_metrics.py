@@ -17,6 +17,8 @@ from roadstead.service import ProxyService
 from roadstead.sse_hub import DROP_SENTINEL, SSEHub
 from roadstead.usage_rates import cloud_cost_usd, cloud_rate
 
+from tests.admin_key import ADMIN_HEADERS, enrol_admin
+
 
 # ----- queue: non-LLM ingest + rollups -----
 
@@ -191,7 +193,7 @@ class _FakeReq:
     class _Client:
         host = "172.16.0.5"   # internal → ACL-allowed
     client = _Client()
-    headers: dict = {}
+    headers: dict = ADMIN_HEADERS
 
     def __init__(self, body=None):
         self._body = body or {}
@@ -211,6 +213,7 @@ def _svc_request_disconnected_false():
 @pytest.mark.asyncio
 async def test_calls_log_ingest_records_and_emits(tmp_path):
     svc = ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db")))
+    enrol_admin(svc)
     svc._backend.probe_vllm_capacity = _none
     svc._backend.probe_props = _none
     svc._backend.probe_models = _none
@@ -238,6 +241,7 @@ async def test_calls_log_ingest_records_and_emits(tmp_path):
 @pytest.mark.asyncio
 async def test_calls_log_rejects_llm_kind():
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     svc._backend.probe_vllm_capacity = _none
     svc._backend.probe_props = _none
     svc._backend.probe_models = _none
@@ -261,7 +265,7 @@ class _LoopReq:
             host = "127.0.0.1"
 
         self.client = _C()
-        self.headers: dict = {}
+        self.headers: dict = dict(ADMIN_HEADERS)
         self._body = body
 
     async def json(self):
@@ -273,6 +277,7 @@ async def test_metrics_renders_truncation_gauge():
     """L-2 (audit 2026-07-12): the per-caller truncation tally must surface on
     /metrics so a TSDB rule can alert on structured truncations by caller."""
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     svc._state.truncation_by_model_caller["tier2|kv4_grader"] = {
         "count": 3, "structured": 2, "freetext": 1}
     resp = await svc.handle_prometheus_metrics(_LoopReq({}))
@@ -289,6 +294,7 @@ async def test_metrics_renders_empty_completion_gauge():
     """C-3 (audit 2026-07-12): the per-endpoint empty-completion counter must
     surface on /metrics so the post-boxa reliability signature is trendable."""
     svc = ProxyService(ProxyConfig())
+    enrol_admin(svc)
     svc._state.empty_completion_by_endpoint["tier2"] = 5
     resp = await svc.handle_prometheus_metrics(_LoopReq({}))
     text = resp.body.decode()
@@ -305,6 +311,8 @@ async def test_calls_log_409_for_llm_class_endpoints():
     from roadstead.service import ProxyService
 
     svc = ProxyService(ProxyConfig())
+
+    enrol_admin(svc)
     for ep in ("rerank", "rerank", "rerank", "embed",
                "embed", "tier3", "chat"):
         resp = await svc.handle_calls_log(_LoopReq(

@@ -8,6 +8,56 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Changed — 🚨 BREAKING and security-relevant: an address no longer grants admin
+
+Landed 2026-09-01. **The admin plane now requires BOTH a reachable address and an `admin`-scoped
+credential.** Until this change a request from **loopback presenting nothing at all** could pause a
+backend, re-weight a caller's quota, ingest call logs or flip a runtime flag. The audit trail
+recorded such a change as `key_id: null, source: "ip"` — the system stating in its own log that
+nobody had authenticated, and permitting the write anyway.
+
+**How it got there matters more than the fix.** It was not a bug anybody wrote. The auto-grant
+belongs to the INFERENCE door, where "already on the box" is a fair proxy for "allowed" on a
+local-first proxy, and it was correct there. The admin plane, and later the management UI, were added
+**on the same port** and inherited it — a default written for one door silently governing a different
+one, with the UI's elaborate reasoning about CSRF, credential kinds and the 401/403 split sitting on
+top of a door that was already open on localhost.
+
+**What breaks:**
+
+- **`ROADSTEAD_ADMIN_NETS` is reinterpreted, not replaced.** It named addresses that WERE admins; it
+  now names addresses that MAY REACH the plane, with a credential still required. A deployment
+  relying on it for unauthenticated admin will start getting 403s and needs a key.
+- **`:admin` on a `ROADSTEAD_ACL` address entry no longer grants the scope**, for the same reason.
+- **Loopback is no longer admin.** Scripts driving `/v1/admin/*` from the local host must present a
+  key.
+- **A key alone is no longer enough from anywhere.** The network gate applies to credentials too, so
+  an admin key used from off-net needs its network named in `ROADSTEAD_ADMIN_NETS`.
+
+**What replaces it:**
+
+- **Reach**: loopback always, docker-internal by default so a container reaches its own plane, and
+  whatever `ROADSTEAD_ADMIN_NETS` names — naming any net **drops the docker default**, because a
+  `/12` is a weak gate. The network is checked first, so an off-net refusal says it is about the
+  network and no credential answers it.
+- **Credential**: an `admin`-scoped key, as `X-API-Key`, `Bearer`, or HTTP Basic in the **password**
+  half (what the UI uses — unchanged).
+- **A bootstrap key, so the plane is never open and never unreachable.** With no *operator* key
+  configured, startup mints a random admin key and logs it; it is not persisted and a new one is
+  minted each boot until `ROADSTEAD_API_KEYS` is set. 🚨 It is **invisible to
+  `KeyRegistry.configured`**, so it cannot flip §1.5 rule 2 on the inference door — counting a
+  self-minted key there would 401 every OpenAI client that sends a placeholder `Authorization`
+  header, which is the exact failure rule 2 exists to prevent.
+
+**Roughly sixty tests failed at once when the grant was removed, and none of them meant to assert
+it.** They were testing what the plane does; that they also asserted it needs no credential was
+invisible until it wasn't. They are authenticated centrally through `tests/admin_key.py` rather than
+one at a time, and the gate itself is pinned separately in `tests/test_admin_gate.py` — a helper that
+authenticates the plane's tests must never also be the thing that tests the gate. Two of the failures
+were doctrine tests asserting the old behaviour in as many words, including one whose docstring
+called the unauthenticated audit record *"a meaningful — and slightly alarming — thing for an
+operator to find"*. It was.
+
 ### Changed — BREAKING for anyone holding a clone or a SHA: the history was rewritten (scrub S6)
 
 Landed 2026-09-01. The second and final `git filter-repo` pass, the last item in

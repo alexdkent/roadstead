@@ -36,6 +36,8 @@ from roadstead.identity import (
 from roadstead.management import Invalid, PREFIX, validate_key_create
 from roadstead.service import ProxyService
 
+from tests.admin_key import ADMIN_HEADERS, enrol_admin
+
 _ROOT = Path(__file__).resolve().parents[1]
 _ADMIN_HOST = "127.0.0.1"
 
@@ -47,7 +49,11 @@ class _Req:
             pass
         _C.host = host
         self.client = _C()
-        self.headers = headers or {}
+        # 🚨 Default to an AUTHENTICATED admin request. These tests are
+        # about what the plane does, not about who may reach it;
+        # `headers={}` still means "no credential" for the ones that
+        # care. See tests/admin_key.py.
+        self.headers = dict(ADMIN_HEADERS) if headers is None else headers
         self.method = method
         self.query_params = query or {}
         self.path_params = path_params or {}
@@ -60,11 +66,15 @@ class _Req:
 
 
 def _svc(tmp_path, **cfg) -> ProxyService:
-    return ProxyService(ProxyConfig(
+    svc = ProxyService(ProxyConfig(
         queue_db_path=str(tmp_path / "q.db"),
         admin_store_path=str(tmp_path / "admin_overlay.json"),
         **cfg,
     ))
+    # The admin plane requires a credential as of 2026-09-01; these
+    # tests are about the plane. See tests/admin_key.py.
+    enrol_admin(svc)
+    return svc
 
 
 async def _body(response):
@@ -316,19 +326,46 @@ async def test_an_audit_record_never_carries_a_credential(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_an_address_derived_admin_is_recorded_with_no_key(tmp_path):
-    """A record showing an address and no `key_id` is a meaningful — and
-    slightly alarming — thing for an operator to find. Both halves are recorded
-    always, so which factor authorized a change is never inferred."""
-    svc = _svc(tmp_path)                       # loopback, no key presented
+async def test_no_change_can_be_recorded_without_a_named_credential(tmp_path):
+    """🚨 This test used to assert the OPPOSITE, and the assertion is the reason
+    the change happened.
+
+    It read: *"a record showing an address and no `key_id` is a meaningful — and
+    slightly alarming — thing for an operator to find"*, and it pinned exactly
+    that: a quota edit from loopback with no credential, recorded as
+    `key_id: None, source: "ip"`. Both halves were recorded so that which factor
+    authorized a change was never inferred — which was good discipline applied
+    to a state that should not have been reachable. The alarming record was the
+    system telling us, in the audit trail, that anyone who could open a socket
+    to loopback could re-weight a caller's quota.
+
+    An address is a GATE now and never a grant, so the unauthenticated write
+    cannot happen and the record it produced cannot exist. Both halves are still
+    recorded — the address still appears beside the key — because the reason for
+    recording both was always sound.
+    """
+    svc = _svc(tmp_path)
+
+    # No credential: refused, and nothing is recorded. A refusal is not a change.
+    resp = await svc.handle_admin_caller(_Req(
+        headers={}, method="PATCH", path_params={"agent_id": "a"},
+        body={"weight": 3.0}))
+    assert resp.status_code == 403
+    assert not svc._state.admin_overlay.audit, (
+        "a REFUSED change was written to the trail — the trail is a record of "
+        "what happened, and nothing happened")
+
+    # With the credential: recorded, and it names the credential AND the address.
     await svc.handle_admin_caller(_Req(
         method="PATCH", path_params={"agent_id": "a"}, body={"weight": 3.0}))
     trail = svc._state.admin_overlay.audit
     assert trail, "the quota edit recorded nothing"
     entry = trail[-1]
     assert entry["action"] == "caller.quota"
-    assert entry["actor"]["key_id"] is None
-    assert entry["actor"]["source"] == "ip"
+    assert entry["actor"]["key_id"] is not None, (
+        "an admin change was recorded with no credential — an address grant "
+        "has come back")
+    assert entry["actor"]["source"] == "api_key"
     assert entry["actor"]["address"] == "127.0.0.1"
     assert entry["detail"] == {"weight": 3.0}
 
@@ -562,6 +599,7 @@ async def test_the_view_reports_its_bound_and_its_durability(tmp_path):
 
     # No store → applies, does not survive, and says so.
     bare = ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "b.db")))
+    enrol_admin(bare)   # built without a store on purpose, so not via _svc
     body = await _body(await bare.handle_admin_audit(_Req()))
     assert body["persisted"] is False
     assert "ROADSTEAD_ADMIN_STORE" in body["reason"]

@@ -19,6 +19,8 @@ from roadstead.config import ProxyConfig
 from roadstead.scheduler import DispatchDecision, QueuedRequest
 from roadstead.service import ProxyService
 
+from tests.admin_key import ADMIN_HEADERS, enrol_admin
+
 
 class _FakeRequest:
     def __init__(self, **params):
@@ -36,6 +38,9 @@ class _FakeJSONRequest:
         self._body = body
         self.client = _FakeClient(host)
         self.method = method
+        # Authenticated by default — the admin plane needs a credential as of
+        # 2026-09-01 and this file is about maintenance windows.
+        self.headers = dict(ADMIN_HEADERS)
         self.query_params = {k: str(v) for k, v in params.items()}
 
     async def json(self):
@@ -45,7 +50,9 @@ class _FakeJSONRequest:
 
 
 def _svc(tmp_path) -> ProxyService:
-    return ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db")))
+    svc = ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db")))
+    enrol_admin(svc)
+    return svc
 
 
 def _req(endpoint: str = "tier3", *, timeout_s: float = 300.0) -> QueuedRequest:

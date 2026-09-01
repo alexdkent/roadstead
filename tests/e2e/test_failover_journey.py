@@ -73,6 +73,8 @@ from roadstead.__main__ import build_app
 
 from roadstead.testing import FAULT_CAPACITY_DESYNC, FakeBackend, FakeBackendServer
 
+from tests.admin_key import ADMIN_HEADERS, enrol_admin
+
 SRC = normalize_endpoint("tier3")     # tier3
 TGT = normalize_endpoint("tier2")    # tier2 (the boxa)
 
@@ -134,6 +136,11 @@ async def journey(caplog) -> AsyncIterator[dict]:
             async def _healthy(ep_cfg):
                 return True
             svc._backend.probe_health = _healthy
+
+            # This journey configures real caller keys, so the registry IS in
+            # play and an unknown credential is a 401. The admin pause below
+            # needs one the registry knows.
+            enrol_admin(svc)
 
             await svc.startup()
             transport = httpx.ASGITransport(
@@ -216,6 +223,7 @@ async def test_tier3_failover_full_journey(journey, caplog):
 
     # -- 1. tier3 down -- the way the system does it: an operator drain -----
     pause = await client.post(f"/v1/admin/endpoints/{SRC}/pause",
+                              headers=dict(ADMIN_HEADERS),
                               json={"reason": "journey: simulate tier3 outage"})
     assert pause.status_code == 200, pause.text
     assert pause.json()["paused"] is True
@@ -283,7 +291,8 @@ async def test_tier3_failover_full_journey(journey, caplog):
         lambda: svc._scheduler.degraded_inflight(SRC) >= 1, timeout_s=2.0
     ), "the held request never registered as degraded in-flight"
 
-    resume = await client.post(f"/v1/admin/endpoints/{SRC}/resume")
+    resume = await client.post(f"/v1/admin/endpoints/{SRC}/resume",
+                               headers=dict(ADMIN_HEADERS))
     assert resume.status_code == 200, resume.text
     assert resume.json()["paused"] is False
     assert svc._health.endpoint_healthy(SRC) is True  # health is instant; drain+dwell gate LEAVE

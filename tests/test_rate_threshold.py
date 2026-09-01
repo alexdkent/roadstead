@@ -30,17 +30,26 @@ from roadstead.config import AgentQuotaConfig, LLMPriority, ProxyConfig
 from roadstead.rate import WINDOW_S, RateLedger, RateStanding, standing
 from roadstead.service import ProxyService
 
+from tests.admin_key import ADMIN_HEADERS, enrol_admin
+
 
 class _Req:
     class _Client:
         host = "127.0.0.1"
 
     client = _Client()
+    # 🚨 NOT authenticated by default, unlike most files' `_Req`. This one is
+    # also used for `handle_submit` — the inference door — where presenting a
+    # credential changes WHICH CALLER the request counts against, and the whole
+    # file is about a named caller's observed rate. The admin read below passes
+    # the credential explicitly instead.
     headers: dict = {}
 
 
 def _svc(tmp_path, **cfg) -> ProxyService:
-    return ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db"), **cfg))
+    svc = ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db"), **cfg))
+    enrol_admin(svc)
+    return svc
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +349,9 @@ async def test_a_read_of_the_plane_fires_no_notice(tmp_path):
     svc._state.rate.record("fast", time.time())
     hooks.set_degradation_sink(lambda **kw: seen.append(kw))
     try:
-        resp = await svc.handle_admin_callers(_Req())
+        admin_req = _Req()
+        admin_req.headers = dict(ADMIN_HEADERS)
+        resp = await svc.handle_admin_callers(admin_req)
     finally:
         hooks.set_degradation_sink(None)
     assert resp.status_code == 200

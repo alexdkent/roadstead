@@ -35,6 +35,8 @@ from roadstead.acl import IPIdentityMap
 from roadstead.management import Invalid, validate_key_create, validate_key_rotate
 from roadstead.service import ProxyService
 
+from tests.admin_key import ADMIN_HEADERS, enrol_admin
+
 _ADMIN_HOST = "127.0.0.1"
 
 
@@ -45,7 +47,11 @@ class _Req:
             pass
         _C.host = host
         self.client = _C()
-        self.headers = headers or {}
+        # 🚨 Default to an AUTHENTICATED admin request. These tests are
+        # about what the plane does, not about who may reach it;
+        # `headers={}` still means "no credential" for the ones that
+        # care. See tests/admin_key.py.
+        self.headers = dict(ADMIN_HEADERS) if headers is None else headers
         self.method = method
         self.query_params: dict = {}
         self.path_params = path_params or {}
@@ -58,11 +64,15 @@ class _Req:
 
 
 def _svc(tmp_path, **cfg) -> ProxyService:
-    return ProxyService(ProxyConfig(
+    svc = ProxyService(ProxyConfig(
         queue_db_path=str(tmp_path / "q.db"),
         admin_store_path=str(tmp_path / "admin_overlay.json"),
         **cfg,
     ))
+    # The admin plane requires a credential as of 2026-09-01; these
+    # tests are about the plane. See tests/admin_key.py.
+    enrol_admin(svc)
+    return svc
 
 
 async def _body(response):

@@ -45,6 +45,8 @@ from roadstead.management import (
 from roadstead.routes import make_routes
 from roadstead.service import ProxyService
 
+from tests.admin_key import ADMIN_HEADERS, enrol_admin
+
 _ROOT = Path(__file__).resolve().parents[1]
 API_DOC = _ROOT / "docs" / "api.md"
 
@@ -63,7 +65,11 @@ class _Req:
 
         _C.host = host
         self.client = _C()
-        self.headers = headers or {}
+        # 🚨 Default to an AUTHENTICATED admin request. These tests are
+        # about what the plane does, not about who may reach it;
+        # `headers={}` still means "no credential" for the ones that
+        # care. See tests/admin_key.py.
+        self.headers = dict(ADMIN_HEADERS) if headers is None else headers
         self.method = method
         self.query_params: dict = {}
         self.path_params = path_params or {}
@@ -76,11 +82,15 @@ class _Req:
 
 
 def _svc(tmp_path, **cfg) -> ProxyService:
-    return ProxyService(ProxyConfig(
+    svc = ProxyService(ProxyConfig(
         queue_db_path=str(tmp_path / "q.db"),
         admin_store_path=str(tmp_path / "admin_overlay.json"),
         **cfg,
     ))
+    # The admin plane needs a credential as of 2026-09-01; these tests are
+    # about the plane, so they get one. tests/admin_key.py says why.
+    enrol_admin(svc)
+    return svc
 
 
 async def _body(response):
@@ -461,8 +471,13 @@ async def test_keys_group_by_agent_id_because_that_is_the_budget_holder(tmp_path
             _Req(method="POST", body={"agent_id": "research-team"}))
     view = await _body(await svc.handle_admin_keys(_Req()))
 
-    assert len(view["by_agent"]["research-team"]["keys"]) == 3
-    assert len({row["key_id"] for row in view["keys"]}) == 3
+    grouped = set(view["by_agent"]["research-team"]["keys"])  # key_ids
+    assert len(grouped) == 3
+    # The flat list mirrors the grouping. Asserted as containment rather than as
+    # a total, because the process also holds a self-minted bootstrap admin key
+    # and an operator is meant to SEE that credential in this view — a count
+    # here would make the test fail for the right thing happening.
+    assert grouped <= {row["key_id"] for row in view["keys"]}
 
 
 @pytest.mark.asyncio
@@ -675,7 +690,11 @@ async def test_an_unpersistable_change_still_takes_effect_and_says_so(tmp_path):
     """🚨 Refusing a revocation because the disk is unwritable is the breach
     argument again. The change applies in memory, and `persisted: false` with a
     reason is a fact an operator can act on — unlike a 503."""
+    # Built without `admin_store_path` ON PURPOSE — that is what makes the
+    # write unpersistable — so it cannot use `_svc`, and needs its own
+    # credential now that the plane requires one.
     svc = ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db")))
+    enrol_admin(svc)
     created = await _body(await svc.handle_admin_keys(
         _Req(method="POST", body={"agent_id": "batch"})))
 

@@ -311,13 +311,22 @@ def test_an_admin_key_grants_admin_from_anywhere():
     assert resolver.is_admin(_Req(host="198.51.100.9", headers=_bearer("ops")))
 
 
-def test_an_authenticated_non_admin_does_not_inherit_its_hosts_privileges():
-    """🚨 The narrowing property. Loopback is in the admin nets, so under the
-    address-only scheme this caller WAS admin. A scoped key that could only ever
-    widen access and never narrow it is worthless on the machine it runs on."""
+def test_neither_an_address_nor_a_non_admin_key_confers_admin():
+    """🚨 Both halves, on the machine where it used to matter most.
+
+    This asserted `is True` for the no-key case until 2026-09-01, and said so
+    deliberately: loopback was in the admin nets, so the caller WAS admin, and
+    the point of the test was that presenting a non-admin key had to NARROW
+    that. The narrowing property still holds and is now trivially satisfied,
+    because the address confers nothing to narrow.
+
+    Kept as two assertions rather than collapsed to one, because they fail for
+    different reasons and a future change could break either: the first says an
+    address is not a credential, the second says a credential without the scope
+    is not an admin credential."""
     resolver = IdentityResolver(
         IPIdentityMap(), _reg(secret="app", agent_id="app", admin=False))
-    assert resolver.is_admin(_Req(host="127.0.0.1")) is True          # no key
+    assert resolver.is_admin(_Req(host="127.0.0.1")) is False         # no key
     assert resolver.is_admin(
         _Req(host="127.0.0.1", headers=_bearer("app"))) is False      # keyed
 

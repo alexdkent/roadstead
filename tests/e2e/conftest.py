@@ -85,6 +85,19 @@ class ProxyHarness:
         self.fake = fake
 
     @property
+    def admin(self) -> dict:
+        """Headers for an ADMIN call.
+
+        🚨 Deliberately not default headers on ``self.client``. The same client
+        drives the inference door, where presenting a credential changes which
+        CALLER the request is attributed to — and several tests here turn on
+        exactly that attribution. Admin calls opt in; inference calls stay
+        anonymous unless a test says otherwise.
+        """
+        from tests.admin_key import ADMIN_HEADERS
+        return dict(ADMIN_HEADERS)
+
+    @property
     def controller(self) -> FakeBackend:
         return self.fake.controller
 
@@ -164,6 +177,12 @@ async def proxy(fake: FakeBackendServer) -> AsyncIterator[ProxyHarness]:
         # exercised end to end rather than mocked away.
         svc._backend.probe_prefix_cache = types.MethodType(
             _REAL_PREFIX_CACHE, svc._backend)
+
+        # The admin plane requires a credential as of 2026-09-01. Minted as a
+        # BOOTSTRAP key so `KeyRegistry.configured` stays False and the e2e
+        # journeys still observe §1.5 rule 2 on the inference door.
+        from tests.admin_key import enrol_admin
+        enrol_admin(svc)
 
         await svc.startup()
         transport = httpx.ASGITransport(
