@@ -425,3 +425,102 @@ def estimate_input_tokens(payload: dict) -> int:
             total_chars += len(str(fn_call.get("name") or ""))
             total_chars += _json_chars(fn_call.get("arguments"))
     return max(1, total_chars // 4)
+
+
+# ---------------------------------------------------------------------------
+# The context-fit predicate — ONE copy, four callers
+# ---------------------------------------------------------------------------
+
+#: The canonical substring every context-overflow message carries.
+#:
+#: 🚨 This is WIRE CONTRACT, not prose. ``docs/api.md`` §2.2 documents it as a
+#: marker substring and ``roadstead.client`` classifies on it as the fallback
+#: when a ``code`` is absent, so a site that rewords its own refusal silently
+#: stops chunking callers' re-chunk handling from engaging. It is defined here,
+#: once, because it was previously typed out by hand at two call sites and
+#: nothing would have caught the third spelling.
+CONTEXT_OVERFLOW_MARKER = "exceeds the available context size"
+
+
+@dataclass(frozen=True)
+class ContextFit:
+    """Whether one request fits in one context ceiling, and the numbers why.
+
+    🚨 THE answer to "does this fit", for every caller that asks. Before
+    2026-09-01 the predicate was written out four times — the admission gate
+    (``lifecycle.handle_submit``), the failover gate (``failover.plan``), the
+    spill gate (``scheduler._admit``) and the recovery tally
+    (``service``) — and three copies of a *safety* predicate is three
+    different answers to one question waiting to happen. The fourth copy had
+    already diverged and was silently dead; see ``context_fit``.
+
+    What the callers legitimately differ on is kept OUT of here, because it is
+    the part that is genuinely per-site:
+
+    * **the denominator.** Each gate asks about a different target — the
+      request's own endpoint, the failover target, the spill target — so the
+      ceiling is a parameter, never something this module looks up.
+    * **the consequence.** Admission is shadow-or-422 under
+      ``context_gate_enforce``; failover refuses always (there the alternative
+      to refusing is a guaranteed backend 400, not a request that probably
+      works); spill defers; recovery counts and never rejects. 🚨 Collapsing
+      those into one enforcing path would arm a flag nobody flipped.
+
+    So this returns the ANSWER AND ITS ARITHMETIC and takes no action at all.
+    """
+
+    #: False only when the request is a chat completion, the ceiling is known,
+    #: and the estimate exceeds it.
+    fits: bool
+    #: Estimated input tokens. 0 when the predicate did not apply — the
+    #: estimator is skipped rather than run for a number nobody reads, and this
+    #: is the admission path of every request.
+    est_in: int
+    #: ``max_tokens`` when it is a usable positive int, else 0.
+    est_out: int
+    #: The ceiling that was applied. 0 means "not known", which admits.
+    limit: int
+
+    def overflow_detail(self, endpoint: str) -> str:
+        """The shared middle of every context-overflow message.
+
+        Callers wrap it with their own framing — admission appends the
+        actionable remedy, failover prefixes what it was trying to do — but the
+        arithmetic and ``CONTEXT_OVERFLOW_MARKER`` come from here so the two
+        cannot drift into two different spellings of the same refusal.
+        """
+        return (f"(est {self.est_in} input tokens + max_tokens "
+                f"{self.est_out}) {CONTEXT_OVERFLOW_MARKER} "
+                f"({self.limit}/slot on {endpoint})")
+
+
+def context_fit(payload: dict, payload_type: str, ctx_limit: int) -> ContextFit:
+    """Does ``payload`` fit in ``ctx_limit`` tokens of context?
+
+    Two conventions, both of which look arbitrary until they bite:
+
+    * **A limit of 0 means "not known", and admits.** A ceiling we have not
+      discovered is not a ceiling of zero — vLLM publishes no per-slot context
+      and a config that seeds none would otherwise refuse every request to it.
+      ``intent.py`` follows the same convention for ``min_context``.
+    * **Only chat completions are gated.** An embedding or rerank payload has
+      no ``messages`` for the estimator to walk, so the number would be
+      meaningless rather than merely imprecise.
+
+    🚨 The estimate is deliberately CONSERVATIVE — see
+    ``estimate_input_tokens``, which undershoots on 86.8% of real requests.
+    Every known undercount is therefore a false NEGATIVE (a request admitted
+    that the backend may still refuse), never a false positive, which is the
+    safe direction for a gate that can 422.
+
+    Takes the payload rather than a ``QueuedRequest`` so this module stays free
+    of the scheduler's types — ``scheduler`` imports ``cost_model``, and the
+    reverse would be a cycle.
+    """
+    if payload_type != "chat_completion" or ctx_limit <= 0:
+        return ContextFit(fits=True, est_in=0, est_out=0, limit=ctx_limit)
+    mt = payload.get("max_tokens")
+    est_out = mt if isinstance(mt, int) and mt > 0 else 0
+    est_in = estimate_input_tokens(payload)
+    return ContextFit(fits=est_in + est_out <= ctx_limit,
+                      est_in=est_in, est_out=est_out, limit=ctx_limit)

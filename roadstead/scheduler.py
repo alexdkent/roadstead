@@ -30,7 +30,7 @@ from .config import (
     normalize_endpoint,
     priority_to_band,
 )
-from .cost_model import CostModel, estimate_input_tokens
+from .cost_model import CostModel, context_fit, estimate_input_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -202,17 +202,17 @@ class QueuedRequest:
 def _fits_context(req: "QueuedRequest", ctx_limit: int) -> bool:
     """Whether ``req`` fits in ``ctx_limit`` tokens of context.
 
-    The same predicate, denominator and estimator as the admission context gate
-    on the normal path and as ``failover.plan``'s gate — deliberately, because
-    three places disagreeing about what "fits" means is three different answers
-    to one question. A limit of 0 means "not known", which admits: a discovered
-    ceiling we do not have is not a ceiling of zero.
+    The spill gate's view of ``cost_model.context_fit`` — literally the same
+    predicate, denominator and estimator as the admission gate
+    (``lifecycle.handle_submit``), the failover gate (``failover.plan``) and
+    the recovery tally, because it IS that function. This docstring used to
+    claim the sameness and four hand-written copies used to have to keep the
+    claim true; one of them had already drifted.
+
+    The spill gate wants only the boolean: a target that cannot fit the request
+    cannot serve it, and the answer is a DEFER carrying no message of its own.
     """
-    if ctx_limit <= 0 or req.payload_type != "chat_completion":
-        return True
-    mt = req.payload.get("max_tokens")
-    est_out = mt if isinstance(mt, int) and mt > 0 else 0
-    return estimate_input_tokens(req.payload) + est_out <= ctx_limit
+    return context_fit(req.payload, req.payload_type, ctx_limit).fits
 
 
 class Admission(Enum):

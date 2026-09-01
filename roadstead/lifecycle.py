@@ -56,7 +56,7 @@ from .constants import (
     _STREAM_TTFT_DEADLINE_S,
 )
 from .correction import _EMPTY_RESCUE_MIN_TOKENS, _ToolCallStreamSanitizer
-from .cost_model import estimate_input_tokens
+from .cost_model import context_fit, estimate_input_tokens
 from .enriched import (
     WIRE_ENRICHED,
     WIRE_OPENAI,
@@ -629,43 +629,43 @@ class Lifecycle:
             gate_cfg = self.state.config.endpoints.get(req.endpoint)
             ctx_limit = gate_cfg.context_per_slot if gate_cfg else 0
             req.ctx_per_slot_at_admission = ctx_limit
-            if ctx_limit > 0:
-                est_in = estimate_input_tokens(req.payload)
-                mt = req.payload.get("max_tokens")
-                est_out = mt if isinstance(mt, int) and mt > 0 else 0
-                if est_in + est_out > ctx_limit:
-                    caller = str(body.get("caller_id") or req.agent_id)
-                    tally = self.state.context_overflows.setdefault(
-                        req.endpoint, {"count": 0, "callers": {}, "max_est_in": 0})
-                    tally["count"] += 1
-                    tally["callers"][caller] = tally["callers"].get(caller, 0) + 1
-                    tally["max_est_in"] = max(tally["max_est_in"], est_in)
-                    # Durable (audit 2026-07-02): the in-memory tally resets on
-                    # every ship restart, so the flip-review window never
-                    # accumulated. Rare event → one async writer op.
-                    try:
-                        self.state.queue_db.record_context_overflow(
-                            req.endpoint, caller, est_in)
-                    except Exception:  # noqa: BLE001 — evidence must not break admission
-                        logger.debug("context-overflow persist failed", exc_info=True)
-                    err = (
-                        f"request (est {est_in} input tokens + max_tokens "
-                        f"{est_out}) exceeds the available context size "
-                        f"({ctx_limit}/slot on {req.endpoint}) — chunk the "
-                        f"input or route to a larger-context endpoint")
-                    if self.state.flags.get("context_gate_enforce"):
-                        if wire == WIRE_OPENAI:
-                            return _openai_error(
-                                err, "invalid_request_error", 422,
-                                code="context_overflow")
-                        return JSONResponse(
-                            {"status": "error", "request_id": req.request_id,
-                             "error": err, "code": "context_overflow"},
-                            status_code=422)
-                    logger.warning(
-                        "context gate SHADOW: %s (caller=%s call_site=%s) — "
-                        "request admitted; flip context_gate_enforce for a "
-                        "fast 422", err, caller, req.call_site)
+            # ONE predicate — `cost_model.context_fit`, shared with the failover
+            # gate, the spill gate and the recovery tally. 🚨 What is NOT shared
+            # is everything below `if not fit.fits`: the shadow counter, the
+            # durable evidence row and the enforce flag are this gate's alone,
+            # and folding them into the shared predicate would arm a flag nobody
+            # flipped on the two gates that refuse unconditionally.
+            fit = context_fit(req.payload, req.payload_type, ctx_limit)
+            if not fit.fits:
+                caller = str(body.get("caller_id") or req.agent_id)
+                tally = self.state.context_overflows.setdefault(
+                    req.endpoint, {"count": 0, "callers": {}, "max_est_in": 0})
+                tally["count"] += 1
+                tally["callers"][caller] = tally["callers"].get(caller, 0) + 1
+                tally["max_est_in"] = max(tally["max_est_in"], fit.est_in)
+                # Durable (audit 2026-07-02): the in-memory tally resets on
+                # every ship restart, so the flip-review window never
+                # accumulated. Rare event → one async writer op.
+                try:
+                    self.state.queue_db.record_context_overflow(
+                        req.endpoint, caller, fit.est_in)
+                except Exception:  # noqa: BLE001 — evidence must not break admission
+                    logger.debug("context-overflow persist failed", exc_info=True)
+                err = (f"request {fit.overflow_detail(req.endpoint)} — chunk "
+                       f"the input or route to a larger-context endpoint")
+                if self.state.flags.get("context_gate_enforce"):
+                    if wire == WIRE_OPENAI:
+                        return _openai_error(
+                            err, "invalid_request_error", 422,
+                            code="context_overflow")
+                    return JSONResponse(
+                        {"status": "error", "request_id": req.request_id,
+                         "error": err, "code": "context_overflow"},
+                        status_code=422)
+                logger.warning(
+                    "context gate SHADOW: %s (caller=%s call_site=%s) — "
+                    "request admitted; flip context_gate_enforce for a "
+                    "fast 422", err, caller, req.call_site)
 
         # Check deterministic cache
         cache_key = self.state.cache.cache_key(req.endpoint, req.payload)

@@ -8,6 +8,42 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — one context-fit predicate, and the dead fourth copy of it
+
+Landed 2026-09-01. "Does this request fit in this much context?" was written out by hand at four
+sites — the admission gate (`lifecycle.handle_submit`), the failover gate (`failover.plan`), the
+spill gate (`scheduler._admit`) and the WAL-recovery shadow tally (`service`). It is now
+`cost_model.context_fit`, called by all four.
+
+- **🚨 The recovery tally never fired.** It read `req.est_input_tokens or 0`, but that field is
+  cached by `scheduler.enqueue` and `recover_queued` builds its `QueuedRequest` straight from the
+  WAL row — the recovery path has not reached the scheduler yet, so the estimate was always **0**
+  and the tally could only fire when `max_tokens` *alone* exceeded the ceiling. The audit that added
+  it (2026-07-02) did so precisely because recovered oversized requests were invisible to the
+  `context_gate_enforce` flip evidence; they stayed invisible. Measured on the corpus this file's
+  differential harness uses: the dead copy disagreed with the shared predicate on **27 of 153**
+  cases. `service.py` had also carried an unused `estimate_input_tokens` import ever since — the
+  residue of a fix that meant to call it.
+- **Nothing else changes behaviour.** The three live gates were byte-identical in effect and are
+  verified so rather than asserted so: a differential harness ran the pre-split implementations
+  transcribed verbatim from `351f749` against the shared one over **2295** combinations of payload
+  shape, payload type, ceiling and endpoint name, comparing the boolean *and* the refusal-message
+  bytes. Zero mismatches.
+- **🚨 The consequences stay different, which is the whole risk of this refactor.** Admission is
+  shadow-or-422 behind `context_gate_enforce`; failover refuses unconditionally (there the
+  alternative to refusing is a guaranteed backend 400, not a request that probably works); spill
+  defers; recovery counts and never rejects. `context_fit` returns the answer and its arithmetic and
+  takes no action at all — folding the consequence in would have armed a flag nobody flipped, and
+  that is pinned by a test.
+- **`CONTEXT_OVERFLOW_MARKER` is defined once per side of the client boundary.** It is wire contract
+  (`docs/api.md` §2.2) and was previously typed out at two call sites. An AST constant sweep — not a
+  substring grep — now allows exactly one spelling in the server and one in `roadstead.client`,
+  which must keep its own because it imports nothing from the server; the document pins them
+  together. A second AST guard fails if any module re-derives a ceiling comparison from
+  `estimate_input_tokens` instead of calling `context_fit`.
+- `tests/test_context_fit.py`. Twelve mutations, every guard observed going red **by assertion** —
+  no timeouts, no collection errors.
+
 ### Added — the management UI (Workstream G)
 
 Landed 2026-09-01. `GET /rs/v1/admin/ui` — the roadmap's "manage and monitor Roadstead as a

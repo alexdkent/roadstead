@@ -11,6 +11,40 @@ guard**. Add an entry *with* the fix, not after it.
 
 ---
 
+## A fix for an invisible gap was itself invisible for two months
+
+**Symptom.** None — which is the entry. An audit on 2026-07-02 found that WAL-recovered requests
+bypassed `handle_submit` and so never contributed to the `context_gate_enforce` shadow evidence, and
+added a tally on the recovery path. That tally counted **zero** for every oversized request it was
+built for, and went on doing so until 2026-09-01.
+
+**Root cause.** The recovery tally estimated from `req.est_input_tokens`. That field is *cached* by
+`scheduler.enqueue`; `recover_queued` constructs a `QueuedRequest` directly from the WAL row and
+never reaches the scheduler, so the field is its dataclass default of `0`. `est_in + est_out > limit`
+then reduced to `max_tokens > limit`, which is true only for a degenerate request nobody sends. The
+other three copies of the same predicate all called `estimate_input_tokens(payload)` and were
+correct. `service.py` even imported `estimate_input_tokens` and never used it — the residue of a fix
+that meant to call it and reached for the cached field instead.
+
+Two things made it undetectable. A shadow counter has no user: nothing 422s, nothing is refused, and
+"the evidence window is not accumulating" looks exactly like "no oversized requests were recovered",
+which is the *expected* reading. And the predicate was written out four times, so there was no single
+place where the divergence was visible as a difference.
+
+**Guard.** One predicate — `cost_model.context_fit` — called by all four gates, with the per-site
+differences (the denominator, and the consequence) kept deliberately outside it. `tests/test_context_fit.py` pins the recovered-request tally firing, and pins as a *fact* that
+`recover_queued` does not populate `est_input_tokens`, so the day it starts, the reasoning is
+revisited rather than silently invalidated. An AST guard fails if any module re-derives a ceiling
+comparison from `estimate_input_tokens` rather than calling the shared predicate.
+
+🚨 **The general shape, which is the reusable part:** a safety predicate written N times is N answers
+to one question, and the copy that drifts will be the one whose failure mode is silence. Look for the
+other instances of *"three places that must agree, kept in agreement by hand"* — and when one of them
+feeds a decision nobody watches (a shadow counter, a flip-review window, a drift alert), weight it
+higher, not lower.
+
+---
+
 ## A stream's `finish_reason` rides alone on a chunk nobody misses
 
 **Symptom.** A downstream client burned a second model call on **47 turns**, "continuing" answers

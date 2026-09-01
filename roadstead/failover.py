@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .config import normalize_endpoint
-from .cost_model import estimate_input_tokens
+from .cost_model import context_fit
 
 if TYPE_CHECKING:
     from .health import Health
@@ -219,26 +219,23 @@ class Failover:
         # prompt answers a different question than the one that was asked, and
         # would pass every check downstream.
         #
-        # Same predicate and the same denominator as the M1 context gate on the
-        # normal path (lifecycle.handle_submit), so the two cannot disagree.
-        # Unlike that one this is ENFORCE-always and has no shadow mode: there
-        # the alternative to refusing is a request that probably works, here it
-        # is a guaranteed backend 400.
+        # ONE predicate, shared with the M1 gate on the normal path
+        # (lifecycle.handle_submit), the spill gate and the recovery tally —
+        # `cost_model.context_fit`, which is also where the marker substring
+        # this message carries is defined. Unlike the M1 gate this is
+        # ENFORCE-always and has no shadow mode: there the alternative to
+        # refusing is a request that probably works, here it is a guaranteed
+        # backend 400. 🚨 That difference lives HERE, in what we do with the
+        # answer, not in a second copy of the arithmetic.
         tgt_cfg = self.state.config.endpoints[tgt]
-        ctx_limit = tgt_cfg.context_per_slot
-        if req.payload_type == "chat_completion" and ctx_limit > 0:
-            est_in = estimate_input_tokens(req.payload)
-            mt = req.payload.get("max_tokens")
-            est_out = mt if isinstance(mt, int) and mt > 0 else 0
-            if est_in + est_out > ctx_limit:
-                return FailoverPlan(
-                    refusal_code=CODE_CONTEXT_OVERFLOW,
-                    refusal_detail=(
-                        f"; it is serving from {tgt} for opted-in callers, but "
-                        f"this request (est {est_in} input tokens + max_tokens "
-                        f"{est_out}) exceeds the available context size "
-                        f"({ctx_limit}/slot on {tgt})"),
-                )
+        fit = context_fit(req.payload, req.payload_type, tgt_cfg.context_per_slot)
+        if not fit.fits:
+            return FailoverPlan(
+                refusal_code=CODE_CONTEXT_OVERFLOW,
+                refusal_detail=(
+                    f"; it is serving from {tgt} for opted-in callers, but "
+                    f"this request {fit.overflow_detail(tgt)}"),
+            )
 
         return FailoverPlan(target=tgt)
 

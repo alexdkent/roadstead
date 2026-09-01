@@ -52,7 +52,7 @@ from .config import (
 _DRAIN_DEADLINE_S = 30.0
 
 
-from .cost_model import CostModel, estimate_input_tokens
+from .cost_model import CostModel, context_fit
 from .flags import RuntimeFlags
 from .timeout_model import TimeoutModel
 from .on_demand import OnDemandManager, OnDemandUnavailable
@@ -331,23 +331,32 @@ class ProxyService:
             # bypasses handle_submit, so recovered oversized requests were
             # invisible to the flip-gate evidence (audit 2026-07-02). Count
             # only; recovery never rejects (there is no caller to 422).
+            #
+            # 🚨 That audit fix was DEAD until 2026-09-01, and this is why the
+            # predicate is shared rather than re-typed. It read
+            # `req.est_input_tokens or 0`, but `recover_queued` builds a
+            # QueuedRequest straight from the WAL row and never populates that
+            # field — it is cached at ENQUEUE, by the scheduler, on a path
+            # recovery has not reached yet. So the estimate was always 0 and
+            # the tally could only fire when `max_tokens` ALONE exceeded the
+            # ceiling. Four hand-written copies of one predicate, and the copy
+            # that silently diverged was the one nobody could see fail.
+            # `cost_model.context_fit` estimates from the payload, which the
+            # recovered request does carry.
             try:
-                if req.payload_type == "chat_completion":
-                    cfg = self._config.endpoints.get(req.endpoint)
-                    limit = cfg.context_per_slot if cfg else 0
-                    mt = req.payload.get("max_tokens")
-                    est_out = mt if isinstance(mt, int) and mt > 0 else 0
-                    est_in = req.est_input_tokens or 0
-                    if limit > 0 and est_in + est_out > limit:
-                        caller = str(req.caller_id or req.agent_id)
-                        tally = self._state.context_overflows.setdefault(
-                            req.endpoint,
-                            {"count": 0, "callers": {}, "max_est_in": 0})
-                        tally["count"] += 1
-                        tally["callers"][caller] = tally["callers"].get(caller, 0) + 1
-                        tally["max_est_in"] = max(tally["max_est_in"], est_in)
-                        self._queue_db.record_context_overflow(
-                            req.endpoint, caller, est_in)
+                cfg = self._config.endpoints.get(req.endpoint)
+                fit = context_fit(req.payload, req.payload_type,
+                                  cfg.context_per_slot if cfg else 0)
+                if not fit.fits:
+                    caller = str(req.caller_id or req.agent_id)
+                    tally = self._state.context_overflows.setdefault(
+                        req.endpoint,
+                        {"count": 0, "callers": {}, "max_est_in": 0})
+                    tally["count"] += 1
+                    tally["callers"][caller] = tally["callers"].get(caller, 0) + 1
+                    tally["max_est_in"] = max(tally["max_est_in"], fit.est_in)
+                    self._queue_db.record_context_overflow(
+                        req.endpoint, caller, fit.est_in)
             except Exception:  # noqa: BLE001 — evidence must not break recovery
                 logger.debug("recovery overflow tally failed", exc_info=True)
             # Same reason the overflow tally is repeated here: recovery bypasses
