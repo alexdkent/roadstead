@@ -198,8 +198,8 @@ def test_a_chain_of_trusted_proxies_is_walked_through():
     """Two hops of real infrastructure: the caller reaches proxy1, which reaches
     proxy2, which reaches us. The chain is [caller, proxy1] and the peer is
     proxy2 — so the answer is three addresses away from the socket."""
-    resolver = _resolver(trusted="127.0.0.1, 10.0.0.0/16")
-    req = _Req(host=_PROXY, headers=_xff(_CALLER, "10.0.0.7"))
+    resolver = _resolver(trusted="127.0.0.1, 198.51.100.0/24")
+    req = _Req(host=_PROXY, headers=_xff(_CALLER, "198.51.100.7"))
     assert resolver.client_address(req) == ClientAddress(ip=_CALLER, forwarded=True)
 
 
@@ -208,9 +208,9 @@ def test_a_chain_of_only_trusted_hops_yields_the_leftmost():
     the chain goes. The leftmost is the closest thing to an answer there is —
     and it is a proxy's address, which is unregistered and therefore refused
     rather than admitted as somebody."""
-    resolver = _resolver(trusted="127.0.0.1, 10.0.0.0/16")
-    addr = resolver.client_address(_Req(host=_PROXY, headers=_xff("10.0.0.9", "10.0.0.7")))
-    assert addr == ClientAddress(ip="10.0.0.9", forwarded=True)
+    resolver = _resolver(trusted="127.0.0.1, 198.51.100.0/24")
+    addr = resolver.client_address(_Req(host=_PROXY, headers=_xff("198.51.100.9", "198.51.100.7")))
+    assert addr == ClientAddress(ip="198.51.100.9", forwarded=True)
 
 
 @pytest.mark.parametrize("hop, expected", [

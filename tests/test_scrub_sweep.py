@@ -17,6 +17,7 @@ covered.
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 import subprocess
 from pathlib import Path
@@ -25,18 +26,49 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 
-#: The private fleet's subnet. Anything matching this in a shipped file is
-#: either real topology or an arbitrary address that merely looks like it — and
-#: from a sweep's side those are indistinguishable, which is the whole problem.
-_FLEET_SUBNET = re.compile(r"10\.0\.0\.[0-9]+")
+#: Every IPv4 literal, before we ask what it means.
+_IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
-#: Files that describe the scrub itself and therefore quote the pattern.
-_MAY_DESCRIBE_THE_SCRUB = {
-    "CLAUDE.md",
-    "docs/corpus_and_scrub_plan.md",
-    "docs/roadmap.md",
-    "tests/test_scrub_sweep.py",
-}
+#: 🚨 The address space this repository is ALLOWED to name. Everything else in
+#: private space is a straggler until somebody puts it here on purpose.
+#:
+#: This guard used to hunt one specific /24 — the origin fleet's. That worked
+#: exactly once. It named the subnet it was hunting, in the one file guaranteed
+#: to be published, which is a strange way to keep a subnet quiet; and it could
+#: only ever catch the topology we already knew about. Inverted, it needs no
+#: private address written down anywhere and it catches the NEXT one too.
+_ALLOWED = (
+    ipaddress.ip_network("0.0.0.0/32"),       # bind-any, in __main__'s --host
+    ipaddress.ip_network("127.0.0.0/8"),      # loopback
+    ipaddress.ip_network("10.0.0.0/24"),      # arbitrary addresses in CIDR/ACL tests
+    ipaddress.ip_network("172.16.0.0/12"),    # docker bridge and overlay ranges
+    ipaddress.ip_network("192.0.2.0/24"),     # RFC 5737 TEST-NET-1
+    ipaddress.ip_network("198.51.100.0/24"),  # RFC 5737 TEST-NET-2
+    ipaddress.ip_network("203.0.113.0/24"),   # RFC 5737 TEST-NET-3
+)
+
+
+def _is_straggler(literal: str) -> bool:
+    """A private address this repo has not sanctioned.
+
+    Public addresses are somebody else's and are not topology — `8.8.8.8`
+    appears as an example and is not a leak. A malformed match (a version
+    string that looks like a dotted quad) is not an address at all.
+    """
+    try:
+        addr = ipaddress.ip_address(literal)
+    except ValueError:
+        return False
+    if any(addr in net for net in _ALLOWED):
+        return False
+    return addr.is_private
+
+
+#: 🚨 The guard needs examples it would catch, so it is the one file allowed to
+#: name unsanctioned private addresses. Scoped to itself deliberately: the
+#: previous design exempted four files, and the docs among them then accumulated
+#: real topology that the sweep was structurally unable to see.
+_THE_GUARD_ITSELF = "tests/test_scrub_sweep.py"
 
 
 def _tracked_files() -> list[str]:
@@ -57,7 +89,7 @@ def test_no_tracked_file_carries_the_private_subnet():
     """
     offenders = []
     for rel in _tracked_files():
-        if rel in _MAY_DESCRIBE_THE_SCRUB:
+        if rel == _THE_GUARD_ITSELF:
             continue
         path = REPO / rel
         try:
@@ -65,11 +97,15 @@ def test_no_tracked_file_carries_the_private_subnet():
         except (UnicodeDecodeError, OSError, IsADirectoryError):
             continue
         for n, line in enumerate(text.splitlines(), 1):
-            if _FLEET_SUBNET.search(line):
-                offenders.append(f"{rel}:{n}: {line.strip()[:90]}")
+            for literal in _IPV4.findall(line):
+                if _is_straggler(literal):
+                    offenders.append(f"{rel}:{n}: {literal} — {line.strip()[:70]}")
 
     assert not offenders, (
-        "tracked files carry the private fleet's subnet — S5 is not clean:\n  "
+        "tracked files name unsanctioned private addresses — S5 is not clean.\n"
+        "Either move them into _ALLOWED space (an RFC 5737 documentation\n"
+        "address is usually right) or, if the address is genuinely part of this\n"
+        "repo's vocabulary, add its network to _ALLOWED with a reason:\n  "
         + "\n  ".join(offenders))
 
 
@@ -124,9 +160,31 @@ def test_endpoint_normalization_has_no_hardcoded_fleet_NAMES():
     assert normalize_endpoint("reasoner") == ROLE_TO_CLASS["reasoner"]
 
 
-@pytest.mark.parametrize("pattern", ["10.0.0.9", "10.0.0.10"])
-def test_the_guard_would_actually_catch_something(pattern, tmp_path):
-    """The regex, exercised — a sweep that matches nothing passes forever."""
-    assert _FLEET_SUBNET.search(f"host: {pattern}")
-    assert not _FLEET_SUBNET.search("host: 192.0.2.11")
-    assert not _FLEET_SUBNET.search("host: 10.0.0.1")
+@pytest.mark.parametrize("literal", ["10.9.9.9", "10.0.0.2", "10.0.1.1",
+                                     "169.254.1.1"])
+def test_the_guard_would_actually_catch_something(literal):
+    """Exercised — a sweep that matches nothing passes forever.
+
+    🚨 None of these is the origin fleet's, and that is the point: the guard no
+    longer needs to name a real private address to prove it works.
+
+    `10.0.1.1` is the edge case — private, and one octet outside the
+    `10.0.0.0/24` the allowlist permits. Written first as `172.15.0.4` on the
+    theory that it sat just outside the docker range; it does not, it is
+    PUBLIC, because RFC 1918's block starts at `172.16`. The test caught that,
+    which is the argument for having it.
+    """
+    assert _is_straggler(literal)
+
+
+@pytest.mark.parametrize("literal", ["127.0.0.1", "10.0.0.1", "172.16.0.5",
+                                     "192.0.2.11", "198.51.100.7", "203.0.113.9",
+                                     "0.0.0.0", "8.8.8.8", "1.2.3.4.5", "3.11.15"])
+def test_the_guard_stays_quiet_on_what_this_repo_legitimately_names(literal):
+    """The other half. A guard that flags everything is deleted within a week.
+
+    `8.8.8.8` is public — somebody else's address is not our topology. The last
+    two are not addresses at all: a sweep over dotted quads will meet version
+    strings, and it must not report them.
+    """
+    assert not _is_straggler(literal)
