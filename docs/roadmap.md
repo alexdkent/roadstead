@@ -158,7 +158,7 @@ Not phases. Several can run concurrently; the dependencies between them are what
 
 ### A · Provider abstraction — *the foundation*
 
-**Landed 2026-08-31** (`455e736`). The case for it, which every workstream after this one drew on:
+**Landed 2026-08-31** (`f04df61`, *"Extract the provider interface out of backend.py"*). The case for it, which every workstream after this one drew on:
 extract a provider interface out of `backend.py` (llama.cpp/vLLM branching inline) and formalise the
 capability descriptor. Nothing else on this list was buildable first — OpenRouter needed it, spill
 needed it, per-provider costing needed it, and enriched model information is largely a readout of it.
@@ -644,18 +644,25 @@ vocabulary around them — and it corrected this plan's own headline finding, wh
 data out of the repo on the strength of no bulk corpus having come across. The synthesized prompts
 were written around real identifiers. The straggler sweep now looks for both.
 
-**S5 — the straggler sweep — is NOT marked done**, and its working-tree half needs re-running rather
-than trusting: it was reported clean on 2026-09-01, and a great deal has changed since. 🚨 **Two
-patterns, not one.** The topology grep could never have found a person's name typed into an example
-prompt, and S4 found exactly that, so the identifier half has to be written out by hand — there is no
-`10.0.0.` to key on.
+**S5 is done** (2026-09-01), and its topology half now runs on every commit as
+`tests/test_scrub_sweep.py`. 🚨 **Two patterns, not one.** The topology grep could never have found a
+person's name typed into an example prompt, and S4 found exactly that, so the identifier half is a
+human pass — there is no fixed string to key on.
 
-**Then the history rewrite (S6)**, which is the expensive one.
+**S6 — the history rewrite — is done** (2026-09-01), over all 321 commits. Two corrections to what
+this section used to say about it, both found by doing it:
 
-⚠️ The history rewrite stays last — it invalidates every SHA, `CLAUDE.md` cites `9b11729`, and the
-origin monorepo's extraction plan cites commits from here. It runs on a fresh clone, and the
-definition of done requires re-verification on a fresh clone rather than on the tree that did the
-scrubbing.
+- 🚨 **`--replace-text` is blobs only.** The plan's one-liner would have left all 321 commit
+  messages untouched, and the messages are the *richer* surface — 282 of them were written inside
+  the origin monorepo. `--replace-message` takes the same file.
+- 🚨 **Every SHA in this repository changed**, this document's own `455e736` included. The citations
+  were translated through filter-repo's `commit-map` and now carry a date and subject too, so a
+  future rewrite cannot orphan them silently. Two SHAs in `docs/evaluation.md` turned out never to
+  have been commits here at all — they cite the origin monorepo.
+
+⚠️ **What remains is a visibility decision, and it is not this plan's to make.** Two items of commit
+metadata (`--replace-text` cannot reach either) were left deliberately: the author name and the
+author email's private hostname, on all 321 commits.
 
 ---
 

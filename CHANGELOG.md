@@ -8,6 +8,39 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Changed — BREAKING for anyone holding a clone or a SHA: the history was rewritten (scrub S6)
+
+Landed 2026-09-01. The second and final `git filter-repo` pass, the last item in
+`docs/corpus_and_scrub_plan.md`. **Every commit SHA in this repository changed.** A clone from
+before this date shares no ancestor with `main` and cannot be fast-forwarded; re-clone rather than
+pull. Any SHA cited in an external document, a branch name, or a bookmark is dead.
+
+This is recorded here rather than passed over as housekeeping because it is the most broadly
+breaking change the project has made — it breaks something for every holder of a copy, which no API
+break does — and because two things about it were wrong in the plan that specified it:
+
+- 🚨 **`--replace-text` rewrites blobs and nothing else.** The documented one-liner would have left
+  all 321 commit messages untouched, and messages were the *denser* surface: 282 of the 321 commits
+  were authored inside the origin monorepo and describe its hosts, its container IDs and its sibling
+  projects far more freely than the code ever did. `--replace-message` takes the same rules file.
+- 🚨 **Bare-word rules would have corrupted content.** `Delta` also occurs as `Gated DeltaNet`, a
+  model architecture, and `Chase` as "Chased to column level". Every one of the 42 rules is a
+  multi-word key or a distinctive stem, authored against an inventory of the actual occurrences.
+
+Host and sibling-project names became pseudonyms throughout — the names you will now read are
+`nexus`, `nasbox`, `boxa`, `tideway`, `beacon` and `sidekick` — and the fleet's `/24` became
+`10.0.0.x`. 🚨 **The mapping itself is not recorded anywhere in this repository, deliberately.**
+Writing `old`→`new` in a changelog would restore every name the pass removed and hand a reader the
+key to reverse the rest; a scrub that documents its own substitutions has not scrubbed anything. **The measurement comments are still records** — `CLAUDE.md` says so, and now
+also says the box names within them are pseudonyms, because a reader who goes looking for the
+machine should be told there isn't one. Model and endpoint-class vocabulary was out of scope and is
+unchanged.
+
+Also fixed in passing: **a real airline booking reference was still in the working tree.** S4
+replaced the traveller, the airline and the airports around it and carried the booking reference
+over verbatim — and a booking reference plus a surname retrieves a booking. It reads `QQ7X2R` now,
+in the tree and throughout the history.
+
 ### Fixed — today's spend survives a restart (Workstream D)
 
 Landed 2026-09-01. `SpendLedger` is in-memory and its day bucket reset to zero on every boot.
@@ -61,7 +94,7 @@ but it changes how a *name a caller sends* resolves, which is as close to the co
 gets.
 
 `normalize_endpoint` stripped a `nexus-` prefix and mapped a bare `nexus` to `chat` — **one private
-fleet's host naming, hardcoded since the first commit (`9b11729`) and shipped to everyone.** It was a
+fleet's host naming, hardcoded since the first commit (`7f209ca`, 2026-05-27) and shipped to everyone.** It was a
 scrub finding and a design defect at once, and the second is the reason it is removed rather than
 renamed:
 
@@ -69,7 +102,7 @@ renamed:
   this codebase refuses everywhere else — and the refusal has a name here, since the alias
   duplicate/shadow notice added in the same release cannot see this one at all.
 - It could not be configured, overridden or disabled, and it silently rewrote **any** endpoint whose
-  name happened to begin with those seven characters. An operator with `nexus-a` and `a` had a pin
+  name happened to begin with those six characters. An operator with `nexus-a` and `a` had a pin
   at the first silently reaching the second.
 
 **Migration**, if you actually want that mapping: put it where every other name lives —
@@ -461,7 +494,7 @@ spill gate (`scheduler._admit`) and the WAL-recovery shadow tally (`service`). I
   residue of a fix that meant to call it.
 - **Nothing else changes behaviour.** The three live gates were byte-identical in effect and are
   verified so rather than asserted so: a differential harness ran the pre-split implementations
-  transcribed verbatim from `351f749` against the shared one over **2295** combinations of payload
+  transcribed verbatim from `048c133` (2026-09-01, *"Give the operator a face"*) against the shared one over **2295** combinations of payload
   shape, payload type, ceiling and endpoint name, comparing the boolean *and* the refusal-message
   bytes. Zero mismatches.
 - **🚨 The consequences stay different, which is the whole risk of this refactor.** Admission is

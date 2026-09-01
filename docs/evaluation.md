@@ -34,7 +34,8 @@ endpoint with a health bit.
 
 **Outcome 3 fails because llmproxy was already nearly free-standing.** It reached into the rest of
 the package exactly four times, three of them lazy function-scope imports. Those four were severed
-on 2026-08-31 (commits `6ca1c83f6` + `a36651c83`); 29 of 30 library modules now import nothing
+on 2026-08-31 (`6ca1c83f6` + `a36651c83` — commits in the **origin monorepo**, not in this
+repository; they never resolved here and S6 did not touch them); 29 of 30 library modules now import nothing
 outside the package. The thing genuinely welded into the fleet is the model catalog (~2,500 lines),
 not the 18,600-line runtime.
 

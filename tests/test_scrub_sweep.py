@@ -105,7 +105,7 @@ def test_endpoint_normalization_has_no_hardcoded_fleet_NAMES():
     first commit and shipped to everyone. It was a SECOND aliasing mechanism
     beside `models.yaml`'s `aliases:`: unconfigurable, unoverridable, invisible
     to the duplicate-alias notice in `model_catalog`, and it silently rewrote
-    any endpoint whose name began with those seven characters.
+    any endpoint whose name began with those six characters.
 
     Asserted behaviourally rather than by grepping for the word, because the
     next one will be spelled differently: a name the catalog does not know must

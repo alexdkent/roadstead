@@ -41,8 +41,8 @@ Four things make it different from every gateway surveyed in `docs/evaluation.md
 
 This code was extracted on 2026-08-31 from a private monorepo (`OriginFleet`), where it still runs
 in production as `originfleet.llmproxy`. The history here is the real thing — 282 commits at
-extraction, going back to `9b11729` (2026-05-27, *"centralized LLM scheduler proxy — DRR scheduling,
-priority bands"*), extracted with `git filter-repo` rather than copied, so `git log`/`git blame` on
+extraction, going back to `7f209ca` (the first commit, 2026-05-27, *"centralized LLM scheduler
+proxy — DRR scheduling, priority bands"*), extracted with `git filter-repo` rather than copied, so `git log`/`git blame` on
 any line still reaches its original rationale. **Use that.** It is the best documentation this project has.
 
 🚨 **For a few hours on 2026-08-31 this file said the monorepo copy was AUTHORITATIVE FOR BEHAVIOUR
@@ -235,9 +235,12 @@ hosts MANY, and declaring its base URL and key once is why the sections are sepa
 `planned` remote endpoints, on RFC 5737 documentation addresses. It is what the suite runs against,
 so it is a worked example that cannot rot. Point `ROADSTEAD_MODELS_YAML` at your own file.
 **Comments throughout this package cite measurements taken on a real fleet under ITS names**
-(`gemma`, `creative`, `tier2-chat`, `llama-thinker`, specific model and box names). Those are
+(`gemma`, `creative`, `tier2-chat`, `llama-thinker`, specific model names). Those are
 records of what was measured — do not "fix" them to match the example, and do not read them as
-references to classes that exist here.
+references to classes that exist here. 🚨 **The HOST names in those records are PSEUDONYMS as of
+S6** — `nexus`, `nasbox`, `boxa`, `beacon`, `sidekick` — rewritten through the whole history on
+2026-09-01. The measurement is real; the machine it names is not, and there is nothing to look up.
+Model and endpoint-class vocabulary was left alone, so those are still the fleet's own words.
 
 **`providers/` is where engine differences live, and nowhere else.** A provider owns the two things
 backends genuinely disagree about: what a request must look like to be accepted
@@ -602,7 +605,12 @@ that is not the same as no personal data, and the sweep in S5 now runs both patt
 
 🚨 **What remains under fleet names is COMMENTS RECORDING MEASUREMENTS, and they stay.** Same rule as
 `models.yaml`: those are records of what was measured, not references to anything that exists here.
+🚨 **Host names within them are pseudonyms as of S6** (see Provenance above); the model and
+endpoint-class vocabulary is not.
 
-🚨 **And scrubbing the working tree is not enough — it is in the history**, across all 312 commits
-(282 of them extracted), which means another `git filter-repo` pass (S6, last, because it invalidates
-every SHA). Read that plan before changing visibility.
+✅ **S6 is DONE (2026-09-01)** — the second `git filter-repo` pass ran over all 321 commits
+(282 of them extracted), rewriting blobs *and* commit messages. 🚨 **Every SHA in this repository
+changed on that date**, so any SHA cited in a document, a branch, or an external reference from
+before it is dead. The citations in this file, `CHANGELOG.md`, `docs/history.md` and
+`docs/roadmap.md` were translated through filter-repo's `commit-map` and now carry a date and
+subject as well, so the next rewrite cannot orphan them silently.
