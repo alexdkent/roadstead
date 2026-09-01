@@ -154,6 +154,23 @@ class CapacityReport:
     #: n_parallel decision belongs to the parser that knows the engine's units
     #: (see ``LlamaCppProvider.parse_capacity``).
     context_per_slot: int | None = None
+    #: Published price, USD per MILLION tokens. Only a provider whose descriptor
+    #: says ``publishes_token_costs`` ever sets these; ``None`` means the backend
+    #: did not say, which is not the same as free.
+    #:
+    #: 🚨 Plain floats rather than a ``spend.TokenPrice`` deliberately. This
+    #: package's import graph runs ``config`` -> ``model_catalog`` -> ``providers``,
+    #: so a provider importing ``spend`` (which needs ``config`` for the priority
+    #: enum) would close a cycle. It is also the right split on its own terms: a
+    #: report says what the BACKEND published, and whether that counts as money
+    #: somebody owes is a policy question ``spend.PriceBook`` answers.
+    input_usd_per_mtok: float | None = None
+    output_usd_per_mtok: float | None = None
+
+    @property
+    def publishes_prices(self) -> bool:
+        return (self.input_usd_per_mtok is not None
+                or self.output_usd_per_mtok is not None)
 
 
 class Provider(ABC):

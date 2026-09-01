@@ -263,14 +263,58 @@ class OpenRouterProvider(Provider):
             if not isinstance(entry, dict) or entry.get("id") != model_id:
                 continue
             ctx = entry.get("context_length")
+            price_in, price_out = self._parse_pricing(entry.get("pricing"))
             return CapacityReport(
-                source="openrouter context_length",
+                source="openrouter context_length + pricing",
                 slots=None,
                 context_per_slot=ctx if isinstance(ctx, int) and ctx > 0 else None,
+                input_usd_per_mtok=price_in,
+                output_usd_per_mtok=price_out,
             )
         logger.warning(
             "openrouter catalogue has no model %r — capacity unknown", model_id)
         return None
+
+    @staticmethod
+    def _parse_pricing(pricing: Any) -> tuple[float | None, float | None]:
+        """``{"prompt": "0.0000005", "completion": "0.0000015"}`` -> USD/Mtok.
+
+        Two things about this shape that a reader will otherwise get wrong.
+
+        **The values are STRINGS, and per single token.** They are strings
+        because a price like ``0.0000005`` is exactly the magnitude where a JSON
+        float starts losing digits, and per-token because that is the unit the
+        upstream bills in. Both are multiplied up here, once, so nothing
+        downstream has to remember the exponent — ``spend.py`` deals in USD per
+        million tokens throughout because that is how every price is *quoted*.
+
+        🚨 **A price of zero is a real price and is kept.** A free model on a
+        remote provider is still a remote model, and reporting "no price" for it
+        would push it onto the imputed avoided-cost fallback — which would then
+        credit the deployment with money SAVED for a call it made over the
+        internet. Only a missing or unparseable field reports ``None``, and the
+        two halves are parsed independently: a provider that publishes a prompt
+        price and no completion price has told us half of something true.
+        """
+        if not isinstance(pricing, dict):
+            return (None, None)
+
+        def _one(key: str) -> float | None:
+            raw = pricing.get(key)
+            if raw is None or isinstance(raw, bool):
+                return None
+            try:
+                per_token = float(raw)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "openrouter pricing.%s is not a number (%r) — treating the "
+                    "price as unpublished rather than as free", key, raw)
+                return None
+            if per_token < 0:
+                return None
+            return per_token * 1e6
+
+        return (_one("prompt"), _one("completion"))
 
 
 #: The stateless singleton. Import this, never instantiate.

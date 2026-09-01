@@ -348,6 +348,15 @@ class Lifecycle:
         declared_priority = body.get("priority")
         if declared_priority is None:
             declared_priority = principal.priority
+        # Workstream D: a caller over its daily spend cap drops one band.
+        # 🚨 Applied HERE, to the priority, and nowhere near the admission
+        # decision — the whole doctrine is that a threshold costs a caller its
+        # PLACE IN THE QUEUE and never its access to local capacity. There is
+        # deliberately no branch below this line that can turn an over-cap
+        # caller into an error.
+        declared_priority = self.state.spend_demote(
+            agent_id, LLMPriority.coerce(declared_priority,
+                                         default=LLMPriority.P1_TURN_SUPPORT))
 
         now = time.monotonic()
 
@@ -1954,6 +1963,26 @@ class Lifecycle:
             ),
             now,
         )
+
+        # Meter the caller (Workstream D). Charged from the tokens the BACKEND
+        # reported, never from the estimate the cost model made — a scheduler
+        # that billed its own guess would be marking its own homework, and the
+        # estimate exists to reserve a slot, not to price a call.
+        #
+        # 🚨 Keyed on ``req.endpoint``, which is the class that ACTUALLY served:
+        # a spilled request has already been re-pointed at the remote endpoint,
+        # so it is priced at the remote endpoint's rate. Pricing it at the
+        # endpoint it was submitted for would be the one arrangement guaranteed
+        # to under-report exactly the calls that cost real money.
+        #
+        # Fail-open like the truncation tally above: accounting must never break
+        # completion, because a request that completed and was not billed is a
+        # far better outcome than a caller who never gets their answer.
+        try:
+            self.state.spend.charge(
+                req.agent_id, req.endpoint, input_tokens, output_tokens)
+        except Exception:  # noqa: BLE001 — metering must not break accounting
+            logger.debug("spend metering failed", exc_info=True)
 
         # Persist completion (with payload + response for corpus).
         # Skip corpus capture for embedding/rerank — large vectors bloat

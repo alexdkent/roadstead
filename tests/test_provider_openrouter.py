@@ -309,6 +309,56 @@ async def test_discovery_reads_the_catalogue_over_the_wire(remote):
     assert report is not None
     assert report.context_per_slot == 96_000
     assert report.slots is None
+    # …and the prices ride the SAME pass. One probe, two facts: a second round
+    # trip to learn what the first response already carried would be a second
+    # thing to keep in step with the first.
+    assert report.publishes_prices
+    assert report.input_usd_per_mtok == pytest.approx(0.5)
+    assert report.output_usd_per_mtok == pytest.approx(1.5)
+
+
+@pytest.mark.asyncio
+async def test_a_published_price_reaches_the_price_book_over_the_wire(remote):
+    """The end of the wire that Workstream D added: a real socket, a real
+    catalogue, and a rate the ledger will bill at.
+
+    🚨 It arrives as REAL money — the descriptor says `publishes_token_costs`,
+    so this endpoint is priced by what the provider charges and never by
+    `usage_rates.py`'s avoided-cost table. An endpoint that fell through to that
+    table would book a SAVING for a call made over the internet.
+    """
+    from roadstead.config import ProxyConfig
+    from roadstead.spend import SOURCE_IMPUTED, SOURCE_PROVIDER
+    from roadstead.state import ProxyState
+
+    pool = BackendClientPool()
+    ep = _ep(remote)
+    remote.controller.catalogue_prompt_cost = "0.000002"     # $2.00 / Mtok
+    remote.controller.catalogue_completion_cost = "0.000008"  # $8.00 / Mtok
+
+    async def probe_json(cfg, path, headers=None, timeout_s=5.0):
+        return await _REAL_PROBE_JSON(pool, cfg, path, headers, timeout_s)
+
+    pool.probe_json = probe_json
+    try:
+        report = await OPENROUTER.discover_capacity(pool, ep)
+    finally:
+        await pool.close()
+
+    state = ProxyState(ProxyConfig())
+    assert state.prices.price("spill-chat").source == SOURCE_IMPUTED, (
+        "the endpoint was already priced, so this proves nothing")
+    from roadstead.health import Health
+
+    Health(state).apply_discovered_capacity("spill-chat", ep, report)
+    price = state.prices.price("spill-chat")
+    assert price.source == SOURCE_PROVIDER
+    assert price.real is True
+    assert price.cost_usd(1_000_000, 1_000_000) == pytest.approx(10.0)
+    # And it is billed as such, against the caller.
+    state.spend.charge("a", "spill-chat", 1_000_000, 1_000_000, now=0.0)
+    assert state.spend.get("a").spent_usd == pytest.approx(10.0)
+    assert state.spend.get("a").avoided_usd == 0.0
 
 
 @pytest.mark.asyncio

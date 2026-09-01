@@ -81,6 +81,36 @@ in `docs/api.md` — the OpenAI surface is unaffected.
 
 ### Added
 
+- **`roadstead/spend.py` — money, and the admission decision that spends it** (roadmap Workstream
+  D). A fourth pure-computation module beside the scheduler, the cost model and the timeout model.
+  - **Admission is ONE decision with THREE outcomes.** `Scheduler._admit` returns
+    `DISPATCH` / `SPILL` / `DEFER`. Local capacity is tried first for every caller — nothing about
+    money appears above that test — so an over-cap caller, a caller with no `spill_ok` and a caller
+    nobody configured all reach the same local dispatch. Spill is considered only once local has
+    said no, which is what makes remote capacity *overflow* rather than a parallel system with its
+    own fairness, and it never chains.
+  - **Two kinds of money, kept in fields that are never summed.** `usage_rates.py` prices a local
+    endpoint at what renting the same class of model would have cost — a saving (`avoided_usd`). A
+    remote provider's published price is an invoice (`spent_usd`). Only the second counts against a
+    threshold: one that counted the first would throttle a caller for using capacity that is free
+    and already paid for.
+  - **`publishes_token_costs` has a reader.** OpenRouter's catalogue prices arrive on the same
+    discovery pass that reads the context ceiling. They are strings, per single token, scaled to
+    per-million on the way in — and 🚨 **a published price of zero is a real price**: reading it as
+    unpublished would push a free remote model onto the imputed table and book a *saving* for a call
+    made over the internet. An operator-declared `policy.input_usd_per_mtok` beats a published one.
+  - **Thresholds degrade and never reject.** Crossing `daily_spend_usd` costs a caller one priority
+    band (floored at the lowest) and access to paid spill. It never costs local capacity, and 🚨 **no
+    error code exists for it** — `docs/api.md` §1.6 says so where `tests/test_spend.py` reads it
+    back and fails if a spend-shaped code ever joins §2.1.
+  - **New config:** `spill_to` and `policy.input_usd_per_mtok` / `output_usd_per_mtok` on an
+    endpoint; `spill_ok` and `daily_spend_usd` on an agent. `spill_to` resolves only to a routed
+    endpoint, the same rule `failover_to` follows, which is what makes the shipped example's
+    `tier3 -> spill-reasoning` inert until somebody sets `$OPENROUTER_API_KEY` and flips that
+    endpoint to `active`.
+  - **`/v1/status` grows a `spend` block** — per-caller totals, the price book, spill counters, and
+    who is over their cap. The two money columns are reported separately there too.
+
 - **`roadstead/identity.py` — API keys as the caller identity** (roadmap Workstream B). A key
   resolves to a `Principal` carrying the `agent_id` (the DRR fair-share key, quota holder and budget
   holder), a default priority, an optional `min_timeout_s` deadline floor and an optional `admin`

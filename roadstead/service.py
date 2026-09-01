@@ -149,6 +149,8 @@ class ProxyService:
     _request_logger = _StateField("request_logger")
     _acl = _StateField("acl")
     _identity = _StateField("identity")
+    _prices = _StateField("prices")
+    _spend = _StateField("spend")
     _sse = _StateField("sse")
     _dispatch_event = _StateField("dispatch_event")
     _draining = _StateField("draining")
@@ -231,6 +233,12 @@ class ProxyService:
         # unhealthy so its queued work defers instead of dispatching into a dead
         # backend (Phase 1.2).
         self._scheduler.is_endpoint_healthy = self._endpoint_healthy
+        # Workstream D: the money half of the admission decision. The scheduler
+        # owns "is there room" and "did the operator opt this caller in"; this
+        # answers "is the caller inside its spend threshold", which is the only
+        # part that lives outside a pure-computation module.
+        self._scheduler.may_spend = self._state.spend_may_spill
+        self._scheduler.on_spill = self._on_spill
 
         # Register endpoints in cost model
         for ep_name, ep_cfg in self._config.endpoints.items():
@@ -819,6 +827,14 @@ class ProxyService:
 
     def _on_admission_timeout(self, req: QueuedRequest) -> None:
         return self._lifecycle.on_admission_timeout(req)
+
+    def _on_spill(self, req: QueuedRequest, src: str, target: str) -> None:
+        """One request moved to remote capacity because local was full."""
+        self._state.spilled_from[src] = self._state.spilled_from.get(src, 0) + 1
+        logger.info(
+            "ROADSTEAD_SPILL %s -> %s agent=%s call_site=%s request_id=%s",
+            src, target, req.agent_id, req.call_site, req.request_id,
+        )
 
     # ----- live in-flight streamer -----
 

@@ -39,6 +39,14 @@ chat-assistant:
   weight: 2.0
   max_balance_ss: 120.0
   degrade_ok: true
+  # `spill_ok` is the OTHER opt-in and a SEPARATE judgement — see the spill
+  # section at the foot of this file. A human waiting on a turn is exactly who
+  # overflow capacity is for, and this caller's prompts are ones the operator is
+  # willing to send off the machine.
+  spill_ok: true
+  # …bounded. Crossing this drops the caller one band and stops its paid spill;
+  # it never costs it local capacity and never turns a request into an error.
+  daily_spend_usd: 5.0
 
 coding-assistant:
   # Bursty and unattended-ish: several calls per interaction, each long. The
@@ -110,5 +118,40 @@ hygiene:
 # `extractor` is the canonical NEVER, and is left at the default rather than
 # written out as `degrade_ok: false`: everything it produces goes into durable
 # state that nobody re-reads, so a quietly worse answer is a permanent one.
+
+
+# --- spill_ok / daily_spend_usd: paid remote overflow ------------------------
+# When an endpoint declaring `spill_to` is FULL, only callers with
+# `spill_ok: true` are sent to remote capacity. Absent = false.
+#
+# 🚨 THIS IS NOT THE SAME QUESTION AS `degrade_ok`, and the two are separate
+# flags because neither implies the other:
+#
+#   * `degrade_ok` asks "may a WORSE model answer this?" — a quality judgement,
+#     answered by the retractability test above.
+#   * `spill_ok` asks "may this leave the machine, at OUR expense?" — a
+#     confidentiality-and-money judgement. A caller whose work degrades happily
+#     may still be one whose prompts must never go to a third party; a caller
+#     that must have the big model may not care at all where it runs.
+#
+# The failure modes differ too, which is why the default is even firmer here. A
+# bad `degrade_ok` produces a worse answer somebody can read and react to. A bad
+# `spill_ok` produces an invoice and a prompt on somebody else's server, and
+# neither is recoverable by replying to it.
+#
+# `daily_spend_usd` bounds it. 🚨 Crossing the cap DEGRADES and never rejects:
+# the caller drops one priority band and loses paid spill, and keeps its full
+# access to local capacity. Two reasons (docs/roadmap.md): admission control is
+# about CAPACITY and not billing, and a misconfigured quota must not be able to
+# take a caller offline. Absent = uncapped, which is the right default for a
+# deployment where almost nothing costs money. `0.0` is NOT absent — it is a
+# real cap meaning "no paid spend at all", one keystroke away and the opposite
+# policy.
+#
+# Only `chat-assistant` opts in above, and deliberately as the only one, for the
+# same reason it is the lone `degrade_ok` seed: a path that never fires is the
+# guard-that-reads-green failure class. `extractor` is the canonical NEVER here
+# as well — the heaviest caller by volume is the one an uncapped spill would
+# bankrupt fastest, and its work is the least urgent.
 #
 # (Any caller not listed here uses the AgentQuotaConfig defaults.)

@@ -18,6 +18,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Callable
 
 from .agent_budget import BudgetManager
@@ -98,6 +99,17 @@ class QueuedRequest:
     # lost its caller, and re-deriving degraded state for it would only
     # complicate the drain.
     degraded_from: str | None = None
+    # Workstream D spill: the endpoint class this request was submitted for,
+    # set only when it was moved to remote capacity because the local one was
+    # FULL. Deliberately a SECOND field beside ``degraded_from`` and not a reuse
+    # of it — a request can be both (spilled off a tier that was itself already
+    # a failover target), and the two answer different questions for whoever
+    # reads the completion row: "was this served by a worse model" and "did this
+    # cost money". Collapsing them would make each unanswerable.
+    #
+    # Never persisted/recovered from the WAL, same as ``degraded_from`` and for
+    # the same reason: a recovered request has lost its caller.
+    spilled_from: str | None = None
 
     @classmethod
     def create(
@@ -140,6 +152,43 @@ class QueuedRequest:
             stream=bool(payload.get("stream")),
             deadline_is_default=deadline_is_default,
         )
+
+
+def _fits_context(req: "QueuedRequest", ctx_limit: int) -> bool:
+    """Whether ``req`` fits in ``ctx_limit`` tokens of context.
+
+    The same predicate, denominator and estimator as the admission context gate
+    on the normal path and as ``failover.plan``'s gate — deliberately, because
+    three places disagreeing about what "fits" means is three different answers
+    to one question. A limit of 0 means "not known", which admits: a discovered
+    ceiling we do not have is not a ceiling of zero.
+    """
+    if ctx_limit <= 0 or req.payload_type != "chat_completion":
+        return True
+    mt = req.payload.get("max_tokens")
+    est_out = mt if isinstance(mt, int) and mt > 0 else 0
+    return estimate_input_tokens(req.payload) + est_out <= ctx_limit
+
+
+class Admission(Enum):
+    """What to do with one request at the head of its band. THE decision.
+
+    🚨 Three outcomes from ONE call, which is the point (``docs/roadmap.md``,
+    "Remote capacity is overflow, not a parallel universe"). Spill is not a
+    second scheduler with its own rules that runs when the first one gives up —
+    it is a third answer to the same question, decided at the same moment, for
+    the same request, by the same code. The alternative shape (a local pass, then
+    an overflow pass) is how remote capacity quietly becomes a parallel system
+    with its own fairness, its own admission and its own bugs.
+    """
+
+    #: A local slot is available now.
+    DISPATCH = "dispatch"
+    #: Local is full, but this request may be served by paid remote capacity.
+    SPILL = "spill"
+    #: Neither. Stay queued — which is a perfectly good answer and the one the
+    #: local-first design expects most of the time.
+    DEFER = "defer"
 
 
 @dataclass
@@ -298,6 +347,7 @@ class Scheduler:
         self._total_dispatched: int = 0
         self._total_timeouts: int = 0
         self._total_completed: int = 0
+        self._total_spilled: int = 0
 
         # Callbacks (set by the proxy service)
         self.on_dispatch: Callable[[DispatchDecision], None] | None = None
@@ -306,6 +356,23 @@ class Scheduler:
         # when set and an endpoint is unhealthy, the scheduler stops dispatching
         # to it so its queue defers instead of feeding a dead backend.
         self.is_endpoint_healthy: Callable[[str], bool] | None = None
+        # Workstream D: "is this caller inside its spend threshold right now?"
+        # The ONLY thing about spill this pure-computation module cannot answer
+        # itself — `spill_ok` is config it already holds, capacity it can see,
+        # and health it already asks about, but money lives in `spend.py` and is
+        # updated by the completion path.
+        #
+        # 🚨 ``None`` means UNCONSTRAINED, not forbidden, and that asymmetry is
+        # deliberate. Authorisation to spend is `spill_ok` — an operator saying
+        # yes about a caller. The ledger is a THRESHOLD, and a threshold that is
+        # not wired up removes nothing; making its absence a refusal would turn
+        # "the accounting is not plumbed in" into "this configured feature
+        # silently does nothing", which is the failure mode this codebase keeps
+        # writing tests about.
+        self.may_spend: Callable[[str], bool] | None = None
+        # Fired after a request is moved to remote capacity — the service uses
+        # it to log and to record the reroute, exactly as failover does.
+        self.on_spill: Callable[[QueuedRequest, str, str], None] | None = None
 
     # ----- public API -----
 
@@ -463,6 +530,7 @@ class Scheduler:
             "total_dispatched": self._total_dispatched,
             "total_timeouts": self._total_timeouts,
             "total_completed": self._total_completed,
+            "total_spilled": self._total_spilled,
         }
 
     def endpoint_snapshot(self, endpoint: str) -> dict:
@@ -555,11 +623,24 @@ class Scheduler:
                 ep_cfg, band, in_flight + len(decisions), eq,
             )
 
+            # 🚨 The old loop guard was `while available > 0 and ...`, so a full
+            # endpoint never entered the body at all. It still does not, unless
+            # this endpoint declares somewhere to spill to: with no `spill_to`
+            # the two loops are identical instruction for instruction, which is
+            # what keeps the shipped catalog's behaviour untouched by all of
+            # this. The local-capacity test itself has moved INTO `_admit`,
+            # because a request that local capacity cannot take is exactly the
+            # request spill has an opinion about — asking "is there a slot" in
+            # the loop guard is what would have made spill a second pass.
+            spill_target = self._spill_target(ep_cfg)
+            if available <= 0 and not spill_target:
+                continue
+
             dispatched_in_band = 0
             max_attempts = eq.band_depth(band) + len(eq.agents_in_band(band))
             attempts = 0
 
-            while available > 0 and eq.band_depth(band) > 0 and attempts < max_attempts:
+            while eq.band_depth(band) > 0 and attempts < max_attempts:
                 attempts += 1
                 candidates = eq.agents_in_band(band)
                 if not candidates:
@@ -585,8 +666,21 @@ class Scheduler:
                     continue
 
                 total_occ = in_flight + len(decisions)
-                if not self._should_admit(ep_name, ep_cfg, req, total_occ, now):
+                verdict = self._admit(
+                    ep_name, ep_cfg, req, total_occ, available, spill_target,
+                )
+                if verdict is Admission.DEFER:
                     break
+                if verdict is Admission.SPILL:
+                    spilled = eq.dequeue(band, agent_id)
+                    if spilled is not None:
+                        self._spill(spilled, spill_target)
+                    # Rotate so the next attempt considers a different agent:
+                    # without this one caller with a deep queue spills its whole
+                    # backlog before anyone else is looked at, which is the
+                    # round-robin failing in the one place it costs money.
+                    eq.rotate_robin(band)
+                    continue
 
                 # Dispatch
                 req = eq.dequeue(band, agent_id)
@@ -667,26 +761,139 @@ class Scheduler:
 
         return total_free
 
-    def _should_admit(
+    def _spill_target(self, ep_cfg: EndpointConfig) -> str:
+        """The endpoint class ``ep_cfg`` may spill to right now, or ``""``.
+
+        Resolved here rather than read straight off the config so ONE definition
+        of "a usable spill target" serves both the loop guard and ``_admit`` —
+        the same lesson ``failover.pairs()`` records, where two places deciding
+        the same thing separately is how one of them ends up wrong.
+
+        A target that is unhealthy is not a target. Spill exists to answer local
+        SCARCITY, and queueing into a second dead backend answers nothing —
+        deferring is strictly better, because the local slot the request is
+        waiting for will actually open.
+        """
+        target = ep_cfg.spill_to
+        if not target or target not in self._config.endpoints:
+            return ""
+        if target == ep_cfg.endpoint_class:
+            # An endpoint spilling to itself would re-enqueue the request onto
+            # the very queue being drained, forever. The catalog parser already
+            # refuses to resolve this, but the parser is not the only way an
+            # EndpointConfig gets built.
+            return ""
+        if self.is_endpoint_healthy is not None and not self.is_endpoint_healthy(target):
+            return ""
+        return target
+
+    def _admit(
         self,
         ep_name: str,
         ep_cfg: EndpointConfig,
         req: QueuedRequest,
         current_occupancy: int,
-        now: float,
-    ) -> bool:
-        """Concurrency-aware admission control.
+        band_available: int,
+        spill_target: str,
+    ) -> Admission:
+        """THE admission decision: dispatch locally, spill, or defer.
 
-        Currently slot-count gating only. The decode_tps degradation
-        guard was removed — llama.cpp's per-slot KV isolation means
-        adding a request doesn't degrade in-flight work the way shared-
-        decode would, and the cost model's observed_tps math produces
-        unreliable factors on prefill-dominated workloads (inflated
-        tps when prefill eats most of the duration).
+        Concurrency-aware, and now money-aware — but only in the direction that
+        can never cost a caller a local slot. Read the order of the tests below
+        as the doctrine it is:
+
+        **Local capacity is tried first, always, for everybody.** A caller over
+        its spend threshold, a caller with no `spill_ok`, a caller nobody has
+        ever configured — all of them reach the same DISPATCH on a free local
+        slot as anyone else. Nothing about money appears above this line, and
+        nothing should: admission control is about capacity, and a budget that
+        could leave a free slot idle while a request waits serves nobody
+        (``spend.py``, ``docs/roadmap.md``).
+
+        **Spill is considered only once local has said no.** That is what makes
+        remote capacity overflow rather than a parallel universe: it is never the
+        first answer, so the local fleet is never bypassed while it has room, and
+        a deployment with no remote provider configured never executes a line of
+        it.
+
+        The slot-count gate itself is unchanged. The decode_tps degradation guard
+        was removed long ago — llama.cpp's per-slot KV isolation means adding a
+        request does not degrade in-flight work the way shared decode would, and
+        the cost model's observed_tps math produces unreliable factors on
+        prefill-dominated workloads (inflated tps when prefill eats most of the
+        duration).
         """
+        # --- local, for everyone -------------------------------------------
         if ep_cfg.max_slots <= 0:
-            return False
-        # effective_max_slots applies any per-endpoint concurrency cap (G1).
-        if current_occupancy >= ep_cfg.effective_max_slots:
-            return False
-        return True
+            # An endpoint with no slots at all is misconfigured, not busy, and
+            # the difference matters here: "busy" is what spill answers, and
+            # spilling a config error would quietly convert it into an invoice.
+            # Defer, exactly as this returned False before Workstream D.
+            return Admission.DEFER
+        if band_available > 0:
+            # effective_max_slots applies any per-endpoint concurrency cap (G1).
+            if current_occupancy < ep_cfg.effective_max_slots:
+                return Admission.DISPATCH
+
+        # --- overflow, for callers who opted in and are inside their cap ----
+        if not spill_target:
+            return Admission.DEFER
+        # 🚨 Spill NEVER CHAINS, the same rule failover follows and for a sharper
+        # reason. Two endpoints whose configs point at each other would otherwise
+        # hand one request back and forth a hop per tick, forever, overwriting
+        # `spilled_from` each time so nothing downstream could even see it
+        # happening. A single hop is also the honest semantics: the question was
+        # "local is full, may somebody else answer", and it has been answered.
+        if req.spilled_from:
+            return Admission.DEFER
+        # Default-deny, and a stronger default-deny than `degrade_ok`: this one
+        # spends money and sends the prompt off the machine. See
+        # AgentQuotaConfig.spill_ok.
+        if not self._config.agent_config(req.agent_id).spill_ok:
+            return Admission.DEFER
+        if self.may_spend is not None and not self.may_spend(req.agent_id):
+            # Over threshold. 🚨 DEFER, never a refusal — the request keeps its
+            # place in the local queue and will be served by the local endpoint
+            # like everything else. Losing spill is the whole penalty.
+            return Admission.DEFER
+        # Physics, not policy, and the same predicate failover uses: a target
+        # that cannot fit the request cannot serve it, and truncating to make it
+        # fit would answer a different question than the one that was asked.
+        tgt_cfg = self._config.endpoints[spill_target]
+        if not _fits_context(req, tgt_cfg.context_per_slot):
+            return Admission.DEFER
+        # Do not spill into a remote endpoint that is already at its own
+        # config-seeded concurrency cap. That cap is a policy knob we chose
+        # rather than a discovered capacity (CLAUDE.md), which makes it the only
+        # bound on how fast a full local tier can turn into an invoice.
+        if len(self._active.get(spill_target, {})) >= tgt_cfg.effective_max_slots:
+            return Admission.DEFER
+        return Admission.SPILL
+
+    def _spill(self, req: QueuedRequest, target: str) -> None:
+        """Move ``req`` onto ``target``'s queue, in place.
+
+        Modelled on ``failover.apply`` and for the same reason: re-pointing
+        ``req.endpoint`` is the whole change, and everything downstream — queue,
+        occupancy, cost model, dispatch, the backend lookup, the served model
+        reported to the caller — re-resolves against the new class on its own.
+
+        Two things it deliberately does NOT do:
+
+        * **Re-derive the deadline.** It was computed from the SOURCE endpoint's
+          floors, and re-deriving would silently move a deadline a caller may
+          have supplied explicitly. Same rule as failover.
+        * **Charge anything.** DRR is charged at DISPATCH, not at enqueue, so a
+          spilled request has not been charged yet and must not be — it is about
+          to be charged against the target it actually occupies. Re-enqueueing
+          through ``enqueue()`` re-estimates its slot-second cost for the target,
+          which matters because a remote endpoint's cost model is its own.
+        """
+        src = req.endpoint
+        req.spilled_from = src
+        req.endpoint = target
+        req.ctx_per_slot_at_admission = self._config.endpoints[target].context_per_slot
+        self._total_spilled += 1
+        self.enqueue(req)
+        if self.on_spill:
+            self.on_spill(req, src, target)

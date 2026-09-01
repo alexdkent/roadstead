@@ -170,6 +170,38 @@ addresses resolve to the identity `internal` and everything else is refused — 
 local-first case needs no configuration at all. `ROADSTEAD_REQUIRE_API_KEY=1` additionally refuses
 any request that presents no key.
 
+### 1.6 Spend, spill, and what a threshold does 🚨
+
+The identity above is also the **quota holder and the budget holder**, which is what makes the
+following expressible at all.
+
+**One admission decision, three outcomes.** For each request, at the moment it reaches the head of
+its band, Roadstead decides exactly one of:
+
+| outcome | when |
+|---|---|
+| **dispatch** | a local slot is free — tried first, for every caller, unconditionally |
+| **spill** | local is full, the caller is opted in (`spill_ok`), inside its cap, and the endpoint declares a `spill_to` whose target is healthy and fits the request |
+| **defer** | anything else — the request stays queued and is served locally when a slot frees |
+
+Spill is **overflow, not a fallback tier**: it is never the first answer, so local capacity is never
+bypassed while it has room, and it never chains (a spilled request does not spill again).
+
+**Two kinds of money, never summed.** A local endpoint is priced at what renting the same class of
+model *would* have cost — a saving, reported as `avoided_usd`. A remote provider's published price
+is an invoice, reported as `spent_usd`. Only the second counts against a threshold; a threshold that
+counted the first would throttle a caller for using capacity that is free.
+
+🚨 **Thresholds DEGRADE. They never reject.** Crossing `daily_spend_usd` costs a caller exactly two
+things: **one priority band** (floored at the lowest, however far over it is) and **access to paid
+spill**. It never costs local capacity, and **no error code exists for it** — the absence from §2.1
+is the contract, not an omission. Two reasons: admission control is about capacity rather than
+billing, and a misconfigured quota must not be able to take a caller offline. A runaway caller stays
+bounded by what is free and by DRR fairness.
+
+A caller cannot observe its own demotion in a response; it is reported to the operator through the
+degradation seam (§5) once per caller per day, and shown on `/v1/status` under `spend`.
+
 
 ## 2. Error contract 🚨
 
@@ -410,7 +442,7 @@ Standard OpenAI SSE. Two backend behaviours are load-bearing:
 | Slot count | ✅ `n_parallel` / `total_slots` / `len(slots)` | ❌ **not exposed** | ❌ **none exists** |
 | Per-request context | ✅ `n_ctx` (already per-slot in current builds) | via `max_model_len` | via `context_length` |
 | Served model | ✅ one, named on `/v1/models` | ✅ one (alias; weights via `root`) | ❌ a catalogue — the model is config |
-| Token costs | ❌ | ❌ | ✅ `pricing` (per token, in dollars) |
+| Token costs | ❌ | ❌ | ✅ `pricing` (per token, in dollars, as **strings**) |
 | Consequence | discovered at runtime | **concurrency stays config-seeded**, with a drift alert | **concurrency is a policy cap we choose** |
 
 🚨 A vLLM-shaped backend cannot have its concurrency discovered. This is a property of the engine,
@@ -420,6 +452,15 @@ not a gap in Roadstead. A known consequence is configured-vs-actual slot drift.
 sells is money and rate limit — so nothing reports slots and the endpoint's concurrency stays a
 deliberate cap on *our own* traffic. Slot-seconds remain the unit of fairness because *local* slots
 are the scarce thing.
+
+**Published prices are read on every discovery pass** and feed the spend accounting in §1.6. Three
+things about that column that are easy to get wrong: the values are **strings** (a price like
+`0.0000005` is where a JSON float starts losing digits), they are **per single token** (scaled to
+per-million on the way in), and **a price of zero is a real price**. A free model on a remote
+provider is still a remote model — reading its zero as *unpublished* would push it onto the imputed
+avoided-cost table and book a *saving* for a call made over the internet. An operator-declared price
+in the catalog beats a published one, because somebody who wrote a number down knows something the
+catalogue does not.
 
 ### 4.4 Optional signals and what degrades without them
 
@@ -465,6 +506,8 @@ verbatim, backend dispatch paths, the capacity-discovery asymmetry, and the metr
 
 **Updated 2026-09-01:** §1.5 (identity and API keys) is new, `invalid_api_key` joins §2.1, and §3
 restates the admin gate now that a key can carry the scope — Workstream B in `docs/roadmap.md`.
+§1.6 (spend, spill and the degrading threshold) and the price row in §4.3 are Workstream D. 🚨 §1.6
+adds **no error code**: that a spend threshold cannot produce one is the contract.
 
 **Previously INCOMPLETE — both closed 2026-08-31:**
 1. ~~Nested response schemas for `/v1/fleet/*` analytics.~~ Chased to column level in §3.1 and

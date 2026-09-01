@@ -143,6 +143,37 @@ def _to_float(value: object, default: float) -> float:
         return default
 
 
+def _spend_block(state) -> dict:
+    """The `/v1/status` money readout (roadmap Workstream D).
+
+    🚨 `spent_usd` is an INVOICE and `avoided_usd` is a saving, and they are
+    never summed here for the same reason `spend.py` keeps them in separate
+    fields: adding them would produce a number that is neither, on a surface an
+    operator reads to decide whether a caller is costing too much.
+
+    On the OPEN `/v1/status` rather than behind the admin gate, and that is a
+    decision rather than a default: this surface already publishes the per-agent
+    DRR budgets, which is the same population of data one dimension over — who
+    calls, and how much. Splitting per-caller consumption across two surfaces by
+    unit would make neither answerable on its own. Revisit with the management
+    interface (roadmap E), where a per-key view belongs.
+    """
+    by_agent = state.spend.snapshot()
+    return {
+        "by_agent": by_agent,
+        # Only endpoints somebody has actually priced — a readout of every
+        # imputed fallback would bury the handful that are real money under the
+        # whole routing table.
+        "prices": state.prices.snapshot(),
+        "spilled_from": dict(state.spilled_from),
+        "over_cap": [
+            st.as_dict()
+            for st in (state.spend_standing(row["agent_id"]) for row in by_agent)
+            if st.over
+        ],
+    }
+
+
 class ProxyHttpHandlers:
     """The Starlette HTTP surface over the shared ProxyState."""
 
@@ -740,6 +771,10 @@ class ProxyHttpHandlers:
             # page like an outage during a PLANNED drain (a drain reads
             # unhealthy, so it trips degraded mode on purpose).
             **self.state.failover.status(),
+            # Workstream D — money, and the two kinds of it kept apart. The
+            # reasoning, including why this is on the OPEN surface, is on
+            # `_spend_block`.
+            "spend": _spend_block(self.state),
         })
     async def handle_admin_flags(self, request: Request) -> Response:
         """GET: current runtime flags. POST: update a subset (JSON object of

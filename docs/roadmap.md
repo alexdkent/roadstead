@@ -130,7 +130,8 @@ clears scrub item **S1** (no addresses shipped in code). **Landed 2026-09-01** �
 ### Token management, thresholds, costing
 
 Costing becomes real, not notional: today `usage_rates.py` computes cloud-equivalent cost *avoided*,
-because everything was local. With remote providers, some spend is actual money.
+because everything was local. With remote providers, some spend is actual money. **Landed
+2026-09-01** — see Workstream D.
 
 **Thresholds degrade; they never reject.** Crossing a budget costs a caller its priority band and
 its access to paid remote spill. It never costs it access to local capacity. Two reasons: admission
@@ -228,8 +229,34 @@ readout. This is where the eventual API spec deliverable comes from.
 
 ### D · Spill, token management and costing
 
-Admission returns local/spill/defer. Per-caller token and cost accounting. Degrading thresholds.
-Needs **A** (remote providers) and **B** (who is being metered).
+**Landed 2026-09-01.** `spend.py` is a fourth pure-computation module: prices, per-caller accounting,
+and the threshold. `Scheduler._admit` returns `DISPATCH` / `SPILL` / `DEFER` — one decision, three
+outcomes, with local capacity tried first for every caller before anything about money is consulted.
+
+- **Two kinds of money, never summed.** A local endpoint is priced at what renting the same class of
+  model would have cost — a saving. A remote provider's published price is an invoice. A
+  `TokenPrice` carries which it is; only the invoice counts against a threshold. A threshold on
+  avoided cost would throttle a caller for using capacity that is free, which is local-first
+  inverted.
+- **Prices are read from the provider.** `publishes_token_costs` finally has a reader:
+  OpenRouter's catalogue prices arrive on the same discovery pass that reads the context ceiling. An
+  operator-declared price in the catalog beats a published one — somebody who wrote a number down
+  knows something the catalogue does not.
+- **Thresholds degrade.** Crossing `daily_spend_usd` costs one priority band and paid spill, and
+  nothing else. **No error code exists for it**, and `docs/api.md` §1.6 says so where a test can read
+  it back.
+- **Spill is overflow, not a fallback tier.** `spill_to` is a separate field from `failover_to` and
+  `spill_ok` a separate flag from `degrade_ok`, because "may a worse model answer" and "may this
+  leave the machine at our expense" are different questions and neither implies the other. Spill
+  never chains.
+
+**Still open in D:** *Where cost truth lives* (below) is untouched — the ledger is our own token
+accounting, and nothing reconciles it against what a provider actually invoices. The live ledger is
+also in-memory and resets on restart, which is right for what it governs (whether a caller is
+degraded *now*) and wrong for anything an operator would want to bill on; the durable record stays in
+`queue.db`. Nothing yet spills on *cost* — the decision is capacity-triggered, so a cheaper remote
+endpoint is never preferred to an expensive local one, deliberately, but a deployment with several
+remote providers will eventually want to choose between them.
 
 ### E · Management interface
 

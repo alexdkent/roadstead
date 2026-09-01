@@ -30,7 +30,12 @@ Two cost regimes:
      later is a one-place change.
 
 The single entry point is `cloud_cost_usd(endpoint, in_tokens, out_tokens)`.
-`cloud_rate(endpoint)` is kept for backward-compat (token (in,out) rate only).
+`cloud_rate(endpoint)` is kept for backward-compat (token (in,out) rate only), and is also what
+`spend.PriceBook` reads for its imputed fallback.
+
+🚨 **Nothing here is money somebody owes.** Every number in this file is what renting the same class
+of model WOULD have cost — a saving, not a bill. `spend.py` keeps that distinction as a property of
+the price itself, because both kinds are USD per million tokens and nothing else would.
 """
 
 from __future__ import annotations
@@ -47,10 +52,12 @@ _RATES_BY_CLASS: dict[str, tuple[float, float]] = {
     #
     # 🚨 These are for the AVOIDED-cost metric, which only makes sense for
     # capacity you own. A REMOTE provider's endpoint costs actual money and must
-    # not be priced from this table — it is metered from what the provider
-    # publishes (roadmap Workstream D). Until that lands a remote class maps to
-    # None below, which reads as $0 and is honest about being unmetered rather
-    # than confidently wrong.
+    # not be priced from this table — as of Workstream D (2026-09-01) it is
+    # metered from what the provider publishes, through `spend.PriceBook`, which
+    # falls back HERE only for an endpoint nobody has priced. A remote class
+    # therefore still maps to None below, and now for a second reason: a remote
+    # endpoint that reached this table would book a SAVING for a call made over
+    # the internet.
     "tier3": (0.14, 0.28),   # large sparse-MoE reasoner (~250B total / ~15B active)
     "tier2": (0.15, 0.55),   # mid MoE with vision (~30B total / ~3B active).
                              # Vision bills as input tokens; no premium.
@@ -99,7 +106,8 @@ _ENDPOINT_CLASS: dict[str, str | None] = {
     "embed": "embed", "embeddings": "embed",
     "rerank": "rerank",
     # --- remote spill: real money, and not this table's business. Explicitly
-    # None so it reads as unmetered rather than free. Workstream D.
+    # None so a stray lookup reads as unpriced rather than free — `spend.py`
+    # owns these, from the provider's published prices.
     "spill-chat": None, "spill-reasoning": None,
     # --- per-unit: speech / audio (input_tokens = audio_seconds*100). Roadstead
     # does not serve these itself; they arrive through /v1/calls/log from

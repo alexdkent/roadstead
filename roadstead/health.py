@@ -36,6 +36,7 @@ from .observability import (
 )
 from .hooks import record_security_event
 from .providers import LLAMACPP, VLLM, CapacityReport, provider_for
+from .spend import SOURCE_PROVIDER, TokenPrice
 
 if TYPE_CHECKING:
     from .config import EndpointConfig
@@ -807,6 +808,20 @@ class Health:
                 "endpoint %s: context_per_slot %d → %d (%s)",
                 ep_name, old_ctx, ctx, report.source,
             )
+
+        # A published price is REAL money — a rate somebody will invoice us at —
+        # so it goes to the price book rather than onto the endpoint config.
+        # ``PriceBook.observe`` loses to an operator declaration on purpose; see
+        # its docstring. Prices are re-read on every discovery pass and are meant
+        # to be: a provider changing one mid-day is exactly the event a live
+        # reader exists to catch, and the alternative is billing at yesterday's.
+        if report.publishes_prices:
+            self.state.prices.observe(ep_name, TokenPrice(
+                input_usd_per_mtok=report.input_usd_per_mtok or 0.0,
+                output_usd_per_mtok=report.output_usd_per_mtok or 0.0,
+                source=SOURCE_PROVIDER,
+                detail=report.source,
+            ))
 
     def apply_discovered_props(
         self, ep_name: str, ep_cfg: EndpointConfig, props: dict,

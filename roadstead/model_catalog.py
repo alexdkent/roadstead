@@ -94,6 +94,9 @@ class EndpointEntry:
     stream_hard_cap_s: float = 0.0
     #: The endpoint class to degrade to when this one is unhealthy.
     failover_to: str = ""
+    #: The endpoint class to spill to when this one is FULL. A different
+    #: question from ``failover_to`` — see ``EndpointConfig.spill_to``.
+    spill_to: str = ""
     capabilities: dict[str, Any] = field(default_factory=dict)
     policy: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
@@ -195,6 +198,7 @@ def _coerce_endpoint(name: str, raw: dict[str, Any]) -> EndpointEntry:
         timeout_ceiling_s=float(raw.get("timeout_ceiling_s", 0) or 0),
         stream_hard_cap_s=float(raw.get("stream_hard_cap_s", 0) or 0),
         failover_to=raw.get("failover_to", ""),
+        spill_to=raw.get("spill_to", ""),
         capabilities=dict(raw.get("capabilities") or {}),
         policy=dict(raw.get("policy") or {}),
         notes=raw.get("notes", ""),
@@ -260,6 +264,12 @@ _POLICY_PASSTHROUGH = (
     # whitespace-banned grammar and greedily returns `{}`. Guarded by
     # test_json_object_guard.py::test_models_yaml_flag_reaches_endpoint_config.
     "disable_any_whitespace",
+    # Operator-declared token price, USD per MILLION tokens. Beats a
+    # provider-published price (spend.PriceBook explains why) and is the only
+    # way to price an endpoint whose backend publishes nothing. Guarded by
+    # test_spend.py::test_declared_price_reaches_endpoint_config.
+    "input_usd_per_mtok",
+    "output_usd_per_mtok",
     # Fraction of max_tokens allowed for REASONING on a backend launched with
     # `--reasoning-config` (vLLM will not honour `thinking_token_budget` without
     # it, and 400s the request instead). Absent/0 = inject nothing, which is
@@ -375,6 +385,19 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
             continue
         if target in out:
             out[e.name]["failover_to"] = target
+
+    # Same treatment for `spill_to:`, and for the same reason: a spill target
+    # that is not itself routed must resolve to nothing rather than arming an
+    # overflow path to a backend that cannot serve. The commonest way to get
+    # this wrong is pointing at one of the `planned` remote endpoints before the
+    # credential is in the environment — `routed()` is what makes that a no-op
+    # instead of a 502 the first time the local tier fills up.
+    for e in cat.routed():
+        target = e.spill_to
+        if not target or e.name not in out or target == e.name:
+            continue
+        if target in out:
+            out[e.name]["spill_to"] = target
     return out
 
 

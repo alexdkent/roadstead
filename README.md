@@ -138,6 +138,43 @@ disagree the key wins, and a presented key that does not resolve is a 401 rather
 demotion to whatever the address would have given. `docs/api.md` §1.5 has the full precedence and
 the reasoning.
 
+## Overflow, and what it costs
+
+Local capacity is the design centre; remote capacity is what happens when the local fleet is **full**.
+For each request Roadstead makes one decision with three outcomes — **dispatch** to a local slot,
+**spill** to a remote provider, or **defer** and stay queued.
+
+Local is tried first for every caller, unconditionally. Spill is considered only once local has said
+no, so the fleet is never bypassed while it has room, and a deployment with no remote provider never
+executes a line of it.
+
+```yaml
+# models.yaml — an endpoint says where its overflow goes
+tier3:
+  failover_to: tier2          # it is DOWN     -> a smaller local model may answer
+  spill_to: spill-reasoning   # it is FULL     -> pay somebody else to answer now
+```
+
+```yaml
+# agents.yaml — and a caller says whether it wants any of that
+chat-assistant:
+  degrade_ok: true            # may a WORSE model answer this?
+  spill_ok: true              # may this leave the machine, at our expense?
+  daily_spend_usd: 5.0
+```
+
+Those are two different questions and neither implies the other: a caller whose work degrades happily
+may still be one whose prompts must never go to a third party.
+
+**Two kinds of money, and they are never added together.** A local call is priced at what renting the
+same class of model *would* have cost — that is a saving, and it is reported separately from what you
+actually spend. Only real spend counts against a cap.
+
+🚨 **A cap degrades; it never rejects.** Crossing `daily_spend_usd` costs a caller one priority band
+and its access to paid spill — and nothing else. It keeps full access to local capacity, and there is
+no error code for it. Admission control here is about *capacity*, not billing, and a quota you typo'd
+must not be able to take a caller offline.
+
 ## A programmable backend, in the box
 
 `roadstead.testing` ships the fake backend the suite runs on, because for a gateway whose thesis is

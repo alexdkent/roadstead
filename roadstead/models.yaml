@@ -74,6 +74,19 @@
 #                     Never applies to an explicit caller deadline.
 #   failover_to       endpoint class to degrade to when this one is unhealthy.
 #                     Ignored unless the target is itself routed.
+#   spill_to          endpoint class to spill to when this one is FULL. A
+#                     DIFFERENT question from failover_to: that one is "this
+#                     backend is down, may a smaller model answer", this one is
+#                     "this backend is busy, may we pay somebody else to answer
+#                     now". Also ignored unless the target is routed, which is
+#                     what makes pointing at a `planned` remote endpoint inert
+#                     rather than a 502 the first time the local tier fills up.
+#   policy.input_usd_per_mtok / output_usd_per_mtok
+#                     Operator-DECLARED price, USD per MILLION tokens. Beats a
+#                     provider-published one — an operator who wrote a number
+#                     down knows something the catalogue does not (a negotiated
+#                     rate, an internal chargeback). Absent = fall back to
+#                     discovery, then to usage_rates.py's imputed avoided cost.
 #   capabilities.*    vision | reasoning | streaming | tool_calling |
 #                     structured_output
 #   policy.*          EndpointConfig knobs — see _POLICY_PASSTHROUGH in
@@ -203,6 +216,16 @@ endpoints:
                                # tier: a generous upper bound that overrides the
                                # band. The counterpart to tier2's absence of one.
     failover_to: tier2         # degrade to the mid tier, never chain further.
+    spill_to: spill-reasoning  # …and when it is merely BUSY, pay for overflow.
+                               # 🚨 Both, deliberately, on the same endpoint:
+                               # they answer different questions and the day
+                               # this tier is down is not the day it is full.
+                               # INERT as shipped — `spill-reasoning` is
+                               # `planned`, so this resolves to nothing until
+                               # somebody flips it to `active`. That is the
+                               # point: the intent is declared here, and setting
+                               # $OPENROUTER_API_KEY plus one status change is
+                               # the whole of turning it on.
     capabilities:
       vision: true             # an mmproj / vision tower is loaded. DEFAULTS
                                # FALSE elsewhere on purpose — a stanza that
@@ -272,6 +295,10 @@ endpoints:
     kind: chat
     status: planned
     model: openai/gpt-oss-120b
+    # No declared price: OpenRouter publishes one per model and capacity
+    # discovery reads it, which is the arrangement to prefer — a price written
+    # here is a price that goes stale silently the next time the upstream
+    # reprices. Declare one only to override what is published.
     slots: 4
     context_per_slot: 131072
     timeout_floor_s: 120

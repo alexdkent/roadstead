@@ -275,6 +275,25 @@ class EndpointConfig:
     # a request-boundary model flip every 30s. From the stanza's
     # `policy.failover_dwell_s`.
     failover_dwell_s: float = 120.0
+    # --- spill: remote overflow under the SAME admission decision (Workstream D)
+    # The endpoint class this one spills to when it is FULL — full, not sick.
+    # 🚨 Not the same thing as `failover_to` and deliberately a second field
+    # rather than a reuse of it. Failover answers "this backend is DOWN, may a
+    # smaller one answer instead", and its target is another local tier. Spill
+    # answers "this backend is BUSY, may we pay somebody else to answer now",
+    # and its target is remote capacity that costs money. The triggers are
+    # different (health vs occupancy), the opt-ins are different (`degrade_ok`
+    # vs `spill_ok` + a budget), and one endpoint can perfectly well want both.
+    # Collapsing them would make a sick backend start spending money, and a busy
+    # one start serving a worse model.
+    spill_to: str = ""
+    # Operator-DECLARED token price for this endpoint, USD per million tokens.
+    # None = undeclared, which is not zero: an undeclared endpoint falls back to
+    # a provider-published price, and then to `usage_rates.py`'s imputed
+    # avoided-cost table. See spend.PriceBook for the precedence and for why a
+    # declaration beats discovery.
+    input_usd_per_mtok: float | None = None
+    output_usd_per_mtok: float | None = None
     background_floor_pct: float = 0.20
     # Slots held back from the BACKGROUND band so an occasional interactive /
     # fast-path call always has an open slot (no preemption exists). When set,
@@ -462,6 +481,31 @@ class AgentQuotaConfig:
     # conversational and extraction/authoring work is in or out as a whole, and
     # the extraction path governs — so it stays OUT.
     degrade_ok: bool = False
+    # --- spill and spend (roadmap Workstream D) -----------------------------
+    # Remote-spill opt-IN. When the local endpoint is FULL and declares a
+    # `spill_to`, only callers that set this are sent to paid remote capacity.
+    # Absent = False, and default-deny here is a stronger requirement than it is
+    # for `degrade_ok`: that one costs quality, this one costs MONEY, and money
+    # spent on somebody's behalf without their say-so is not recoverable by
+    # replying to it. It is also the only knob in this file whose default being
+    # wrong shows up on an invoice rather than in a latency graph.
+    #
+    # 🚨 Opting in is NOT the same judgement as `degrade_ok` and the two are
+    # deliberately separate flags. Spill sends the request OFF THE MACHINE to a
+    # third party. A caller whose work may be answered by a smaller local model
+    # may still be one whose prompts must never leave, and the reverse is just
+    # as common — a caller that must have the big model and does not care where
+    # it runs. Neither implies the other, so neither defaults from the other.
+    spill_ok: bool = False
+    # Per-day REAL-money cap, USD. None = uncapped (the default, and the right
+    # one for a local-first deployment where almost nothing costs money).
+    #
+    # 🚨 Crossing it DEGRADES, it never rejects: the caller drops one priority
+    # band and loses paid spill, and it keeps full access to local capacity. See
+    # spend.SpendStanding. A cap of 0.0 is a real cap meaning "no paid spend at
+    # all" — distinct from None, which is why this is Optional and not a float
+    # with a zero default.
+    daily_spend_usd: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -877,7 +921,10 @@ def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaCo
         weight (float),
         max_balance_ss (float),
         default_priority (str enum name — e.g. "P3_INGESTION"),
-        degrade_ok (bool — tier3 failover opt-in, § 9.5).
+        degrade_ok (bool — failover opt-in, § 9.5),
+        spill_ok (bool — paid remote-spill opt-in, Workstream D),
+        daily_spend_usd (float or null — per-day REAL-money cap; crossing it
+            degrades the caller, never rejects it).
     Missing keys fall back to the AgentQuotaConfig dataclass defaults.
     ⚠️ A key not parsed below is SILENTLY IGNORED — adding a knob to
     AgentQuotaConfig is not enough to make it operator-reachable. Guarded by
@@ -920,6 +967,16 @@ def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaCo
             kwargs["default_priority"] = LLMPriority.coerce(cfg["default_priority"])
         if "degrade_ok" in cfg:
             kwargs["degrade_ok"] = bool(cfg["degrade_ok"])
+        if "spill_ok" in cfg:
+            kwargs["spill_ok"] = bool(cfg["spill_ok"])
+        if "daily_spend_usd" in cfg:
+            raw_cap = cfg["daily_spend_usd"]
+            # An explicit null means "uncapped", which is a thing an operator may
+            # want to write down to override something — so None survives rather
+            # than becoming 0.0, which is the opposite policy (no paid spend at
+            # all). The two are one keystroke apart in YAML and mean opposite
+            # things, which is why this is not a bare float().
+            kwargs["daily_spend_usd"] = None if raw_cap is None else float(raw_cap)
         out[str(agent_id)] = AgentQuotaConfig(**kwargs)
     logger.info("loaded %d agent quota config(s) from %s", len(out), p)
     return out

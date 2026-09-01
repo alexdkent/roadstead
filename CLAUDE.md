@@ -167,10 +167,11 @@ without new, backend-correct A/B evidence.
 ## Layout
 
 ```
-roadstead/          the package (32 modules + providers/)
+roadstead/          the package (34 modules + providers/)
   scheduler.py      DRR + priority bands + admission        — pure computation, no I/O
   cost_model.py     slot-second cost, EWMA-calibrated       — pure computation, no I/O
   timeout_model.py  learned latency → recommended deadline  — pure computation, no I/O
+  spend.py          prices, per-caller spend, thresholds    — pure computation, no I/O
   correction.py     the output-integrity layer
   lifecycle.py      admission → dispatch → streaming → timeout recording
   health.py         capacity discovery, circuit breaker, drain
@@ -187,7 +188,7 @@ tools/              off-default-path experiments (real processes, real signals)
 docs/               specs, plan, evaluation, ledger
 ```
 
-The three `pure computation, no I/O` modules are the crown jewels and the easiest to test — keep
+The four `pure computation, no I/O` modules are the crown jewels and the easiest to test — keep
 them that way.
 
 **`models.yaml` has two sections, and the split is load-bearing.** `providers:` is *how to reach a
@@ -256,6 +257,36 @@ bites, all in `docs/api.md` §1.5:
 
 `/v1/submit` is gated like the OpenAI doors as of 2026-09-01. It was not, on the same port, which
 meant the fair-share key was self-asserted by anyone who used that door.
+
+🚨 **Money: two kinds of it, and adding them together is the bug `spend.py` exists to prevent.**
+`usage_rates.py` prices a LOCAL endpoint at what renting the same class of model would have cost —
+a saving, never a bill. A remote provider's published price is an invoice. Both are USD per million
+tokens and nothing in the type system separates them, so a `TokenPrice` carries which kind it is and
+`SpendLedger` keeps `spent_usd` and `avoided_usd` in fields that are never summed. **A threshold
+reads only the spent one** — one that counted avoided cost would throttle a caller for using
+capacity that is free and already paid for, which is local-first inverted.
+
+🚨 **Thresholds DEGRADE, they never reject, and there is NO ERROR CODE for one.** Crossing
+`daily_spend_usd` costs a caller exactly two things: one priority band (floored at the lowest,
+however far over it is) and access to paid spill. It never costs local capacity. Admission control is
+about *capacity*, not billing, and a misconfigured quota must not be able to take a caller offline —
+a runaway caller is already bounded by what is free and by DRR fairness. `docs/api.md` §1.6, and
+`tests/test_spend.py` fails if a spend-shaped code ever appears in §2.1.
+
+🚨 **Admission is ONE decision with THREE outcomes** — `Scheduler._admit` returns
+`DISPATCH` / `SPILL` / `DEFER`. **Local capacity is tried first, for everybody**: no test involving
+money appears above that line, so an over-cap caller, an un-opted-in caller and a caller nobody
+configured all reach the same local dispatch. Spill is considered only once local has said no, which
+is what makes remote capacity *overflow* rather than a parallel system with its own fairness. It
+never chains — a spilled request does not spill again, or two endpoints pointing at each other would
+hand one request back and forth a hop per tick forever.
+
+🚨 **`spill_to` is not `failover_to`, and `spill_ok` is not `degrade_ok`.** Failover asks "this
+backend is DOWN, may a smaller model answer" — a quality judgement, answered by whether the output is
+retractable. Spill asks "this backend is BUSY, may we pay somebody else to answer now" — a
+confidentiality-and-money judgement. The triggers differ (health vs occupancy), the failure modes
+differ (a worse answer somebody can react to vs an invoice and a prompt on a third party's server),
+and one endpoint can want both. Neither flag defaults from the other.
 
 **`hooks.py` is the integration seam.** A host application can register a degradation sink; the
 default is a WARNING log. Everything else in the package reports through it. Keep this module

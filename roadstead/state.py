@@ -22,6 +22,7 @@ import time
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
+from . import hooks
 from .acl import IPIdentityMap
 from .agent_budget import BudgetManager
 from .backend import BackendClientPool
@@ -34,6 +35,14 @@ from .observability import RequestLogger, RollingMetrics
 from .on_demand import OnDemandManager
 from .queue import PersistentQueue
 from .scheduler import Scheduler
+from .spend import (
+    PriceBook,
+    SpendLedger,
+    SpendStanding,
+    day_bucket,
+    declared_price,
+    standing,
+)
 from .sse_hub import SSEHub
 from .timeout_model import TimeoutModel
 
@@ -99,6 +108,28 @@ class ProxyState:
         # turn it used to kill. Without it the fix is unobservable.
         self.stream_progress_extensions = 0
         self.budget_mgr = BudgetManager(starvation_timeout_s=config.starvation_timeout_s)
+        # Money (roadmap Workstream D). The price book is seeded from the
+        # catalog and then kept current by capacity discovery on any provider
+        # whose descriptor says `publishes_token_costs`; the ledger is the LIVE
+        # per-caller account a threshold decision reads without going to the DB.
+        # 🚨 Both are ordinary single-loop in-memory state — the concurrency
+        # invariant in CLAUDE.md covers them exactly as it covers `budget_mgr`.
+        self.prices = PriceBook()
+        for ep_name, ep_cfg in config.endpoints.items():
+            declared = declared_price(ep_name, ep_cfg)
+            if declared is not None:
+                self.prices.declare(ep_name, declared)
+        self.spend = SpendLedger(self.prices)
+        # agent_id -> the epoch day its over-cap demotion was last reported, so
+        # a caller that stays over its cap all day reports once rather than on
+        # every request. A report per call would bury the event it exists to
+        # surface.
+        self.spend_demotion_noted: dict[str, int] = {}
+        # source endpoint class -> how many requests it has spilled to remote
+        # capacity. The counterpart to `degraded_rerouted`, and separate from it
+        # for the same reason the two request fields are separate: a reroute is
+        # a worse answer, a spill is a bill.
+        self.spilled_from: dict[str, int] = {}
         self.scheduler = Scheduler(config, self.cost_model, self.budget_mgr)
         self.backend = BackendClientPool()
         self.queue_db = PersistentQueue(config.queue_db_path or None)
@@ -377,6 +408,67 @@ class ProxyState:
     # them here removes the only cross-collaborator method calls (contract §5.1
     # prefers the shared-state form). ProxyService keeps `_resolve_error` /
     # `_metrics_payload` as thin delegators to these.
+
+    # ----- spend thresholds (Workstream D) -----
+    # Here rather than on ProxyService for the same reason: Lifecycle applies
+    # the band demotion on the submit path and the Scheduler asks the spill
+    # question at dispatch, and both hold the state, not the service.
+
+    def spend_standing(self, agent_id: str) -> SpendStanding:
+        """Where ``agent_id`` stands against its daily cap, right now.
+
+        The one place the ledger and the agent config are joined, so the
+        dispatch gate and the band demotion cannot end up reading different
+        answers to the same question about the same request.
+        """
+        return standing(
+            self.spend, agent_id,
+            self.config.agent_config(agent_id).daily_spend_usd,
+        )
+
+    def spend_may_spill(self, agent_id: str) -> bool:
+        """Whether ``agent_id`` may currently be served by PAID remote capacity.
+
+        This is the only thing crossing a threshold takes away at dispatch. It
+        does not gate local dispatch and it is not reachable from any path that
+        could refuse a request: ``Scheduler._admit`` calls it strictly after
+        local capacity has already said no.
+        """
+        return self.spend_standing(agent_id).may_spill
+
+    def spend_demote(self, agent_id: str, declared: LLMPriority) -> LLMPriority:
+        """The band ``agent_id`` actually gets, given what it declared.
+
+        One step down while it is over its daily cap, and no further. Called on
+        the submit path before the request is queued, because the band is fixed
+        at enqueue and re-banding a queued request would mean moving it between
+        per-agent deques mid-flight for no gain.
+
+        The demotion is reported through ``hooks.degradation`` the first time it
+        bites in a day. A caller that suddenly waits longer with nothing logged
+        is indistinguishable from a slow backend, and that ambiguity is the whole
+        cost of choosing to degrade rather than to reject — worth paying, but
+        only if somebody can see it happening.
+        """
+        st = self.spend_standing(agent_id)
+        effective = st.effective_priority(declared)
+        if effective is declared:
+            return declared
+        today = day_bucket(time.time())
+        if self.spend_demotion_noted.get(agent_id) != today:
+            self.spend_demotion_noted[agent_id] = today
+            hooks.degradation(
+                component="spend",
+                reason="caller is over its daily spend cap",
+                impact=("its requests drop one priority band and it may not use "
+                        "paid remote spill; local capacity is unaffected"),
+                agent_id=agent_id,
+                spent_today_usd=round(st.spent_today_usd, 6),
+                cap_usd=st.cap_usd,
+                priority_declared=declared.name,
+                priority_effective=effective.name,
+            )
+        return effective
 
     def effective_timeout_advice(
         self, endpoint: str, priority: int, est_in: int, est_out: int,
