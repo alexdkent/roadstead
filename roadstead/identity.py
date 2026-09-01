@@ -58,6 +58,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -233,6 +234,12 @@ class KeyRegistry:
 
     def __init__(self) -> None:
         self._by_digest: dict[str, Principal] = {}
+        # Provenance, kept OUT of the hot-path dict on purpose: ``resolve`` runs
+        # on every request and must stay a single dict hit returning the
+        # principal itself. Where a key came from is an operator question asked
+        # by the management plane a few times a day, not a request-path one.
+        # {digest: {"source": "env" | "file" | "runtime", "created_at": float}}
+        self._provenance: dict[str, dict] = {}
 
     def __len__(self) -> int:
         return len(self._by_digest)
@@ -253,11 +260,17 @@ class KeyRegistry:
         min_timeout_s: float | None = None,
         admin: bool = False,
         key_id: str | None = None,
+        source: str = "file",
     ) -> str | None:
         """Register one key. Returns its ``key_id``, or None if it was rejected.
 
         Exactly one of ``secret`` (plaintext, hashed here and dropped) or
         ``key_sha256`` (a digest the operator computed) must be given.
+
+        ``source`` records where the registration came from — ``env``, ``file``
+        or ``runtime`` — which the management plane needs in order to tell an
+        operator that a key it can revoke *now* will come back on restart
+        because it is also declared in the environment.
         """
         if bool(secret) == bool(key_sha256):
             logger.warning(
@@ -294,7 +307,27 @@ class KeyRegistry:
             source="api_key",
             key_id=label,
         )
+        self._provenance[digest] = {"source": source, "created_at": time.time()}
         return label
+
+    def revoke(self, key_id: str) -> bool:
+        """Remove the key labelled ``key_id``. True if one was removed.
+
+        🚨 **Revocation works regardless of where the key was declared.** A key
+        that leaked has to stop working NOW, and refusing because it came from
+        the environment rather than the runtime store would be a correctness
+        argument answered, in the moment, by a breach. What the environment
+        decides is whether the revocation SURVIVES A RESTART — which the
+        management plane reports rather than silently getting wrong (see
+        ``management.AdminOverlay``: an env-declared key is tombstoned in the
+        overlay and the read plane says to remove it from the environment too).
+        """
+        for digest, principal in list(self._by_digest.items()):
+            if principal.key_id == key_id:
+                del self._by_digest[digest]
+                self._provenance.pop(digest, None)
+                return True
+        return False
 
     def resolve(self, presented: str) -> Principal | None:
         """The principal behind ``presented``, or None if no key matches."""
@@ -318,8 +351,12 @@ class KeyRegistry:
                     "priority": p.priority.name,
                     "min_timeout_s": p.min_timeout_s,
                     "admin": p.admin,
+                    # Where the registration came from, so an operator can tell
+                    # a runtime enrolment from a line in the environment.
+                    "source": self._provenance.get(d, {}).get("source", "file"),
+                    "created_at": self._provenance.get(d, {}).get("created_at"),
                 }
-                for p in self._by_digest.values()
+                for d, p in self._by_digest.items()
             ),
             key=lambda row: (str(row["agent_id"]), str(row["key_id"])),
         )
@@ -365,7 +402,8 @@ class KeyRegistry:
             secret, spec = entry.split("=", 1)
             agent_id, priority, floor, admin = parse_identity_spec(spec.strip())
             self.register(secret=secret.strip(), agent_id=agent_id,
-                          priority=priority, min_timeout_s=floor, admin=admin)
+                          priority=priority, min_timeout_s=floor, admin=admin,
+                          source="env")
 
     #: Fields a keys-file entry may set. 🚨 A key NOT in this set is reported,
     #: not dropped in silence: an unreachable knob looks exactly like a policy
@@ -400,11 +438,15 @@ class KeyRegistry:
                 continue
             unknown = sorted(set(entry) - self._FILE_FIELDS)
             if unknown:
-                logger.warning(
-                    "api keys file: entry %r has unrecognised field(s) %s — they "
-                    "have NO effect; known fields are %s",
-                    entry.get("id") or entry.get("agent_id"), unknown,
-                    sorted(self._FILE_FIELDS))
+                hooks.config_notice(
+                    source=str(p),
+                    subject=str(entry.get("id") or entry.get("agent_id") or "?"),
+                    problem="unknown_key",
+                    detail=(f"key entry field(s) {unknown} are not read and have "
+                            f"NO effect on this credential"),
+                    keys=unknown,
+                    known=sorted(self._FILE_FIELDS),
+                )
             priority = LLMPriority.P3_INGESTION
             if entry.get("priority") is not None:
                 try:

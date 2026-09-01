@@ -112,6 +112,15 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
                 "LLM_PROXY_RUNTIME_FLAGS",
                 os.path.join(data_dir, "runtime_flags.json"),
             ),
+            # The management plane's overlay (management.AdminOverlay) — runtime
+            # key enrolments, revocations and quota overrides. Beside the flags
+            # file for the same reason: it is state the API writes, never
+            # something an operator hand-edits, and it must not be mixed in with
+            # config that is.
+            admin_store_path=os.environ.get(
+                "ROADSTEAD_ADMIN_STORE",
+                os.path.join(data_dir, "admin_overlay.json"),
+            ),
             request_log_path=os.environ.get(
                 "LLM_PROXY_REQUEST_LOG",
                 os.path.join(log_dir, "llmproxy_requests.jsonl"),

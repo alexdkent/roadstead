@@ -1,20 +1,20 @@
-"""The `/v1/fleet/*` analytics schemas in `docs/api.md` §3.1, pinned to reality.
+"""The `/v1/fleet/*` analytics schemas in `docs/api.md` §3.6, pinned to reality.
 
 These payloads have external consumers — in the origin fleet a web UI reads
-them — so their key names are public API. §3.1 documents them to column level;
+them — so their key names are public API. §3.6 documents them to column level;
 this file drives the REAL producers against a seeded `queue.db` and asserts the
 key sets match, **in both directions**:
 
   * every field the producer emits is documented (nothing ships undocumented);
-  * every field §3.1 documents is emitted (the doc cannot describe a field that
+  * every field §3.6 documents is emitted (the doc cannot describe a field that
     was renamed or dropped).
 
 One direction alone is the usual failure. A doc-to-code check passes while new
 undocumented fields accumulate; a code-to-doc check passes while the doc grows
-fiction. Together they make §3.1 mechanically true rather than prose.
+fiction. Together they make §3.6 mechanically true rather than prose.
 
 The parsing is deliberately dumb — it reads the markdown tables under each
-`####` heading in §3.1 — so writing the doc badly fails loudly here rather than
+`####` heading in §3.6 — so writing the doc badly fails loudly here rather than
 quietly weakening the check.
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ from tests.wire_contract import API_DOC
 
 
 # --------------------------------------------------------------------------
-# Parse §3.1 out of docs/api.md
+# Parse §3.6 out of docs/api.md
 # --------------------------------------------------------------------------
 
 _FIELD_ROW = re.compile(r"^\|\s*`([A-Za-z_][A-Za-z0-9_]*)`\s*\|")
@@ -48,7 +48,7 @@ def _documented_tables() -> dict[str, list[set[str]]]:
     the field-exists-but-is-undocumented direction. Compare shape to shape.
     """
     doc = API_DOC.read_text(encoding="utf-8")
-    start = doc.index("### 3.1 `/v1/fleet/*` analytics — response schemas")
+    start = doc.index("### 3.6 `/v1/fleet/*` analytics — response schemas")
     section = doc[start:doc.index("\n## ", start)]
 
     out: dict[str, list[set[str]]] = {}
@@ -79,7 +79,7 @@ def _tables_for(substring: str) -> list[set[str]]:
     docs = _documented_tables()
     matches = [k for k in docs if substring in k]
     assert len(matches) == 1, (
-        f"expected exactly one §3.1 heading containing {substring!r}, "
+        f"expected exactly one §3.6 heading containing {substring!r}, "
         f"found {matches} — headings: {sorted(docs)}")
     return docs[matches[0]]
 
@@ -88,15 +88,15 @@ def test_the_section_parses_into_the_expected_shape():
     """🚨 Refuse to pass on an empty set. If the heading text or the table
     format changes, every check below would sail through on empty sets."""
     docs = _documented_tables()
-    assert len(docs) >= 4, f"expected >=4 subsections in §3.1, found {sorted(docs)}"
+    assert len(docs) >= 4, f"expected >=4 subsections in §3.6, found {sorted(docs)}"
     expected_tables = {"fleet/activity": 3, "fleet/savings": 2, "v1/usage": 2}
     for substring, n in expected_tables.items():
         tables = _tables_for(substring)
         assert len(tables) == n, (
-            f"§3.1 '{substring}' should document {n} tables (a top-level shape "
+            f"§3.6 '{substring}' should document {n} tables (a top-level shape "
             f"plus its nested rows), found {len(tables)}: {tables}")
         for t in tables:
-            assert len(t) >= 3, f"§3.1 '{substring}' has a thin table: {t}"
+            assert len(t) >= 3, f"§3.6 '{substring}' has a thin table: {t}"
 
 
 # --------------------------------------------------------------------------
@@ -125,10 +125,10 @@ def _assert_matches(actual: set[str], documented: set[str], what: str):
     undocumented = actual - documented
     fictional = documented - actual
     assert not undocumented, (
-        f"{what}: emits {sorted(undocumented)}, which docs/api.md §3.1 does not "
+        f"{what}: emits {sorted(undocumented)}, which docs/api.md §3.6 does not "
         f"document — these are public API, add them")
     assert not fictional, (
-        f"{what}: docs/api.md §3.1 documents {sorted(fictional)}, which is not "
+        f"{what}: docs/api.md §3.6 documents {sorted(fictional)}, which is not "
         f"emitted — renamed or dropped without updating the contract")
 
 
@@ -169,7 +169,7 @@ def test_usage_rollup_matches_the_documented_schema(seeded):
 # --------------------------------------------------------------------------
 
 def test_the_unopened_db_shapes_are_the_narrower_ones(tmp_path):
-    """§3.1's last subsection: with no connection these early-out to a SMALLER
+    """§3.6's last subsection: with no connection these early-out to a SMALLER
     shape. A consumer assuming `now` or `today_start` is always present gets a
     KeyError, not a degraded value — documented because it is easy to hit in a
     test double and never in production."""
@@ -189,7 +189,7 @@ def test_the_unopened_db_shapes_are_the_narrower_ones(tmp_path):
 
 
 def test_the_em_dash_sentinel_is_unreachable_by_construction(tmp_path):
-    """§3.1: `usage_rollup` falls back to `"—"` on a NULL dimension.
+    """§3.6: `usage_rollup` falls back to `"—"` on a NULL dimension.
 
     That fallback is DEFENSIVE, not reachable: all three groupable columns are
     `NOT NULL`, so `persist_complete` rejects the row before the rollup ever
@@ -198,7 +198,7 @@ def test_the_em_dash_sentinel_is_unreachable_by_construction(tmp_path):
     ("there are no NULLs") disagree, and only one of them is checkable.
 
     🚨 If a migration makes any of these nullable, this test fails — and at that
-    point the `"—"` row in §3.1 stops being trivia and starts being contract.
+    point the `"—"` row in §3.6 stops being trivia and starts being contract.
     """
     pq = PersistentQueue(str(tmp_path / "q.db"))
     try:
@@ -210,7 +210,7 @@ def test_the_em_dash_sentinel_is_unreachable_by_construction(tmp_path):
         for groupable in ("agent_id", "endpoint", "call_site"):
             assert cols.get(groupable) is True, (
                 f"proxy_completions.{groupable} is no longer NOT NULL — the "
-                f'"—" fallback in usage_rollup is now reachable, so §3.1 needs '
+                f'"—" fallback in usage_rollup is now reachable, so §3.6 needs '
                 f"a real test of it rather than this one")
 
         # And prove the constraint actually bites, rather than trusting PRAGMA.
@@ -225,7 +225,7 @@ def test_the_em_dash_sentinel_is_unreachable_by_construction(tmp_path):
 
 
 def test_latency_bases_differ_between_the_two_rollups(seeded):
-    """§3.1 documents that `usage_rollup`'s p50/p95 INCLUDE queue wait while
+    """§3.6 documents that `usage_rollup`'s p50/p95 INCLUDE queue wait while
     `fleet_activity`'s p95 does not. Same corpus, so with non-zero queue waits
     the former must come out strictly higher — otherwise one of them silently
     changed basis and every latency comparison across the two is wrong."""

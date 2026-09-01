@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import deque
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,94 @@ def degradation(
         "DEGRADATION component=%s reason=%s impact=%s fields=%r",
         component, reason, impact, fields,
     )
+
+
+# ---------------------------------------------------------------------------
+# Configuration notices — "you wrote this and it has no effect"
+# ---------------------------------------------------------------------------
+#
+# Three loaders in this package accept a fixed set of keys and drop everything
+# else: ``model_catalog._POLICY_PASSTHROUGH``, ``config.load_agent_configs`` and
+# ``identity.KeyRegistry._FILE_FIELDS``. Each of them has silently ignored a
+# real knob at least once, and the reason that failure is so expensive is that
+# from outside it is INDISTINGUISHABLE from the policy decision the operator was
+# trying to make: a dropped ``spill_ok`` looks exactly like a caller who never
+# opted in.
+#
+# A WARNING at startup is not enough, because the operator reading it is usually
+# not the operator who wrote the file, and the line has scrolled by the time
+# anybody asks why the knob does nothing. So a notice is RETAINED as well as
+# logged, and the management plane reads it back (``docs/api.md`` §3.4) — which
+# is what makes "what did you write that is not in force?" an answerable
+# question rather than a log-grep.
+#
+# 🚨 Emitted at LOAD time, from the thread doing the loading — startup, or an
+# operator edit on the loop thread. Nothing on the hot path appends here, which
+# is why a plain deque with no lock is the right amount of machinery.
+
+class ConfigNoticeSink(Protocol):
+    """A host application's sink for configuration notices."""
+
+    def __call__(
+        self, *, source: str, subject: str, problem: str, detail: str,
+        **fields: Any,
+    ) -> None: ...
+
+
+#: Bounded so a pathological config (or a test suite loading a catalog a few
+#: thousand times) cannot grow this without limit. Oldest notices are dropped
+#: first: a config problem that is still true is re-reported on the next load,
+#: so the recent end is the useful one.
+_MAX_CONFIG_NOTICES = 256
+
+_config_notices: "deque[dict[str, Any]]" = deque(maxlen=_MAX_CONFIG_NOTICES)
+_config_notice_sink: ConfigNoticeSink | None = None
+
+
+def set_config_notice_sink(sink: ConfigNoticeSink | None) -> None:
+    """Register the host's config-notice reporter (``None`` restores default)."""
+    global _config_notice_sink
+    _config_notice_sink = sink
+
+
+def config_notice(
+    *, source: str, subject: str, problem: str, detail: str, **fields: Any,
+) -> None:
+    """Record something an operator WROTE that is not in force.
+
+    ``source`` is the file or environment variable it was written in, ``subject``
+    the stanza within it, ``problem`` a stable slug (``unknown_key``,
+    ``unparseable``, ``duplicate``…) and ``detail`` the human sentence. Never
+    raises: a reporting seam must not be able to stop a config from loading.
+    """
+    record = {
+        "source": source,
+        "subject": subject,
+        "problem": problem,
+        "detail": detail,
+        **fields,
+    }
+    _config_notices.append(record)
+    if _config_notice_sink is not None:
+        try:
+            _config_notice_sink(
+                source=source, subject=subject, problem=problem,
+                detail=detail, **fields)
+        except Exception:  # noqa: BLE001 — the seam must never break a load
+            logger.debug("config notice sink failed; falling back to log",
+                         exc_info=True)
+    logger.warning("CONFIG NOTICE source=%s subject=%s problem=%s detail=%s",
+                   source, subject, problem, detail)
+
+
+def config_notices() -> list[dict[str, Any]]:
+    """Every retained notice, oldest first. Read by the management plane."""
+    return list(_config_notices)
+
+
+def clear_config_notices() -> None:
+    """Drop the retained notices. For tests, and for a deliberate reload."""
+    _config_notices.clear()
 
 
 # ---------------------------------------------------------------------------

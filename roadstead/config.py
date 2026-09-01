@@ -22,7 +22,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
-from . import model_catalog
+from . import hooks, model_catalog
 from .constants import _INTERACTIVE_CEILING_S
 
 logger = logging.getLogger(__name__)
@@ -864,6 +864,11 @@ class ProxyConfig:
     # Runtime-mutable feature flags (flags.py): persisted JSON, mutated via
     # POST /v1/admin/flags. Empty path → in-memory defaults (tests).
     runtime_flags_path: str = ""
+    # The management plane's overlay (management.AdminOverlay): runtime key
+    # enrolments, revocations and caller-quota overrides, layered OVER the
+    # config files at startup rather than written back into them. Empty path →
+    # in-memory, and every control response says `persisted: false`.
+    admin_store_path: str = ""
     # Capacity-poller cadence. Production default 10s; tests shrink it so
     # poller-loop behaviour is observable without 10s waits.
     poller_interval_s: float = 10.0
@@ -934,6 +939,17 @@ class ProxyConfig:
 
 _DEFAULT_AGENTS_CONFIG_PATH = Path(__file__).resolve().parent / "agents.yaml"
 
+#: Keys an ``agents.yaml`` stanza may set. 🚨 This is the ALLOWLIST, and it must
+#: be extended in step with the parser below — a field added to
+#: ``AgentQuotaConfig`` and to neither is a knob an operator can write and no
+#: code can read. Both halves are pinned by
+#: ``tests/test_management_plane.py::test_agent_config_fields_match_the_parser``.
+_AGENT_CONFIG_FIELDS = frozenset({
+    "weight", "max_balance_ss", "default_priority",
+    "degrade_ok", "spill_ok", "daily_spend_usd",
+})
+
+
 
 def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaConfig]:
     """Load per-agent DRR quota config from a YAML file.
@@ -949,9 +965,13 @@ def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaCo
         daily_spend_usd (float or null — per-day REAL-money cap; crossing it
             degrades the caller, never rejects it).
     Missing keys fall back to the AgentQuotaConfig dataclass defaults.
-    ⚠️ A key not parsed below is SILENTLY IGNORED — adding a knob to
-    AgentQuotaConfig is not enough to make it operator-reachable. Guarded by
-    test_failover.py::test_degrade_ok_reaches_agent_config.
+    ⚠️ A key not parsed below is IGNORED — adding a knob to AgentQuotaConfig is
+    not enough to make it operator-reachable. Guarded by
+    test_failover.py::test_degrade_ok_reaches_agent_config. It is no longer
+    ignored *silently*: an unrecognised key is reported through
+    ``hooks.config_notice`` and read back by ``GET /rs/v1/admin/callers``,
+    because a dropped ``spill_ok`` is indistinguishable from a caller who never
+    opted in — which is the whole reason this failure keeps costing something.
 
     When ``path`` is None, looks for ``LLM_PROXY_AGENTS_CONFIG`` env
     var, else falls back to ``<package>/agents.yaml``. A missing file
@@ -981,6 +1001,17 @@ def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaCo
                 agent_id, type(cfg),
             )
             continue
+        unknown = sorted(set(cfg) - _AGENT_CONFIG_FIELDS)
+        if unknown:
+            hooks.config_notice(
+                source=str(p),
+                subject=str(agent_id),
+                problem="unknown_key",
+                detail=(f"agent config key(s) {unknown} are not read and have NO "
+                        f"effect on this caller"),
+                keys=unknown,
+                known=sorted(_AGENT_CONFIG_FIELDS),
+            )
         kwargs: dict[str, Any] = {"agent_id": str(agent_id)}
         if "weight" in cfg:
             kwargs["weight"] = float(cfg["weight"])

@@ -794,7 +794,7 @@ class ProxyHttpHandlers:
         change behaviour immediately, no process restart."""
         remote_ip = _remote_ip(request)
         self.audit_admin_ip("/v1/admin/flags", remote_ip)
-        denied = self._deny_non_admin(request, remote_ip)
+        denied = self.deny_non_admin(request, remote_ip)
         if denied is not None:
             return denied
         if request.method == "GET":
@@ -826,7 +826,7 @@ class ProxyHttpHandlers:
         max_model_len), and the deferred queue drains."""
         remote_ip = _remote_ip(request)
         self.audit_admin_ip("/v1/admin/endpoints", remote_ip)
-        denied = self._deny_non_admin(request, remote_ip)
+        denied = self.deny_non_admin(request, remote_ip)
         if denied is not None:
             return denied
         ep = normalize_endpoint(endpoint)
@@ -887,7 +887,7 @@ class ProxyHttpHandlers:
         (close it later via the drain resume, or re-POST with ended_at)."""
         remote_ip = _remote_ip(request)
         self.audit_admin_ip("/v1/admin/maintenance", remote_ip)
-        denied = self._deny_non_admin(request, remote_ip)
+        denied = self.deny_non_admin(request, remote_ip)
         if denied is not None:
             return denied
         if self.state.queue_db is None:
@@ -953,7 +953,7 @@ class ProxyHttpHandlers:
         Admin surface (was unauthenticated — tightened with the rest)."""
         remote_ip = _remote_ip(request)
         self.audit_admin_ip("/v1/admin/maintenance", remote_ip)
-        denied = self._deny_non_admin(request, remote_ip)
+        denied = self.deny_non_admin(request, remote_ip)
         if denied is not None:
             return denied
         if self.state.queue_db is None:
@@ -1080,7 +1080,7 @@ class ProxyHttpHandlers:
         Best-effort: validates the minimum, records, fans out, returns ok."""
         remote_ip = _remote_ip(request)
         self.audit_admin_ip("/v1/calls/log", remote_ip)
-        denied = self._deny_non_admin(request, remote_ip)
+        denied = self.deny_non_admin(request, remote_ip)
         if denied is not None:
             return denied
         try:
@@ -1366,7 +1366,7 @@ class ProxyHttpHandlers:
             status_code=200 if ready else 503,
         )
 
-    def _deny_non_admin(self, request: Request, remote_ip: str) -> Response | None:
+    def deny_non_admin(self, request: Request, remote_ip: str) -> Response | None:
         """The admin gate: ``None`` to proceed, otherwise the refusal to return.
 
         TWO refusals, and they mean different things. A presented credential

@@ -137,6 +137,29 @@ class IPIdentityMap:
 
         return None
 
+    def entries(self) -> dict[str, dict]:
+        """Every OPERATOR REGISTRATION, address → what it resolves to.
+
+        For the management plane's per-caller view (roadmap E), which needs to
+        show that a caller is reachable by address as well as by key.
+
+        🚨 Reports only what an operator REGISTERED. The built-in internal nets
+        are deliberately absent: they resolve to the ``internal`` identity in
+        ``identify()`` without appearing here, and listing them as though they
+        were registrations would tell an operator that removing a line from
+        ``ROADSTEAD_ACL`` closes a door that is in fact built in.
+        """
+        out: dict[str, dict] = {}
+        for address, reg in self._exact.items():
+            out[address] = {"agent_id": reg.agent_id,
+                            "priority": reg.priority.name,
+                            "min_timeout_s": reg.min_timeout_s}
+        for net, reg in self._subnets:
+            out[str(net)] = {"agent_id": reg.agent_id,
+                             "priority": reg.priority.name,
+                             "min_timeout_s": reg.min_timeout_s}
+        return out
+
     def identify(self, remote_ip: str) -> tuple[str, LLMPriority] | None:
         """Returns (agent_id, default_priority) for the given IP, or None
         if the IP is not registered."""

@@ -104,6 +104,37 @@ class BudgetManager:
             self._recalculate_rates()
         return self._agents[agent_id]
 
+    def reweight(
+        self,
+        agent_id: str,
+        *,
+        weight: float | None = None,
+        max_balance: float | None = None,
+    ) -> bool:
+        """Apply an operator's quota edit to a LIVE budget. True if one existed.
+
+        🚨 **Changes the RATE, never the BALANCE.** Re-crediting (or clearing) a
+        balance on a weight change would hand a caller a fresh allowance as a
+        side effect of an unrelated knob — a fairness reset wearing a config
+        edit's clothes, and the caller who benefits is exactly the one an
+        operator is usually reweighting *because* it is consuming too much. The
+        new rate takes effect on the next replenish tick; the deficit the caller
+        has already run stays where it is.
+
+        Without this, a runtime weight change would apply only to callers the
+        proxy has not seen yet — which reads as "the edit did nothing" for
+        precisely the busy callers it was aimed at (roadmap E).
+        """
+        budget = self._agents.get(agent_id)
+        if budget is None:
+            return False
+        if weight is not None:
+            budget.weight = float(weight)
+        if max_balance is not None:
+            budget.max_balance = float(max_balance)
+        self._recalculate_rates()
+        return True
+
     def remove(self, agent_id: str) -> None:
         self._agents.pop(agent_id, None)
         self._recalculate_rates()

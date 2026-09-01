@@ -578,6 +578,28 @@ class Scheduler:
             "total_spilled": self._total_spilled,
         }
 
+    def agent_snapshot(self, agent_id: str) -> dict:
+        """Queued and in-flight counts for ONE caller, across the whole fleet.
+
+        A read, not a mutation — the management plane's per-caller view
+        (roadmap E) asks "what is this caller doing right now", and the existing
+        snapshots are all per-ENDPOINT, which is the same population sliced the
+        other way. Walks the queues rather than keeping a counter: a counter
+        would be a second piece of scheduler state to keep in step with the
+        queues themselves, for a surface an operator reads a few times a day.
+        """
+        queued = 0
+        for eq in self._queues.values():
+            for band in PriorityBand:
+                queued += eq.agent_depth(band, agent_id)
+        in_flight = sum(
+            1
+            for active in self._active.values()
+            for req in active.values()
+            if req.agent_id == agent_id
+        )
+        return {"queued": queued, "in_flight": in_flight}
+
     def endpoint_snapshot(self, endpoint: str) -> dict:
         eq = self._queues.get(endpoint)
         ep_cfg = self._config.endpoints.get(endpoint)

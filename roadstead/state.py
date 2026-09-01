@@ -31,6 +31,7 @@ from .config import ProxyConfig, normalize_endpoint
 from .cost_model import CostModel
 from .flags import RuntimeFlags
 from .identity import IdentityResolver, KeyRegistry
+from .management import AdminOverlay
 from .observability import RequestLogger, RollingMetrics
 from .on_demand import OnDemandManager
 from .queue import PersistentQueue
@@ -165,6 +166,13 @@ class ProxyState:
         # own field because it is the thing an operator configures and a test
         # registers into, not because anything reads it directly any more.
         self.identity = IdentityResolver(self.acl, KeyRegistry.from_env())
+        # The management plane's overlay (roadmap E). Applied AFTER the registry
+        # and the agent configs are loaded, because it is a layer OVER them:
+        # runtime enrolments, revocations and quota overrides that must win over
+        # the files without rewriting them. `apply` is the only thing that
+        # touches either object outside a request.
+        self.admin_overlay = AdminOverlay(config.admin_store_path or None)
+        self.admin_overlay.apply(self.identity.keys, config)
         # Real-time fan-out (Phase 1: proxy = fleet call-metrics authority).
         # Every completion emits a `call.completed` event; the poller pushes a
         # periodic `metrics` frame. Drives the unified Inference page's usage

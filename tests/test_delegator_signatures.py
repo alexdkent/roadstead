@@ -1,7 +1,8 @@
 """`service.py`'s delegators must keep the signatures of the handlers they call.
 
-`ProxyService` forwards ~30 HTTP methods straight to `ProxyHttpHandlers`, and
-since Workstream C three more to `EnrichedApi`. The delegation is mechanical, so
+`ProxyService` forwards ~30 HTTP methods straight to `ProxyHttpHandlers`,
+since Workstream C three more to `EnrichedApi`, and since Workstream E six more
+to `ManagementApi`. The delegation is mechanical, so
 nothing enforces it: change a handler's signature and the delegator still
 *compiles*, still forwards, and fails at runtime on the one route nobody
 exercised.
@@ -30,6 +31,7 @@ SERVICE = _ROOT / "roadstead" / "service.py"
 _COLLABORATORS = {
     "_http": (_ROOT / "roadstead" / "http_handlers.py", "ProxyHttpHandlers"),
     "_enriched": (_ROOT / "roadstead" / "enriched.py", "EnrichedApi"),
+    "_management": (_ROOT / "roadstead" / "management.py", "ManagementApi"),
 }
 
 #: Fewer than this means the sweep has gone blind, not green (docs/ledger.md,

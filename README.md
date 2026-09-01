@@ -169,6 +169,40 @@ disagree the key wins, and a presented key that does not resolve is a 401 rather
 demotion to whatever the address would have given. `docs/api.md` §1.5 has the full precedence and
 the reasoning.
 
+## Managing it — `/rs/v1/admin`
+
+Keys, quotas and budgets are also **runtime** operations, so enrolling a caller does not mean editing
+a file and restarting a proxy that is serving traffic.
+
+```sh
+# enrol a caller. The secret comes back ONCE and is never stored — only its digest is.
+curl -sX POST localhost:42100/rs/v1/admin/keys \
+     -d '{"agent_id": "coding-assistant", "priority": "P1_TURN_SUPPORT"}'
+
+# adjust its share of the fleet, and cap what it may spend off-machine
+curl -sX PATCH localhost:42100/rs/v1/admin/callers/coding-assistant \
+     -d '{"weight": 3.0, "spill_ok": true, "daily_spend_usd": 5.0}'
+
+# revoke, immediately, whatever declared it
+curl -sX DELETE localhost:42100/rs/v1/admin/keys/coding-assistant-laptop
+```
+
+**A runtime change never rewrites your config file.** It goes to a JSON overlay layered over
+`models.yaml`, `agents.yaml` and your keys file at startup — so your comments survive, and what you
+wrote stays separable from what the API changed.
+
+The read side answers the question a config file cannot: **what did I write that is not in force?**
+
+```sh
+curl -s localhost:42100/rs/v1/admin/config     # sources, and every knob nothing reads
+curl -s localhost:42100/rs/v1/admin/providers  # declared capacity vs what discovery found
+curl -s localhost:42100/rs/v1/admin/callers    # quota in force, declared, and overridden
+```
+
+A dropped `policy:` key looks exactly like a knob that was never load-bearing, and a slot count that
+discovery overwrote looks exactly like one it never probed. Those gaps are where the expensive
+mistakes live, so the views report both numbers rather than the winning one. `docs/api.md` §3.
+
 ## Overflow, and what it costs
 
 Local capacity is the design centre; remote capacity is what happens when the local fleet is **full**.

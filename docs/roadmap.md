@@ -141,10 +141,11 @@ is for.
 
 ### A management interface
 
-Eventually: manage and monitor Roadstead as a standalone product — keys, quotas, budgets, providers,
-backends, and the live picture of what the fleet is doing. Deferred, but two constraints bind from
-now: it must not violate the concurrency invariant (`CLAUDE.md` — heavy reads go off-loop), and it
-must not drag a frontend toolchain into a package whose dependency list is deliberately short.
+Manage and monitor Roadstead as a standalone product — keys, quotas, budgets, providers, backends,
+and the live picture of what the fleet is doing. **The HTTP half landed 2026-09-01** (`/rs/v1/admin`
+— Workstream E); a UI has not, and the two constraints still bind: it must not violate the
+concurrency invariant (`CLAUDE.md` — heavy reads go off-loop, mutations stay on it), and it must not
+drag a frontend toolchain into a package whose dependency list is deliberately short.
 
 ---
 
@@ -216,10 +217,11 @@ answer off a `Principal` rather than asking about an address.
 - **Clears scrub S1**, as planned — and S3 with it, plus a fourth private inventory the plan had not
   listed (`agents.yaml`, the same way S2 turned up `usage_rates.py`).
 
-**Still open in B:** keys are flat — there is no team → key nesting for quota and budget
-inheritance, which is the "multi-tenancy depth" question below. Nothing reads a key on the
-management side yet either: there is no enrolment surface, so a key is created by editing config and
-restarting. That belongs with **E**.
+**~~Still open in B~~ — closed 2026-09-01 by E.** Enrolment and revocation are now runtime
+operations on `/rs/v1/admin/keys`, so a key is no longer created by editing config and restarting.
+Keys stay flat, and that turned out to be the answer rather than a gap: the budget holder is the
+`agent_id`, not the key, so many keys → one `agent_id` is already the team-level inheritance the
+"multi-tenancy depth" question was asking for.
 
 ### C · The enriched API
 
@@ -298,7 +300,53 @@ remote providers will eventually want to choose between them.
 
 ### E · Management interface
 
-Read first, control second. After **B** and **D** exist to be managed.
+**Landed 2026-09-01.** `/rs/v1/admin/*` — read first, control second, and it went last because there
+was nothing worth managing until keys, quotas, budgets and providers all existed.
+
+**The thesis.** An operator's questions are not the caller's questions one level up. A caller asks
+*what can serve me, how long, what does it cost*; an operator asks something the package could not
+answer at all: **"what did I write that is not in force?"** Every expensive failure in
+`docs/ledger.md` lives in a gap between two sources that agree most of the time — a dropped `policy:`
+key, a declared slot count discovery overwrote (or did not), a fingerprint the backend stopped
+matching, an `api_key_env` nobody exported. So the views report the declared value beside the one in
+force, and a surface that merely echoed `models.yaml` back would be a worse `cat`.
+
+- **On `/rs/v1/admin/*`, not `/v1/admin/*`.** `/v1` is versioned by OpenAI and management is the
+  surface most likely to need its own second version. The four control routes that predate this are
+  served at **both** spellings — same handler, same gate — so no consumer breaks and an operator has
+  one prefix rather than two.
+- **`hooks.config_notice` is a fourth reporting seam and the first that reports IN.** The three
+  allowlist parsers still drop unknown keys and still log, but a notice is now *retained* and read
+  back by `GET /rs/v1/admin/config`. A startup WARNING is read by whoever booted the process; "why
+  does this knob do nothing" is asked by somebody else, a week later.
+- **Enrolment and revocation without a restart** — the half of **B** that was left open. A generated
+  secret is returned once and never stored; a plaintext one is never accepted. Revocation is never
+  refused on provenance grounds, because "that key came from the environment, use a different tool"
+  is a correctness argument answered, in the moment, by a breach.
+- **🚨 Revoking the LAST key changes the identity regime back, and is disclosed.** An empty registry
+  is not in play (§1.5 rule 2), so the revoked key is *ignored* rather than refused and the address
+  decides. Found by the e2e journey, not by reasoning; fixed by disclosing rather than by narrowing
+  rule 2, which would 401 exactly the deployment that just emptied its registry deliberately.
+- **Quota edits reach the LIVE budget**, and move the rate rather than the balance — clearing a
+  deficit on a config edit would hand a fresh allowance to precisely the caller being reweighted
+  because it consumes too much. **§1.6 is inherited at the write boundary**: no field can express a
+  rejection, so the plane cannot mint a policy admission refuses to honour.
+- **A runtime edit never rewrites a config file.** A JSON overlay is layered over the files at
+  startup — enrolments and overrides on top, revocations last. Comments survive, the operator's
+  editor is not raced, and "who changed this" stays answerable. **An unpersistable change still takes
+  effect and says so**, which is why §3 mints no error code for it.
+- Twenty mutations, every guard observed going red — two of which failed the first pass and were
+  real: the doc pin was satisfied by a route named in *prose* rather than in the table, and one
+  mutation was a no-op that had to be rewritten before it proved anything.
+
+**Still open in E.** It is read-and-control over HTTP, not a product: there is no UI, and the
+roadmap's "manage and monitor as a standalone product" line still wants one — with the two
+constraints it has always had (heavy reads off-loop, no frontend toolchain in a package whose
+dependency list is deliberately short). Providers and endpoints are **read-only**: adding a backend
+is still a `models.yaml` edit and a restart, deliberately, because an endpoint is a routing-table
+entry that discovery, health and the DRR denominator all key on, and hot-adding one is a much larger
+question than hot-adding a key. Nothing here is audited: an operator can see what changed but not
+*who* changed it or *when*, and the overlay is the obvious place for that.
 
 ### F · Hardening — the concurrency invariant, guarded
 
@@ -394,8 +442,13 @@ in ways the name does not suggest (`history.md`, "Things that will mislead you")
 - **Where the intent vocabulary lives.** Profiles are built into `intent.py` today. A deployment
   whose fleet has a capability the built-ins do not name has to edit the package — which is the
   `models.yaml` argument again, one layer up.
-- **Multi-tenancy depth.** Are keys flat, or do they nest (team → key) for quota and budget
-  inheritance? Flat is enough for the primary goal and probably not for the secondary one.
+- ~~**Multi-tenancy depth.**~~ **Settled 2026-09-01 with E: keys stay flat, because the shape that
+  was wanted already exists.** The quota holder, the DRR fair share and the spend cap are keyed on
+  the `agent_id`, never on the key — so several keys naming one `agent_id` give a team one budget
+  with per-key revocation and per-key priority, which is what nesting was for. `GET
+  /rs/v1/admin/keys` groups by `agent_id` so the structure is visible rather than inferable. A real
+  team → key hierarchy would only start to earn its keep with per-team *aggregate* caps distinct from
+  the per-caller ones, and nothing yet needs that.
 - **Where cost truth lives.** Provider-reported spend vs. our own token accounting; they will
   disagree, and one of them has to be authoritative for threshold decisions.
 - **Streaming through a remote provider** under a computed deadline — the soft-deadline extension

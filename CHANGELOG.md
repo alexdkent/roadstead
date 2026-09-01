@@ -8,6 +8,65 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Added — the management plane (Workstream E)
+
+Landed 2026-09-01. **Nothing here is breaking, deliberately**: the plane is additive, the four
+pre-existing `/v1/admin/*` control routes keep working unchanged, and §3 mints **no new error code**
+— the third time that call has been made (§1.6, §1.7).
+
+- **`/rs/v1/admin/*` — the management plane** (`roadstead/management.py`, `docs/api.md` §3). Six new
+  routes: `config`, `keys` (GET/POST), `keys/{key_id}` (DELETE), `callers` (GET),
+  `callers/{agent_id}` (PATCH), `providers`. *Why not `/v1/admin`:* `/v1` is versioned by OpenAI, and
+  management is the surface most likely to need its own second version. The four legacy control
+  routes are served at **both** spellings — same handler, same gate — so no consumer breaks and an
+  operator has one prefix rather than two. A test pins the pair, because an alias that stops aliasing
+  is a control surface that works on one spelling and 404s on the other.
+- **Keys are enrolled and revoked at runtime.** Workstream B made a key the caller's identity and
+  left "create one" meaning *edit a file and restart*. A generated secret is returned **once** and
+  never stored (the registry keeps the digest); a plaintext secret is never *accepted*, because a
+  secret in a request body lands in an access log. Revocation is never refused on provenance grounds
+  — a key declared in the environment can be killed now, and the response says the declaration will
+  outlive the reason it is dead.
+- **🚨 Revoking the LAST key is disclosed, because it changes the identity regime back.** An empty
+  registry is not in play (§1.5 rule 2), so a presented key — including the one just revoked — is
+  ignored again and the address decides. Nothing is escalated; what stops being true is *revoked
+  means refused*. Found by the e2e journey rather than reasoned about, and fixed by **disclosing**
+  it: narrowing rule 2 would 401 exactly the deployment that has just emptied its registry on
+  purpose. Disclosures arrive in a `warnings` **array**, because two can be true of one action.
+- **Caller quotas are editable at runtime** — `weight`, `max_balance_ss`, `default_priority`,
+  `degrade_ok`, `spill_ok`, `daily_spend_usd`, the same set `agents.yaml` accepts, pinned against it
+  *and* against the dataclass. A weight change reaches the **live** DRR budget (or the edit would
+  apply only to callers the proxy has never seen — "it did nothing" for exactly the busy caller it
+  was aimed at) and moves the **rate, never the balance**.
+- **🚨 §1.6 is inherited at the write boundary, not re-implemented there.** No field can express a
+  rejection, so the plane cannot mint a policy admission refuses to honour. An unknown field is a
+  400 naming the known set — never a silent drop, on the surface whose purpose is exposing them.
+- **A runtime edit never rewrites your config file.** Changes go to a JSON overlay
+  (`ROADSTEAD_ADMIN_STORE`) layered over the files at startup: enrolments and overrides on top,
+  revocations last. Comments survive, the operator's editor is not raced, and "who changed this" is
+  answerable. **A change that cannot be persisted still takes effect and says so** (`persisted:
+  false` plus a reason) — refusing a revocation because a disk is read-only is a correctness
+  argument answered, in the moment, by a breach.
+- **`hooks.config_notice` — a fourth reporting seam, and the first that reports *in*.** Three loaders
+  drop unknown keys (`models.yaml` `policy:`, `agents.yaml`, a keys-file entry) and each has cost
+  something, because a dropped `spill_ok` is indistinguishable from a caller who never opted in. The
+  keys are still dropped and still logged, but now **retained** and readable at
+  `GET /rs/v1/admin/config` — the operator who reads a boot log and the one who asks why a knob does
+  nothing are not the same person, a week apart.
+- **The read views report the GAP, not the config.** `providers` shows declared capacity (the
+  catalog seed) beside what is in force and whether the engine publishes it at all, so "discovery
+  agreed" and "discovery never ran" stop being indistinguishable. `callers` splits quota into
+  `in_force` / `declared` / `runtime`, so an override reads as a difference rather than a label.
+- **🚨 Keys stay FLAT, and that answers the roadmap's open multi-tenancy question rather than
+  deferring it.** The quota holder, the DRR share and the spend cap are keyed on `agent_id`, never on
+  the key — so several keys naming one `agent_id` already give a team one budget with per-key
+  revocation and per-key priority. The view groups by it to make that visible.
+- **New supporting surface:** `IPIdentityMap.entries()` (registrations only — the built-in internal
+  nets are deliberately absent, or an operator would think removing a line closes a door that is
+  built in), `Scheduler.agent_snapshot`, `BudgetManager.reweight`, `KeyRegistry.revoke` and key
+  provenance. `tests/loop_affinity.py` arms the three newly-mutable objects and grew dotted-path
+  resolution to reach the registry behind the identity resolver.
+
 ### Breaking
 
 Landed 2026-09-01 with **Workstream C** (the enriched API) and **Workstream F** (hardening). Two of

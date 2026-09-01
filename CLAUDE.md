@@ -98,6 +98,14 @@ on a path the load actually reaches — which is most of them, but not the one y
   WAL permits concurrent readers) so a slow aggregation never blocks the loop.
 - **Never add a `workers=` parameter, a thread pool that WRITES, or a second thread that touches
   scheduler or budget state.** Connections are never shared across threads.
+- 🚨 **Workstream E added a new KIND of writer: a request handler.** Everything else that mutates
+  single-loop state is written by the scheduler loop itself; `management.py` mutates the key
+  registry, `config.agents` and the DRR budgets from an admin request. The rule it follows is
+  **mutate on the loop, persist off it** — the file write goes through `asyncio.to_thread`, the
+  mutation does not. That is deliberately stricter than `flags.py`, which runs its whole `set_many`
+  off-loop: a flag dict is written in a blue moon, whereas a registry write racing `resolve()` on
+  every request is the exact interleaving this invariant forbids. `loop_affinity.py` arms all three
+  objects (and grew dotted-path resolution to reach the registry behind the identity resolver).
 
 Shut down with **SIGTERM**, which runs a bounded drain (≤30s) that finishes in-flight work, flushes
 the write queue, and persists DRR budgets. The monorepo's knowledge layer contradicted itself here;
@@ -176,7 +184,7 @@ without new, backend-correct A/B evidence.
 ## Layout
 
 ```
-roadstead/          the package (36 modules + providers/ + client/)
+roadstead/          the package (37 modules + providers/ + client/)
   scheduler.py      DRR + priority bands + admission        — pure computation, no I/O
   cost_model.py     slot-second cost, EWMA-calibrated       — pure computation, no I/O
   timeout_model.py  learned latency → recommended deadline  — pure computation, no I/O
@@ -185,6 +193,7 @@ roadstead/          the package (36 modules + providers/ + client/)
   correction.py     the output-integrity layer
   lifecycle.py      admission → dispatch → streaming → timeout recording
   enriched.py       north face TWO: /rs/v1 (see below)
+  management.py     north face THREE: /rs/v1/admin — the operator's plane
   http_handlers.py  north face ONE: the OpenAI doors, admin, analytics
   health.py         capacity discovery, circuit breaker, drain
   queue.py          durable event log + THE single writer thread
@@ -279,6 +288,43 @@ spill}` narrows what the operator granted, and both gates take the **AND** — a
 a caller award itself a permission its operator withheld, which is the self-asserted `agent_id` bug
 in a different costume, and for spill the consequence is money. Declining is a DEFER, not an error:
 the request keeps its place and is served locally.
+
+🚨 **The management plane answers ONE question: what did you write that is not in force?**
+`management.py` (`/rs/v1/admin/*`) is the operator's face, and it is a diagnostic rather than a
+readout — a view that echoed `models.yaml` back would be a worse `cat`. Every expensive failure in
+`docs/ledger.md` lives in a gap between two sources that agree most of the time, so the views report
+the **declared** value beside the one **in force**: the catalog's slot seed beside what discovery
+left (and whether the engine publishes it at all, so "discovery agreed" and "discovery never ran"
+stop being indistinguishable), a caller's quota as `in_force`/`declared`/`runtime`, and
+`hooks.config_notice` — the fourth reporting seam and the first that reports *in* — retaining every
+knob the three allowlist parsers dropped. It is on `/rs/v1/admin`, not `/v1/admin`, because `/v1` is
+versioned by OpenAI; the four control routes that predate it are served at **both** spellings, same
+handler, same gate.
+
+🚨 **A management surface never emits a credential, and a control action that cannot be persisted
+still takes effect.** Not the key, not the digest (a digest is a working credential to anyone who can
+compute one), never the value behind an `api_key_env` — only its name and whether it resolved. And a
+runtime edit **never rewrites the operator's config file**: changes go to a JSON overlay layered over
+the files at startup (enrol, then revoke — a tombstone is a later statement than the enrolment it
+follows). When the overlay is unwritable the change applies in memory and the response says
+`persisted: false` with a reason, because refusing a revocation over a read-only disk is a
+correctness argument answered, in the moment, by a breach. Same reason revocation is never refused on
+*provenance* grounds — an env-declared key can be killed now, and the response says the declaration
+will outlive the reason it is dead. 🚨 **Revoking the LAST key changes the identity regime back**
+(§1.5 rule 2: an empty registry is not in play, so the revoked key is *ignored* rather than refused),
+and that is disclosed rather than fixed — narrowing rule 2 would 401 exactly the deployment that just
+emptied its registry on purpose. Disclosures ride in a `warnings` **array**: two can be true at once,
+and a single field means the second silently overwrites the first.
+
+🚨 **The write boundary INHERITS §1.6 rather than re-implementing it, and keys stay FLAT.** No
+editable field can express a rejection — every quota knob changes a share, a band or a cap — so the
+plane cannot mint a policy the admission path refuses to honour; an unknown field is a 400 that names
+the known set, never a silent drop, on the surface whose whole purpose is exposing silent drops. A
+quota edit reaches the **live** DRR budget (or it applies only to callers the proxy has never seen,
+which reads as "the edit did nothing" for exactly the busy caller it was aimed at) and moves the
+**rate, not the balance**. And keys are flat because the budget holder is the `agent_id`, not the
+key: many keys → one `agent_id` is already team-level quota inheritance, which is what the roadmap's
+"multi-tenancy depth" question was asking for.
 
 🚨 **`roadstead.client` imports nothing from the server, and that is a rule with a test.** Two
 reasons, and the second is the one that would be lost silently: a consumer sending an HTTP request

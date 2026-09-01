@@ -1,7 +1,7 @@
 # Roadstead API specification
 
 **Status:** v0.1 — the load-bearing contracts, verified against source on 2026-08-31. The two areas
-previously marked INCOMPLETE are now filled (§3.1 and §5), and both are pinned by tests that read
+previously marked INCOMPLETE are now filled (§3.6 and §5), and both are pinned by tests that read
 this document back, so it fails the suite rather than rotting.
 
 This document is Roadstead's **public contract** — the surface `docs/compatibility.md` marks 🔒
@@ -506,25 +506,136 @@ caller says who it is, its privileges are that identity's; inheriting the host's
 key could only ever widen access and never narrow it, which makes it worthless on the machine it
 runs on.
 
+**The management plane lives at `/rs/v1/admin/*`.** `/v1` is versioned by OpenAI (§1.7), and this is
+the surface most likely to need its own second version — it grows with the product rather than with
+somebody else's published standard. The four control routes that predate it keep their `/v1/admin/*`
+spelling *and* gain the new one: same handler, same gate, both paths served, so no existing consumer
+breaks and an operator has one prefix rather than two.
+
+🚨 **§3 mints no error code.** The same call as §1.6 and §1.7, for the third time. Every refusal here
+is one of §2.1's existing codes — `invalid_api_key` (401), `access_denied` (403),
+`invalid_request_error` (400/404/409). In particular a control action that could not be **persisted**
+is not an error: see §3.2.
+
 | Route | Purpose |
 |---|---|
-| `POST /v1/admin/endpoints/{ep}/pause` | Drain an endpoint: background defers, interactive fast-fails, the poller stops probing. Auto-opens an annotated PLANNED maintenance window. |
-| `POST /v1/admin/endpoints/{ep}/resume` | Re-probe, **re-discover capacity**, drain the deferred queue, close the window. |
-| `GET`/`POST /v1/admin/flags` | Read/flip runtime flags; persisted to JSON, survives restart. |
-| `GET`/`POST /v1/admin/maintenance` | List, or backdate a closed window for a restart done without draining. |
+| `GET /rs/v1/admin/config` | The configuration sources, and everything written that is **not in force** (§3.5). |
+| `GET /rs/v1/admin/keys` | The key registry, redacted. Never a key, never a digest. |
+| `POST /rs/v1/admin/keys` | Enrol a credential. Returns the secret **once** (§3.3). |
+| `DELETE /rs/v1/admin/keys/{key_id}` | Revoke one credential, whatever declared it. |
+| `GET /rs/v1/admin/callers` | Per caller: identities, quota (declared vs in force), DRR budget, spend, live occupancy. |
+| `PATCH /rs/v1/admin/callers/{agent_id}` | Edit one caller's quota (§3.4). Partial; absent fields untouched. |
+| `GET /rs/v1/admin/providers` | Providers and endpoints: declared vs discovered capacity, credential presence, prices, health. |
+| `POST /rs/v1/admin/endpoints/{ep}/pause` · `POST /v1/admin/endpoints/{ep}/pause` | Drain an endpoint: background defers, interactive fast-fails, the poller stops probing. Auto-opens an annotated PLANNED maintenance window. |
+| `POST /rs/v1/admin/endpoints/{ep}/resume` · `POST /v1/admin/endpoints/{ep}/resume` | Re-probe, **re-discover capacity**, drain the deferred queue, close the window. |
+| `GET`/`POST /rs/v1/admin/flags` · `GET`/`POST /v1/admin/flags` | Read/flip runtime flags; persisted to JSON, survives restart. |
+| `GET`/`POST /rs/v1/admin/maintenance` · `GET`/`POST /v1/admin/maintenance` | List, or backdate a closed window for a restart done without draining. |
 
 Open surfaces: `GET /v1/status` (per-endpoint health, capacity, reliability counters),
 `GET /v1/timeouts`, `GET /metrics` (Prometheus), `GET /health`, `GET /readyz` (fails closed on
 readiness-critical endpoints), and the `/v1/fleet/*` analytics family.
 
-The three `/rs/v1` routes are **not** open — they are gated like the inference doors (§1.7).
-`GET /rs/v1/models` in particular is a map of the fleet: slot counts, live occupancy, health and
-prices. An unenrolled caller has no more business reading that than dispatching to it.
+The three `/rs/v1` inference routes are **not** open — they are gated like the inference doors
+(§1.7). `GET /rs/v1/models` in particular is a map of the fleet: slot counts, live occupancy, health
+and prices. An unenrolled caller has no more business reading that than dispatching to it.
 
 🚨 **`/v1/status` and `/metrics` have external consumers** — in the origin fleet a gateway, a
 ground-truth verifier and a web UI all read them. Treat their top-level key names as public API.
 
-### 3.1 `/v1/fleet/*` analytics — response schemas
+### 3.2 What a control action promises 🚨
+
+Every mutating route answers with the change it made **plus** `persisted` and, when that is false, a
+`reason`.
+
+🚨 **A change that cannot be persisted still takes effect.** The runtime store is unwritable in an
+embedded deployment, on a read-only disk, and in a test. Refusing a revocation on those grounds is a
+correctness argument answered, in the moment, by a breach — so the mutation applies in memory and the
+response says it will not survive a restart. That is a fact an operator can act on; a 503 is not.
+
+🚨 **A runtime edit never rewrites your config file.** `models.yaml`, `agents.yaml` and a keys file
+stay exactly as they were written, comments included. Runtime changes go to a separate JSON overlay
+(`ROADSTEAD_ADMIN_STORE`, default `<data dir>/admin_overlay.json`) that is **layered over** those
+files at startup: enrolments and quota overrides applied on top, revocations applied last. So what
+you wrote and what the API changed remain two separately readable things, which is what makes "who
+changed this" answerable at all.
+
+### 3.3 Keys 🚨
+
+**A generated secret is returned exactly once**, by the `POST` that creates it, and cannot be
+recovered: the registry holds only the SHA-256 digest. Losing it costs a revoke-and-enrol, which is
+the correct price — a surface that could re-read a key is a key store.
+
+**A plaintext secret is never accepted.** There is no `key` field; a secret in a request body lands
+in an access log, a proxy buffer and a shell history. To migrate an existing credential, send its
+`key_sha256`.
+
+**The first enrolment changes the identity regime for every caller**, and the response says so: until
+then a presented key is ignored and the address decides (§1.5 rule 2); from then on an unrecognised
+key is a 401.
+
+🚨 **Revoking the LAST key changes it back, and the response says that too.** An empty registry is
+not in play at all, so a presented key — including the one just revoked — is ignored again and the
+source address decides. Nothing is escalated (the credential confers nothing either way), but
+*revoked means refused* stops being true for a caller whose address is enrolled. Rule 2 is not
+narrowed to hide this: it exists so a deployment with no keys is not broken by the placeholder
+`Authorization` header every OpenAI client sends, and a registry that stayed in play once populated
+would 401 exactly the deployment that has just emptied it on purpose.
+
+Disclosures arrive in a **`warnings` array**, not a string: two of them can be true of one action —
+revoking an env-declared key that is also the last one is both — and a single field means the second
+silently overwrites the first.
+
+**Revocation is never refused on provenance grounds.** A key declared in `ROADSTEAD_API_KEYS` or a
+keys file can be revoked at runtime and the revocation survives a restart — but this plane cannot
+edit an environment, so the response warns that the declaration will outlive the reason it is dead.
+
+🚨 **Keys are flat, and that is the answer to team-level quotas rather than a gap in it.** The quota
+holder, the DRR fair share and the spend cap are all keyed on `agent_id`, never on the key — so
+several keys naming one `agent_id` already give a team one budget with per-key revocation and per-key
+priority. `GET /rs/v1/admin/keys` groups by `agent_id` so the structure is visible rather than
+inferable.
+
+### 3.4 Caller quotas 🚨
+
+`PATCH /rs/v1/admin/callers/{agent_id}` accepts exactly the fields an `agents.yaml` stanza accepts:
+`weight`, `max_balance_ss`, `default_priority`, `degrade_ok`, `spill_ok`, `daily_spend_usd`. An
+unknown field is a **400 that names the known set** — never a silent drop, on the surface whose
+purpose is to expose silent drops. `daily_spend_usd: null` is *uncapped*; `0` is a real cap meaning
+*no paid spend at all*, and they are one keystroke apart.
+
+🚨 **An edit changes policy, never history.** A new weight moves the replenish rate and leaves the
+deficit already run; lowering a cap charges nobody retroactively. Clearing a balance on a config edit
+would hand a fresh allowance to precisely the caller being reweighted because it consumes too much.
+
+🚨 **§1.6 is inherited here, not re-implemented.** There is no field with which to express a
+rejection — every knob changes a share, a band or a cap, and crossing a cap still costs one priority
+band and paid spill and nothing else. A `blocked` or `max_requests` field would break that without
+touching a line of admission code, which is why the editable set is closed and pinned.
+
+### 3.5 The gap — what you wrote that is not in force 🚨
+
+`GET /rs/v1/admin/config` reports the configuration **sources** (catalog, agents, keys, ACL, flags,
+the runtime store and whether it is writable) and a list of **notices**: every knob an operator wrote
+that no code reads.
+
+Three loaders accept a fixed set of keys and drop the rest — `models.yaml`'s `policy:` block,
+`agents.yaml`'s stanzas, and a keys-file entry. Each has silently ignored a real knob at least once,
+and the cost is always the same: a dropped `spill_ok` is indistinguishable from a caller who never
+opted in. The keys are still dropped (a typo must not stop a fleet booting) and still logged — but
+they are now **retained** and readable here, because the operator who reads a boot log and the
+operator who asks why a knob does nothing are usually not the same person, a week apart.
+
+An empty `notices` list is the healthy state. It is not the same as "no config was loaded": the
+`sources` block says which files were read.
+
+The same principle shapes the other two read views. `GET /rs/v1/admin/providers` reports each
+endpoint's **declared** capacity (the `models.yaml` seed) beside what is **in force** (what discovery
+left), plus whether the engine publishes it at all — so "discovery agreed" and "discovery never ran"
+are distinguishable, which they are not on `/v1/status`. `GET /rs/v1/admin/callers` reports quota as
+three blocks — `in_force`, `declared` (what the file set) and `runtime` (what this API changed) — so
+an override reads as a difference rather than a label.
+
+### 3.6 `/v1/fleet/*` analytics — response schemas
 
 Chased to column level 2026-08-31. Every field below is pinned by
 `tests/test_fleet_analytics_schema.py`, which drives the real producers against a seeded
@@ -812,7 +923,7 @@ buy nobody anything. `POST /v1/submit` is **removed**; §1.9 is the map and `CHA
 reason. Read back by `tests/test_client_sdk.py` and `tests/e2e/test_enriched_api.py`.
 
 **Previously INCOMPLETE — both closed 2026-08-31:**
-1. ~~Nested response schemas for `/v1/fleet/*` analytics.~~ Chased to column level in §3.1 and
+1. ~~Nested response schemas for `/v1/fleet/*` analytics.~~ Chased to column level in §3.6 and
    pinned by `tests/test_fleet_analytics_schema.py`, which reads this document back.
 2. ~~Delegator-signature drift between `service.py` and `http_handlers.py`.~~ Audited by AST:
    **30 delegators, 30 identical signatures, zero drift** — the stated contract holds. Now

@@ -39,6 +39,7 @@ from typing import Any
 
 import yaml
 
+from . import hooks
 from .intent import KNOWN_CAPABILITIES
 from .providers import DEFAULT_PROVIDER, provider_for_engine
 
@@ -290,6 +291,12 @@ _POLICY_PASSTHROUGH = (
 )
 
 
+#: ``policy:`` keys read OUTSIDE the passthrough loop above, because their YAML
+#: shape is not their ``EndpointConfig`` shape. Listed here so the unknown-key
+#: notice does not report a key that is, in fact, load-bearing.
+_POLICY_HANDLED = frozenset({"model_fingerprint", "thinking_kwargs"})
+
+
 def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any]]:
     """Per-endpoint-class kwargs for constructing proxy ``EndpointConfig``.
 
@@ -379,6 +386,22 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
         for src in _POLICY_PASSTHROUGH:
             if src in pol:
                 kw[src] = pol[src]
+        # 🚨 Everything else in `policy:` is DROPPED, and a dropped knob looks
+        # exactly like a knob that was never load-bearing. Reported (never
+        # raised — a typo must not stop a fleet booting) and retained, so
+        # `GET /rs/v1/admin/providers` can answer "what did I write that is not
+        # in force?" without anybody grepping a startup log. See hooks.py.
+        unknown_policy = sorted(set(pol) - set(_POLICY_PASSTHROUGH) - _POLICY_HANDLED)
+        if unknown_policy:
+            hooks.config_notice(
+                source="models.yaml",
+                subject=f"endpoints.{e.name}.policy",
+                problem="unknown_key",
+                detail=(f"policy key(s) {unknown_policy} are not read by any "
+                        f"code and have NO effect on this endpoint"),
+                keys=unknown_policy,
+                known=sorted(set(_POLICY_PASSTHROUGH) | _POLICY_HANDLED),
+            )
         # Declared per MODEL and checked against what the backend actually
         # serves; see health.model_swap_alerts.
         raw_fp = pol.get("model_fingerprint")

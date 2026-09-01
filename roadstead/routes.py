@@ -23,6 +23,12 @@ Provides:
   - GET  /v1/timeouts      — calls that hit their timeout (per model/tier/layer)
   - GET  /v1/timeouts/stalls — backend-stall aborts for one caller + window
   - GET/POST /v1/admin/maintenance — annotate/list planned-restart windows
+  - GET  /rs/v1/admin/config    — configuration sources + what is NOT in force
+  - GET/POST /rs/v1/admin/keys  — the key registry (redacted) / enrol a key
+  - DELETE /rs/v1/admin/keys/{key_id} — revoke a key
+  - GET  /rs/v1/admin/callers   — per-caller identity, quota, DRR, spend
+  - PATCH /rs/v1/admin/callers/{agent_id} — edit one caller's quota
+  - GET  /rs/v1/admin/providers — providers + endpoints: declared vs in force
   - GET  /health           — health check
 """
 
@@ -39,6 +45,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .enriched import PREFIX
+from .management import PREFIX as ADMIN_PREFIX
 
 if TYPE_CHECKING:
     from .service import ProxyService
@@ -154,6 +161,24 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_inflight(request: Request) -> Response:
         return await svc.handle_inflight(request)
 
+    async def handle_admin_config(request: Request) -> Response:
+        return await svc.handle_admin_config(request)
+
+    async def handle_admin_keys(request: Request) -> Response:
+        return await svc.handle_admin_keys(request)
+
+    async def handle_admin_key(request: Request) -> Response:
+        return await svc.handle_admin_key(request)
+
+    async def handle_admin_callers(request: Request) -> Response:
+        return await svc.handle_admin_callers(request)
+
+    async def handle_admin_caller(request: Request) -> Response:
+        return await svc.handle_admin_caller(request)
+
+    async def handle_admin_providers(request: Request) -> Response:
+        return await svc.handle_admin_providers(request)
+
     return [
         # --- the enriched north face (roadmap Workstream C) -----------------
         # 🚨 This REPLACES the `/v1/submit` envelope, which was removed rather
@@ -199,6 +224,31 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         Route("/v1/admin/maintenance", handle_maintenance, methods=["GET", "POST"]),
         # Runtime feature flags: the shadow→enforce flip surface (internal/ACL).
         Route("/v1/admin/flags", handle_admin_flags, methods=["GET", "POST"]),
+        # --- the management plane (roadmap Workstream E) ---------------------
+        # 🚨 On `/rs/v1/admin/*` rather than `/v1/admin/*`: `/v1` is versioned by
+        # OpenAI, and management is the surface most likely to need its own
+        # second version. See `management.py`.
+        Route(f"{ADMIN_PREFIX}/config", handle_admin_config, methods=["GET"]),
+        Route(f"{ADMIN_PREFIX}/keys", handle_admin_keys, methods=["GET", "POST"]),
+        Route(f"{ADMIN_PREFIX}/keys/{{key_id}}", handle_admin_key, methods=["DELETE"]),
+        Route(f"{ADMIN_PREFIX}/callers", handle_admin_callers, methods=["GET"]),
+        Route(f"{ADMIN_PREFIX}/callers/{{agent_id}}", handle_admin_caller,
+              methods=["PATCH"]),
+        Route(f"{ADMIN_PREFIX}/providers", handle_admin_providers, methods=["GET"]),
+        # The four control routes that predate the management plane, served at
+        # the new prefix TOO. They keep their `/v1/admin/*` spelling because §3
+        # published it and external consumers read it; the alias exists so an
+        # operator has one prefix rather than two. Same handler, same gate — the
+        # pair is pinned by `tests/test_management_plane.py`, because an alias
+        # that silently stopped aliasing is a control surface that works on one
+        # spelling and 404s on the other.
+        Route(f"{ADMIN_PREFIX}/endpoints/{{endpoint}}/pause", handle_admin_pause,
+              methods=["POST"]),
+        Route(f"{ADMIN_PREFIX}/endpoints/{{endpoint}}/resume", handle_admin_resume,
+              methods=["POST"]),
+        Route(f"{ADMIN_PREFIX}/maintenance", handle_maintenance,
+              methods=["GET", "POST"]),
+        Route(f"{ADMIN_PREFIX}/flags", handle_admin_flags, methods=["GET", "POST"]),
         Route("/health", handle_health, methods=["GET"]),
         # LIVENESS is /health (fail-open, alert-don't-kill). READINESS is here
         # and fails CLOSED on the conversational endpoint — §8.0 req 4. The two

@@ -115,9 +115,17 @@ def test_a_snapshot_never_carries_the_secret_or_its_digest():
     blob = repr(reg.snapshot())
     assert "top-secret" not in blob
     assert hashlib.sha256(b"top-secret").hexdigest() not in blob
-    assert reg.snapshot() == [{"key_id": "a-key", "agent_id": "a",
-                               "priority": "P3_INGESTION", "min_timeout_s": None,
-                               "admin": False}]
+    # Equality, not a subset check: the point is that the field SET is pinned,
+    # so a field added here is a deliberate decision about what an admin readout
+    # publishes rather than something that arrived with a refactor. `source` and
+    # `created_at` are Workstream E's — the management plane has to be able to
+    # tell a runtime enrolment from a line in the environment.
+    row = reg.snapshot()[0]
+    created_at = row.pop("created_at")
+    assert isinstance(created_at, float)
+    assert row == {"key_id": "a-key", "agent_id": "a",
+                   "priority": "P3_INGESTION", "min_timeout_s": None,
+                   "admin": False, "source": "file"}
 
 
 def test_the_env_form_uses_the_shared_identity_grammar(monkeypatch):

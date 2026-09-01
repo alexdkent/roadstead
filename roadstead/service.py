@@ -83,6 +83,7 @@ from .correction import (
     _top_shingle_reps,  # noqa: F401
 )
 from .enriched import WIRE_ENRICHED, EnrichedApi
+from .management import ManagementApi
 from .failover import Failover
 from .health import Health
 from .http_handlers import (
@@ -227,6 +228,12 @@ class ProxyService:
         # holds the OpenAI door, the admin surface and the analytics family is
         # not where a new API should be discovered.
         self._enriched = EnrichedApi(self._state, self._lifecycle, self._health)
+        # The management plane (/rs/v1/admin — roadmap E). A THIRD collaborator,
+        # for the same reason as the second: it is a different audience with a
+        # different contract. It holds ProxyHttpHandlers by reference for the
+        # admin gate rather than reimplementing it — this repo already carries a
+        # note about a predicate written out three times.
+        self._management = ManagementApi(self._state, self._http)
 
     # ----- lifecycle -----
 
@@ -569,6 +576,26 @@ class ProxyService:
 
     async def handle_rs_chat(self, body: dict, request: Request) -> Response:
         return await self._enriched.handle_rs_chat(body, request)
+
+    # ----- handler: the management plane (/rs/v1/admin) -----
+
+    async def handle_admin_config(self, request: Request) -> Response:
+        return await self._management.handle_admin_config(request)
+
+    async def handle_admin_keys(self, request: Request) -> Response:
+        return await self._management.handle_admin_keys(request)
+
+    async def handle_admin_key(self, request: Request) -> Response:
+        return await self._management.handle_admin_key(request)
+
+    async def handle_admin_callers(self, request: Request) -> Response:
+        return await self._management.handle_admin_callers(request)
+
+    async def handle_admin_caller(self, request: Request) -> Response:
+        return await self._management.handle_admin_caller(request)
+
+    async def handle_admin_providers(self, request: Request) -> Response:
+        return await self._management.handle_admin_providers(request)
 
     def _extract_grammar(self, payload: dict) -> tuple[str | None, str | None]:
         return self._correction.extract_grammar(payload)

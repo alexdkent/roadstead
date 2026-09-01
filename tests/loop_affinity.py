@@ -182,7 +182,10 @@ STATE_METHODS: dict[str, tuple[str, ...]] = {
     # the one whose corruption would be silent for the longest.
     "budget_mgr": ("charge", "replenish", "retroactive_adjust", "pick_agent",
                    "get_or_create", "remove", "prune_idle",
-                   "set_total_capacity"),
+                   "set_total_capacity",
+                   # Workstream E: an operator's quota edit, applied to a LIVE
+                   # budget from a request handler.
+                   "reweight"),
     # The EWMA calibration behind every slot-second estimate.
     "cost_model": ("record_completion", "register_endpoint", "update_max_slots"),
     # Workstream D. Ordinary single-loop mutable state, and would race exactly
@@ -193,6 +196,15 @@ STATE_METHODS: dict[str, tuple[str, ...]] = {
     "cache": ("put",),
     # The learned latency distribution.
     "timeout_model": ("record", "prune"),
+    # Workstream E. The management plane mutates all three of these from a
+    # request handler, which is a NEW kind of writer: everything above is
+    # written by the scheduler loop itself. The registry is read by
+    # `IdentityResolver.resolve` on every single request, so a registry write
+    # from a pool thread is the exact interleaving this module exists to forbid
+    # — and `management.py` states the rule (mutate on the loop, persist off
+    # it). Armed so the rule is checked rather than merely written down.
+    "identity.keys": ("register", "revoke"),
+    "admin_overlay": ("add_key", "revoke_key", "set_agent"),
 }
 
 
@@ -212,7 +224,15 @@ def arm(state) -> LoopAffinity:
     """
     affinity = LoopAffinity()
     for attr, methods in STATE_METHODS.items():
-        obj = getattr(state, attr, None)
+        obj: object | None = state
+        # Dotted paths, because not every single-loop object hangs directly off
+        # ProxyState: the key registry lives behind the identity resolver, which
+        # is the thing the request path asks. Resolving the path here beats
+        # hoisting the registry onto ProxyState purely so a test can find it.
+        for part in attr.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
         if obj is None:
             continue
         affinity.watch(obj, attr, methods)
