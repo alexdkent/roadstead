@@ -495,11 +495,29 @@ declared-vs-in-force pair collapses. Both of those actually happened, and both w
 rendering the page. **The compensating discipline is the one already in use:** when rendering finds
 something, leave behind a guard a *source read* can make. That has worked twice (H).
 
-**The gap is unchanged, and it is the case FOR building one**: four of seven tabs
-(Callers, Providers, Control, Audit) have never been rendered by anybody, no write control has ever
-been clicked in a browser, the live feed has only ever been observed saying *waiting for traffic…*,
-and the read-only view has never been looked at — the plane's refusal is verified, what an operator
-sees is not.
+**~~The gap~~ — closed by hand on 2026-09-01, without a driver and without a download.** All seven
+tabs rendered against a running server, a write control clicked (the runtime-flag toggle: banner,
+state flip, button relabel, and an audit row naming the credential), and the read-only view rendered
+for the first time. Cost: zero bytes downloaded, because the browser was already installed. 🚨 **That
+is the distinction the "browser test" argument kept collapsing** — validating the page ONCE needs no
+driver at all; only a permanent CI lane does, and only that lane costs a browser binary.
+
+**It found one real defect and the guard for it found two more.** As a read-only operator the
+Maintenance form's three inputs accepted typing while their Record button was correctly disabled — a
+form inviting an operator to fill in something they could never send. Not a security hole (the
+button is dead and the plane 403s anyway); the same lie as a cell rendering "—" forever. The
+compensating discipline applied as usual: `test_every_input_a_write_action_reads_is_scope_guarded_too`
+keys on the real relationship — an input whose id is read inside a write action's body must be
+`guarded(...)` — because the existing guard only sees elements carrying an `onclick`, which these do
+not. It immediately found `#nk-agent` and `#rk-overlap` on a tab nobody had rendered read-only.
+
+🚨 **And it corrected a wrong reading of my own.** The Record button *looked* enabled in a
+screenshot and the DOM said `disabled: true`; the computed styles were identical to the flag
+buttons. Checking the DOM rather than the pixels is what turned a false report into a real one.
+
+**Still not covered:** the live feed under real traffic. `EventSource` cannot carry a header, so it
+authenticates from the browser's credential cache — which the injection technique used here
+deliberately bypasses, and which is exactly why the door is HTTP Basic in the first place.
 
 **Weigh it against** the fact that every control is one request and one re-render, which is the
 regime where a source-level guard can stand in for a rendered one. That regime ends if the page

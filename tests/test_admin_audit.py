@@ -548,6 +548,52 @@ def test_every_write_control_in_the_ui_is_scope_guarded():
         "operator learns their scope from a 403 after clicking: " + str(unguarded))
 
 
+def test_every_input_a_write_action_reads_is_scope_guarded_too():
+    """🚨 Found by rendering the page as a READ-ONLY operator on 2026-09-01 —
+    the second time running the page has found something a green suite did not.
+
+    `recordWindow` is a write action and its Record button was correctly
+    `guarded(...)`. The three fields it reads — `#mw-ep`, `#mw-reason`,
+    `#mw-dur` — were not, so a read-only operator got a form that accepted
+    typing and a submit button that was dead. Not a security hole: the button is
+    disabled and the plane 403s regardless. It is the same lie as a cell that
+    renders "—" forever — a control that looks usable and is not.
+
+    The test above only sees elements carrying an `onclick`, which is why it
+    could not catch this: these inputs have no handler, they are READ BY one.
+    So this guard keys on the actual relationship — an input whose id appears
+    inside a write action's body must be created through `guarded(...)`.
+    """
+    script = _ui_script()
+    writers = _write_action_names(script)
+    assert writers, "the extraction found no write actions — it is asserting nothing"
+
+    # ids each write action reads, e.g. `$("#mw-ep").value`
+    read_ids: set[str] = set()
+    for name in writers:
+        m = re.search(r"(?:async\s+)?function\s+" + re.escape(name) + r"\s*\(", script)
+        if not m:
+            continue
+        body = script[m.start(): _call_end(script, script.index("{", m.end()) )]
+        read_ids |= set(re.findall(r'\$\("#([\w-]+)"\)', body))
+    assert read_ids, (
+        "no write action was found reading an input by id — either the page "
+        "stopped using $(\"#id\") or this extraction has rotted")
+
+    unguarded = []
+    for ident in sorted(read_ids):
+        m = re.search(r'el\("input",\s*\{[^}]*id:\s*"' + re.escape(ident) + r'"', script)
+        if not m:
+            continue
+        line = script[:m.start()].count("\n") + 1
+        if not script[:m.start()].rstrip().endswith("guarded("):
+            unguarded.append(f"#{ident} (index.html script line ~{line})")
+    assert not unguarded, (
+        "these inputs feed a write action but are live for a read-only admin "
+        "scope — the operator can fill in a form they cannot submit: "
+        + str(unguarded))
+
+
 def test_the_scope_is_known_before_the_first_paint():
     """🚨 The second thing running the page found, and the sharper one.
 

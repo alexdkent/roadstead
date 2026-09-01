@@ -600,7 +600,7 @@ async function viewKeys(root) {
     el("h2", { text: "Enrol" }),
     el("p", { class: "lede", text: "The secret is generated here, returned once, and never stored — only its digest is. A plaintext secret is never accepted in a request body, because a secret in a body is a secret in an access log." }),
     el("div", { class: "row" },
-      field("agent_id", el("input", { id: "nk-agent", placeholder: "coding-assistant" })),
+      field("agent_id", guarded(el("input", { id: "nk-agent", placeholder: "coding-assistant" }))),
       field("priority", select("nk-prio", ["P0_REALTIME", "P1_TURN_SUPPORT", "P2_POST_TURN", "P3_INGESTION", "P4_HYGIENE"], "P3_INGESTION")),
       field("min_timeout_s", el("input", { id: "nk-floor", type: "number", step: "1", placeholder: "none", style: "width:110px" })),
       field("key id", el("input", { id: "nk-id", placeholder: "auto" })),
@@ -655,7 +655,7 @@ function rotate(keyId, agentId) {
     el("b", { text: "Rotate " + keyId + " (" + agentId + ")" }),
     el("p", { class: "lede", text: "The successor inherits this key's agent_id, priority, deadline floor, admin scope and binding — a rotation is a new secret for the same identity. The overlap is how long the OLD key keeps working while you deploy the new one; 0 revokes it immediately, which breaks any caller still presenting it." }),
     el("div", { class: "row" },
-      field("overlap (s)", el("input", { id: "rk-overlap", type: "number", step: "1", value: "3600", style: "width:130px" })),
+      field("overlap (s)", guarded(el("input", { id: "rk-overlap", type: "number", step: "1", value: "3600", style: "width:130px" }))),
       field("successor id", el("input", { id: "rk-id", placeholder: "auto" })),
       guarded(el("button", { class: "act", text: "Rotate", onclick: () => doRotate(keyId) })),
       el("button", { class: "act", text: "Cancel", onclick: () => banner("") })));
@@ -914,9 +914,16 @@ async function viewControl(root) {
     el("h2", { text: "Maintenance windows" }),
     el("p", { class: "lede", text: "Tag a deliberate restart so its burst of timeouts reads as planned rather than as an incident. Pause/resume records one automatically; this is for a restart taken without the drain." }),
     el("div", { class: "row" },
-      field("endpoint", el("input", { id: "mw-ep", placeholder: "tier1 or *" })),
-      field("reason", el("input", { id: "mw-reason", placeholder: "model swap", style: "width:220px" })),
-      field("backdate (s)", el("input", { id: "mw-dur", type: "number", placeholder: "open now", style: "width:120px" })),
+      // 🚨 The INPUTS are guarded too, not just the submit. Found by rendering
+      // the page as a read-only operator on 2026-09-01: the Record button was
+      // correctly disabled and the three fields beside it were not, so the form
+      // invited an operator to fill in something they could never send. Not a
+      // security hole — the button is dead and the plane 403s anyway — but a
+      // control that looks usable and is not is the same lie as a cell that
+      // renders "—" forever.
+      field("endpoint", guarded(el("input", { id: "mw-ep", placeholder: "tier1 or *" }))),
+      field("reason", guarded(el("input", { id: "mw-reason", placeholder: "model swap", style: "width:220px" }))),
+      field("backdate (s)", guarded(el("input", { id: "mw-dur", type: "number", placeholder: "open now", style: "width:120px" }))),
       guarded(el("button", { class: "act", text: "Record", onclick: recordWindow }))),
     pick(windows, "windows", []).length
       ? table(["endpoint", "started", "ended", "reason", "operator"],
