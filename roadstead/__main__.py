@@ -22,6 +22,7 @@ import json
 
 import uvicorn
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -63,6 +64,110 @@ async def _on_unhandled(request: Request, exc: Exception) -> JSONResponse:
                      request.method, request.url.path)
     return JSONResponse({"status": "error", "error": "internal proxy error"},
                         status_code=500)
+
+
+#: The envelope a straggler's caller gets when uvicorn cancels its handler at
+#: the graceful-shutdown mark.
+#:
+#: 🚨 `draining` + 503 + the literal ``backpressure`` marker, which is the same
+#: triple `lifecycle` already emits for work REFUSED while draining — and it has
+#: to be, because the caller's situation is identical: this instance is going
+#: away and the next one can serve you. §2.2 classifies deferrable on the marker
+#: substring, so dropping the word would make a shutdown look like a hard
+#: failure to every client that has not migrated to classifying on `code`.
+_SHUTDOWN_CANCELLED_BODY = {
+    "status": "error",
+    "error": "proxy shutting down — request cancelled before completion, "
+             "backpressure",
+    "code": "draining",
+}
+
+
+class ShutdownEnvelopeMiddleware:
+    """Turn uvicorn's shutdown cancellation into the proxy's own envelope.
+
+    🚨 **The bug this closes** (`docs/ledger.md`): at
+    ``timeout_graceful_shutdown`` uvicorn calls ``task.cancel()`` on every
+    in-flight handler. ``asyncio.CancelledError`` derives from
+    ``BaseException``, not ``Exception``, so it sails past BOTH
+    ``exception_handlers`` below and Starlette's own ``ServerErrorMiddleware``,
+    and the caller of a straggler received a raw
+    ``500 Internal Server Error`` — plain text, no ``code``, no marker — for a
+    condition that is retryable and entirely our doing. Measured at 48.77s by
+    ``tools/sigterm_drain_probe.py`` scenario S3.
+
+    It is a middleware rather than another entry in ``exception_handlers``
+    because a handler there would never be reached: Starlette dispatches
+    handlers from inside an ``except Exception`` block. User middleware sits
+    *inside* ``ServerErrorMiddleware`` and *outside* the router, so it is the
+    outermost place a ``BaseException`` from a route is still catchable.
+
+    🚨 **The cancellation is always re-raised.** Swallowing it would break the
+    asyncio contract and leave uvicorn waiting on a task that has decided not to
+    die — turning a bounded shutdown into the unbounded one the whole shutdown
+    budget exists to prevent. This adds a response; it does not decline to stop.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started = False
+        is_sse = False
+
+        async def _send(message) -> None:
+            nonlocal started, is_sse
+            if message["type"] == "http.response.start":
+                started = True
+                for key, value in message.get("headers") or ():
+                    if key.lower() == b"content-type":
+                        is_sse = value.lower().startswith(b"text/event-stream")
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _send)
+        except asyncio.CancelledError:
+            # Best effort, and never at the cost of the cancellation: a failure
+            # to deliver this must not mask why we are unwinding.
+            try:
+                await self._explain(send, started=started, is_sse=is_sse)
+            except BaseException:      # noqa: BLE001 — see the comment above
+                logger.debug("could not deliver the shutdown envelope",
+                             exc_info=True)
+            raise
+
+    @staticmethod
+    async def _explain(send, *, started: bool, is_sse: bool) -> None:
+        body = json.dumps(_SHUTDOWN_CANCELLED_BODY).encode()
+        if not started:
+            await send({
+                "type": "http.response.start", "status": 503,
+                "headers": [(b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode())],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+
+        if is_sse:
+            # 🚨 An error frame and deliberately NO `[DONE]`. `[DONE]` is the
+            # backend asserting completeness, and this stream is truncated — the
+            # proxy's own `finish_reason` repair exists precisely because those
+            # two must never be collapsed. Emitting it here would tell the
+            # caller a cancelled answer was a finished one.
+            await send({"type": "http.response.body",
+                        "body": b"data: " + body + b"\n\n",
+                        "more_body": False})
+            return
+
+        # Headers are already on the wire and it is not a stream: there is no
+        # frame to say this in. Close the body rather than leave the caller
+        # waiting on a response that will never continue.
+        await send({"type": "http.response.body", "body": b"",
+                    "more_body": False})
 
 
 def _parse_args() -> argparse.Namespace:
@@ -184,6 +289,9 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
     app = Starlette(
         routes=routes,
         lifespan=lifespan,
+        # 🚨 Outside the router, inside `ServerErrorMiddleware` — the only place
+        # a `BaseException` from a route is still catchable. See the class.
+        middleware=[Middleware(ShutdownEnvelopeMiddleware)],
         # Robustness backstop: malformed JSON → 400; any other uncaught route
         # exception → logged clean 500 (never a raw ASGI 500). Per-field
         # coercions (priority/timeout_s/query-params) are handled at the source;

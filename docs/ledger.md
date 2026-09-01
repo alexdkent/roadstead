@@ -227,11 +227,32 @@ what SIGKILL would lose. But the drain is slow enough to matter:
   derivation encoded the nesting this entry disproves, but its VALUE is unchanged so the drain
   semantics settled by experiment stay settled.
 
-- **Open, and ours to fix.** The caller of the straggler receives a raw `500 Internal Server Error`
-  at the 48s mark, not the proxy's clean JSON error envelope — uvicorn cancels the handler task,
-  which bypasses the `exception_handlers` backstop in `build_app`. Parked as "belongs upstream"
-  while the origin monorepo was authoritative for behaviour; that rule was retired 2026-08-31 and
-  this is now simply an open bug here.
+- **~~Open, and ours to fix.~~ Fixed 2026-09-01.** The caller of the straggler received a raw
+  `500 Internal Server Error` at the 48s mark, not the proxy's JSON envelope. **Root cause:**
+  `asyncio.CancelledError` derives from `BaseException`, not `Exception`, so uvicorn's
+  `task.cancel()` sailed past both the `exception_handlers` backstop in `build_app` and Starlette's
+  own `ServerErrorMiddleware` — neither of which can see a `BaseException`. Parked as "belongs
+  upstream" while the origin monorepo was authoritative; that rule was retired 2026-08-31.
+
+  **Guard.** `ShutdownEnvelopeMiddleware`, and `tests/test_shutdown_envelope.py`. It is a
+  *middleware* because no `exception_handlers` entry could ever be reached: Starlette dispatches
+  those from inside an `except Exception`. User middleware sits outside the router and inside
+  `ServerErrorMiddleware`, which is the outermost place a route's `BaseException` is still
+  catchable. Measured with the probe, before and after:
+
+  | | caller status | body | elapsed |
+  |---|---|---|---|
+  | before | `500` | `Internal Server Error` (plain text) | 48.77s |
+  | after | `503` | `{"code": "draining", … "backpressure"}` | 48.76s |
+
+  Three things are deliberate. 🚨 **The cancellation is always re-raised** — swallowing it would
+  leave uvicorn waiting on a task that declined to die, converting the bounded shutdown into the
+  unbounded one this whole entry is about. 🚨 **A cancelled STREAM gets an error frame and no
+  `[DONE]`**: `[DONE]` is an assertion of completeness, and emitting one over a truncated answer is
+  the exact collapse the `finish_reason` repair refuses to make. And it **mints no new code** —
+  `draining` + 503 + the `backpressure` marker is precisely what `lifecycle` already emits for work
+  *refused* while draining, because the caller's situation is identical: this instance is going
+  away, the next one can serve you.
 
 ---
 

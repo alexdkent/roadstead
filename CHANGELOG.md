@@ -8,6 +8,43 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — a cancelled straggler's caller gets the envelope, not a raw 500
+
+Landed 2026-09-01. `docs/ledger.md` carried this as "Open, and ours to fix"; it was parked as
+"belongs upstream" while the origin monorepo was authoritative for behaviour, and that rule was
+retired on 2026-08-31.
+
+**Root cause.** `asyncio.CancelledError` derives from `BaseException`, not `Exception`. At
+`timeout_graceful_shutdown` uvicorn calls `task.cancel()` on every in-flight handler, and the
+resulting exception sails past *both* the `exception_handlers` backstop in `build_app` and
+Starlette's own `ServerErrorMiddleware` — neither can see a `BaseException`. The caller of a
+straggler got `500 Internal Server Error`, plain text, no `code`, no marker, for a condition that is
+retryable and entirely ours.
+
+`ShutdownEnvelopeMiddleware` closes it. A **middleware**, not another `exception_handlers` entry: a
+handler there could never be reached, because Starlette dispatches them from inside an
+`except Exception`. User middleware sits outside the router and inside `ServerErrorMiddleware`, which
+is the outermost place a route's `BaseException` is still catchable.
+
+- **No new code.** `draining` + 503 + the literal `backpressure` marker is exactly what `lifecycle`
+  already emits for work *refused* while draining, and it has to be: the caller's situation is
+  identical. §2.2 classifies deferrable on the marker substring, so dropping the word would make a
+  shutdown read as a hard failure to every client that has not migrated to classifying on `code`.
+- 🚨 **The cancellation is always re-raised.** Swallowing it breaks the asyncio contract and leaves
+  uvicorn waiting on a task that has declined to die — turning the bounded shutdown into the
+  unbounded one `SHUTDOWN_DEADLINE_S` exists to prevent. This adds a response; it does not decline
+  to stop. A failure to deliver the envelope is swallowed rather than the cancellation.
+- 🚨 **A cancelled STREAM gets an error frame and NO `[DONE]`.** `[DONE]` is an assertion of
+  completeness; emitting one over a truncated answer is the exact collapse `correction.py`'s
+  `finish_reason` repair refuses to make.
+- A cancelled non-stream whose headers are already out has its body **closed**, not left hanging.
+
+Measured with `tools/sigterm_drain_probe.py` S3, before → after: `500 Internal Server Error` at
+48.77s → `503 {"code": "draining", …}` at 48.76s. Exit time (78.2s) and what is persisted are both
+unchanged. `tests/test_shutdown_envelope.py`. Nine mutations, every guard observed going red — one
+first failed with a bare `TypeError` and asserts first now.
+
+
 ### Fixed — an alias claimed twice routed silently, and the soak was measuring itself
 
 Landed 2026-09-01. Two unrelated defects, both found by doing the thing rather than reading it: one
