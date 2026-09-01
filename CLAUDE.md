@@ -4,9 +4,13 @@
 > free up. That is not a metaphor for the admission queue — it *is* the queue, and specifically one
 > that exists because capacity is finite and currently occupied.
 
-**What this is:** a capacity-aware admission-controlling gateway for LLM inference — several
-llama.cpp servers and a vLLM tensor-parallel pair across heterogeneous hardware, without Kubernetes.
-OpenAI-compatible on the front, model-authoritative on the back.
+**What this is:** a **local-first LLM scheduler** — it stands between many kinds of caller and many
+kinds of model and absorbs the mismatch, so neither side has to model the other. Today that means
+several llama.cpp servers and a vLLM pair across heterogeneous hardware, without Kubernetes;
+OpenAI-compatible on the front, model-authoritative on the back. Mission in `docs/roadmap.md`.
+
+Call it a *scheduler*, not an "orchestrator" — that word means agent/chain frameworks here, and
+Roadstead runs no workflows. "Gateway" is fine in technical prose.
 
 **Where it is going — read `docs/roadmap.md` before planning anything.** Roadstead is an independent
 project with two goals: a high-quality local capability (primary) and an open-source project others

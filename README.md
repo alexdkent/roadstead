@@ -3,9 +3,17 @@
 > A **roadstead** is the sheltered anchorage outside a harbour where vessels wait for a berth to
 > free up.
 
-Capacity-aware admission control for self-hosted LLM inference fleets — several llama.cpp servers
-and a vLLM tensor-parallel pair across heterogeneous hardware, **without Kubernetes**.
-OpenAI-compatible on the front, model-authoritative on the back.
+**A local-first LLM scheduler.** It stands between many kinds of caller and many kinds of model, and
+absorbs the mismatch so that neither side has to model the other.
+
+Callers differ in *urgency*, not just in what they ask for — an interactive turn and an overnight
+summarizer may want the same model and cannot wait the same amount of time. Backends differ in
+capacity, capability and failure mode — four fixed slots or elastic, thinking or not, honours a
+grammar or silently drops it. **Local capacity is the default and the design center; cloud is
+explicit overflow**, never the fallback that quietly becomes the norm.
+
+Local-first also means what you would hope: it runs with no account and no internet, and nothing
+leaves the machine unless someone opts into spilling it.
 
 > ⚠️ **Pre-release, and private.** Extracted from a production monorepo on 2026-08-31 and still
 > stabilising. It is an independent project rather than a replacement for its origin — expect it to
@@ -14,14 +22,18 @@ OpenAI-compatible on the front, model-authoritative on the back.
 
 ## Why it exists
 
+**Cloud gateways assume elastic capacity, so admission control is uninteresting to them. Local tools
+assume one user, so fairness is uninteresting to them.** Roadstead is the case neither serves:
+capacity that is finite *and* many callers competing for it.
+
 Most LLM gateways treat a backend as an opaque endpoint with a health bit. They load-balance across
 it, retry on failure, and take a timeout as a number the caller supplies. That works when the
 backend is an elastic cloud API.
 
 It does not work when the backend is a llama.cpp server with exactly four slots and a fixed
-per-slot context, sitting on a GPU you own. There, the interesting question is not *which* backend
-to send to — it is **whether to send at all right now, whose request goes first, and how long it is
-reasonable to wait.**
+per-slot context, sitting on a GPU you own. There, the interesting question stops being *which
+backend* and becomes: **whether to send at all right now, whose turn it is, how long is reasonable
+to wait, what it costs — and what to do when the answer comes back malformed.**
 
 Roadstead answers that question by measuring rather than assuming:
 
@@ -44,6 +56,10 @@ outside Kubernetes, and none at all that does the last two.
 That survey was of a proxy for one private fleet. Roadstead generalises it: the same question, asked
 across local *and* remote capacity, for callers who declare what they need rather than which model
 to use. See `docs/roadmap.md`.
+
+> **Not an "LLM orchestrator."** It does not chain calls or run multi-step workflows — no agents, no
+> graphs. It is a *scheduler* in the operating-system sense: it decides what runs where, when, and
+> for whom, under contention. It sits underneath an agent framework, not beside one.
 
 ## Status
 

@@ -17,6 +17,11 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ### Added
 
+- **A stated mission** (`docs/roadmap.md`, and the README lead): Roadstead is a **local-first LLM
+  scheduler** that stands between many kinds of caller and many kinds of model and absorbs the
+  mismatch, so neither side has to model the other. Positioning note: *scheduler*, not
+  "orchestrator" — that word means agent/chain frameworks in this field, and Roadstead runs no
+  workflows.
 - **`docs/roadmap.md`** — what Roadstead is being built into: modular providers (llama.cpp and vLLM
   local, OpenRouter and others remote), remote capacity as spill under a single admission decision,
   an enriched API beside the OpenAI one, caller-intent model abstraction, API-key identity, and

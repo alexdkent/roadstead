@@ -8,7 +8,42 @@ provides. A new API spec is a *deliverable* to whoever wants it, not a constrain
 
 ---
 
-## What we are building
+## The mission
+
+**Roadstead is a local-first LLM scheduler. It stands between many kinds of caller and many kinds of
+model, and absorbs the mismatch so that neither side has to model the other.**
+
+That sentence is doing specific work, so each half is worth unpacking.
+
+**Diverse callers.** Low-latency chat turns, coding assistants, summarizers, extractors, batch
+ingestion. They differ in *urgency* more than in what they ask for: an interactive turn and an
+overnight summarizer may want the identical model and cannot wait the same amount of time. That is
+why deadline tolerance — not model choice — is the axis fair-sharing has to run along, and why the
+unit of fairness is occupancy *time*.
+
+**Diverse backends.** Small to medium to cloud. Thinking and non-thinking. Four fixed slots or
+elastic. Grammar-conforming and grammar-broken. That last one is the part the field mostly pretends
+away: backends are not merely faster or slower, they are unreliable in *specific, characterizable*
+ways — a model that drops `finish_reason`, a vLLM that 400s the whole request over a missing launch
+flag, a structured endpoint that returns `{}` for 31 hours while looking perfectly healthy.
+Absorbing that is not a side feature; `correction.py` is the largest module in the package.
+
+**Local-first**, precisely: local capacity is the default *and the design center*, cloud is explicit
+overflow rather than the fallback that quietly becomes the norm. It runs with no account and no
+internet, and nothing leaves the machine unless someone opts into spilling it. Not local-only, and
+emphatically not cloud-first-with-local-bolted-on.
+
+**Neither side models the other.** Callers declare intent, not models, and never need to know that
+one endpoint has four slots of 32K each or that another needs a specific flag to reason. Backends
+are met on their own terms, warts included.
+
+🚨 **Not an "LLM orchestrator."** In this field that word means agent and chain frameworks;
+Roadstead runs no workflows and chains no calls. It is a *scheduler* in the operating-system sense —
+what runs where, when, and for whom, under contention. Use "scheduler" in positioning and "gateway"
+in technical prose where it is literally accurate. Getting this wrong attracts the wrong audience
+and loses the right one.
+
+### The two goals
 
 **Primary: a high-quality capability, run locally.** This is the thing that has to be excellent. It
 is judged by whether it serves real traffic well — not by feature count.
@@ -17,9 +52,17 @@ is judged by whether it serves real traffic well — not by feature count.
 configuration, no private topology, a published contract, a credible getting-started path. But when
 the two conflict, the local capability wins.
 
-The origin was a proxy for one fleet. The thesis generalises: *the interesting question is not which
-backend to send to, but whether to send at all right now, whose request goes first, how long it is
-reasonable to wait, and — new — what it costs and who pays.*
+### Why anyone else would want it
+
+**Cloud gateways assume elastic capacity, so admission control is uninteresting to them. Local tools
+assume one user, so fairness is uninteresting to them.** The intersection — capacity that is finite
+*and* many callers competing for it — is unoccupied, and everything distinctive in this codebase
+falls out of standing in it: slot-second fairness, runtime capacity discovery, computed deadlines,
+and a correction layer for backends that misbehave under load.
+
+Because the capacity is finite and yours, the interesting question stops being *which backend* and
+becomes: **whether to send at all right now, whose turn it is, how long is reasonable to wait, what
+it costs — and what to do when the answer comes back malformed.**
 
 ---
 
