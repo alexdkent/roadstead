@@ -174,11 +174,11 @@ def test_no_other_endpoint_declares_a_ratio_it_cannot_honour():
                 if getattr(ep, "thinking_budget_ratio", 0)}
     # Aliases of the same endpoint resolve to the same object, so compare the set of
     # distinct ROLES rather than of names.
-    # models.yaml keys the block `reasoner`; the resolved endpoint is `thinker`
-    # with role `llama-thinker`. Assert on the RESOLVED role, since that is what the
+    # models.yaml keys the block `reasoner`; the resolved endpoint is `tier3`
+    # with role `tier3`. Assert on the RESOLVED role, since that is what the
     # dispatch path actually reads.
     roles = {config.DEFAULT_ENDPOINTS[n].role for n in declared}
-    assert roles == {"llama-thinker"}, (
+    assert roles == {"tier3"}, (
         f"roles declaring a reasoning cap: {roles} (via {sorted(declared)}). "
         "Every one of them must be "
         "launched with --reasoning-config; see the vendored serve scripts."

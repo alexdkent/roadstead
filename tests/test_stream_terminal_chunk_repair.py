@@ -89,7 +89,7 @@ def _backend(*, emit_finish: bool, emit_done: bool):
 
 def _body():
     return {
-        "agent_id": "beacon", "endpoint": "llama-thinker",
+        "agent_id": "beacon", "endpoint": "tier3",
         "priority": "P1_TURN_SUPPORT", "call_site": "t",
         "payload_type": "chat_completion",
         "payload": {"messages": [{"role": "user", "content": "x"}], "stream": True},

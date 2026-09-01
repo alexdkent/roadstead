@@ -36,19 +36,19 @@ from roadstead.testing import (
     FAULT_SCHEMA_VALID_WRONG,
 )
 
-FLAG = "COLLECTIVE_PROXY_SCHEMA_BACKSTOP"
-SHADOW = "COLLECTIVE_PROXY_SCHEMA_BACKSTOP_SHADOW"
+FLAG = "ROADSTEAD_PROXY_SCHEMA_BACKSTOP"
+SHADOW = "ROADSTEAD_PROXY_SCHEMA_BACKSTOP_SHADOW"
 
 
 @pytest.fixture(autouse=True)
 def _pin_structured_validity_off(monkeypatch):
     """Pin the always-on structured-validity floor
-    (COLLECTIVE_PROXY_STRUCTURED_VALIDITY, 2026-07-11) OFF for this file: it
+    (ROADSTEAD_PROXY_STRUCTURED_VALIDITY, 2026-07-11) OFF for this file: it
     tests the BACKSTOP layer's own OFF/shadow parity contracts, which assert a
     malformed structured 200 passes through untouched — the floor (which runs
     after the backstop and would 502 those) is a different layer with its own
     suite (test_truncation_guard.py). Env is read live per request."""
-    monkeypatch.setenv("COLLECTIVE_PROXY_STRUCTURED_VALIDITY", "0")
+    monkeypatch.setenv("ROADSTEAD_PROXY_STRUCTURED_VALIDITY", "0")
 
 # A strict schema: repair CANNOT synthesize a missing required field, so a
 # parseable-but-schema-violating body forces the bounded retry (not an in-memory

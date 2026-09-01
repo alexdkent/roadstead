@@ -31,11 +31,11 @@ from roadstead.testing import (
     FAULT_TIMEOUT,
 )
 
-ENFORCE = "COLLECTIVE_PROXY_ENDPOINT_COOLDOWN"
-SHADOW = "COLLECTIVE_PROXY_ENDPOINT_COOLDOWN_SHADOW"
-ALLOWED = "COLLECTIVE_PROXY_COOLDOWN_ALLOWED_FAILS"
-WINDOW = "COLLECTIVE_PROXY_COOLDOWN_WINDOW_S"
-DURATION = "COLLECTIVE_PROXY_COOLDOWN_DURATION_S"
+ENFORCE = "ROADSTEAD_PROXY_ENDPOINT_COOLDOWN"
+SHADOW = "ROADSTEAD_PROXY_ENDPOINT_COOLDOWN_SHADOW"
+ALLOWED = "ROADSTEAD_PROXY_COOLDOWN_ALLOWED_FAILS"
+WINDOW = "ROADSTEAD_PROXY_COOLDOWN_WINDOW_S"
+DURATION = "ROADSTEAD_PROXY_COOLDOWN_DURATION_S"
 
 
 def _all_off(mp):
@@ -50,7 +50,7 @@ def _all_off(mp):
 #
 # Resolved at import from normalize_endpoint rather than hardcoded: the target
 # has moved twice already (→ "classify" on the 2026-07-03 analyst decommission,
-# → "creative" on the 2026-07-11 boxa consolidation, which re-homed the
+# → "tier2" on the 2026-07-11 boxa consolidation, which re-homed the
 # classify/analyst/vision family onto the boxa endpoint). Each move left this
 # file asserting on a class the proxy no longer keys, and the KeyError went
 # unseen because `local_tollgate` never actually ran a test until 2026-07-27
@@ -258,11 +258,11 @@ async def test_sibling_endpoint_unaffected(proxy, monkeypatch):
         await proxy.chat("hi", model="chat")
     assert proxy.svc._health.endpoint_healthy("chat") is False, "chat should cool"
     # A different endpoint (role/model) was never driven → healthy → serves.
-    assert proxy.svc._health.endpoint_healthy("companion") is True
-    r = await proxy.chat("hi", model="companion")
+    assert proxy.svc._health.endpoint_healthy("tier3") is True
+    r = await proxy.chat("hi", model="tier3")
     assert r.status_code == 200, "sibling endpoint must keep serving"
     st = proxy.svc._correction.state
-    assert "companion" not in st.endpoint_cooldown_trips
+    assert "tier3" not in st.endpoint_cooldown_trips
 
 
 # --------------------------------------------------------------------------- #

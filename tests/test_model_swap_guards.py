@@ -19,12 +19,12 @@ observed going red is not a guard, so each "stays quiet" test is paired with a
 The live probe values below were measured against the running backends
 2026-08-24 (both the passing and the failing arms):
 
-  thinker      root=/srv/models/deepseek-v4-flash-0731
+  tier3      root=/srv/models/deepseek-v4-flash-0731
                key `thinking`        -> 193 chars reasoning   (declared: PASS)
-  creative     params=27320697856;vocab=248320;ftype=Q4_0
+  tier2     params=27320697856;vocab=248320;ftype=Q4_0
                key `enable_thinking` -> 349 chars reasoning   (declared: PASS)
                key `thinking`        ->   0 chars reasoning   (wrong key: FIRES)
-  tier2-chat   params=34660610688;vocab=248320;ftype=Q4_K - Medium
+  tier2   params=34660610688;vocab=248320;ftype=Q4_K - Medium
                key `enable_thinking` -> 835 chars reasoning   (declared: PASS)
                key `thinking`        ->   0 chars reasoning   (wrong key: FIRES)
 """
@@ -83,26 +83,26 @@ def _ep(**kw):
 
 
 # Captured verbatim from the live backends 2026-08-24.
-VLLM_MODELS = {"data": [{"id": "llama-thinker", "object": "model",
+VLLM_MODELS = {"data": [{"id": "tier3", "object": "model",
                          "root": "/srv/models/deepseek-v4-flash-0731",
                          "max_model_len": 1048576}]}
-LLAMACPP_MODELS = {"data": [{"id": "creative", "object": "model",
+LLAMACPP_MODELS = {"data": [{"id": "tier2", "object": "model",
                              "meta": {"vocab_type": 2, "n_vocab": 248320,
                                       "n_ctx": 262144, "n_embd": 5120,
                                       "n_params": 27320697856,
                                       "size": 16045481984, "ftype": "Q4_0"}}]}
 # tier1's build genuinely omits ftype — absent fields must be dropped, not faked.
-LLAMACPP_NO_FTYPE = {"data": [{"id": "gemma", "meta": {"n_vocab": 262144,
+LLAMACPP_NO_FTYPE = {"data": [{"id": "tier1", "meta": {"n_vocab": 262144,
                                                        "n_params": 7518069290}}]}
 
 
 def test_vllm_fingerprint_is_the_weights_path_not_the_served_alias():
-    """THE WHOLE POINT. `id` is `llama-thinker` and stayed that way across the
+    """THE WHOLE POINT. `id` is `tier3` and stayed that way across the
     cutover; `root` is what actually moved."""
     pool = _pool_returning(VLLM_MODELS)
     got = asyncio.run(_REAL_FINGERPRINT(pool, _ep()))
     assert got == "/srv/models/deepseek-v4-flash-0731"
-    assert "llama-thinker" not in got, (
+    assert "tier3" not in got, (
         "keying the fingerprint on the served alias would make this guard "
         "incapable of ever firing — that alias is exactly what did NOT change")
 
@@ -146,13 +146,13 @@ def test_drift_alert_fires_on_the_real_2026_08_23_swap():
     """Declared Laguna, serving DeepSeek — the exact live pair measured above."""
     ep = _ep(model_fingerprint="/srv/models/laguna-s-2.1",
              discovered_model_fingerprint="/srv/models/deepseek-v4-flash-0731")
-    assert "model_fingerprint_drift" in _alerts_for({"thinker": ep})
+    assert "model_fingerprint_drift" in _alerts_for({"tier3": ep})
 
 
 def test_drift_alert_is_silent_when_they_agree():
     ep = _ep(model_fingerprint="/srv/models/deepseek-v4-flash-0731",
              discovered_model_fingerprint="/srv/models/deepseek-v4-flash-0731")
-    assert _alerts_for({"thinker": ep}) == []
+    assert _alerts_for({"tier3": ep}) == []
 
 
 def test_drift_alert_is_silent_when_either_side_is_unknown():
@@ -174,7 +174,7 @@ def test_canary_alert_fires_when_the_declared_key_switches_nothing():
         "sent chat_template_kwargs {thinking: true} and got 0 chars of "
         "reasoning (139 chars of content) — the declared switch is not "
         "switching anything on the model this endpoint is serving now"))
-    assert "thinking_switch_broken" in _alerts_for({"creative": ep})
+    assert "thinking_switch_broken" in _alerts_for({"tier2": ep})
 
 
 def test_canary_alert_is_silent_when_ok_or_unknown():
@@ -183,7 +183,7 @@ def test_canary_alert_is_silent_when_ok_or_unknown():
 
 
 def test_canary_counts_reasoning_not_content():
-    """tier2-chat's real probe came back with 835 chars of reasoning and ZERO
+    """tier2's real probe came back with 835 chars of reasoning and ZERO
     content — reasoning ate the 200-token budget. That is a PASS: the switch
     worked, which is the only thing being asked. Judging on content would
     invert this into a false alarm, and judging via `BackendClient.call` would
@@ -233,10 +233,10 @@ def test_canary_probe_returns_none_rather_than_guessing():
 
 def test_declared_fingerprints_reach_config():
     kw = model_catalog.build_endpoint_kwargs()
-    assert kw["thinker"]["model_fingerprint"] == "/srv/models/deepseek-v4-flash-0731"
-    assert kw["creative"]["model_fingerprint"] == \
-        "params=27320697856;vocab=248320;ftype=Q4_0"
-    ep = config.EndpointConfig(**kw["thinker"])
+    assert kw["tier3"]["model_fingerprint"] == "/srv/models/example-reasoner-2026-01"
+    assert kw["tier2"]["model_fingerprint"] == \
+        "params=27000000000;vocab=151936;ftype=Q4_K - Medium"
+    ep = config.EndpointConfig(**kw["tier3"])
     assert ep.model_fingerprint and not ep.discovered_model_fingerprint
 
 
@@ -264,14 +264,18 @@ def test_every_backend_probe_is_stubbed_in_the_unit_suite():
     """
     from tests.conftest import STUBBED_PROBES
 
-    # Deliberately NOT stubbed, and this predates 2026-08-24 — the coverage
-    # test found them, it did not create them. Both are driven only by tests
-    # that supply their own fake client to exercise the real parsing, and
-    # stubbing them breaks exactly those tests. Listed here so the gap is a
-    # RECORDED decision rather than an omission that looks identical to one.
-    # If either ever starts being called from the poller on a real host, stub
-    # it and fix those tests instead.
-    deliberately_unstubbed = {"probe_prefix_cache", "probe_progress_counters"}
+    # Deliberately NOT stubbed: driven only by tests that supply their own fake
+    # client to exercise the real parsing, and stubbing it would break exactly
+    # those. Recorded here so the gap is a DECISION rather than an omission that
+    # looks identical to one.
+    #
+    # `probe_prefix_cache` used to be on this list with a note saying to stub it
+    # "if it ever starts being called from the poller". It always was — the
+    # cache-stats tick scrapes it — and only a LAN that refused connections fast
+    # kept that invisible. It moved to STUBBED_PROBES on 2026-08-31. A probe
+    # reached from a background loop does not belong here, whatever the parsing
+    # tests would prefer.
+    deliberately_unstubbed = {"probe_progress_counters"}
 
     actual = {n for n in dir(backend.BackendClientPool)
               if n.startswith("probe_")

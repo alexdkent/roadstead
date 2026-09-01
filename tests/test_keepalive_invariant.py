@@ -11,7 +11,7 @@ That file was 21 tests of ``ProxyLLMClient`` — host code — and went back to 
 monorepo whole; this one assertion is the only part of it Roadstead owns, so it
 is rehomed here rather than lost.
 
-🚨 ``PROXY_SERVER_KEEPALIVE_S`` reads ``COLLECTIVE_PROXY_SERVER_KEEPALIVE_S``,
+🚨 ``PROXY_SERVER_KEEPALIVE_S`` reads ``ROADSTEAD_PROXY_SERVER_KEEPALIVE_S``,
 so the invariant can be broken from a deployment config without touching code —
 which is exactly why the server side deserves its own test.
 """
@@ -29,9 +29,9 @@ def _server_keepalive(monkeypatch, value: str | None = None) -> float:
     """Re-import the entrypoint so the module-level env read runs again."""
     import roadstead.__main__ as main_mod
     if value is None:
-        monkeypatch.delenv("COLLECTIVE_PROXY_SERVER_KEEPALIVE_S", raising=False)
+        monkeypatch.delenv("ROADSTEAD_PROXY_SERVER_KEEPALIVE_S", raising=False)
     else:
-        monkeypatch.setenv("COLLECTIVE_PROXY_SERVER_KEEPALIVE_S", value)
+        monkeypatch.setenv("ROADSTEAD_PROXY_SERVER_KEEPALIVE_S", value)
     return importlib.reload(main_mod).PROXY_SERVER_KEEPALIVE_S
 
 
@@ -40,7 +40,7 @@ def _restore_module(monkeypatch):
     """Reloading ``__main__`` mutates a module other tests import from, so put
     the default back whatever this test did."""
     yield
-    monkeypatch.delenv("COLLECTIVE_PROXY_SERVER_KEEPALIVE_S", raising=False)
+    monkeypatch.delenv("ROADSTEAD_PROXY_SERVER_KEEPALIVE_S", raising=False)
     importlib.reload(importlib.import_module("roadstead.__main__"))
 
 

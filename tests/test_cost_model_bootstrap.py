@@ -28,7 +28,7 @@ def _seed_completions(conn: sqlite3.Connection, n: int = 20) -> None:
             " status, completed_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                f"req_{i:04d}", "forum-agent", "thinker",
+                f"req_{i:04d}", "forum-agent", "tier3",
                 "forum-agent.proposal_emitter", 3,
                 6000 + i * 100, 250 + i * 10,
                 25.0 + i * 0.5, 5.0 + i,
@@ -53,7 +53,7 @@ def test_bootstrap_populates_cost_model(tmp_path):
 
     svc._bootstrap_cost_model()
 
-    model = svc._cost_model.get("thinker")
+    model = svc._cost_model.get("tier3")
     assert model is not None
     assert "forum-agent.proposal_emitter" in model.output_length_ewma
     ewma = model.output_length_ewma["forum-agent.proposal_emitter"]
@@ -75,7 +75,7 @@ def test_bootstrap_skips_errors_and_zero_tokens(tmp_path):
         " input_tokens, output_tokens, duration_s, queue_wait_ms, "
         " status, completed_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("req_err", "sidekick", "thinker", "sidekick.critic", 1,
+        ("req_err", "sidekick", "tier3", "sidekick.critic", 1,
          5000, 0, 45.0, 100.0, "error", now - 60),
     )
     conn.execute(
@@ -84,13 +84,13 @@ def test_bootstrap_skips_errors_and_zero_tokens(tmp_path):
         " input_tokens, output_tokens, duration_s, queue_wait_ms, "
         " status, completed_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("req_zero", "sidekick", "thinker", "sidekick.critic", 1,
+        ("req_zero", "sidekick", "tier3", "sidekick.critic", 1,
          5000, 0, 30.0, 50.0, "ok", now - 30),
     )
 
     svc._bootstrap_cost_model()
 
-    model = svc._cost_model.get("thinker")
+    model = svc._cost_model.get("tier3")
     assert model is not None
     assert model.output_length_ewma == {}
 
@@ -100,6 +100,6 @@ def test_bootstrap_no_db():
     svc = ProxyService(config)
     _register_endpoints(svc)
     svc._bootstrap_cost_model()
-    model = svc._cost_model.get("thinker")
+    model = svc._cost_model.get("tier3")
     assert model is not None
     assert model.output_length_ewma == {}

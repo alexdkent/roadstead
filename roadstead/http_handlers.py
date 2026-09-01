@@ -32,34 +32,20 @@ if TYPE_CHECKING:
     from .lifecycle import Lifecycle
 
 
-_TIER_RE = re.compile(r"^tier\d+$")
-_ADVERTISED_ID: "dict[str, str] | None" = None
-
-
 def _advertised_model_id(ep_cfg) -> str:
-    """The name /v1/models advertises for an endpoint: its CANONICAL tier name.
+    """The name ``/v1/models`` advertises for an endpoint: its endpoint CLASS.
 
-    The 2026-07-30 tier migration made ``tier1``/``tier2``/``tier3`` the
-    canonical names; the ``role:`` strings (``gemma-router``, ``creative``,
-    ``llama-thinker``) are legacy and only kept resolving for compat. /v1/models
-    is where third-party clients LEARN a model name and then pin it in their own
-    config, so advertising a legacy role there mints new callers on the old name
-    indefinitely — which is exactly the thing the migration was ending.
+    🚨 This is where a third-party client LEARNS a model name and then pins it in
+    its own config, so whatever appears here is a name we are agreeing to keep
+    answering to. The class is that name: it is what the scheduler accounts
+    against and what every alias resolves TO, so a client that pins it survives
+    a role rename and a model swap underneath it.
 
-    Falls back to ``role`` for endpoints with no tier (embed/rerank are not
-    tiers). Built once from the catalog; the catalog is the authority, so a
-    renamed tier follows automatically.
+    ``role`` is deliberately NOT advertised. It labels the model behind the
+    class for one deployment — advertising it mints external callers on a name
+    that is expected to change.
     """
-    global _ADVERTISED_ID
-    if _ADVERTISED_ID is None:
-        from .model_catalog import load_catalog
-        mapping: dict[str, str] = {}
-        for e in load_catalog().proxy_endpoints():
-            tier = next((a for a in e.aliases if _TIER_RE.match(a)), None)
-            if tier:
-                mapping[e.role] = tier
-        _ADVERTISED_ID = mapping
-    return _ADVERTISED_ID.get(ep_cfg.role, ep_cfg.role)
+    return getattr(ep_cfg, "endpoint_class", "") or ep_cfg.role
 
 
 def _embedding_texts(raw) -> "tuple[list, str]":
@@ -243,7 +229,11 @@ class ProxyHttpHandlers:
 
         submit_body = {
             "agent_id": agent_id,
-            "endpoint": "bge-m3-embed",
+            # The endpoint CLASS, not a role: the OpenAI embeddings route has no
+            # way for a caller to choose, so the gateway picks — and it should
+            # pick a name the catalog owns rather than one deployment's model
+            # name. Caller-declared intent replaces this hardcode in Workstream C.
+            "endpoint": "embed",
             "priority": int(default_priority),
             "call_site": f"{agent_id}.openai_compat_embed",
             "payload_type": "embedding",
@@ -337,21 +327,16 @@ class ProxyHttpHandlers:
         for ep_name, ep_cfg in self.state.config.endpoints.items():
             ctx = ep_cfg.context_per_slot
             rows.append({
-                # The CANONICAL tier name (tier1/tier2/tier3), never the legacy
-                # `role`. `role` is still `gemma-router`/`creative`/
-                # `llama-thinker` for compat, but the 2026-07-30 tier migration
-                # made the tier names canonical and this is the surface every
-                # NEW external client copies its model name from — advertising
-                # `llama-thinker` here would mint fresh callers on a legacy name
-                # forever. Non-tier endpoints (embed/rerank) have no tier and
-                # keep their role. Guarded by
-                # test_v1_models_advertises_canonical_tier_names.
+                # The endpoint CLASS, never the `role` — see
+                # `_advertised_model_id`. This is the surface every new external
+                # client copies its model name from, so it must be the name we
+                # intend to keep answering to.
                 "id": _advertised_model_id(ep_cfg),
                 "object": "model",
                 # OpenAI clients expect `created`; vLLM emits it. Static per
                 # boot is fine — nothing consumes the value, only the key.
                 "created": self.state.boot_time_epoch,
-                "owned_by": "collective",
+                "owned_by": "roadstead",
                 # The served context window, in the field vLLM uses (see above).
                 "max_model_len": ctx,
                 "endpoint_class": ep_name,
@@ -669,7 +654,7 @@ class ProxyHttpHandlers:
                 "smart_default_shadow": self.state.smart_default_shadow,
                 # Thinking option (per-request native reasoning) health. All 0
                 # until a caller opts in with thinking:true. Watch
-                # thinking_truncated to tune COLLECTIVE_PROXY_THINKING_BUDGET down.
+                # thinking_truncated to tune ROADSTEAD_PROXY_THINKING_BUDGET down.
                 "thinking_requests": self.state.thinking_requests,
                 "thinking_clean": self.state.thinking_clean,
                 "thinking_recovered": self.state.thinking_recovered,

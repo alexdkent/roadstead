@@ -57,7 +57,7 @@ def _ok_backend(svc: ProxyService) -> None:
 
 def _body(timeout_s=5.0):
     return {
-        "agent_id": "a", "endpoint": "llama-thinker", "priority": "P3_INGESTION",
+        "agent_id": "a", "endpoint": "tier3", "priority": "P3_INGESTION",
         "call_site": "t", "payload_type": "chat_completion",
         "payload": {"messages": [{"role": "user", "content": "x"}]},
         "timeout_s": timeout_s,

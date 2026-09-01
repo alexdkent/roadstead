@@ -101,8 +101,8 @@ class ProxyState:
         self.scheduler = Scheduler(config, self.cost_model, self.budget_mgr)
         self.backend = BackendClientPool()
         self.queue_db = PersistentQueue(config.queue_db_path or None)
-        # On-demand endpoints (e.g. `creative`, Gemma-4-31B abliterated): the model is loaded
-        # lazily under the anvil GPU-slot dispatcher lease and idle-unloaded.
+        # On-demand endpoints: the model is NOT always-resident — it is loaded
+        # lazily under a host dispatcher's lease and idle-unloaded when quiet.
         self.on_demand = OnDemandManager(config.endpoints)
         # § 9 tier3 failover. Assigned by ProxyService right after Health is
         # built (Failover consumes endpoint_healthy and must not duplicate it),
@@ -154,7 +154,7 @@ class ProxyState:
         # WS-4 shadow egress detector: per-call_site silent grammar-drop tally
         # over ALL grammar-bearing responses (read-only; NEVER mutates a
         # response). {call_site: {"checked": int, "dropped": int}}. Populated by
-        # _shadow_egress_detect when COLLECTIVE_PROXY_SHADOW_EGRESS is on (default).
+        # _shadow_egress_detect when ROADSTEAD_PROXY_SHADOW_EGRESS is on (default).
         self.shadow_drop: dict[str, dict] = {}
         # Egress degeneration guard tallies (repetition-loop detect + re-dispatch).
         self.degeneration_detected = 0      # responses flagged as a repetition loop
@@ -189,8 +189,8 @@ class ProxyState:
         # Per-endpoint empty-completion events (audit 2026-07-12, C-3): a 2xx
         # backend response with no content/tool_calls (position-0-EOS), counted
         # each time the fail-loud gate in backend.call() trips — the
-        # post-boxa-consolidation reliability signature for "empty completion on
-        # creative". Loop-thread-only writes (single-writer invariant), emitted
+        # reliability signature for "this endpoint returned an empty
+        # completion". Loop-thread-only writes (single-writer invariant), emitted
         # on /metrics as ``llmproxy_empty_completion_total{endpoint}``.
         self.empty_completion_by_endpoint: dict[str, int] = {}
         # Truncation / structured-validity guard tallies (operator mandate

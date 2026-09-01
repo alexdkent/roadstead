@@ -35,7 +35,7 @@ def _svc(tmp_path) -> ProxyService:
 
 
 def _event(svc, *, request_id, occurred_at, caller_id, abort_reason,
-           endpoint="thinker", layer="stream"):
+           endpoint="tier3", layer="stream"):
     """Write one proxy_timeouts row with an EXPLICIT occurred_at.
 
     `persist_timeout_event` stamps `time.time()` itself, which would make every
@@ -69,7 +69,7 @@ def test_returns_the_matching_stall(tmp_path):
     assert rows[0]["request_id"] == "s1"
     assert rows[0]["abort_reason"] == "stall"
     assert rows[0]["caller_id"] == "pool-analyst"
-    assert rows[0]["endpoint"] == "thinker"
+    assert rows[0]["endpoint"] == "tier3"
 
 
 def test_prefix_matching_is_deliberate(tmp_path):
@@ -235,7 +235,7 @@ async def test_route_returns_the_rows_not_merely_a_200(tmp_path):
     assert row["request_id"] == "s1"
     assert row["abort_reason"] == "stall"
     assert row["caller_id"] == "pool-analyst:job-abc"
-    assert row["endpoint"] == "thinker"
+    assert row["endpoint"] == "tier3"
     assert row["occurred_at"] == 1000.0
 
 

@@ -64,7 +64,7 @@ def test_shadow_row_written_and_model_fed(tmp_path):
 def test_no_shadow_row_for_non_ok(tmp_path):
     svc = _make_service(tmp_path)
     t0 = time.monotonic()
-    req = _make_req("thinker", now=t0)
+    req = _make_req("tier3", now=t0)
 
     svc._record_timeout_shadow(req, t0 + 5.0, duration_s=5.0, output_tokens=0, status="error")
 
@@ -76,7 +76,7 @@ def test_no_shadow_row_for_non_ok(tmp_path):
 def test_shadow_fault_does_not_propagate(tmp_path):
     svc = _make_service(tmp_path)
     t0 = time.monotonic()
-    req = _make_req("thinker", now=t0)
+    req = _make_req("tier3", now=t0)
     decision = DispatchDecision(request=req, queue_wait_ms=100.0, occupancy_at_dispatch=1)
 
     # Make the shadow computation blow up.

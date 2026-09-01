@@ -1,7 +1,7 @@
 """JOURNEY — § 9.9 of `docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md`
-(plan item D2, the tier3 → tier2-analyst LLM-proxy failover).
+(plan item D2, the tier3 → tier2 LLM-proxy failover).
 
-    tier3 down -> served by tier2-analyst -> response labelled and
+    tier3 down -> served by tier2 -> response labelled and
     resp.model correct -> health-verifier chip raised -> an agent WITHOUT degrade_ok
     gets a clean 503 + Retry-After in the same window -> tier3 back ->
     drained -> next request on tier3, chip cleared.
@@ -16,14 +16,14 @@ that wire is correct, not merely what the code intended to send.
 
 Real seams driven, nothing else faked:
   * tier3 is made sick the way an operator actually does it — POST
-    ``/v1/admin/endpoints/thinker/pause`` (the same drain switch used for a
+    ``/v1/admin/endpoints/tier3/pause`` (the same drain switch used for a
     live vLLM restart), not by touching ``Failover``/``ProxyState`` directly.
   * requests are submitted through the real ``/v1/submit`` front door (the
     internal API every agent's ``ProxyLLMClient`` actually calls), which runs
     the full ``Lifecycle.handle_submit`` — circuit breaker, failover gates,
     scheduler, dispatch — exactly as production does.
-  * two independent fake backends stand in for tier3 (``thinker``) and
-    tier2-analyst (``creative``) so a captured ``resp.model`` can only have
+  * two independent fake backends stand in for tier3 (``tier3``) and
+    tier2 (``tier2``) so a captured ``resp.model`` can only have
     come from whichever one actually served — the identical-content "echo:"
     shape a single shared fake would produce can't prove that; a distinct
     ``served_model_id`` per backend can. (``fake_backend.py`` had to learn to
@@ -37,7 +37,7 @@ Real seams driven, nothing else faked:
 DWELL HANDLING: the plan sets `policy.failover_dwell_s: 120` in
 models.yaml. This journey does NOT sleep 120s and does NOT monkeypatch
 `Failover` — it builds its OWN `ProxyConfig` (same pattern as
-`conftest.py::_repointed_config`) with the `thinker` stanza's
+`conftest.py::_repointed_config`) with the `tier3` stanza's
 `failover_dwell_s` overridden to 0.3s via `dataclasses.replace`, i.e. driving
 the config the way an operator would tune the dwell, not the clock. The
 recovery LEAVE transition is then driven by the real poller loop (interval
@@ -68,8 +68,8 @@ from roadstead.__main__ import build_app
 
 from roadstead.testing import FAULT_CAPACITY_DESYNC, FakeBackend, FakeBackendServer
 
-SRC = normalize_endpoint("thinker")     # tier3
-TGT = normalize_endpoint("creative")    # tier2-analyst (the boxa)
+SRC = normalize_endpoint("tier3")     # tier3
+TGT = normalize_endpoint("tier2")    # tier2 (the boxa)
 
 _INTERNAL_CLIENT = ("127.0.0.1", 41998)  # loopback -> ACL "internal" + admin
 
@@ -87,11 +87,11 @@ async def _wait_until(predicate, timeout_s: float = 5.0, interval_s: float = 0.0
 
 @pytest_asyncio.fixture
 async def journey(caplog) -> AsyncIterator[dict]:
-    """A real ProxyService with tier3 (`thinker`) and tier2-analyst
-    (`creative`) backed by TWO INDEPENDENT fake backends, real agents.yaml
-    (`discord.degrade_ok=True`, `sidekick.degrade_ok=False`), and the `thinker`
+    """A real ProxyService with tier3 (`tier3`) and tier2
+    (`tier2`) backed by TWO INDEPENDENT fake backends, real agents.yaml
+    (`discord.degrade_ok=True`, `sidekick.degrade_ok=False`), and the `tier3`
     dwell shrunk to FAST_DWELL_S. Every other endpoint is left pointed at the
-    tier2-analyst fake — unused by this journey, but must resolve to
+    tier2 fake — unused by this journey, but must resolve to
     something so config construction doesn't 404 on itself.
     """
     caplog.set_level(logging.WARNING, logger="roadstead.failover")
@@ -178,7 +178,7 @@ async def test_tier3_failover_full_journey(journey, caplog):
     assert env["response"]["model"] == "llama-thinker-live"
     assert "degraded" not in env
     assert fake_thinker.controller.requests, "baseline call never reached tier3's fake"
-    assert not fake_creative.controller.requests, "baseline call leaked onto tier2-analyst"
+    assert not fake_creative.controller.requests, "baseline call leaked onto tier2"
 
     # -- 1. tier3 down -- the way the system does it: an operator drain -----
     pause = await client.post(f"/v1/admin/endpoints/{SRC}/pause",
@@ -187,7 +187,7 @@ async def test_tier3_failover_full_journey(journey, caplog):
     assert pause.json()["paused"] is True
     assert svc._health.endpoint_healthy(SRC) is False
 
-    # -- 2. served by tier2-analyst; response labelled; resp.model correct --
+    # -- 2. served by tier2; response labelled; resp.model correct --
     fake_creative.controller.reset()
     resp = await client.post("/v1/submit", json=_submit_body("discord", content="degraded turn"))
     assert resp.status_code == 200, resp.text
@@ -196,11 +196,11 @@ async def test_tier3_failover_full_journey(journey, caplog):
     assert env["degraded"] is True
     assert env["degraded_from"] == SRC
     # 🚨 the wire fact, not the intent: it must have come back FROM the
-    # tier2-analyst fake specifically, naming ITS served model.
+    # tier2 fake specifically, naming ITS served model.
     assert env["response"]["model"] == "qwen3-creative-live"
     assert env["response"]["choices"][0]["message"]["content"] == "echo: degraded turn"
     assert any(r.path == "/v1/chat/completions" for r in fake_creative.controller.requests), (
-        "the degraded request never reached tier2-analyst's fake")
+        "the degraded request never reached tier2's fake")
 
     # -- 3. health-verifier chip raised -------------------------------------------
     # health-verifier's llmproxy verifier chips off exactly two observable signals: the
@@ -234,7 +234,7 @@ async def test_tier3_failover_full_journey(journey, caplog):
     assert not any("not opted in" in str(r.body) for r in fake_creative.controller.requests)
 
     # -- 5. tier3 back -- drained -- next request on tier3, chip cleared ----
-    # Hold ONE degraded request in flight on tier2-analyst (CAPACITY_DESYNC's
+    # Hold ONE degraded request in flight on tier2 (CAPACITY_DESYNC's
     # sleep-then-serve happy path) so the LEAVE transition has a real,
     # observable cohort to drain rather than an instantaneous empty one.
     fake_creative.controller.set_fault(FAULT_CAPACITY_DESYNC, 0.5)
@@ -280,4 +280,4 @@ async def test_tier3_failover_full_journey(journey, caplog):
     assert env["response"]["model"] == "llama-thinker-live"
     assert any(r.path == "/v1/chat/completions" for r in fake_thinker.controller.requests)
     assert not fake_creative.controller.requests, (
-        "post-recovery request still landed on tier2-analyst")
+        "post-recovery request still landed on tier2")

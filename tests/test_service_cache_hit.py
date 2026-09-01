@@ -37,7 +37,7 @@ async def test_cache_hit_has_status_ok():
 
     body = {
         "agent_id": "test_agent",
-        "endpoint": "qwen-analyst",
+        "endpoint": "tier2",
         "priority": "P1_TURN_SUPPORT",
         "call_site": "test",
         "payload_type": "chat_completion",
@@ -72,7 +72,7 @@ async def test_cache_hit_response_shape_matches_dispatch():
 
     body = {
         "agent_id": "test_agent",
-        "endpoint": "qwen-analyst",
+        "endpoint": "tier2",
         "priority": "P2_POST_TURN",
         "call_site": "test",
         "payload_type": "chat_completion",
@@ -123,10 +123,10 @@ def test_cache_key_differs_on_response_format():
 
 def test_cache_key_differs_on_structured_outputs_grammar():
     cache = DeterministicCache()
-    a = cache.cache_key("thinker", {
+    a = cache.cache_key("tier3", {
         **_base_payload(), "structured_outputs": {"grammar": 'root ::= "a"'},
     })
-    b = cache.cache_key("thinker", {
+    b = cache.cache_key("tier3", {
         **_base_payload(), "structured_outputs": {"grammar": 'root ::= "b"'},
     })
     assert a and b and a != b
@@ -149,7 +149,7 @@ def test_cache_key_stable_for_identical_payload_and_gates_unchanged():
           "messages": [{"role": "user", "content": "classify this"}]}
     assert cache.cache_key("chat", p1) == cache.cache_key("chat", p2)
     # Same payload, different endpoint → different key.
-    assert cache.cache_key("chat", p1) != cache.cache_key("companion", p1)
+    assert cache.cache_key("chat", p1) != cache.cache_key("tier3", p1)
     # Cacheability gates unchanged: non-zero temperature / streaming → None.
     assert cache.cache_key("chat", {**p1, "temperature": 0.7}) is None
     assert cache.cache_key("chat", {**p1, "stream": True}) is None

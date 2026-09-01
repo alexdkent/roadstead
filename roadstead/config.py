@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import dataclasses
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
@@ -469,16 +470,20 @@ class AgentQuotaConfig:
 # Top-level proxy config
 # ---------------------------------------------------------------------------
 
-# THE canonical role→host:port routing table — DERIVED from the model authority
-# (llmproxy/models.yaml). Each `proxy_endpoint: true` role produces one entry,
-# keyed by its endpoint class. Slots/context are STARTUP SEEDS — the capacity
-# poller overwrites max_slots/context_per_slot from backend /props at runtime.
-# To add/move/retune a routed model, edit models.yaml (+ the box's systemd unit);
-# the per-class policy knobs (slot_affinity, fast_path_reserve_slots,
-# dispatch_concurrency_cap, background_floor_pct, skip_discovery) live in its
-# `policy:` block. The deep operational rationale for each knob is in the model's
-# `notes:` field in models.yaml. NOTE: the "gemma-hot" class (E2B :9090) is
-# decommissioned — do NOT re-add a probe of :9090.
+# THE routing table, DERIVED from the catalog (``models.yaml``). Each ROUTED
+# endpoint produces one entry, keyed by its endpoint class; its connection comes
+# from the provider it names. Slots/context here are STARTUP SEEDS — the capacity
+# poller overwrites them from the backend where the engine publishes them.
+#
+# To add/move/retune a routed model, edit models.yaml; the per-class policy knobs
+# (slot_affinity, fast_path_reserve_slots, dispatch_concurrency_cap,
+# background_floor_pct, skip_discovery) live in its `policy:` block, and a key
+# missing from `model_catalog._POLICY_PASSTHROUGH` is dropped in silence.
+#
+# 🚨 The shipped catalog is an EXAMPLE (`tier1`/`tier2`/`tier3`/`embed`/`rerank`,
+# RFC 5737 addresses). Comments throughout this package cite measurements taken
+# on a real fleet under ITS names — those are records of what was measured, not
+# references to classes that exist here.
 DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
     cls: EndpointConfig(**kwargs)
     for cls, kwargs in model_catalog.build_endpoint_kwargs().items()
@@ -507,7 +512,7 @@ def thinking_enabled() -> bool:
     """Feature kill-switch (default ON). Per-request opt-in is the real gate;
     nothing reasons until a caller sets ``thinking: true``, so this only exists
     to disable the path fleet-wide in an incident."""
-    return os.environ.get("COLLECTIVE_PROXY_THINKING", "1").strip().lower() not in (
+    return os.environ.get("ROADSTEAD_PROXY_THINKING", "1").strip().lower() not in (
         "0", "false", "no", "off", "",
     )
 
@@ -518,8 +523,8 @@ def shadow_egress_detect_enabled() -> bool:
     fail / markdown-fence / non-conformance, i.e. llama.cpp dropped the grammar
     and ran free-form), but NEVER mutate the response. Zero caller risk, so
     default ON: the whole point is to collect a baseline silent-drop rate per
-    call_site from live traffic. Env kill-switch ``COLLECTIVE_PROXY_SHADOW_EGRESS``."""
-    return os.environ.get("COLLECTIVE_PROXY_SHADOW_EGRESS", "1").strip().lower() not in (
+    call_site from live traffic. Env kill-switch ``ROADSTEAD_PROXY_SHADOW_EGRESS``."""
+    return os.environ.get("ROADSTEAD_PROXY_SHADOW_EGRESS", "1").strip().lower() not in (
         "0", "false", "no", "off", "",
     )
 
@@ -530,8 +535,8 @@ def degeneration_guard_enabled() -> bool:
     …'), a model failure mode any caller can hit on a long prompt — and RE-DISPATCH
     with an anti-repetition penalty. A 200-with-garbage is invisible to the
     transient-error and grammar checks, so this is the layer that catches it.
-    Default ON. Env kill-switch ``COLLECTIVE_PROXY_DEGENERATION_GUARD``."""
-    return os.environ.get("COLLECTIVE_PROXY_DEGENERATION_GUARD", "1").strip().lower() not in (
+    Default ON. Env kill-switch ``ROADSTEAD_PROXY_DEGENERATION_GUARD``."""
+    return os.environ.get("ROADSTEAD_PROXY_DEGENERATION_GUARD", "1").strip().lower() not in (
         "0", "false", "no", "off", "",
     )
 
@@ -540,8 +545,8 @@ def degeneration_shadow_only() -> bool:
     """When set, the degeneration guard only DETECTS + logs + counts (no
     re-dispatch) — the shadow-measure phase to confirm it never false-flags
     legitimate repetition (a song chorus) before it acts. Default OFF (the guard
-    actively corrects). Env ``COLLECTIVE_PROXY_DEGENERATION_SHADOW``."""
-    return os.environ.get("COLLECTIVE_PROXY_DEGENERATION_SHADOW", "0").strip().lower() in (
+    actively corrects). Env ``ROADSTEAD_PROXY_DEGENERATION_SHADOW``."""
+    return os.environ.get("ROADSTEAD_PROXY_DEGENERATION_SHADOW", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -556,8 +561,8 @@ def uniform_correction_enabled() -> bool:
     un-send, but it records the same tallies the sync guards do, so streaming is no
     longer a correction blind spot). Default OFF == byte-identical (only OpenAI
     streams sanitized, no stream-side detection). Env
-    ``COLLECTIVE_PROXY_UNIFORM_CORRECTION``."""
-    return os.environ.get("COLLECTIVE_PROXY_UNIFORM_CORRECTION", "0").strip().lower() in (
+    ``ROADSTEAD_PROXY_UNIFORM_CORRECTION``."""
+    return os.environ.get("ROADSTEAD_PROXY_UNIFORM_CORRECTION", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -585,9 +590,9 @@ def thinking_canary_enabled() -> bool:
     OBSERVABILITY ONLY — it raises a `thinking_switch_broken` WARNING and never
     changes routing, admission or any caller's payload, so default ON for the
     same reason the shadow-egress detector is. Env kill-switch
-    ``COLLECTIVE_PROXY_THINKING_CANARY=0`` for the case where a backend must not
+    ``ROADSTEAD_PROXY_THINKING_CANARY=0`` for the case where a backend must not
     be touched at all (a benchmark run wanting a quiet endpoint)."""
-    return os.environ.get("COLLECTIVE_PROXY_THINKING_CANARY", "1") != "0"
+    return os.environ.get("ROADSTEAD_PROXY_THINKING_CANARY", "1") != "0"
 
 
 def max_slots_reconcile_enabled() -> bool:
@@ -599,8 +604,8 @@ def max_slots_reconcile_enabled() -> bool:
     the serve script) and raises a ``max_slots_drift`` WARNING alert on mismatch.
     OBSERVABILITY ONLY — it never changes admission (zero caller-visible effect,
     like the shadow-egress detector), so default ON. Env kill-switch
-    ``COLLECTIVE_PROXY_MAX_SLOTS_RECONCILE``."""
-    return os.environ.get("COLLECTIVE_PROXY_MAX_SLOTS_RECONCILE", "1").strip().lower() not in (
+    ``ROADSTEAD_PROXY_MAX_SLOTS_RECONCILE``."""
+    return os.environ.get("ROADSTEAD_PROXY_MAX_SLOTS_RECONCILE", "1").strip().lower() not in (
         "0", "false", "no", "off", "",
     )
 
@@ -614,9 +619,9 @@ def cache_drift_alarm_enabled() -> bool:
     most every ``CACHE_DRIFT_REALERT_S``). OBSERVABILITY ONLY — it never changes
     routing/admission/output (zero caller-visible effect, like the max_slots
     reconciler + shadow-egress detector), so default ON. Env kill-switch
-    ``COLLECTIVE_PROXY_CACHE_DRIFT_ALARM``. See
+    ``ROADSTEAD_PROXY_CACHE_DRIFT_ALARM``. See
     ``docs/llmproxy_prefix_cache_observability.md`` (Tier-2 step 3)."""
-    return os.environ.get("COLLECTIVE_PROXY_CACHE_DRIFT_ALARM", "1").strip().lower() not in (
+    return os.environ.get("ROADSTEAD_PROXY_CACHE_DRIFT_ALARM", "1").strip().lower() not in (
         "0", "false", "no", "off", "",
     )
 
@@ -629,8 +634,8 @@ def endpoint_cooldown_enabled() -> bool:
     strings ``health_fail_threshold`` in a row — which the consecutive-fail circuit
     misses). Only DEFERS/DEGRADES — never reroutes across backends (that's Phase 4),
     so a cache-sensitive interactive conversation is not cache-busted. Default OFF
-    == byte-identical. Env ``COLLECTIVE_PROXY_ENDPOINT_COOLDOWN``."""
-    return os.environ.get("COLLECTIVE_PROXY_ENDPOINT_COOLDOWN", "0").strip().lower() in (
+    == byte-identical. Env ``ROADSTEAD_PROXY_ENDPOINT_COOLDOWN``."""
+    return os.environ.get("ROADSTEAD_PROXY_ENDPOINT_COOLDOWN", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -654,8 +659,8 @@ def structured_validity_guard_enabled() -> bool:
     owns schema validation) — this catches truncation/malformation only. The
     LLMPROXY_TRUNCATION / LLMPROXY_STRUCTURED_INVALID observability (ERROR log
     + per-(model, caller) tallies) is NOT gated by this switch — it's read-only.
-    Default ON. Env kill-switch ``COLLECTIVE_PROXY_STRUCTURED_VALIDITY``."""
-    return os.environ.get("COLLECTIVE_PROXY_STRUCTURED_VALIDITY", "1").strip().lower() not in (
+    Default ON. Env kill-switch ``ROADSTEAD_PROXY_STRUCTURED_VALIDITY``."""
+    return os.environ.get("ROADSTEAD_PROXY_STRUCTURED_VALIDITY", "1").strip().lower() not in (
         "0", "false", "no", "off", "",
     )
 
@@ -669,9 +674,9 @@ def schema_backstop_enabled() -> bool:
     fenced / malformed-``tool_calls.arguments`` gap (today only empty / degenerate
     / truncated / thinking-noise are rescued). Default OFF == byte-identical (the
     guard early-returns before any observable effect). Env
-    ``COLLECTIVE_PROXY_SCHEMA_BACKSTOP``. See
+    ``ROADSTEAD_PROXY_SCHEMA_BACKSTOP``. See
     ``docs/llmproxy_phase3_schema_backstop_contract.md``."""
-    return os.environ.get("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", "0").strip().lower() in (
+    return os.environ.get("ROADSTEAD_PROXY_SCHEMA_BACKSTOP", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -682,8 +687,8 @@ def schema_backstop_shadow() -> bool:
     ORIGINAL response untouched (no swap, no retry re-dispatch, no fail-loud). The
     review window: measure how often the backstop fires and whether repair succeeds
     before it mutates live responses. Default OFF (the guard actively corrects when
-    enabled). Env ``COLLECTIVE_PROXY_SCHEMA_BACKSTOP_SHADOW``."""
-    return os.environ.get("COLLECTIVE_PROXY_SCHEMA_BACKSTOP_SHADOW", "0").strip().lower() in (
+    enabled). Env ``ROADSTEAD_PROXY_SCHEMA_BACKSTOP_SHADOW``."""
+    return os.environ.get("ROADSTEAD_PROXY_SCHEMA_BACKSTOP_SHADOW", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -692,8 +697,8 @@ def endpoint_cooldown_shadow() -> bool:
     """Step 4b SHADOW (review this first): count backend-fault failures + log a
     'would cool' + surface the trip on /v1/status, but DON'T actually pull the
     endpoint. Confirm the thresholds don't false-trip on this fleet's traffic, then
-    flip enforce. Default OFF. Env ``COLLECTIVE_PROXY_ENDPOINT_COOLDOWN_SHADOW``."""
-    return os.environ.get("COLLECTIVE_PROXY_ENDPOINT_COOLDOWN_SHADOW", "0").strip().lower() in (
+    flip enforce. Default OFF. Env ``ROADSTEAD_PROXY_ENDPOINT_COOLDOWN_SHADOW``."""
+    return os.environ.get("ROADSTEAD_PROXY_ENDPOINT_COOLDOWN_SHADOW", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -701,27 +706,27 @@ def endpoint_cooldown_shadow() -> bool:
 def cooldown_allowed_fails() -> int:
     """Backend-fault failures within the window that trip a cooldown (default 4 —
     above the 3-consecutive circuit so this catches the INTERMITTENT case).
-    Env ``COLLECTIVE_PROXY_COOLDOWN_ALLOWED_FAILS``."""
+    Env ``ROADSTEAD_PROXY_COOLDOWN_ALLOWED_FAILS``."""
     try:
-        return max(1, int(os.environ.get("COLLECTIVE_PROXY_COOLDOWN_ALLOWED_FAILS", "4")))
+        return max(1, int(os.environ.get("ROADSTEAD_PROXY_COOLDOWN_ALLOWED_FAILS", "4")))
     except ValueError:
         return 4
 
 
 def cooldown_window_s() -> float:
     """Sliding window over which ``cooldown_allowed_fails`` is counted (default 60s).
-    Env ``COLLECTIVE_PROXY_COOLDOWN_WINDOW_S``."""
+    Env ``ROADSTEAD_PROXY_COOLDOWN_WINDOW_S``."""
     try:
-        return max(1.0, float(os.environ.get("COLLECTIVE_PROXY_COOLDOWN_WINDOW_S", "60")))
+        return max(1.0, float(os.environ.get("ROADSTEAD_PROXY_COOLDOWN_WINDOW_S", "60")))
     except ValueError:
         return 60.0
 
 
 def cooldown_duration_s() -> float:
     """How long a tripped endpoint stays cooled before auto-recovery (default 30s).
-    Env ``COLLECTIVE_PROXY_COOLDOWN_DURATION_S``."""
+    Env ``ROADSTEAD_PROXY_COOLDOWN_DURATION_S``."""
     try:
-        return max(1.0, float(os.environ.get("COLLECTIVE_PROXY_COOLDOWN_DURATION_S", "30")))
+        return max(1.0, float(os.environ.get("ROADSTEAD_PROXY_COOLDOWN_DURATION_S", "30")))
     except ValueError:
         return 30.0
 
@@ -732,9 +737,9 @@ def thinking_reasoning_budget() -> int:
     small a budget truncates mid-reasoning (finish=length). Operator directive
     (2026-06-05): prefer short-term slowness over cutoff failures — start
     generous, watch the truncation metric, tune DOWN over time. Env override
-    ``COLLECTIVE_PROXY_THINKING_BUDGET``."""
+    ``ROADSTEAD_PROXY_THINKING_BUDGET``."""
     try:
-        return max(0, int(os.environ.get("COLLECTIVE_PROXY_THINKING_BUDGET", "8000")))
+        return max(0, int(os.environ.get("ROADSTEAD_PROXY_THINKING_BUDGET", "8000")))
     except ValueError:
         return 8000
 
@@ -748,9 +753,9 @@ def forced_reasoning_budget() -> int:
     the reasoning. Deliberately smaller than ``thinking_reasoning_budget`` (that's for
     explicit vLLM long-form thinking); creative turns reason ~350-500 tokens, so the
     default gives ~3x headroom without inflating tiny caps into runaway generations.
-    Env override ``COLLECTIVE_PROXY_FORCED_REASONING_BUDGET``."""
+    Env override ``ROADSTEAD_PROXY_FORCED_REASONING_BUDGET``."""
     try:
-        return max(0, int(os.environ.get("COLLECTIVE_PROXY_FORCED_REASONING_BUDGET", "1536")))
+        return max(0, int(os.environ.get("ROADSTEAD_PROXY_FORCED_REASONING_BUDGET", "1536")))
     except ValueError:
         return 1536
 
@@ -760,9 +765,9 @@ def _inflight_stream_interval_s() -> float:
     in-flight board. The instant ``call.dispatched``/``call.completed`` events do
     the real work; this just refreshes elapsed/queue/occupancy and recovers any
     missed event. Gated on connected clients (free when nobody's watching). Env
-    override ``COLLECTIVE_PROXY_INFLIGHT_INTERVAL_S`` (clamped ≥0.25s)."""
+    override ``ROADSTEAD_PROXY_INFLIGHT_INTERVAL_S`` (clamped ≥0.25s)."""
     try:
-        return max(0.25, float(os.environ.get("COLLECTIVE_PROXY_INFLIGHT_INTERVAL_S", "1.5")))
+        return max(0.25, float(os.environ.get("ROADSTEAD_PROXY_INFLIGHT_INTERVAL_S", "1.5")))
     except ValueError:
         return 1.5
 
@@ -771,7 +776,18 @@ def _inflight_stream_interval_s() -> float:
 class ProxyConfig:
     """Top-level proxy configuration."""
     port: int = 42161
-    endpoints: dict[str, EndpointConfig] = field(default_factory=lambda: dict(DEFAULT_ENDPOINTS))
+    # 🚨 A COPY PER INSTANCE, not `dict(DEFAULT_ENDPOINTS)`. That was a shallow
+    # copy of the dict around the SAME EndpointConfig objects, so every
+    # ProxyConfig in a process shared them — and they are mutated at runtime:
+    # capacity discovery writes max_slots and context_per_slot, and the poller
+    # writes served_model_id. One service's discovery therefore reached into
+    # another's config. It never mattered in production, where there is exactly
+    # one, which is why it survived; in the suite it means one test's
+    # `endpoints["tier2"].context_per_slot = 0` silently governs every test that
+    # runs after it, and the failure surfaces somewhere unrelated.
+    endpoints: dict[str, EndpointConfig] = field(
+        default_factory=lambda: {k: dataclasses.replace(v)
+                                 for k, v in DEFAULT_ENDPOINTS.items()})
     agents: dict[str, AgentQuotaConfig] = field(default_factory=dict)
     starvation_timeout_s: float = 30.0
     drr_tick_interval_s: float = 0.01

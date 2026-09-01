@@ -113,20 +113,20 @@ def test_the_alert_names_the_endpoint_and_the_top_contributing_call_site():
     """So the operator can tell "one caller answers nothing a lot" from "this
     endpoint's grammar is broken" without opening a shell."""
     w = {}
-    _feed(w, "thinker", n_empty=30, n_ok=0, call_site="auto_approve.critic")
-    _feed(w, "thinker", n_empty=5, n_ok=65, call_site="knowledge.extract")
+    _feed(w, "tier3", n_empty=30, n_ok=0, call_site="auto_approve.critic")
+    _feed(w, "tier3", n_empty=5, n_ok=65, call_site="knowledge.extract")
     detail = obs.structured_empty_alerts(w, 1000.0)[0].detail
-    assert "thinker" in detail
+    assert "tier3" in detail
     assert "auto_approve.critic" in detail
     assert "35/100" in detail
 
 
 def test_a_healthy_endpoint_is_unaffected_by_a_sick_neighbour():
     w = {}
-    _feed(w, "thinker", n_empty=50, n_ok=50)
-    _feed(w, "gemma", n_empty=0, n_ok=200)
+    _feed(w, "tier3", n_empty=50, n_ok=50)
+    _feed(w, "tier1", n_empty=0, n_ok=200)
     names = [a.detail for a in obs.structured_empty_alerts(w, 1000.0)]
-    assert len(names) == 1 and "thinker" in names[0]
+    assert len(names) == 1 and "tier3" in names[0]
 
 
 # ---------------------------------------------------------------------------
@@ -136,11 +136,11 @@ def test_a_healthy_endpoint_is_unaffected_by_a_sick_neighbour():
 def test_samples_older_than_the_window_are_dropped():
     """A cleared fault must clear the alarm — otherwise it latches and the
     next real one is invisible under it."""
-    w = _feed({}, "thinker", n_empty=50, n_ok=50, now=1000.0)
+    w = _feed({}, "tier3", n_empty=50, n_ok=50, now=1000.0)
     assert len(obs.structured_empty_alerts(w, 1000.0)) == 1
     later = 1000.0 + W + 1
-    _feed(w, "thinker", n_empty=0, n_ok=FLOOR, now=later)
-    assert obs.structured_empty_rates(w, later)["thinker"]["n"] == FLOOR
+    _feed(w, "tier3", n_empty=0, n_ok=FLOOR, now=later)
+    assert obs.structured_empty_rates(w, later)["tier3"]["n"] == FLOOR
     assert obs.structured_empty_alerts(w, later) == []
 
 
@@ -183,7 +183,7 @@ class _NullMetrics:
 
 
 def test_alarm_reaches_state_alerts_via_evaluate_alerts():
-    h, st = _health_with(_feed({}, "thinker", n_empty=50, n_ok=50))
+    h, st = _health_with(_feed({}, "tier3", n_empty=50, n_ok=50))
     h.evaluate_alerts(1000.0)
     named = [a for a in st.alerts if a["name"] == "structured_empty_rate"]
     assert len(named) == 1, st.alerts
@@ -191,7 +191,7 @@ def test_alarm_reaches_state_alerts_via_evaluate_alerts():
 
 
 def test_no_alarm_on_a_healthy_fleet():
-    h, st = _health_with(_feed({}, "thinker", n_empty=0, n_ok=200))
+    h, st = _health_with(_feed({}, "tier3", n_empty=0, n_ok=200))
     h.evaluate_alerts(1000.0)
     assert [a for a in st.alerts if a["name"] == "structured_empty_rate"] == []
 
@@ -205,20 +205,20 @@ def test_no_alarm_on_a_healthy_fleet():
 # constraint and whose choices[0].message.content json-parses to a dict:
 #
 #   22,148 structured completions, 2026-07-30 23:24Z -> 2026-08-02 00:22Z
-#   tier3 ('thinker') BEFORE the 15:06:52Z restart  0/1188  =  0.0%  (23 buckets)
+#   tier3 ('tier3') BEFORE the 15:06:52Z restart  0/1188  =  0.0%  (23 buckets)
 #   tier3             AFTER                      1271/4844  = 26.2%  (65 buckets)
-#   gemma / creative / companion, whole period    0 empty across 114 buckets
+#   tier1 / tier2 / tier3, whole period    0 empty across 114 buckets
 #
-# Replaying that stream minute-by-minute through THIS code fired on `thinker`
+# Replaying that stream minute-by-minute through THIS code fired on `tier3`
 # at 2026-07-31 16:32Z — but see the note in the 15%-threshold test below.
 _INCIDENT = [
     # (label, endpoint, n_structured, n_empty, must_alarm) — 30-min buckets
-    ("tier3, whole pre-restart period", "thinker", 1188, 0, False),
-    ("tier3, whole post-restart period", "thinker", 4844, 1271, True),  # 26.2%
-    ("tier3, first hours after", "thinker", 69, 25, True),              # 36.2%
-    ("tier3, sustained peak", "thinker", 100, 68, True),                # 68%
-    ("gemma, same period", "gemma", 391, 0, False),
-    ("creative, same period", "creative", 85, 0, False),
+    ("tier3, whole pre-restart period", "tier3", 1188, 0, False),
+    ("tier3, whole post-restart period", "tier3", 4844, 1271, True),  # 26.2%
+    ("tier3, first hours after", "tier3", 69, 25, True),              # 36.2%
+    ("tier3, sustained peak", "tier3", 100, 68, True),                # 68%
+    ("tier1, same period", "tier1", 391, 0, False),
+    ("tier2, same period", "tier2", 85, 0, False),
 ]
 
 
@@ -249,10 +249,10 @@ def test_the_threshold_keeps_real_margin_under_the_real_incident():
 
 
 def test_the_quietest_endpoint_never_evaluates_and_we_say_so():
-    """Measured: `companion` peaked at 6 structured requests per 30-minute
+    """Measured: `tier3` peaked at 6 structured requests per 30-minute
     bucket and had ZERO evaluated buckets across the whole two days, so it can
     never reach the sample floor and is NOT covered by this alarm. Pinned here
     so the gap is a recorded decision rather than a surprise."""
-    w = _feed({}, "companion", n_empty=6, n_ok=0)
-    assert obs.structured_empty_rates(w, 1000.0)["companion"]["evaluated"] is False
+    w = _feed({}, "tier3", n_empty=6, n_ok=0)
+    assert obs.structured_empty_rates(w, 1000.0)["tier3"]["evaluated"] is False
     assert obs.structured_empty_alerts(w, 1000.0) == []

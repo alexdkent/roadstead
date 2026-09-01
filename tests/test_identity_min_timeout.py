@@ -2,7 +2,7 @@
 
 A registered OpenAI-door caller that supplies NO deadline of its own is entirely
 at the mercy of the adaptive timeout model, and the model's ``size_stretch``
-clamps at 3.0 — floor(thinker 180s) x surge(1.0) x 3.0 = a flat 540s wall for
+clamps at 3.0 — floor(tier3 180s) x surge(1.0) x 3.0 = a flat 540s wall for
 any tier3 prompt above ~82K tokens. Live evidence: three consecutive kills at
 elapsed_s=539.999 against applied_timeout_s=540.0 on a 123,466-token prompt
 (agent_id=lan-generic, layer=stream). ``timeout_ceiling_s`` cannot fix that —
@@ -30,7 +30,7 @@ from roadstead.config import LLMPriority, ProxyConfig
 from roadstead.constants import _DEFAULT_TIMEOUT_S, _SMART_DEFAULT_CAP_S
 from roadstead.service import ProxyService
 
-# The smart default for "chat" (-> the creative endpoint class) on a cold model.
+# The smart default for "chat" (-> the tier2 endpoint class) on a cold model.
 # Both it and the flat default are far below the 1800s floor, so the floor is
 # visibly the binding constraint in BOTH flag states.
 _CREATIVE_FLOOR_S = 120.0
@@ -251,7 +251,7 @@ async def test_openai_door_batch_caller_gets_the_floor(smart):
     await svc.startup()
     try:
         with _capture_applied_timeout() as created:
-            body = {"model": "llama-thinker",
+            body = {"model": "tier3",
                     "messages": [{"role": "user", "content": "hi"}]}
             r = await asyncio.wait_for(
                 svc.handle_openai_chat(dict(body), _Req("10.0.0.25")), timeout=10.0)

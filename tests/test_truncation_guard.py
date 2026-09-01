@@ -22,7 +22,7 @@ Pins (both response modes, internal door):
   * FREE-TEXT truncation NEVER fails the request (may be a legitimate cap).
   * guided_choice / bare-token grammars are truncation-gated but never
     parse-gated (their legitimate output is not JSON).
-  * Kill-switch COLLECTIVE_PROXY_STRUCTURED_VALIDITY=0 restores the legacy
+  * Kill-switch ROADSTEAD_PROXY_STRUCTURED_VALIDITY=0 restores the legacy
     caller-visible behavior (markers/counters stay).
   * Counters appear under /v1/status "reliability".
 """
@@ -55,8 +55,8 @@ def _isolate_layers(monkeypatch):
     ALWAYS-ON floor in isolation (the backstop is ON in the container env and
     would repair/502 before the floor runs); leave the floor itself at its
     DEFAULT (on) — that default is part of what this file pins."""
-    monkeypatch.setenv("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", "0")
-    monkeypatch.delenv("COLLECTIVE_PROXY_STRUCTURED_VALIDITY", raising=False)
+    monkeypatch.setenv("ROADSTEAD_PROXY_SCHEMA_BACKSTOP", "0")
+    monkeypatch.delenv("ROADSTEAD_PROXY_STRUCTURED_VALIDITY", raising=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -69,7 +69,7 @@ _SCHEMA_RF = {"type": "json_schema",
 
 def _body(payload, timeout_s=15.0):
     return {
-        "agent_id": "kv4", "endpoint": "llama-thinker", "priority": "P3_INGESTION",
+        "agent_id": "kv4", "endpoint": "tier3", "priority": "P3_INGESTION",
         "call_site": "kv4.judge", "payload_type": "chat_completion",
         "payload": payload, "timeout_s": timeout_s,
     }
@@ -162,7 +162,7 @@ async def _drive_stream(svc, payload):
 
 
 def _tally(svc):
-    return svc._correction.state.truncation_by_model_caller.get("thinker|kv4")
+    return svc._correction.state.truncation_by_model_caller.get("tier3|kv4")
 
 
 # --------------------------------------------------------------------------- #
@@ -179,7 +179,7 @@ async def test_sync_structured_truncation_502_and_marker(caplog):
     marker = [r for r in caplog.records if "LLMPROXY_TRUNCATION" in r.getMessage()]
     assert len(marker) == 1 and marker[0].levelno == logging.ERROR
     msg = marker[0].getMessage()
-    assert ("model=thinker" in msg and "agent=kv4" in msg
+    assert ("model=tier3" in msg and "agent=kv4" in msg
             and "call_site=kv4.judge" in msg and "priority=P3_INGESTION" in msg
             and "max_tokens=64" in msg and "output_tokens=16" in msg
             and "structured=True" in msg)
@@ -204,7 +204,7 @@ async def test_sync_freetext_truncation_served_but_loud(caplog):
 
 @pytest.mark.asyncio
 async def test_sync_freetext_warmer_probe_exempt_from_marker(caplog):
-    """A prefix-cache warmer deliberately asks for a 1-token (gemma: 16) freetext
+    """A prefix-cache warmer deliberately asks for a 1-token (tier1: 16) freetext
     completion to keep the composer prefix hot; finish_reason=length on such a
     probe is EXPECTED, not a caller-visible cut-off. It must NOT log a marker or
     tally — else the warmers (fired every ~90s) bury the real truncation signal.
@@ -223,7 +223,7 @@ async def test_sync_freetext_warmer_probe_exempt_from_marker(caplog):
 
 @pytest.mark.asyncio
 async def test_sync_freetext_16token_probe_exempt(caplog):
-    """The gemma warmer uses max_tokens=16 — the exemption ceiling is inclusive."""
+    """The tier1 warmer uses max_tokens=16 — the exemption ceiling is inclusive."""
     svc = _svc_sync("x", "length", output_tokens=16)
     with caplog.at_level(logging.ERROR):
         resp, result = await _drive_sync(svc, _payload(max_tokens=16))
@@ -284,7 +284,7 @@ async def test_sync_vllm_truncated_toolcall_args_fail_loud(caplog):
     """vLLM mislabels a mid-tool-call truncation as finish_reason="tool_calls":
     cut-off arguments on a vLLM sync 200 = truncation → the pinned deferrable
     502, LLMPROXY_TRUNCATION marker + tally — never a json-repaired
-    valid-but-fabricated argument. (thinker is the vLLM endpoint.)"""
+    valid-but-fabricated argument. (tier3 is the vLLM endpoint.)"""
     svc = _svc_toolcall('{"cmd": "rm -rf /tmp/x')  # cut mid-string
     with caplog.at_level(logging.ERROR):
         resp, result = await _drive_sync(
@@ -301,12 +301,12 @@ async def test_sync_vllm_truncated_toolcall_args_fail_loud(caplog):
 @pytest.mark.asyncio
 async def test_sync_vllm_truncated_toolcall_wins_over_live_backstop(monkeypatch):
     """ORDER IS LOAD-BEARING: with the schema backstop in LIVE enforce mode
-    (COLLECTIVE_PROXY_SCHEMA_BACKSTOP=1 in the container), a truncated vLLM
+    (ROADSTEAD_PROXY_SCHEMA_BACKSTOP=1 in the container), a truncated vLLM
     tool_call argument must be classified TRUNCATION before the backstop runs —
     json-repair would otherwise close the cut-off string into valid-but-
     FABRICATED JSON and return it as a silent 200. One backend call, no
     backstop engagement."""
-    monkeypatch.setenv("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", "1")
+    monkeypatch.setenv("ROADSTEAD_PROXY_SCHEMA_BACKSTOP", "1")
     calls = {"n": 0}
     svc = ProxyService(ProxyConfig())
 
@@ -354,10 +354,10 @@ async def test_sync_structured_parse_failure_502_and_marker(caplog):
     marker = [r for r in caplog.records
               if "LLMPROXY_STRUCTURED_INVALID" in r.getMessage()]
     assert len(marker) == 1 and marker[0].levelno == logging.ERROR
-    assert "model=thinker" in marker[0].getMessage()
+    assert "model=tier3" in marker[0].getMessage()
     assert svc._correction.state.structured_parse_failure_total == 1
     assert svc._correction.state.structured_parse_failures_by_model_caller == {
-        "thinker|kv4": 1}
+        "tier3|kv4": 1}
 
 
 @pytest.mark.asyncio
@@ -384,7 +384,7 @@ async def test_sync_guided_choice_not_parse_gated():
 
 @pytest.mark.asyncio
 async def test_sync_kill_switch_restores_legacy_200(monkeypatch, caplog):
-    monkeypatch.setenv("COLLECTIVE_PROXY_STRUCTURED_VALIDITY", "0")
+    monkeypatch.setenv("ROADSTEAD_PROXY_STRUCTURED_VALIDITY", "0")
     svc = _svc_sync("garbage not json", "stop")
     resp, result = await _drive_sync(svc, _payload(structured=True))
     assert resp.status_code == 200 and result["status"] == "ok"  # legacy pass-through
@@ -420,7 +420,7 @@ async def test_stream_structured_parse_failure_error_frame(caplog):
     assert any("LLMPROXY_STRUCTURED_INVALID" in r.getMessage()
                for r in caplog.records)
     assert svc._correction.state.structured_parse_failures_by_model_caller == {
-        "thinker|kv4": 1}
+        "tier3|kv4": 1}
 
 
 @pytest.mark.asyncio
@@ -450,7 +450,7 @@ async def test_stream_structured_happy_path_done():
 
 @pytest.mark.asyncio
 async def test_stream_kill_switch_restores_legacy_done(monkeypatch):
-    monkeypatch.setenv("COLLECTIVE_PROXY_STRUCTURED_VALIDITY", "0")
+    monkeypatch.setenv("ROADSTEAD_PROXY_STRUCTURED_VALIDITY", "0")
     svc = _svc_stream(['{"a":'], "length")
     events = await _drive_stream(svc, _payload(structured=True, stream=True))
     assert any(e.get("type") == "done" for e in events)  # legacy behavior
@@ -471,11 +471,11 @@ async def test_counters_exposed_on_status():
 
     r1 = json.loads((await svc.handle_status(_Req())).body)["reliability"]
     assert r1["structured_parse_failure_total"] == 1
-    assert r1["structured_parse_failures_by_model_caller"] == {"thinker|kv4": 1}
+    assert r1["structured_parse_failures_by_model_caller"] == {"tier3|kv4": 1}
     r2 = json.loads((await svc2.handle_status(_Req())).body)["reliability"]
     assert r2["truncation_total"] == 1
     assert r2["truncation_by_model_caller"] == {
-        "thinker|kv4": {"count": 1, "structured": 0, "freetext": 1}}
+        "tier3|kv4": {"count": 1, "structured": 0, "freetext": 1}}
 
 
 # --------------------------------------------------------------------------- #
@@ -484,7 +484,7 @@ async def test_counters_exposed_on_status():
 
 def _req_for(payload):
     return QueuedRequest.create(
-        agent_id="a", endpoint="thinker", priority="P3_INGESTION",
+        agent_id="a", endpoint="tier3", priority="P3_INGESTION",
         call_site="t", payload_type="chat_completion", payload=payload,
         timeout_s=10.0)
 

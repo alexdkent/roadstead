@@ -117,19 +117,23 @@ def test_a_vision_and_a_text_only_endpoint_both_exist_so_the_gate_discriminates(
     assert blind, "no text-only endpoint — the gate could never fire"
 
 
-def test_the_chat_lane_is_text_only_and_the_analyst_can_see():
-    """The specific topology the 2026-08-19 regression violated. If these two
-    ever collapse onto one capability, re-read the discord vision routing in
-    `agents/discord/_common.py` before changing this test."""
+def test_the_chat_lane_is_text_only_and_the_long_form_tier_can_see():
+    """The topology the gate exists to protect, not just the flag.
+
+    A conversational lane with no vision tower and a long-form tier that has one
+    is the arrangement that makes an image call ROUTABLE-BUT-WRONG: both
+    endpoints answer, and only one of them can see. That is how an alias move
+    once sent every image describe to a text-only box for a day with no test and
+    no alert noticing. If these two ever collapse onto one capability the gate
+    still passes and stops meaning anything.
+    """
     endpoints = ProxyConfig().endpoints
-    if "tier2-chat" in endpoints and "creative" in endpoints:
-        assert endpoints["tier2-chat"].vision is False, (
-            "tier2-chat became vision-capable — if jetty grew an mmproj that is "
-            "good news, but discord's VISION_MODEL_ROLE split exists because it "
-            "had none; re-read that decision rather than just editing this line")
-        assert endpoints["creative"].vision is True, (
-            "the analyst endpoint lost its vision capability — every vision "
-            "caller on the fleet routes here")
+    assert endpoints["tier2"].vision is False, (
+        "the conversational lane became vision-capable — if that is deliberate, "
+        "some other endpoint has to stay text-only or the gate can never fire")
+    assert endpoints["tier3"].vision is True, (
+        "no vision-capable endpoint left: the gate would warn on every "
+        "legitimate image call")
 
 
 # ------------------------------------------------------------ 3. gate counting

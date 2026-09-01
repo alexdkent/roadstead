@@ -137,3 +137,45 @@ async def test_status_exposes_flags_and_admin_audit():
     status = json.loads((await svc.handle_status(_Req())).body)
     assert status["flags"] == DEFAULT_FLAGS
     assert status["reliability"]["admin_ips_seen"]["/v1/admin/flags"] == ["127.0.0.1"]
+
+
+# ---------------------------------------------------------------------------
+# The 2026-08-31 environment-variable rename
+# ---------------------------------------------------------------------------
+
+def test_a_retired_collective_env_var_is_reported_not_silently_ignored(
+        monkeypatch, caplog):
+    """🚨 The dangerous half of a rename is not the flag that stops working, it
+    is the flag that stops working IN SILENCE. An operator who had turned a
+    correction layer off gets it back on, and nothing says so.
+
+    The old name is NOT honoured — two spellings for one switch is how they end
+    up disagreeing — so the contract is exactly: ignored, and loud about it.
+    """
+    from roadstead.__main__ import warn_on_retired_env_vars
+
+    monkeypatch.setenv("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", "0")
+    with caplog.at_level("WARNING"):
+        found = warn_on_retired_env_vars()
+    assert found == ["COLLECTIVE_PROXY_SCHEMA_BACKSTOP"]
+    text = caplog.text
+    assert "COLLECTIVE_PROXY_SCHEMA_BACKSTOP" in text
+    assert "ROADSTEAD_PROXY_SCHEMA_BACKSTOP" in text, (
+        "the warning must name the REPLACEMENT — an operator reading it should "
+        "not have to guess the new spelling")
+
+
+def test_no_collective_env_var_is_still_read_anywhere():
+    """The rename is only complete if nothing reads the old prefix. A leftover
+    reader would make one flag answer to two names, which is how the two end up
+    disagreeing."""
+    import re
+    from pathlib import Path
+
+    pkg = Path(__file__).resolve().parents[1] / "roadstead"
+    offenders = []
+    for path in sorted(pkg.rglob("*.py")):
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"""environ(\.get)?\(?\s*["']COLLECTIVE_""", line):
+                offenders.append(f"{path.name}:{i}")
+    assert not offenders, f"still reading retired COLLECTIVE_* names: {offenders}"

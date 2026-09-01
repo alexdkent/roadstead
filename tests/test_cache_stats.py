@@ -54,13 +54,13 @@ def _snap(at, ep, hits, queries, screen):
 
 
 def test_build_fleet_payload_actual_and_window():
-    labels = {"creative": "creative", "chat": "analyst"}
-    engines = {"creative": "vllm", "chat": "llama.cpp"}
+    labels = {"tier2": "tier2", "chat": "analyst"}
+    engines = {"tier2": "vllm", "chat": "llama.cpp"}
     snaps = [
-        _snap(100.0, "creative", 100, 1000, [{"call_site": "a", "verdict": "misaligned",
+        _snap(100.0, "tier2", 100, 1000, [{"call_site": "a", "verdict": "misaligned",
                                               "reqs": 10, "lcp_pct": 2.0, "jacc": 0.6,
                                               "wasted_tokens": 50, "roi": 500}]),
-        _snap(200.0, "creative", 300, 2000, [{"call_site": "a", "verdict": "misaligned",
+        _snap(200.0, "tier2", 300, 2000, [{"call_site": "a", "verdict": "misaligned",
                                               "reqs": 10, "lcp_pct": 2.0, "jacc": 0.6,
                                               "wasted_tokens": 50, "roi": 500}]),
         # llama.cpp endpoint: no counters → actual n/a, screen still present
@@ -70,10 +70,10 @@ def test_build_fleet_payload_actual_and_window():
     ]
     out = cs.build_fleet_payload(snaps, labels, engines)
     m = {x["endpoint"]: x for x in out["models"]}
-    # creative: lifetime 300/2000=0.15; window Δ=(300-100)/(2000-1000)=0.2
-    assert m["creative"]["actual_hit_rate"] == 0.15
-    assert m["creative"]["window_hit_rate"] == 0.2
-    assert m["creative"]["engine"] == "vllm"
+    # tier2: lifetime 300/2000=0.15; window Δ=(300-100)/(2000-1000)=0.2
+    assert m["tier2"]["actual_hit_rate"] == 0.15
+    assert m["tier2"]["window_hit_rate"] == 0.2
+    assert m["tier2"]["engine"] == "vllm"
     # llama.cpp: actual unavailable
     assert m["chat"]["actual_hit_rate"] is None
     assert m["chat"]["window_hit_rate"] is None
@@ -83,15 +83,15 @@ def test_build_fleet_payload_actual_and_window():
 
 
 def test_build_fleet_payload_drift():
-    labels = {"creative": "creative"}
-    engines = {"creative": "vllm"}
+    labels = {"tier2": "tier2"}
+    engines = {"tier2": "vllm"}
     good = {"call_site": "c", "verdict": "aligned", "reqs": 30, "lcp_pct": 80.0,
             "jacc": 0.7, "wasted_tokens": 0, "roi": 0}
     broke = {**good, "verdict": "misaligned", "lcp_pct": 5.0, "wasted_tokens": 40, "roi": 200}
-    snaps = [_snap(1.0, "creative", 1, 10, [good]),
-             _snap(2.0, "creative", 2, 20, [good]),
-             _snap(3.0, "creative", 3, 30, [broke]),
-             _snap(4.0, "creative", 4, 40, [broke])]
+    snaps = [_snap(1.0, "tier2", 1, 10, [good]),
+             _snap(2.0, "tier2", 2, 20, [good]),
+             _snap(3.0, "tier2", 3, 30, [broke]),
+             _snap(4.0, "tier2", 4, 40, [broke])]
     out = cs.build_fleet_payload(snaps, labels, engines)
     assert out["drift"] and out["drift"][0]["call_site"] == "c"
     assert out["drift"][0]["from"] >= cs.MISALIGN_LCP_PCT and out["drift"][0]["to"] == 5.0
@@ -105,15 +105,15 @@ def _drift_snaps(reqs: int = 30):
     good = {"call_site": "c", "verdict": "aligned", "reqs": reqs, "lcp_pct": 80.0,
             "jacc": 0.7, "wasted_tokens": 0, "roi": 0}
     broke = {**good, "verdict": "misaligned", "lcp_pct": 5.0}
-    return [_snap(1.0, "creative", 1, 10, [good]),
-            _snap(2.0, "creative", 2, 20, [good]),
-            _snap(3.0, "creative", 3, 30, [broke]),
-            _snap(4.0, "creative", 4, 40, [broke])]
+    return [_snap(1.0, "tier2", 1, 10, [good]),
+            _snap(2.0, "tier2", 2, 20, [good]),
+            _snap(3.0, "tier2", 3, 30, [broke]),
+            _snap(4.0, "tier2", 4, 40, [broke])]
 
 
 def test_detect_drift_flags_collapsed_prefix():
     drift = cs.detect_drift(_drift_snaps())
-    assert [(d["call_site"], d["endpoint"]) for d in drift] == [("c", "creative")]
+    assert [(d["call_site"], d["endpoint"]) for d in drift] == [("c", "tier2")]
     assert drift[0]["from"] >= cs.MISALIGN_LCP_PCT and drift[0]["to"] == 5.0
 
 
@@ -145,16 +145,16 @@ def test_detect_drift_ignores_never_front_loaded():
     lo = {"call_site": "x", "verdict": "misaligned", "reqs": 30, "lcp_pct": 10.0,
           "jacc": 0.6, "wasted_tokens": 5, "roi": 5}
     worse = {**lo, "lcp_pct": 1.0}
-    snaps = [_snap(1.0, "creative", 1, 10, [lo]),
-             _snap(2.0, "creative", 2, 20, [lo]),
-             _snap(3.0, "creative", 3, 30, [worse]),
-             _snap(4.0, "creative", 4, 40, [worse])]
+    snaps = [_snap(1.0, "tier2", 1, 10, [lo]),
+             _snap(2.0, "tier2", 2, 20, [lo]),
+             _snap(3.0, "tier2", 3, 30, [worse]),
+             _snap(4.0, "tier2", 4, 40, [worse])]
     assert cs.detect_drift(snaps) == []
 
 
 def test_drift_alarms_first_fire_dedup_recover():
     drift = cs.detect_drift(_drift_snaps())
-    key = ("c", "creative")
+    key = ("c", "tier2")
     # First detection fires and records the timestamp.
     fire1, alerted = cs.drift_alarms_to_fire(drift, {}, now=1000.0)
     assert [d["call_site"] for d in fire1] == ["c"] and alerted[key] == 1000.0

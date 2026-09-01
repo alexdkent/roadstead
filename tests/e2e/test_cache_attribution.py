@@ -69,33 +69,33 @@ async def test_sync_capture_rollup_deblend_and_surfaces(proxy):
     test_endpoint_rate_uses_real_backend_metric_not_null.)
 
     Traffic: 2 attributed chats emitting cached_tokens=6/12 + 4 NULL
-    (llama.cpp shape) chats — driven on the 'chat'/'thinker' endpoints."""
+    (llama.cpp shape) chats — driven on the 'chat'/'tier3' endpoints."""
     proxy.controller.cached_tokens = 6
     for _ in range(2):
         assert (await proxy.chat("hi", model="chat")).status_code == 200
     proxy.controller.cached_tokens = None  # llama.cpp: no counter
     for _ in range(4):
-        # 2026-07-30: was model="companion". That role was repointed to tier3, and
-        # normalize_endpoint("companion") now resolves to "thinker" — the ROLE shadows the
-        # identically-named CLASS. Addressing "thinker" directly keeps this test comparing TWO
+        # 2026-07-30: was model="tier3". That role was repointed to tier3, and
+        # normalize_endpoint("tier3") now resolves to "tier3" — the ROLE shadows the
+        # identically-named CLASS. Addressing "tier3" directly keeps this test comparing TWO
         # DISTINCT endpoints (one attributed, one NULL-cached), which is the whole point.
-        assert (await proxy.chat("hi", model="thinker")).status_code == 200
+        assert (await proxy.chat("hi", model="tier3")).status_code == 200
 
     attr = _attr(proxy)
-    # 2026-08-19 (tier2 split): `model="chat"` normalizes to the "tier2-chat"
-    # endpoint class now — jetty's llama.cpp/Vulkan box — NOT "creative". `chat`
+    # 2026-08-19 (tier2 split): `model="chat"` normalizes to the "tier2"
+    # endpoint class now — jetty's llama.cpp/Vulkan box — NOT "tier2". `chat`
     # left the boxa with the whole conversational lane. The test's shape is
     # unchanged (llama.cpp emits no prefix-cache counter on either box); only
     # the class the rows land under moved, which is precisely the drift a
     # hardcoded class name here would have hidden.
-    chat_ep = next(e for e in attr["by_endpoint"] if e["endpoint"] == "tier2-chat")
+    chat_ep = next(e for e in attr["by_endpoint"] if e["endpoint"] == "tier2")
     assert chat_ep["attributed_calls"] == 2
     assert chat_ep["unattributed_calls"] == 0
     assert chat_ep["cached_tokens"] == 12             # 2 × 6
     assert chat_ep["attributable_input_tokens"] == 24  # 2 × 12
     assert chat_ep["hit_rate"] == 0.5
     # NULL (llama.cpp) rows: n/a, NOT a 0% hit — counted as unattributed.
-    comp = next(e for e in attr["by_endpoint"] if e["endpoint"] == "thinker")
+    comp = next(e for e in attr["by_endpoint"] if e["endpoint"] == "tier3")
     assert comp["attributed_calls"] == 0
     assert comp["unattributed_calls"] == 4
     assert comp["hit_rate"] is None
@@ -110,7 +110,7 @@ async def test_sync_capture_rollup_deblend_and_surfaces(proxy):
     assert resp.status_code == 200
     j = resp.json()
     assert set(("window_s", "by_call_site", "by_endpoint", "fleet")) <= set(j)
-    assert any(r["endpoint"] == "tier2-chat" and r["hit_rate"] == 0.5
+    assert any(r["endpoint"] == "tier2" and r["hit_rate"] == 0.5
                for r in j["by_endpoint"])
     for row in j["by_call_site"]:
         assert set(("call_site", "endpoint", "calls", "attributed_calls",
@@ -126,28 +126,28 @@ async def test_endpoint_rate_uses_real_backend_metric_not_null(proxy):
     counter) shows n/a — never a fabricated 0.
 
     The fake exposes vllm:prefix_cache_{hits,queries}_total from these knobs;
-    'thinker' is a vLLM endpoint, 'chat' (→ 'tier2-chat' since the 2026-08-19
-    split — jetty's llama.cpp/Vulkan box; it was the boxa 'creative' class
+    'tier3' is a vLLM endpoint, 'chat' (→ 'tier2' since the 2026-08-19
+    split — jetty's llama.cpp/Vulkan box; it was the boxa 'tier2' class
     before) has no counter."""
     proxy.controller.prefix_cache_hits = 40
     proxy.controller.prefix_cache_queries = 100     # → 0.40 real endpoint rate
-    await proxy.chat("hi", model="thinker")
+    await proxy.chat("hi", model="tier3")
     await proxy.chat("hi", model="chat")
     proxy.svc._queue_db.flush(timeout=5.0)
     await proxy.svc._health.compute_cache_stats()
 
     # /v1/status: real rate for the vLLM endpoint, absent for llama.cpp.
     snap = (await proxy.client.get("/v1/status")).json()["endpoints"]
-    assert snap["thinker"].get("cache_hit_rate") == 0.4
-    assert "cache_hit_rate" not in snap["tier2-chat"], "llama.cpp has no counter → n/a"
+    assert snap["tier3"].get("cache_hit_rate") == 0.4
+    assert "cache_hit_rate" not in snap["tier2"], "llama.cpp has no counter → n/a"
 
     # attribution by_endpoint: the vLLM row's headline hit_rate is overlaid with
     # the real metric + flagged; llama.cpp stays n/a (no overlay).
     j = (await proxy.client.get("/v1/fleet/cache-attribution?window=1h")).json()
-    thinker = next(r for r in j["by_endpoint"] if r["endpoint"] == "thinker")
-    assert thinker["hit_rate"] == 0.4
-    assert thinker["hit_rate_source"] == "backend_prefix_cache_metrics"
-    chat = next((r for r in j["by_endpoint"] if r["endpoint"] == "tier2-chat"), None)
+    tier3 = next(r for r in j["by_endpoint"] if r["endpoint"] == "tier3")
+    assert tier3["hit_rate"] == 0.4
+    assert tier3["hit_rate_source"] == "backend_prefix_cache_metrics"
+    chat = next((r for r in j["by_endpoint"] if r["endpoint"] == "tier2"), None)
     if chat is not None:  # llama.cpp: no metric overlay, no source flag
         assert "hit_rate_source" not in chat
 
@@ -158,7 +158,7 @@ async def test_stream_cached_tokens_captured(proxy):
     proxy.controller.cached_tokens = 3   # 3/12 = 0.25
     frames = await proxy.stream_frames("a b c", model="chat")
     assert frames and any("[DONE]" in f or "stop" in f for f in frames)
-    chat_ep = next(e for e in _attr(proxy)["by_endpoint"] if e["endpoint"] == "tier2-chat")
+    chat_ep = next(e for e in _attr(proxy)["by_endpoint"] if e["endpoint"] == "tier2")
     assert chat_ep["attributed_calls"] == 1
     assert chat_ep["cached_tokens"] == 3
     assert chat_ep["hit_rate"] == 0.25

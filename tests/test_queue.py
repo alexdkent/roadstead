@@ -8,7 +8,7 @@ from roadstead.queue import PersistentQueue
 
 
 def _pc(pq, rid, status="ok", in_tok=10, out_tok=5, dur=1.0, qw=2.0):
-    pq.persist_complete(rid, "agentA", "thinker", "site", 3,
+    pq.persist_complete(rid, "agentA", "tier3", "site", 3,
                         in_tok, out_tok, dur, qw, status)
 
 
@@ -18,7 +18,7 @@ def test_history_buckets_aggregates(tmp_path):
     _pc(pq, "r2", status="error")
     buckets = pq.history_buckets(hours=1, bucket_minutes=60)
     assert buckets
-    ep = buckets[0]["per_endpoint"]["thinker"]
+    ep = buckets[0]["per_endpoint"]["tier3"]
     assert ep["requests"] == 2 and ep["ok"] == 1 and ep["errors"] == 1
     pq.close()
 
@@ -48,7 +48,7 @@ def test_completions_for_calibration_filters(tmp_path):
 def test_timeouts_report(tmp_path):
     pq = PersistentQueue(str(tmp_path / "q.db"))
     pq.persist_timeout_event(
-        request_id="t1", endpoint="thinker", priority=3, agent_id="a",
+        request_id="t1", endpoint="tier3", priority=3, agent_id="a",
         call_site="s", layer="backend", elapsed_s=10.0, applied_timeout_s=60.0,
         queue_wait_ms=5.0, in_flight=2, queued=1, max_slots=32, est_in=100, est_out=50,
         recommended_ms=15000.0, under_recommended=True)
@@ -164,16 +164,16 @@ def test_load_context_overflows_windows_out_stale_rows(tmp_path):
     import time
     from roadstead.queue import _CONTEXT_OVERFLOW_SEED_WINDOW_S
     pq = PersistentQueue(str(tmp_path / "q.db"))
-    pq.record_context_overflow("creative", "callerOld", 8000)
-    pq.record_context_overflow("thinker", "callerFresh", 16000)
-    # Backdate the "creative" aggregate past the seed window.
+    pq.record_context_overflow("tier2", "callerOld", 8000)
+    pq.record_context_overflow("tier3", "callerFresh", 16000)
+    # Backdate the "tier2" aggregate past the seed window.
     pq._conn.execute(
         "UPDATE proxy_context_overflows SET last_at=? WHERE endpoint=?",
-        (time.time() - (_CONTEXT_OVERFLOW_SEED_WINDOW_S + 3600), "creative"))
+        (time.time() - (_CONTEXT_OVERFLOW_SEED_WINDOW_S + 3600), "tier2"))
     loaded = pq.load_context_overflows()
-    assert "thinker" in loaded, "fresh overflow row must seed the shadow"
-    assert "creative" not in loaded, "stale (>48h) overflow row must be windowed out"
-    assert loaded["thinker"]["max_est_in"] == 16000
+    assert "tier3" in loaded, "fresh overflow row must seed the shadow"
+    assert "tier2" not in loaded, "stale (>48h) overflow row must be windowed out"
+    assert loaded["tier3"]["max_est_in"] == 16000
     pq.close()
 
 
@@ -252,13 +252,13 @@ def test_recover_queued_drops_stream_rows(tmp_path):
 
     pq = PersistentQueue(str(tmp_path / "q.db"))
     sync_req = QueuedRequest.create(
-        agent_id="a", endpoint="thinker", priority="P3_INGESTION",
+        agent_id="a", endpoint="tier3", priority="P3_INGESTION",
         call_site="t", payload_type="chat_completion",
         payload={"messages": [{"role": "user", "content": "x"}]},
         timeout_s=120.0,
     )
     stream_req = QueuedRequest.create(
-        agent_id="a", endpoint="thinker", priority="P3_INGESTION",
+        agent_id="a", endpoint="tier3", priority="P3_INGESTION",
         call_site="t", payload_type="chat_completion",
         payload={"messages": [{"role": "user", "content": "y"}], "stream": True},
         timeout_s=120.0,

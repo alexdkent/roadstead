@@ -48,7 +48,7 @@ def test_exactly_one_endpoint_is_conversational():
 
     Two would mean readiness 503s when either is down, which is a broader claim
     than go-dark makes. At the Phase 3 cutover the flag MOVES from
-    tier2-analyst to tier2-chat; it is never on both.
+    tier2 to tier2; it is never on both.
     """
     kwargs = build_endpoint_kwargs()
     marked = [c for c, kw in kwargs.items() if kw.get("readiness_critical")]

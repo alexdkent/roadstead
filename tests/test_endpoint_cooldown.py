@@ -11,21 +11,21 @@ Self-binds the real Health methods to a stub state (the Mac 3.9 conftest blocks
 pytest, so it also runs as a plain script).
 
 
-2026-07-30: these drove the identifier "companion". That role resolves to the
-anvil tier3 (Laguna) endpoint whose class is "thinker", so failures landed in
-the thinker bucket. They were switched to "tier3-backup" on the belief that the
-nexus 122B "still OWNS the `companion` endpoint class".
+2026-07-30: these drove the identifier "tier3". That role resolves to the
+anvil tier3 (Laguna) endpoint whose class is "tier3", so failures landed in
+the tier3 bucket. They were switched to "tier3-backup" on the belief that the
+nexus 122B "still OWNS the `tier3` endpoint class".
 
-2026-08-02: that belief was the bug. `tier3-backup` normalized to `companion`,
+2026-08-02: that belief was the bug. `tier3-backup` normalized to `tier3`,
 which was ALSO an alias of tier3 — so a second normalization pass collapsed it to
-`thinker` and the proxy silently served the backup off tier3 (ledger
+`tier3` and the proxy silently served the backup off tier3 (ledger
 `endpoint-class-alias-collision`). These tests only passed because they asserted
-on the intermediate `companion` bucket, which is exactly the state that should
+on the intermediate `tier3` bucket, which is exactly the state that should
 never have existed. The 122B is no longer a proxy endpoint at all.
 
-Now driven by "creative" — a real, live, non-thinker endpoint class — so the
+Now driven by "tier2" — a real, live, non-thinker endpoint class — so the
 cooldown mechanics are exercised on a genuine class and stay isolated from the
-"thinker" assertions elsewhere in this file. The mechanics under test are
+"tier3" assertions elsewhere in this file. The mechanics under test are
 unchanged throughout.
 """
 from __future__ import annotations
@@ -50,11 +50,11 @@ BackendError = backend_mod.BackendError
 BackendTimeout = backend_mod.BackendTimeout
 BackendUnavailable = backend_mod.BackendUnavailable
 
-ENFORCE = "COLLECTIVE_PROXY_ENDPOINT_COOLDOWN"
-SHADOW = "COLLECTIVE_PROXY_ENDPOINT_COOLDOWN_SHADOW"
-ALLOWED = "COLLECTIVE_PROXY_COOLDOWN_ALLOWED_FAILS"
-WINDOW = "COLLECTIVE_PROXY_COOLDOWN_WINDOW_S"
-DURATION = "COLLECTIVE_PROXY_COOLDOWN_DURATION_S"
+ENFORCE = "ROADSTEAD_PROXY_ENDPOINT_COOLDOWN"
+SHADOW = "ROADSTEAD_PROXY_ENDPOINT_COOLDOWN_SHADOW"
+ALLOWED = "ROADSTEAD_PROXY_COOLDOWN_ALLOWED_FAILS"
+WINDOW = "ROADSTEAD_PROXY_COOLDOWN_WINDOW_S"
+DURATION = "ROADSTEAD_PROXY_COOLDOWN_DURATION_S"
 
 
 def _state():
@@ -96,10 +96,10 @@ def test_both_flags_off_is_noop(monkeypatch):
     _all_off(monkeypatch)
     h = _health()
     for _ in range(10):
-        h.record_dispatch_failure("creative", _fail())
+        h.record_dispatch_failure("tier2", _fail())
     assert h.state.endpoint_failure_times == {}
     assert h.state.endpoint_cooldown_trips == {}
-    assert h.endpoint_healthy("creative") is True
+    assert h.endpoint_healthy("tier2") is True
 
 
 # --- backend-fault classification ------------------------------------------
@@ -109,10 +109,10 @@ def test_4xx_does_not_count(monkeypatch):
     monkeypatch.delenv(ENFORCE, raising=False)
     h = _health()
     for _ in range(10):
-        h.record_dispatch_failure("creative", BackendError(400, "bad request"))
+        h.record_dispatch_failure("tier2", BackendError(400, "bad request"))
     assert h.state.endpoint_cooldown_trips == {}  # never trips on client errors
-    assert "creative" not in h.state.endpoint_failure_times or \
-        h.state.endpoint_failure_times.get("creative") == []
+    assert "tier2" not in h.state.endpoint_failure_times or \
+        h.state.endpoint_failure_times.get("tier2") == []
 
 
 def test_timeout_and_unavailable_count(monkeypatch):
@@ -120,9 +120,9 @@ def test_timeout_and_unavailable_count(monkeypatch):
     monkeypatch.delenv(ENFORCE, raising=False)
     monkeypatch.setenv(ALLOWED, "2")
     h = _health()
-    h.record_dispatch_failure("thinker", BackendTimeout("stall"))     # 504
-    h.record_dispatch_failure("thinker", BackendUnavailable("down"))  # 503
-    assert h.state.endpoint_cooldown_trips.get("thinker") == 1
+    h.record_dispatch_failure("tier3", BackendTimeout("stall"))     # 504
+    h.record_dispatch_failure("tier3", BackendUnavailable("down"))  # 503
+    assert h.state.endpoint_cooldown_trips.get("tier3") == 1
 
 
 # --- threshold + window -----------------------------------------------------
@@ -132,10 +132,10 @@ def test_below_threshold_no_trip(monkeypatch):
     monkeypatch.setenv(ALLOWED, "4")
     h = _health()
     for _ in range(3):
-        h.record_dispatch_failure("creative", _fail())
+        h.record_dispatch_failure("tier2", _fail())
     assert h.state.endpoint_cooldown_trips == {}
-    h.record_dispatch_failure("creative", _fail())  # the 4th trips
-    assert h.state.endpoint_cooldown_trips.get("creative") == 1
+    h.record_dispatch_failure("tier2", _fail())  # the 4th trips
+    assert h.state.endpoint_cooldown_trips.get("tier2") == 1
 
 
 def test_stale_failures_pruned_from_window(monkeypatch):
@@ -144,8 +144,8 @@ def test_stale_failures_pruned_from_window(monkeypatch):
     monkeypatch.setenv(WINDOW, "1")  # 1s window
     h = _health()
     # 3 old failures (well outside the 1s window) + 1 fresh → prune leaves 1.
-    h.state.endpoint_failure_times["creative"] = [time.monotonic() - 100] * 3
-    h.record_dispatch_failure("creative", _fail())
+    h.state.endpoint_failure_times["tier2"] = [time.monotonic() - 100] * 3
+    h.record_dispatch_failure("tier2", _fail())
     assert h.state.endpoint_cooldown_trips == {}  # stale ones don't count
 
 
@@ -157,10 +157,10 @@ def test_shadow_counts_but_does_not_pull(monkeypatch):
     monkeypatch.setenv(ALLOWED, "3")
     h = _health()
     for _ in range(3):
-        h.record_dispatch_failure("creative", _fail())
-    assert h.state.endpoint_cooldown_trips.get("creative") == 1
-    assert "creative" not in h.state.endpoint_cooldown_until  # NOT cooled
-    assert h.endpoint_healthy("creative") is True             # NOT pulled
+        h.record_dispatch_failure("tier2", _fail())
+    assert h.state.endpoint_cooldown_trips.get("tier2") == 1
+    assert "tier2" not in h.state.endpoint_cooldown_until  # NOT cooled
+    assert h.endpoint_healthy("tier2") is True             # NOT pulled
 
 
 # --- enforce: pull + auto-recover ------------------------------------------
@@ -171,13 +171,13 @@ def test_enforce_pulls_then_auto_recovers(monkeypatch):
     monkeypatch.setenv(DURATION, "30")
     h = _health()
     for _ in range(3):
-        h.record_dispatch_failure("creative", _fail())
-    assert h.state.endpoint_cooldown_trips.get("creative") == 1
-    assert "creative" in h.state.endpoint_cooldown_until
-    assert h.endpoint_healthy("creative") is False  # cooled → deferred
+        h.record_dispatch_failure("tier2", _fail())
+    assert h.state.endpoint_cooldown_trips.get("tier2") == 1
+    assert "tier2" in h.state.endpoint_cooldown_until
+    assert h.endpoint_healthy("tier2") is False  # cooled → deferred
     # Simulate the cooldown expiring → auto-recovery (next dispatch tick).
-    h.state.endpoint_cooldown_until["creative"] = time.monotonic() - 1
-    assert h.endpoint_healthy("creative") is True
+    h.state.endpoint_cooldown_until["tier2"] = time.monotonic() - 1
+    assert h.endpoint_healthy("tier2") is True
 
 
 def test_enforce_resets_window_after_trip(monkeypatch):
@@ -187,8 +187,8 @@ def test_enforce_resets_window_after_trip(monkeypatch):
     monkeypatch.setenv(ALLOWED, "3")
     h = _health()
     for _ in range(3):
-        h.record_dispatch_failure("creative", _fail())
-    assert h.state.endpoint_failure_times.get("creative") == []  # window reset
+        h.record_dispatch_failure("tier2", _fail())
+    assert h.state.endpoint_failure_times.get("tier2") == []  # window reset
 
 
 # --- guard-bite -------------------------------------------------------------
@@ -202,8 +202,8 @@ def test_guard_bite_enforce_off_never_pulls(monkeypatch):
     monkeypatch.setenv(ALLOWED, "2")
     h = _health()
     # Force a would-be-active cooldown window directly, then confirm OFF ignores it.
-    h.state.endpoint_cooldown_until["creative"] = time.monotonic() + 999
-    assert h.endpoint_healthy("creative") is True  # enforce off → gate skipped
+    h.state.endpoint_cooldown_until["tier2"] = time.monotonic() + 999
+    assert h.endpoint_healthy("tier2") is True  # enforce off → gate skipped
 
 
 if __name__ == "__main__":  # plain-script mode (Mac 3.9)
@@ -240,18 +240,18 @@ def test_best_effort_timeout_never_trips_cooldown(monkeypatch):
     monkeypatch.setenv(ALLOWED, "2")
     h = _health()
     for _ in range(20):
-        h.record_dispatch_failure("gemma", BackendTimeout("gave up"), best_effort=True)
+        h.record_dispatch_failure("tier1", BackendTimeout("gave up"), best_effort=True)
     assert h.state.endpoint_cooldown_trips == {}
-    assert h.state.endpoint_failure_times.get("gemma", []) == []
+    assert h.state.endpoint_failure_times.get("tier1", []) == []
 
 
 def test_best_effort_skip_is_counted_so_the_guard_is_observable(monkeypatch):
     monkeypatch.setenv(SHADOW, "1")
     h = _health()
     for _ in range(3):
-        h.record_dispatch_failure("gemma", BackendTimeout("gave up"), best_effort=True)
+        h.record_dispatch_failure("tier1", BackendTimeout("gave up"), best_effort=True)
     # A guard nobody can see firing is indistinguishable from one that is dead.
-    assert h.state.cooldown_best_effort_skips.get("gemma") == 3
+    assert h.state.cooldown_best_effort_skips.get("tier1") == 3
 
 
 def test_genuine_faults_still_cool_the_same_endpoint(monkeypatch):
@@ -260,11 +260,11 @@ def test_genuine_faults_still_cool_the_same_endpoint(monkeypatch):
     monkeypatch.setenv(SHADOW, "1")
     monkeypatch.setenv(ALLOWED, "2")
     h = _health()
-    h.record_dispatch_failure("gemma", BackendTimeout("gave up"), best_effort=True)
+    h.record_dispatch_failure("tier1", BackendTimeout("gave up"), best_effort=True)
     assert h.state.endpoint_cooldown_trips == {}          # excluded
-    h.record_dispatch_failure("gemma", BackendTimeout("real stall"))
-    h.record_dispatch_failure("gemma", BackendTimeout("real stall"))
-    assert h.state.endpoint_cooldown_trips.get("gemma") == 1   # still cools
+    h.record_dispatch_failure("tier1", BackendTimeout("real stall"))
+    h.record_dispatch_failure("tier1", BackendTimeout("real stall"))
+    assert h.state.endpoint_cooldown_trips.get("tier1") == 1   # still cools
 
 
 def test_best_effort_defaults_false_so_existing_callers_are_unchanged(monkeypatch):
@@ -273,9 +273,9 @@ def test_best_effort_defaults_false_so_existing_callers_are_unchanged(monkeypatc
     monkeypatch.setenv(SHADOW, "1")
     monkeypatch.setenv(ALLOWED, "2")
     h = _health()
-    h.record_dispatch_failure("creative", BackendTimeout("stall"))
-    h.record_dispatch_failure("creative", BackendTimeout("stall"))
-    assert h.state.endpoint_cooldown_trips.get("creative") == 1
+    h.record_dispatch_failure("tier2", BackendTimeout("stall"))
+    h.record_dispatch_failure("tier2", BackendTimeout("stall"))
+    assert h.state.endpoint_cooldown_trips.get("tier2") == 1
     assert h.state.cooldown_best_effort_skips == {}
 
 
@@ -284,7 +284,7 @@ def test_best_effort_4xx_is_classified_out_before_the_skip_tally(monkeypatch):
     skip counter, or the counter stops meaning what /v1/status says it means."""
     monkeypatch.setenv(SHADOW, "1")
     h = _health()
-    h.record_dispatch_failure("gemma", BackendError(400, "bad"), best_effort=True)
+    h.record_dispatch_failure("tier1", BackendError(400, "bad"), best_effort=True)
     assert h.state.cooldown_best_effort_skips == {}
     assert h.state.endpoint_cooldown_trips == {}
 
@@ -292,7 +292,7 @@ def test_best_effort_4xx_is_classified_out_before_the_skip_tally(monkeypatch):
 def test_both_flags_off_still_noop_for_best_effort(monkeypatch):
     _all_off(monkeypatch)
     h = _health()
-    h.record_dispatch_failure("gemma", BackendTimeout("x"), best_effort=True)
+    h.record_dispatch_failure("tier1", BackendTimeout("x"), best_effort=True)
     assert h.state.cooldown_best_effort_skips == {}
 
 

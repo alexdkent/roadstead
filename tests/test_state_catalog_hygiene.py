@@ -34,8 +34,8 @@ def test_proxystate_initial_invariants():
 
 def test_catalog_resolution_canonical_alias_unknown():
     cat = mc.load_catalog()
-    eps = cat.proxy_endpoints()
-    assert eps, "models.yaml must define proxy endpoints"
+    eps = cat.routed()
+    assert eps, "models.yaml must define routed endpoints"
     e0 = eps[0]
     # A canonical name resolves to itself; its aliases resolve to it.
     assert cat.canonical(e0.name) == e0.name
@@ -53,13 +53,13 @@ def test_catalog_resolution_canonical_alias_unknown():
 def test_coerce_entry_retired_key_sets_status():
     # F-2 (audit 2026-07-12): a stanza carrying a `retired:` key is retired even
     # without an explicit `status:` — it must NOT silently default to "active".
-    e = mc._coerce_entry("old-model", {"kind": "chat", "retired": "2026-07-11"})
+    e = mc._coerce_endpoint("old-model", {"kind": "chat", "retired": "2026-07-11"})
     assert e.status == "retired"
     # No retired key → the historic "active" default is unchanged.
-    e2 = mc._coerce_entry("live-model", {"kind": "chat"})
+    e2 = mc._coerce_endpoint("live-model", {"kind": "chat"})
     assert e2.status == "active"
     # An explicit status still wins over the retired-key inference.
-    e3 = mc._coerce_entry("odd", {"kind": "chat", "retired": "2026-01-01",
+    e3 = mc._coerce_endpoint("odd", {"kind": "chat", "retired": "2026-01-01",
                                   "status": "on_demand"})
     assert e3.status == "on_demand"
 
@@ -76,11 +76,11 @@ def test_endpoint_kwargs_derive_from_catalog():
 # ---- cache-drift alarm kill-switch (guard-bite) ------------------------------
 
 def test_cache_drift_alarm_kill_switch(monkeypatch):
-    monkeypatch.delenv("COLLECTIVE_PROXY_CACHE_DRIFT_ALARM", raising=False)
+    monkeypatch.delenv("ROADSTEAD_PROXY_CACHE_DRIFT_ALARM", raising=False)
     assert cache_drift_alarm_enabled() is True  # default ON (observability-only)
-    monkeypatch.setenv("COLLECTIVE_PROXY_CACHE_DRIFT_ALARM", "0")
+    monkeypatch.setenv("ROADSTEAD_PROXY_CACHE_DRIFT_ALARM", "0")
     assert cache_drift_alarm_enabled() is False
-    monkeypatch.setenv("COLLECTIVE_PROXY_CACHE_DRIFT_ALARM", "off")
+    monkeypatch.setenv("ROADSTEAD_PROXY_CACHE_DRIFT_ALARM", "off")
     assert cache_drift_alarm_enabled() is False
 
 
@@ -90,19 +90,19 @@ def test_queue_kv_and_context_overflow_roundtrip(tmp_path):
     q = PersistentQueue(tmp_path / "q.db")
     try:
         # KV blob round-trip (cache-drift dedup map shape: [[cs, ep, ts], ...]).
-        q.kv_set("cache_drift_alerted", [["a.b", "creative", 123.0]])
-        assert q.kv_get("cache_drift_alerted") == [["a.b", "creative", 123.0]]
+        q.kv_set("cache_drift_alerted", [["a.b", "tier2", 123.0]])
+        assert q.kv_get("cache_drift_alerted") == [["a.b", "tier2", 123.0]]
         assert q.kv_get("missing", "dflt") == "dflt"
         # Context-overflow aggregate: upsert accumulates count + max_est_in.
         q.record_context_overflow("chat", "x/y/z", 20_000)
         q.record_context_overflow("chat", "x/y/z", 25_000)
-        q.record_context_overflow("thinker", "other", 90_000)
+        q.record_context_overflow("tier3", "other", 90_000)
         q.flush()
         shadow = q.load_context_overflows()
         assert shadow["chat"]["count"] == 2
         assert shadow["chat"]["callers"] == {"x/y/z": 2}
         assert shadow["chat"]["max_est_in"] == 25_000
-        assert shadow["thinker"]["count"] == 1
+        assert shadow["tier3"]["count"] == 1
     finally:
         q.close()
 

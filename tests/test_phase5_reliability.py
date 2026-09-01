@@ -59,7 +59,7 @@ def _stub_probes(svc: ProxyService) -> None:
 
 def _body(stream=False, timeout_s=10.0):
     return {
-        "agent_id": "a", "endpoint": "llama-thinker", "priority": "P3_INGESTION",
+        "agent_id": "a", "endpoint": "tier3", "priority": "P3_INGESTION",
         "call_site": "t", "payload_type": "chat_completion",
         "payload": {"messages": [{"role": "user", "content": "x"}], "stream": stream},
         "timeout_s": timeout_s,
@@ -96,7 +96,7 @@ async def test_consumer_disconnect_cancels_producer_and_frees_slot():
                 if '"chunk"' in t or '"delta"' in t:
                     return
         await asyncio.wait_for(read_until_chunk(), timeout=5.0)
-        assert svc._scheduler.endpoint_snapshot("thinker")["in_flight"] >= 1
+        assert svc._scheduler.endpoint_snapshot("tier3")["in_flight"] >= 1
 
         # Consumer disconnects: close the SSE generator → finally cancels the
         # producer.
@@ -104,12 +104,12 @@ async def test_consumer_disconnect_cancels_producer_and_frees_slot():
 
         # Let the cancellation + CancelledError handler propagate.
         async def wait_freed():
-            while svc._scheduler.endpoint_snapshot("thinker")["in_flight"] > 0:
+            while svc._scheduler.endpoint_snapshot("tier3")["in_flight"] > 0:
                 await asyncio.sleep(0.02)
         await asyncio.wait_for(wait_freed(), timeout=5.0)
 
         assert svc._slot_leak_reclaimed >= 1, "producer cancel must reclaim the slot"
-        assert svc._scheduler.endpoint_snapshot("thinker")["in_flight"] == 0
+        assert svc._scheduler.endpoint_snapshot("tier3")["in_flight"] == 0
     finally:
         await svc.shutdown()
 
@@ -181,12 +181,12 @@ async def test_circuit_recovers_on_health_even_if_discovery_fails():
     try:
         # Tripped (e.g. discovery had been failing); /health is back but
         # capacity-discovery still fails. Old code latched open forever.
-        svc._endpoint_health["thinker"] = {
+        svc._endpoint_health["tier3"] = {
             "healthy": False, "consecutive_failures": 9,
             "unhealthy_since": 1.0}
-        ep_cfg = svc._config.endpoints["thinker"]
-        await svc._update_endpoint_health("thinker", ep_cfg, probe_ok=False)
-        assert svc._endpoint_health["thinker"]["healthy"] is True, (
+        ep_cfg = svc._config.endpoints["tier3"]
+        await svc._update_endpoint_health("tier3", ep_cfg, probe_ok=False)
+        assert svc._endpoint_health["tier3"]["healthy"] is True, (
             "must recover on /health alone, not latch open on discovery failure")
     finally:
         await svc.shutdown()
@@ -221,10 +221,10 @@ async def test_ttft_fastfail_aborts_zero_token_hang(monkeypatch):
 
         # Slot freed promptly (NOT held for the full deadline).
         async def wait_freed():
-            while svc._scheduler.endpoint_snapshot("thinker")["in_flight"] > 0:
+            while svc._scheduler.endpoint_snapshot("tier3")["in_flight"] > 0:
                 await asyncio.sleep(0.02)
         await asyncio.wait_for(wait_freed(), timeout=5.0)
-        assert svc._scheduler.endpoint_snapshot("thinker")["in_flight"] == 0
+        assert svc._scheduler.endpoint_snapshot("tier3")["in_flight"] == 0
     finally:
         await svc.shutdown()
 
@@ -233,9 +233,9 @@ async def test_ttft_fastfail_aborts_zero_token_hang(monkeypatch):
 
 def _imbalanced_metrics(now):
     m = RollingMetrics()
-    m.record(MetricsSample(now, "companion", "heavy", "P3_INGESTION",
+    m.record(MetricsSample(now, "tier3", "heavy", "P3_INGESTION",
                            0.1, 1.0, "ok", 100.0))
-    m.record(MetricsSample(now, "companion", "light", "P3_INGESTION",
+    m.record(MetricsSample(now, "tier3", "light", "P3_INGESTION",
                            0.1, 1.0, "ok", 1.0))
     return m
 
@@ -243,7 +243,7 @@ def _imbalanced_metrics(now):
 def test_drr_imbalance_silent_without_queue():
     now = 1000.0
     alerts = check_alerts(
-        endpoint_snapshots={"companion": {"queued": 0}}, agent_budgets=[],
+        endpoint_snapshots={"tier3": {"queued": 0}}, agent_budgets=[],
         metrics=_imbalanced_metrics(now), cost_model_samples={},
         queue_wal_size=0, now=now)
     assert not any(a.name == "drr_imbalance" for a in alerts), \
@@ -253,7 +253,7 @@ def test_drr_imbalance_silent_without_queue():
 def test_drr_imbalance_fires_with_queue():
     now = 1000.0
     alerts = check_alerts(
-        endpoint_snapshots={"companion": {"queued": 3}}, agent_budgets=[],
+        endpoint_snapshots={"tier3": {"queued": 3}}, agent_budgets=[],
         metrics=_imbalanced_metrics(now), cost_model_samples={},
         queue_wal_size=0, now=now)
     assert any(a.name == "drr_imbalance" for a in alerts), \
@@ -280,7 +280,7 @@ async def test_transient_retry_records_exactly_one_completion():
     async def flaky(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise BackendUnavailable("backend thinker unreachable")
+            raise BackendUnavailable("backend tier3 unreachable")
         return BackendResponse(200, _OK_COMPLETION, 0.01, 5, 2, finish_reason="stop")
 
     svc._backend.call = flaky
@@ -300,9 +300,9 @@ async def test_transient_retry_records_exactly_one_completion():
 
 # --- 5F operator drain: pause/resume an endpoint for maintenance ------------
 
-def _ibody():  # interactive (P0) thinker request
+def _ibody():  # interactive (P0) tier3 request
     return {
-        "agent_id": "a", "endpoint": "llama-thinker", "priority": "P0_REALTIME",
+        "agent_id": "a", "endpoint": "tier3", "priority": "P0_REALTIME",
         "call_site": "t", "payload_type": "chat_completion",
         "payload": {"messages": [{"role": "user", "content": "x"}]},
         "timeout_s": 10.0,
@@ -317,12 +317,12 @@ async def test_operator_pause_drains_then_resume_restores():
     try:
         # PAUSE
         resp = await svc.handle_admin_endpoint_pause(
-            "llama-thinker", _FakeRequest(), pause=True)
+            "tier3", _FakeRequest(), pause=True)
         assert resp.status_code == 200
         body = json.loads(resp.body.decode())
         assert body["paused"] is True
-        assert "thinker" in body["paused_endpoints"]
-        assert svc._endpoint_healthy("llama-thinker") is False
+        assert "tier3" in body["paused_endpoints"]
+        assert svc._endpoint_healthy("tier3") is False
 
         # interactive fast-fails CLEANLY + DEFERRABLY (not a hang)
         r = await svc.handle_submit(_ibody(), _FakeRequest())
@@ -333,10 +333,10 @@ async def test_operator_pause_drains_then_resume_restores():
 
         # RESUME restores health (poller takes back over)
         resp2 = await svc.handle_admin_endpoint_pause(
-            "llama-thinker", _FakeRequest(), pause=False)
+            "tier3", _FakeRequest(), pause=False)
         assert json.loads(resp2.body.decode())["paused"] is False
-        assert svc._endpoint_healthy("llama-thinker") is True
-        assert "thinker" not in svc._paused_endpoints
+        assert svc._endpoint_healthy("tier3") is True
+        assert "tier3" not in svc._paused_endpoints
     finally:
         await svc.shutdown()
 
@@ -348,9 +348,9 @@ async def test_operator_pause_is_acl_gated():
     await svc.startup()
     try:
         resp = await svc.handle_admin_endpoint_pause(
-            "llama-thinker", _DeniedRequest(), pause=True)
+            "tier3", _DeniedRequest(), pause=True)
         assert resp.status_code == 403
-        assert "thinker" not in svc._paused_endpoints  # NOT paused by a denied caller
+        assert "tier3" not in svc._paused_endpoints  # NOT paused by a denied caller
     finally:
         await svc.shutdown()
 
@@ -376,7 +376,7 @@ async def test_operator_pause_alerts_drained_not_outage():
     _stub_probes(svc)
     await svc.startup()
     try:
-        svc._paused_endpoints.add("thinker")
+        svc._paused_endpoints.add("tier3")
         svc._evaluate_alerts(time.monotonic())
         names = {(a["name"], a["severity"]) for a in svc._alerts}
         assert ("endpoint_drained", "WARNING") in names
@@ -384,11 +384,11 @@ async def test_operator_pause_alerts_drained_not_outage():
         # `status: on_demand`, and an on-demand endpoint that is not currently loaded raises its
         # own legitimate endpoint_paused — unrelated to this drain. A blanket "no endpoint_paused
         # anywhere" made this test sensitive to every other endpoint on the box; asserting about
-        # `thinker` specifically is what it actually meant to check.
-        assert not any(a["name"] == "endpoint_paused" and "thinker" in str(a.get("detail", ""))
+        # `tier3` specifically is what it actually meant to check.
+        assert not any(a["name"] == "endpoint_paused" and "tier3" in str(a.get("detail", ""))
                        for a in svc._alerts)
     finally:
-        svc._paused_endpoints.discard("thinker")
+        svc._paused_endpoints.discard("tier3")
         await svc.shutdown()
 
 
@@ -419,7 +419,7 @@ async def test_drain_503_body_is_deferrable():
 async def test_open_drain_window_repauses_endpoint_on_startup(tmp_path):
     db = str(tmp_path / "q.db")
     seed = PersistentQueue(db)
-    seed.maintenance_open(endpoint="thinker", reason="vLLM restart",
+    seed.maintenance_open(endpoint="tier3", reason="vLLM restart",
                           source="drain")
     seed.close()
 
@@ -427,8 +427,8 @@ async def test_open_drain_window_repauses_endpoint_on_startup(tmp_path):
     _stub_probes(svc)
     await svc.startup()
     try:
-        assert "thinker" in svc._paused_endpoints
-        assert svc._endpoint_healthy("thinker") is False  # drain semantics apply
+        assert "tier3" in svc._paused_endpoints
+        assert svc._endpoint_healthy("tier3") is False  # drain semantics apply
     finally:
         await svc.shutdown()
 
@@ -438,13 +438,13 @@ async def test_stale_or_closed_or_manual_windows_do_not_repause(tmp_path):
     db = str(tmp_path / "q.db")
     seed = PersistentQueue(db)
     # >24h-old open drain: the forgot-to-resume guard skips it.
-    seed.maintenance_open(endpoint="thinker", source="drain",
+    seed.maintenance_open(endpoint="tier3", source="drain",
                           started_at=time.time() - 25 * 3600)
     # Closed drain window: restart finished cleanly.
     seed.maintenance_record(endpoint="chat", started_at=time.time() - 600,
                             ended_at=time.time() - 300, source="drain")
     # Open MANUAL annotation: informational, not a drain.
-    seed.maintenance_open(endpoint="gemma", source="manual")
+    seed.maintenance_open(endpoint="tier1", source="manual")
     seed.close()
 
     svc = ProxyService(ProxyConfig(queue_db_path=db))

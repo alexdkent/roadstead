@@ -22,16 +22,21 @@ from __future__ import annotations
 
 import dataclasses
 import tempfile
+import types
 from typing import Any, AsyncIterator, Dict, Iterator, Optional
 
 import httpx
 import pytest
 import pytest_asyncio
 
+from roadstead.backend import BackendClientPool
 from roadstead.config import EndpointConfig, ProxyConfig
 from roadstead.__main__ import build_app
 
 from roadstead.testing import FakeBackend, FakeBackendServer
+
+#: Captured at import, before the parent conftest's autouse fixture replaces it.
+_REAL_PREFIX_CACHE = BackendClientPool.probe_prefix_cache
 
 
 # Loopback client for the ASGI transport → ACL "internal" identity.
@@ -152,6 +157,13 @@ async def proxy(fake: FakeBackendServer) -> AsyncIterator[ProxyHarness]:
         # Instance override (shadows the parent conftest class stub) so the
         # circuit never trips on probe timing during the test window.
         svc._backend.probe_health = _healthy
+        # Same pattern for the prefix-cache scrape: the parent conftest stubs it
+        # to "cannot tell" so the unit suite never dials a documentation address,
+        # but here every endpoint points at the local fake, which publishes the
+        # real counters. Restore the real method so the cache-stats path is
+        # exercised end to end rather than mocked away.
+        svc._backend.probe_prefix_cache = types.MethodType(
+            _REAL_PREFIX_CACHE, svc._backend)
 
         await svc.startup()
         transport = httpx.ASGITransport(

@@ -1649,7 +1649,7 @@ class Lifecycle:
         # path's truncation-integrity 502. Truncation checks any structured
         # constraint; the json.loads validity check only JSON-implying ones
         # (guided_choice / bare-token grammars are exempt) and is bounded by the
-        # request's max_tokens. Kill-switch COLLECTIVE_PROXY_STRUCTURED_VALIDITY
+        # request's max_tokens. Kill-switch ROADSTEAD_PROXY_STRUCTURED_VALIDITY
         # (guard_on) restores the legacy clean-'done' behavior.
         stream_guard_err: str | None = None
         stream_guard_status = "ok"

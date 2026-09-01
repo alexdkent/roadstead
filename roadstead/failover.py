@@ -1,8 +1,10 @@
 """Failover — degraded routing from a sick endpoint to its declared fallback.
 
-§ 9 of ``docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md``. Day-1 shape:
-tier3 (``thinker``) degrades to tier2-analyst (``creative``) while tier3 is
-unhealthy, for the agents that have opted in.
+An endpoint declaring ``failover_to:`` degrades to that endpoint class while it
+is unhealthy, for the agents that have opted in. In the example catalog that is
+``tier3 -> tier2``: the heavy tier falls back to the mid one rather than to
+nothing. Failover never CHAINS — the target may not declare one of its own, or
+an outage would walk the fleet.
 
 Three things this module deliberately does NOT do, each because the proxy
 already owns it and a second copy would be worse than none:

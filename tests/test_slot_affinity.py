@@ -1,4 +1,4 @@
-"""Tests for companion slot affinity (id_slot injection in _execute_dispatch)."""
+"""Tests for tier3 slot affinity (id_slot injection in _execute_dispatch)."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def test_different_sessions_can_map_to_different_slots():
 
 
 # ---------------------------------------------------------------------------
-# Unit: EndpointConfig.slot_affinity default and companion value
+# Unit: EndpointConfig.slot_affinity default and tier3 value
 # ---------------------------------------------------------------------------
 
 def test_slot_affinity_defaults_false():
@@ -65,9 +65,9 @@ def test_slot_affinity_defaults_false():
 def test_no_live_endpoint_uses_slot_affinity():
     """As of 2026-08-02 NOTHING live sets slot_affinity — and that is expected.
 
-    It was only ever set on the nexus 122B (`companion`), whose `--slot-prompt-
+    It was only ever set on the nexus 122B (`tier3`), whose `--slot-prompt-
     similarity` KV reuse it existed for. That stanza stopped being a proxy
-    endpoint when its class name was found to collide with the `companion` ALIAS
+    endpoint when its class name was found to collide with the `tier3` ALIAS
     of tier3 (ledger `endpoint-class-alias-collision`), so the flag now has no
     live consumer.
 
@@ -87,14 +87,14 @@ def test_no_live_endpoint_uses_slot_affinity():
 
 
 # ---------------------------------------------------------------------------
-# Integration: _execute_dispatch injects id_slot for interactive companion calls
+# Integration: _execute_dispatch injects id_slot for interactive tier3 calls
 # ---------------------------------------------------------------------------
 
 @dataclass
 class _FakeQueuedRequest:
     request_id: str = "req-test"
     agent_id: str = "orchestrator"
-    endpoint: str = "companion"
+    endpoint: str = "tier3"
     priority: Any = None
     band: Any = None
     call_site: str = "test"
@@ -113,7 +113,7 @@ class _FakeQueuedRequest:
 
 def _make_ep_cfg(**kwargs) -> EndpointConfig:
     defaults = dict(
-        endpoint_class="companion", role="qwen-composer",
+        endpoint_class="tier3", role="tier3",
         max_slots=4, dispatch_concurrency_cap=3,
         slot_affinity=True, host="10.0.0.6", port=8081,
     )

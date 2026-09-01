@@ -30,17 +30,20 @@ LOW_OVERLAP_JACC = 0.3   # below this, genuinely unique — nothing to cache
 
 
 def chat_endpoint_labels() -> dict[str, str]:
-    """endpoint_class -> human label for the chat models, e.g. ``gemma`` ->
-    ``router/classifier`` (one backend serves both). Drives the per-model rows."""
-    out: dict[str, list[str]] = {}
+    """endpoint class -> human label for the chat endpoints: the class plus the
+    aliases that resolve to it, so a row reads as the names callers actually
+    use. Drives the per-model rows."""
+    out: dict[str, str] = {}
     try:
         cat = model_catalog.load_catalog()
         for e in cat.by_kind("chat"):
-            if e.endpoint_class:
-                out.setdefault(e.endpoint_class, []).append(e.name)
+            if not e.routed:
+                continue
+            names = sorted(set(e.all_names) - {e.name})
+            out[e.name] = "/".join([e.name, *names]) if names else e.name
     except Exception:
         pass
-    return {ec: "/".join(sorted(names)) for ec, names in out.items()}
+    return out
 
 
 def prompt_text(payload_json: str) -> str:

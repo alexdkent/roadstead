@@ -34,7 +34,7 @@ _PROBLEM_STATUSES = frozenset({"error", "timeout", "truncated"})
 # — a genuine stall there degrades gracefully (no greeting hint / retried
 # extract), so it's a WARNING, not the ERROR that pages / reads as fleet-degraded.
 _ENDPOINT_STALL_MIN_TIMEOUTS = 8
-_ENDPOINT_STALL_WARN_ENDPOINTS = frozenset({"gemma"})
+_ENDPOINT_STALL_WARN_ENDPOINTS = frozenset({"tier1"})
 
 # callsite_timeout_too_tight tuning (2026-07-12). The complement of the stall
 # alert: it counts PREMATURE timeouts — a caller giving up BELOW the model's

@@ -186,10 +186,11 @@ not own, and with it the assumptions the local engines let us keep:
 
 **Still open in A:**
 
-- **The catalog's provider dimension.** `models.yaml` still describes engines by name in a
-  `backend_engine` string, which the registry resolves tolerantly, and a remote stanza is documented
-  in its header rather than modelled. Redesigning the catalog around providers is the same piece of
-  work as scrub item **S2** — see the cross-cutting scrub below.
+**Landed 2026-08-31 — the catalog.** `models.yaml` is now `providers:` + `endpoints:`: connection and
+engine on one side, capacity and policy on the other, each endpoint naming its provider. A local
+provider hosts one endpoint; a remote one hosts many, which is what makes the split earn its keep.
+Shipped as a generic example on RFC 5737 addresses — the same piece of work as scrub item **S2**,
+done together as planned rather than twice.
 - **Per-provider costing** is descriptor-shaped (`publishes_token_costs`, and OpenRouter's catalogue
   carries the prices) but has no reader; it lands with **D**.
 - **A second remote provider** would be the real test of the abstraction. One of each is enough to
@@ -225,10 +226,12 @@ cover the new surfaces, especially anything that touches remote providers over t
 
 ### Cross-cutting · The scrub
 
-`corpus_and_scrub_plan.md`. Gates the open-source goal, and **S2 (`models.yaml` → an example) is now
-on the critical path for a second reason**: the config schema has to change anyway to describe
-providers, capabilities, costs and aliases. Redesigning the catalog and genericising it are the same
-piece of work, and doing them separately means doing them twice.
+`corpus_and_scrub_plan.md`. Gates the open-source goal. **S2 is done** (2026-08-31), together with
+the catalog redesign it shared its work with — and it turned up a second inventory nobody had listed,
+`usage_rates.py`, which is now anchored to model classes rather than to one fleet's models.
+
+**S1 (the ACL's `10.0.0.x` seeds) and S3 (the remaining topology references) are the open ones**, and
+they are the cheap half. The history rewrite is still the expensive one.
 
 ⚠️ The history rewrite stays last — it invalidates every SHA.
 

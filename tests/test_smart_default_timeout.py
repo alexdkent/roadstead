@@ -88,16 +88,16 @@ def _capture_applied_timeout():
 def test_shadow_off_returns_flat_default_and_tallies():
     svc = ProxyService(ProxyConfig())
     # Flag OFF (default): flat 180s applied, byte-identical to history.
-    # "chat" resolves to the "tier2-chat" endpoint class since the 2026-08-19
-    # tier2 split (it was "creative" on the boxa before) — tallies + floors key
+    # "chat" resolves to the "tier2" endpoint class since the 2026-08-19
+    # tier2 split (it was "tier2" on the boxa before) — tallies + floors key
     # off the RESOLVED class, which is exactly why this assertion had to move
     # when the alias did.
     assert svc._lifecycle.resolve_default_timeout("chat", _submit_body()) == _DEFAULT_TIMEOUT_S
-    tally = svc._smart_default_shadow["tier2-chat"]
+    tally = svc._smart_default_shadow["tier2"]
     assert tally["count"] == 1
     assert tally["flat_s"] == _DEFAULT_TIMEOUT_S
-    # Cold model (no samples) → the "tier2-chat" per-class floor (120s, held
-    # equal to creative's across the split so the cutover moved aliases and not
+    # Cold model (no samples) → the "tier2" per-class floor (120s, held
+    # equal to tier2's across the split so the cutover moved aliases and not
     # numbers) is what the smart default WOULD be — recorded even though the
     # flat value is applied.
     assert tally["smart_s_min"] == tally["smart_s_max"] == 120.0
@@ -107,12 +107,12 @@ def test_shadow_off_returns_flat_default_and_tallies():
 def test_enforce_uses_class_floor_advice_cold():
     svc = ProxyService(ProxyConfig())
     svc._flags.set_many({"smart_default_timeout": True})
-    # chat → tier2-chat (not on-demand) → the flag's effect is visible: the
-    # tier2-chat floor is 120s, lower than the flat _DEFAULT_TIMEOUT_S (180s).
+    # chat → tier2 (not on-demand) → the flag's effect is visible: the
+    # tier2 floor is 120s, lower than the flat _DEFAULT_TIMEOUT_S (180s).
     assert svc._lifecycle.resolve_default_timeout("chat", _submit_body()) == 120.0
-    # embed floor is 15s; gemma 60s — per-class, not a blanket number.
-    assert svc._lifecycle.resolve_default_timeout("bge-m3-embed", _submit_body("bge-m3-embed")) == 15.0
-    assert svc._lifecycle.resolve_default_timeout("gemma-router", _submit_body("gemma-router")) == 60.0
+    # embed floor is 15s; tier1 60s — per-class, not a blanket number.
+    assert svc._lifecycle.resolve_default_timeout("embed", _submit_body("embed")) == 15.0
+    assert svc._lifecycle.resolve_default_timeout("tier1", _submit_body("tier1")) == 60.0
 
 
 def test_enforce_honors_warm_recommendation_and_cap():
@@ -120,35 +120,33 @@ def test_enforce_honors_warm_recommendation_and_cap():
     svc._flags.set_many({"smart_default_timeout": True})
     tm = svc._timeout_model
     now = 1000.0
-    # Seed the P1 tier2-chat cell with enough fast samples that p99*margin < floor
+    # Seed the P1 tier2 cell with enough fast samples that p99*margin < floor
     # → the floor still governs (recommendation never drops below the class floor).
     # 🚨 SEED AND READ MUST RESOLVE TO THE SAME CLASS. Before the 2026-08-19 split
-    # this seeded "classify" and read "chat" — both normalized to "creative". They
+    # this seeded "classify" and read "chat" — both normalized to "tier2". They
     # do not any more: "classify" stayed on the analyst and "chat" moved to jetty,
     # so seeding "classify" would now fill a cell this call never reads and the
     # test would silently degrade into the cold-model case it already covers
-    # above. "companion-lite" resolves to tier2-chat, same cell as "chat".
+    # above. "tier2" resolves to tier2, same cell as "chat".
     for i in range(60):
-        tm.record("companion-lite", 1, 8, 8, 500.0, "ok", now + i)
+        tm.record("tier2", 1, 8, 8, 500.0, "ok", now + i)
     assert svc._lifecycle.resolve_default_timeout("chat", _submit_body()) == 120.0
-    # Now seed a huge-latency cell so p99*margin >> floor, and the CEILING governs
-    # the tail. 🔑 THE ANSWER CHANGED AT THE SPLIT, AND THE CHANGE IS THE POINT:
-    # `creative` carries a models.yaml `timeout_ceiling_s: 1800` role override so
-    # the generous long-form band applied on every tier (song-compose runs
-    # interactive). `tier2-chat` deliberately carries NO override — long-form
-    # authoring goes to tier3 — so a P1 turn gets the INTERACTIVE band, 600s.
-    # That is the "no 1,800s jobs on the chat lane" property, enforced at the
-    # timeout layer rather than merely asserted in the plan.
+    # Now seed a huge-latency cell so p99*margin >> floor, and the CEILING
+    # governs the tail. 🔑 THE TWO LANES ANSWER DIFFERENTLY, AND THAT IS THE
+    # POINT: `tier2` is the conversational lane and deliberately carries NO
+    # `timeout_ceiling_s`, so a P1 turn there gets the INTERACTIVE band, 600s.
+    # That is the "no 1,800-second jobs on the chat lane" property, enforced at
+    # the timeout layer rather than merely asserted in a plan.
     for i in range(60):
-        tm.record("companion-lite", 1, 8, 8, 5_000_000.0, "ok", now + 100 + i)
+        tm.record("tier2", 1, 8, 8, 5_000_000.0, "ok", now + 100 + i)
     got = svc._lifecycle.resolve_default_timeout("chat", _submit_body())
-    assert got == 600.0, "tier2-chat has no role ceiling → the interactive band"
-    # …and the analyst still does carry the override, so the two lanes really do
-    # differ rather than both having quietly fallen back to a band.
+    assert got == 600.0, "tier2 has no class ceiling → the interactive band"
+    # …and the long-form tier DOES carry the override, so the two lanes really
+    # do differ rather than both having quietly fallen back to a band.
     for i in range(60):
-        tm.record("classify", 1, 8, 8, 5_000_000.0, "ok", now + 200 + i)
+        tm.record("composer", 1, 8, 8, 5_000_000.0, "ok", now + 200 + i)
     assert svc._lifecycle.resolve_default_timeout(
-        "classify", _submit_body("classify")) == 1800.0
+        "composer", _submit_body("composer")) == 1800.0
 
 
 def test_tally_records_both_modes_and_accumulates():
@@ -157,9 +155,9 @@ def test_tally_records_both_modes_and_accumulates():
         svc._lifecycle.resolve_default_timeout("chat", _submit_body())
     svc._flags.set_many({"smart_default_timeout": True})
     svc._lifecycle.resolve_default_timeout("chat", _submit_body())
-    tally = svc._smart_default_shadow["tier2-chat"]
+    tally = svc._smart_default_shadow["tier2"]
     assert tally["count"] == 4                # tallied whether flag on or off
-    assert tally["smart_s_sum"] == 120.0 * 4  # mean = sum/count (tier2-chat floor 120)
+    assert tally["smart_s_sum"] == 120.0 * 4  # mean = sum/count (tier2 floor 120)
 
 
 def test_guarded_against_bad_priority_and_payload():
@@ -170,7 +168,7 @@ def test_guarded_against_bad_priority_and_payload():
     bad = {"agent_id": "a", "endpoint": "chat", "priority": "NONSENSE",
            "call_site": "t", "payload_type": "chat_completion", "payload": "not-a-dict"}
     got = svc._lifecycle.resolve_default_timeout("chat", bad)
-    assert got == 120.0  # creative floor still applies; no crash
+    assert got == 120.0  # tier2 floor still applies; no crash
 
 
 # --------------------------------------------------------------------------
@@ -188,14 +186,14 @@ async def test_bare_submit_omitted_timeout_applies_default():
             r = await asyncio.wait_for(svc.handle_submit(_submit_body(), _Req()), timeout=10.0)
             assert r.status_code == 200
             assert created[-1].timeout_s == _DEFAULT_TIMEOUT_S
-            # Flag ON → the smart default (tier2-chat floor 120; "chat" resolves
-            # to the jetty tier2-chat endpoint since the 2026-08-19 split) applied.
+            # Flag ON → the smart default (tier2 floor 120; "chat" resolves
+            # to the jetty tier2 endpoint since the 2026-08-19 split) applied.
             svc._flags.set_many({"smart_default_timeout": True})
             r = await asyncio.wait_for(svc.handle_submit(_submit_body(), _Req()), timeout=10.0)
             assert r.status_code == 200
             assert created[-1].timeout_s == 120.0
         status = json.loads((await svc.handle_status(_Req())).body)
-        assert "tier2-chat" in status["reliability"]["smart_default_shadow"]
+        assert "tier2" in status["reliability"]["smart_default_shadow"]
     finally:
         await svc.shutdown()
 
@@ -228,13 +226,13 @@ async def test_openai_door_omits_timeout_and_inherits_default():
         with _capture_applied_timeout() as created:
             # No timeout_s in the OpenAI body → door omits it → handle_submit
             # default. OFF → 180.
-            body = {"model": "qwen-analyst",
+            body = {"model": "tier2",
                     "messages": [{"role": "user", "content": "hi"}]}
             r = await asyncio.wait_for(svc.handle_openai_chat(dict(body), _Req()), timeout=10.0)
             assert r.status_code == 200
             assert created[-1].timeout_s == _DEFAULT_TIMEOUT_S
-            # ON → the creative smart default (120) — qwen-analyst is a legacy
-            # alias resolving to the boxa creative endpoint since the 2026-07-11
+            # ON → the tier2 smart default (120) — tier2 is a legacy
+            # alias resolving to the boxa tier2 endpoint since the 2026-07-11
             # one-model consolidation.
             svc._flags.set_many({"smart_default_timeout": True})
             r = await asyncio.wait_for(svc.handle_openai_chat(dict(body), _Req()), timeout=10.0)

@@ -55,12 +55,12 @@ def test_overlay_does_not_clobber_a_row_with_real_per_request_data(monkeypatch):
     own measured rate, not have it replaced by a lifetime backend counter."""
     out = _attribution(
         monkeypatch,
-        rows=[{"endpoint": "thinker", "attributed_calls": 10,
+        rows=[{"endpoint": "tier3", "attributed_calls": 10,
                "attributable_input_tokens": 1000, "cached_tokens": 800,
                "hit_rate": 0.8}],
         fleet={"attributable_input_tokens": 1000, "cached_tokens": 800,
                "hit_rate": 0.8},
-        real={"thinker": {"hit_rate": 0.4672, "queries": 3_150_000_000,
+        real={"tier3": {"hit_rate": 0.4672, "queries": 3_150_000_000,
                           "source": "backend_prefix_cache_metrics"}},
     )
     row = out["by_endpoint"][0]
@@ -75,12 +75,12 @@ def test_overlay_still_fills_a_genuine_gap(monkeypatch):
     reports nothing per-request gets the /metrics rate rather than n/a."""
     out = _attribution(
         monkeypatch,
-        rows=[{"endpoint": "thinker", "attributed_calls": 0,
+        rows=[{"endpoint": "tier3", "attributed_calls": 0,
                "attributable_input_tokens": 0, "cached_tokens": 0,
                "hit_rate": None}],
         fleet={"attributable_input_tokens": 0, "cached_tokens": 0,
                "hit_rate": None},
-        real={"thinker": {"hit_rate": 0.4672, "queries": 100,
+        real={"tier3": {"hit_rate": 0.4672, "queries": 100,
                           "source": "backend_prefix_cache_metrics"}},
     )
     row = out["by_endpoint"][0]
@@ -94,12 +94,12 @@ def test_fleet_headline_matches_its_own_columns_when_data_exists(monkeypatch):
     the whole fleet — that is a number answering a different question."""
     out = _attribution(
         monkeypatch,
-        rows=[{"endpoint": "creative", "attributed_calls": 37,
+        rows=[{"endpoint": "tier2", "attributed_calls": 37,
                "attributable_input_tokens": 47701, "cached_tokens": 8725,
                "hit_rate": 0.1829}],
         fleet={"attributable_input_tokens": 174386, "cached_tokens": 101730,
                "hit_rate": 0.5833},
-        real={"thinker": {"hit_rate": 0.4672, "queries": 3_150_000_000,
+        real={"tier3": {"hit_rate": 0.4672, "queries": 3_150_000_000,
                           "source": "backend_prefix_cache_metrics"}},
     )
     fleet = out["fleet"]
@@ -118,7 +118,7 @@ def test_fleet_overlay_applies_when_nothing_was_attributable(monkeypatch):
         rows=[],
         fleet={"attributable_input_tokens": 0, "cached_tokens": 0,
                "hit_rate": None},
-        real={"thinker": {"hit_rate": 0.4672, "queries": 100,
+        real={"tier3": {"hit_rate": 0.4672, "queries": 100,
                           "source": "backend_prefix_cache_metrics"}},
     )
     assert out["fleet"]["hit_rate"] == 0.4672

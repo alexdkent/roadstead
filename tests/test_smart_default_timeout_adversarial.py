@@ -55,7 +55,7 @@ _INTERNAL_CLIENT = ("127.0.0.1", 41999)
 # endpoints map are all keyed by the RESOLVED CLASS.
 #
 # Derived from normalize_endpoint rather than hardcoded, because the target has
-# moved twice: → "classify" (2026-07-03 analyst decommission), → "creative"
+# moved twice: → "classify" (2026-07-03 analyst decommission), → "tier2"
 # (2026-07-11 boxa consolidation, which re-homed classify/analyst/vision onto the
 # boxa endpoint as aliases). Each move left this file raising KeyError on a class
 # the proxy no longer keys; nothing caught it because `local_tollgate` never
@@ -151,7 +151,7 @@ def test_resolve_never_raises_and_is_sane(flag_on):
     floor = 30.0  # chat
     for pri in _HOSTILE_PRIORITIES:
         for pay in _HOSTILE_PAYLOADS:
-            for ep in ("chat", "bge-m3-embed", "gemma-router", "no-such-xyz"):
+            for ep in ("chat", "embed", "tier1", "no-such-xyz"):
                 body = _body(ep, priority=pri, payload=pay)
                 d = svc._lifecycle.resolve_default_timeout(ep, body)
                 # C: finite, positive, never NaN/inf, never above the cap.
@@ -167,7 +167,7 @@ def test_resolve_never_raises_and_is_sane(flag_on):
                     # Derived from the LIVE model, not a hardcoded table: the
                     # floor moves whenever a role is re-homed (chat's went
                     # 180→120 when the boxa consolidation aliased it onto
-                    # "creative"). The invariant under test is "never dips below
+                    # "tier2"). The invariant under test is "never dips below
                     # the class floor" — not any particular number.
                     exp_floor = svc._timeout_model.floor_ms(ep) / 1000.0
                     assert d >= exp_floor, f"{ep}: {d} < floor {exp_floor}"
@@ -188,7 +188,7 @@ def test_resolve_on_caps_pathological_tail_and_stays_finite():
     uplift the per-class CEILING governs first, so the pathological tail is
     bounded by the ceiling that actually applies to chat's resolved class —
     derived here, not hardcoded. NB since the 2026-07-11 boxa consolidation that
-    class is "creative", which carries an explicit `timeout_ceiling_s: 1800`
+    class is "tier2", which carries an explicit `timeout_ceiling_s: 1800`
     role override in models.yaml ("a role override so the generous background
     band applies on EVERY tier", because song-compose runs at an interactive
     tier). So chat no longer lands on the 600s interactive band — a real
@@ -242,17 +242,17 @@ def test_guardbite_flag_gate_is_load_bearing():
     (always-smart), the OFF==180 assertion below would fail — so its passing
     means the gate is genuinely governing."""
     svc = ProxyService(ProxyConfig())
-    # Use gemma-router (class floor 60) as the guard-bite endpoint: its floor
+    # Use tier1 (class floor 60) as the guard-bite endpoint: its floor
     # DIFFERS from the flat default (180), so flag ON vs OFF is observably
     # different. NB "chat"/classify can no longer guard-bite here — its floor was
     # raised to 180 (2026-07-04), which now coincides with _DEFAULT_TIMEOUT_S.
-    body = _body("gemma-router")
+    body = _body("tier1")
     # E-i: the two modes DIFFER — the smart value is reachable and != 180.
-    off = svc._lifecycle.resolve_default_timeout("gemma-router", body)
+    off = svc._lifecycle.resolve_default_timeout("tier1", body)
     svc._flags.set_many({"smart_default_timeout": True})
-    on = svc._lifecycle.resolve_default_timeout("gemma-router", body)
+    on = svc._lifecycle.resolve_default_timeout("tier1", body)
     assert off == _DEFAULT_TIMEOUT_S
-    assert on == 60.0  # gemma class floor
+    assert on == 60.0  # tier1 class floor
     assert on != off, "flag had NO observable effect — gate is dead"
 
 

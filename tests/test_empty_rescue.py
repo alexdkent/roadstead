@@ -40,7 +40,7 @@ class _Req:
 
 def _body(timeout_s=20.0):
     return {
-        "agent_id": "sidekick", "endpoint": "llama-thinker", "priority": "P2_POST_TURN",
+        "agent_id": "sidekick", "endpoint": "tier3", "priority": "P2_POST_TURN",
         "call_site": "sidekick.compose_daily_song.craft_6", "payload_type": "chat_completion",
         "payload": {"messages": [{"role": "user", "content": "x"}],
                     "max_tokens": 4000, "temperature": 0.85},
@@ -59,7 +59,7 @@ def _ok_response():
 
 def _empty_error():
     return BackendError(
-        502, "backend llama-thinker returned empty completion "
+        502, "backend tier3 returned empty completion "
              "(no content, output_tokens=1)")
 
 
@@ -127,7 +127,7 @@ async def test_non_empty_transient_retry_does_not_inject():
     async def flaky(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
         seen.append(payload)
         if len(seen) == 1:
-            raise BackendUnavailable("backend llama-thinker unreachable: boom")
+            raise BackendUnavailable("backend tier3 unreachable: boom")
         return _ok_response()
 
     svc._backend.call = flaky

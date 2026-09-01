@@ -600,7 +600,7 @@ class Correction:
         the caller decides whether to cache. The pre-existing steps carry no flag
         gate (byte-identical to the prior inline calls); the Step-4a flag governs
         the NEW streaming coverage, and the Phase-3 ``maybe_repair_schema`` step is
-        itself flag-gated (``COLLECTIVE_PROXY_SCHEMA_BACKSTOP``, default OFF ==
+        itself flag-gated (``ROADSTEAD_PROXY_SCHEMA_BACKSTOP``, default OFF ==
         byte-identical). Schema repair runs AFTER the finalizers (so it sees
         de-thought, degeneration-corrected content) and BEFORE the shadow detector
         (detect-only, last). ``enforce_structured_validity`` (operator mandate
@@ -786,8 +786,8 @@ class Correction:
         FAIL-OPEN: any error (or all re-dispatches still degenerate) leaves the
         original result untouched — the guard can never make a response worse or
         break the response path. Bounded by the caller's own remaining deadline.
-        Kill-switch ``COLLECTIVE_PROXY_DEGENERATION_GUARD``; shadow (detect-only)
-        ``COLLECTIVE_PROXY_DEGENERATION_SHADOW``."""
+        Kill-switch ``ROADSTEAD_PROXY_DEGENERATION_GUARD``; shadow (detect-only)
+        ``ROADSTEAD_PROXY_DEGENERATION_SHADOW``."""
         try:
             if not degeneration_guard_enabled():
                 return
@@ -936,7 +936,7 @@ class Correction:
         thinking-noise are rescued).
 
         FAIL-OPEN: any error leaves ``result`` byte-identical. Flag-gated
-        (``COLLECTIVE_PROXY_SCHEMA_BACKSTOP``, default OFF); shadow
+        (``ROADSTEAD_PROXY_SCHEMA_BACKSTOP``, default OFF); shadow
         (``…_SHADOW``) = detect + repair-in-memory + count + log, return original
         untouched. See docs/llmproxy_phase3_schema_backstop_contract.md."""
         try:
@@ -1456,7 +1456,7 @@ class Correction:
         # Unrecoverable → fail safe (caller retry / 2-call), never pass noise.
         if finish == "length":
             self.state.thinking_truncated += 1
-            why = "thinking output truncated (finish=length) — raise COLLECTIVE_PROXY_THINKING_BUDGET"
+            why = "thinking output truncated (finish=length) — raise ROADSTEAD_PROXY_THINKING_BUDGET"
         else:
             self.state.thinking_fallback += 1
             why = "thinking structured output unrecoverable"
@@ -1554,7 +1554,7 @@ class Correction:
         "truncated structured output" shape so the caller retries. Runs BEFORE
         ``maybe_repair_schema`` in :meth:`apply` — order is load-bearing.
         vLLM-only: llama.cpp labels truncation "length" correctly. FAIL-OPEN;
-        kill-switch ``COLLECTIVE_PROXY_STRUCTURED_VALIDITY``."""
+        kill-switch ``ROADSTEAD_PROXY_STRUCTURED_VALIDITY``."""
         try:
             if not structured_validity_guard_enabled():
                 return
@@ -1633,7 +1633,7 @@ class Correction:
         bounded by the request's ``max_tokens`` cap, and only for structured
         requests whose content survived every prior guard — an acceptable,
         rare, bounded cost on the single event loop. FAIL-OPEN on internal
-        errors. Kill-switch ``COLLECTIVE_PROXY_STRUCTURED_VALIDITY``."""
+        errors. Kill-switch ``ROADSTEAD_PROXY_STRUCTURED_VALIDITY``."""
         try:
             if not structured_validity_guard_enabled():
                 return

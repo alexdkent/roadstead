@@ -59,7 +59,7 @@ def _body(*, tools: bool = False, priority: str = "P3_INGESTION"):
             "function": {"name": "write_file", "parameters": {"type": "object"}},
         }]
     return {
-        "agent_id": "a", "endpoint": "llama-thinker", "priority": priority,
+        "agent_id": "a", "endpoint": "tier3", "priority": priority,
         "call_site": "t", "payload_type": "chat_completion", "payload": payload,
     }
 

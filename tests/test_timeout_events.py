@@ -48,7 +48,7 @@ def _svc(tmp_path) -> ProxyService:
     return ProxyService(ProxyConfig(queue_db_path=str(tmp_path / "q.db")))
 
 
-def _req(endpoint: str = "thinker", *, timeout_s: float = 300.0) -> QueuedRequest:
+def _req(endpoint: str = "tier3", *, timeout_s: float = 300.0) -> QueuedRequest:
     return QueuedRequest.create(
         agent_id="sidekick",
         endpoint=endpoint,
@@ -107,7 +107,7 @@ def test_timeout_event_deduped_across_layers(tmp_path):
 
 def test_premature_flag_when_below_recommended(tmp_path):
     svc = _svc(tmp_path)
-    # cold model → thinker recommended = 180s floor; a 5s timeout is premature.
+    # cold model → tier3 recommended = 180s floor; a 5s timeout is premature.
     req = _req(timeout_s=5.0)
     svc._record_timeout_event(req, layer="client_wait", elapsed_s=5.0)
     rows = _rows(svc, req.request_id)
@@ -154,7 +154,7 @@ def test_timeouts_report_aggregates(tmp_path):
     svc = _svc(tmp_path)
     for i in range(3):
         svc._queue_db.persist_timeout_event(
-            request_id=f"b{i}", endpoint="thinker", priority=1, agent_id="sidekick",
+            request_id=f"b{i}", endpoint="tier3", priority=1, agent_id="sidekick",
             call_site="x", layer="backend", elapsed_s=10.0 + i,
             applied_timeout_s=300.0, queue_wait_ms=50.0, in_flight=2, queued=5,
             max_slots=6, est_in=2000, est_out=256, recommended_ms=180000.0,
@@ -165,7 +165,7 @@ def test_timeouts_report_aggregates(tmp_path):
     assert rep["premature"] == 2
     assert len(rep["rows"]) == 1
     row = rep["rows"][0]
-    assert (row["endpoint"], row["layer"], row["count"]) == ("thinker", "backend", 3)
+    assert (row["endpoint"], row["layer"], row["count"]) == ("tier3", "backend", 3)
     assert row["premature"] == 2
     assert row["avg_in_flight"] == 2.0
     assert row["avg_queued"] == 5.0
@@ -174,7 +174,7 @@ def test_timeouts_report_aggregates(tmp_path):
 def test_timeout_event_records_identity_and_context(tmp_path):
     svc = _svc(tmp_path)
     req = QueuedRequest.create(
-        agent_id="sidekick", endpoint="thinker", priority="P1_TURN_SUPPORT",
+        agent_id="sidekick", endpoint="tier3", priority="P1_TURN_SUPPORT",
         call_site="sidekick.test", payload_type="chat_completion",
         payload={"messages": [{"role": "user", "content": "x" * 4000}], "max_tokens": 256},
         timeout_s=300.0, session_id="sess9", turn_id="turn1",
@@ -188,18 +188,17 @@ def test_timeout_event_records_identity_and_context(tmp_path):
     assert row[0] == "sess9"
     assert row[1] == "turn1"
     assert row[2] == "sidekick/sidekick.test/sess9"
-    # thinker context_per_slot (vLLM --max-model-len). 1048576 since 2026-08-22: tier3 cut
-    # over to the two-node DeepSeek-V4-Flash-0731 pair, which serves the model's full native
-    # window directly (no YaRN override needed, unlike Laguna's 700000 memory-bound cap).
-    assert row[3] == 1048576
-    # est_in = 4000 chars / 4 = 1000 tokens; 1000 / 1048576 * 100 ≈ 0.0954%, rounds to 0.1%
-    assert row[4] == 0.1
+    # tier3's context_per_slot from the catalog — the whole point of recording it
+    # is that a timeout can be read against how full the window actually was.
+    assert row[3] == 131072
+    # est_in = 4000 chars / 4 = 1000 tokens; 1000 / 131072 * 100 ≈ 0.76%, rounds to 0.8%
+    assert row[4] == 0.8
 
 
 def test_completion_persists_identity(tmp_path):
     svc = _svc(tmp_path)
     req = QueuedRequest.create(
-        agent_id="sidekick", endpoint="thinker", priority="P1_TURN_SUPPORT",
+        agent_id="sidekick", endpoint="tier3", priority="P1_TURN_SUPPORT",
         call_site="sidekick.test", payload_type="chat_completion",
         payload={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 64},
         timeout_s=300.0, session_id="s1", turn_id="t1", caller_id="sidekick/sidekick.test/s1",
@@ -218,7 +217,7 @@ def test_report_surfaces_callers_and_context(tmp_path):
     svc = _svc(tmp_path)
     for i in range(3):
         svc._queue_db.persist_timeout_event(
-            request_id=f"c{i}", endpoint="thinker", priority=3, agent_id="forum-agent",
+            request_id=f"c{i}", endpoint="tier3", priority=3, agent_id="forum-agent",
             call_site="forum-agent.ingest", layer="client_wait", elapsed_s=600.0,
             applied_timeout_s=600.0, queue_wait_ms=0.0, in_flight=2, queued=0,
             max_slots=6, est_in=30000, est_out=1024, recommended_ms=1500000.0,
@@ -258,7 +257,7 @@ def test_migration_upgrades_old_timeouts_table(tmp_path):
 async def test_timeouts_report_endpoint(tmp_path):
     svc = _svc(tmp_path)
     svc._queue_db.persist_timeout_event(
-        request_id="a0", endpoint="thinker", priority=3, agent_id="sidekick",
+        request_id="a0", endpoint="tier3", priority=3, agent_id="sidekick",
         call_site="x", layer="admission", elapsed_s=12.0, applied_timeout_s=300.0,
         queue_wait_ms=None, in_flight=3, queued=9, max_slots=6, est_in=100,
         est_out=64, recommended_ms=180000.0, under_recommended=True,
@@ -274,7 +273,7 @@ async def test_timeouts_report_endpoint(tmp_path):
 
 # ----- maintenance-window tagging (planned-restart annotation) -----
 
-def _to_event(svc, request_id="m0", endpoint="thinker"):
+def _to_event(svc, request_id="m0", endpoint="tier3"):
     svc._queue_db.persist_timeout_event(
         request_id=request_id, endpoint=endpoint, priority=2, agent_id="forum-agent",
         call_site="forum-agent.proposal_emitter", layer="client_wait", elapsed_s=180.0,
@@ -290,13 +289,13 @@ def test_report_tags_event_inside_window_as_planned(tmp_path):
     now = time.time()
     # window covering "now" (when the event was recorded)
     svc._queue_db.maintenance_record(
-        endpoint="thinker", started_at=now - 60, ended_at=now + 60,
-        reason="thinker restart: 128K bump", operator="op")
+        endpoint="tier3", started_at=now - 60, ended_at=now + 60,
+        reason="tier3 restart: 128K bump", operator="op")
     rep = svc._queue_db.timeouts_report(24)
     assert rep["total"] == 1
     assert rep["planned"] == 1
     assert rep["rows"][0]["planned"] == 1
-    assert rep["maintenance_windows"][0]["reason"] == "thinker restart: 128K bump"
+    assert rep["maintenance_windows"][0]["reason"] == "tier3 restart: 128K bump"
 
 
 def test_premature_unplanned_excludes_maintenance_and_background(tmp_path):
@@ -320,26 +319,26 @@ def test_premature_unplanned_excludes_maintenance_and_background(tmp_path):
         )
 
     # Foreground (P1) premature, NOT in a window → the one genuine health event.
-    _ev("fg", "gemma", 1, True)
+    _ev("fg", "tier1", 1, True)
     # Foreground (P1) premature, but INSIDE a drain window → maintenance collateral.
-    _ev("fg_planned", "creative", 1, True)
+    _ev("fg_planned", "tier2", 1, True)
     # Background (P3) premature on a DIFFERENT endpoint (not drained) → unplanned,
     # but still background so it defers+retries, not a foreground health signal.
-    _ev("bg", "thinker", 3, True)
+    _ev("bg", "tier3", 3, True)
     # Background (P3) premature AND planned (the dominant real-world case).
-    _ev("bg_planned", "creative", 3, True)
+    _ev("bg_planned", "tier2", 3, True)
 
     svc._queue_db.maintenance_record(
-        endpoint="creative", started_at=now - 60, ended_at=now + 60,
-        reason="creative prefill drain", operator="op")
+        endpoint="tier2", started_at=now - 60, ended_at=now + 60,
+        reason="tier2 prefill drain", operator="op")
 
     rep = svc._queue_db.timeouts_report(24)
     assert rep["premature"] == 4                     # raw, overlaps planned (the old buggy number)
-    # 2026-07-30: was "companion". normalize_endpoint("companion") now returns "thinker" — the
-    # ROLE shadows the identically-named CLASS, since composer/companion were repointed to tier3.
+    # 2026-07-30: was "tier3". normalize_endpoint("tier3") now returns "tier3" — the
+    # ROLE shadows the identically-named CLASS, since composer/tier3 were repointed to tier3.
     # That collapsed these events onto the same endpoint as the "bg" event and destroyed the
-    # two-distinct-endpoints structure this test needs. `creative` restores it.
-    assert rep["planned"] == 2                        # 2 creative events fell in the window
+    # two-distinct-endpoints structure this test needs. `tier2` restores it.
+    assert rep["planned"] == 2                        # 2 tier2 events fell in the window
     assert rep["premature_unplanned"] == 2            # excludes the 2 planned premature (fg + bg survive)
     assert rep["premature_foreground_unplanned"] == 1  # + excludes the unplanned background (only fg)
 
@@ -350,7 +349,7 @@ def test_report_does_not_tag_event_outside_window(tmp_path):
     now = time.time()
     # window that ended well before the event
     svc._queue_db.maintenance_record(
-        endpoint="thinker", started_at=now - 7200, ended_at=now - 3600,
+        endpoint="tier3", started_at=now - 7200, ended_at=now - 3600,
         reason="earlier maintenance", operator="op")
     rep = svc._queue_db.timeouts_report(24)
     assert rep["planned"] == 0
@@ -359,8 +358,8 @@ def test_report_does_not_tag_event_outside_window(tmp_path):
 
 def test_wildcard_window_tags_any_endpoint(tmp_path):
     svc = _svc(tmp_path)
-    _to_event(svc, request_id="e1", endpoint="thinker")
-    _to_event(svc, request_id="e2", endpoint="companion")
+    _to_event(svc, request_id="e1", endpoint="tier3")
+    _to_event(svc, request_id="e2", endpoint="tier3")
     now = time.time()
     svc._queue_db.maintenance_record(
         endpoint="*", started_at=now - 60, ended_at=now + 60,
@@ -371,11 +370,11 @@ def test_wildcard_window_tags_any_endpoint(tmp_path):
 
 def test_role_name_window_normalizes_to_endpoint_class(tmp_path):
     svc = _svc(tmp_path)
-    _to_event(svc, endpoint="thinker")
+    _to_event(svc, endpoint="tier3")
     now = time.time()
-    # a window keyed by the ROLE name should still match the 'thinker' class
+    # a window keyed by the ROLE name should still match the 'tier3' class
     svc._queue_db.maintenance_record(
-        endpoint="llama-thinker", started_at=now - 60, ended_at=now + 60,
+        endpoint="tier3", started_at=now - 60, ended_at=now + 60,
         reason="role-keyed", operator="op")
     rep = svc._queue_db.timeouts_report(24)
     assert rep["planned"] == 1
@@ -385,13 +384,13 @@ def test_open_window_extends_to_now(tmp_path):
     svc = _svc(tmp_path)
     now = time.time()
     svc._queue_db.maintenance_open(
-        endpoint="thinker", reason="restarting", operator="op", source="drain",
+        endpoint="tier3", reason="restarting", operator="op", source="drain",
         started_at=now - 30)
     _to_event(svc)  # recorded at ~now, inside the still-open window
     rep = svc._queue_db.timeouts_report(24)
     assert rep["planned"] == 1
     # closing it leaves the (now closed) window present in the report
-    svc._queue_db.maintenance_close(endpoint="thinker")
+    svc._queue_db.maintenance_close(endpoint="tier3")
     win = svc._queue_db.maintenance_windows(24)[0]
     assert win["ended_at"] is not None
 
@@ -400,15 +399,15 @@ def test_open_window_extends_to_now(tmp_path):
 async def test_drain_pause_opens_and_resume_closes_window(tmp_path):
     svc = _svc(tmp_path)
     await svc.handle_admin_endpoint_pause(
-        "thinker", _FakeJSONRequest({"reason": "128K bump"}), pause=True)
+        "tier3", _FakeJSONRequest({"reason": "128K bump"}), pause=True)
     wins = svc._queue_db.maintenance_windows(24)
     assert len(wins) == 1
-    assert wins[0]["endpoint"] == "thinker"
+    assert wins[0]["endpoint"] == "tier3"
     assert wins[0]["reason"] == "128K bump"
     assert wins[0]["source"] == "drain"
     assert wins[0]["ended_at"] is None  # still open
     await svc.handle_admin_endpoint_pause(
-        "thinker", _FakeJSONRequest(None), pause=False)
+        "tier3", _FakeJSONRequest(None), pause=False)
     assert svc._queue_db.maintenance_windows(24)[0]["ended_at"] is not None
 
 
@@ -417,7 +416,7 @@ async def test_manual_annotate_backdates_closed_window(tmp_path):
     svc = _svc(tmp_path)
     _to_event(svc)  # a timeout that already happened
     resp = await svc.handle_maintenance(_FakeJSONRequest(
-        {"endpoint": "thinker", "reason": "raw restart", "duration_s": 600}))
+        {"endpoint": "tier3", "reason": "raw restart", "duration_s": 600}))
     assert resp.status_code == 200
     rep = svc._queue_db.timeouts_report(24)
     assert rep["planned"] == 1
@@ -443,5 +442,5 @@ async def test_manual_annotate_requires_endpoint(tmp_path):
 async def test_manual_annotate_denied_for_external_ip(tmp_path):
     svc = _svc(tmp_path)
     resp = await svc.handle_maintenance(_FakeJSONRequest(
-        {"endpoint": "thinker"}, host="8.8.8.8"))
+        {"endpoint": "tier3"}, host="8.8.8.8"))
     assert resp.status_code == 403

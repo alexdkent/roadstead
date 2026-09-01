@@ -201,7 +201,7 @@ class TestToolHeavyPayloadsAreNotHalved:
         result = "R" * 60_000
         prompt = "P" * 4_000
         payload = {
-            "model": "thinker",
+            "model": "tier3",
             "stream": True,
             "messages": [
                 {"role": "user", "content": prompt},

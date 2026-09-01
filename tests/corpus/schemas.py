@@ -473,7 +473,7 @@ _CHAT_CASE_C: Dict[str, Any] = {
 # Case D — grammar-constrained inner sub-call (routing decision), extra_body carries a grammar.
 _CHAT_CASE_D: Dict[str, Any] = {
     "name": "loop_routing_grammar_subcall",
-    "model": "gemma-router",
+    "model": "tier1",
     "messages": [
         {
             "role": "system",

@@ -44,7 +44,7 @@ def test_the_context_overflow_marker_is_published_verbatim(doc):
 def test_the_matcher_is_not_vacuous():
     """A matcher that says yes to everything, or no to everything, would make
     every caller of it pass. Pin both directions."""
-    assert carries_deferral_marker("backend thinker unavailable (circuit open)")
+    assert carries_deferral_marker("backend tier3 unavailable (circuit open)")
     assert carries_deferral_marker("proxy draining for shutdown — backpressure")
     assert carries_deferral_marker("", "BACKPRESSURE: queue saturated")  # case-insensitive
     assert not carries_deferral_marker("unknown endpoint 'typo' — no such model/role")

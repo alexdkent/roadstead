@@ -73,7 +73,7 @@ request that was never attempted.
 | | value | where |
 |---|---|---|
 | Client `keepalive_expiry` | **4.5s** | the caller's HTTP pool (host's `_CLIENT_KEEPALIVE_EXPIRY_S`) |
-| Server `timeout_keep_alive` | **30s** | `PROXY_SERVER_KEEPALIVE_S`, env `COLLECTIVE_PROXY_SERVER_KEEPALIVE_S` |
+| Server `timeout_keep_alive` | **30s** | `PROXY_SERVER_KEEPALIVE_S`, env `ROADSTEAD_PROXY_SERVER_KEEPALIVE_S` |
 
 **Required: client < server, with at least 5s of margin** — enough to cover clock skew and RTT
 jitter, not merely a positive difference. The client must always retire idle connections first, so
@@ -89,7 +89,7 @@ config without touching code. `tests/test_keepalive_invariant.py` pins the serve
 
 ### 1.4 `GET /v1/timeout-advice` — and the floor a client must not mirror wrong
 
-Query: `model` (**required**; role names are normalized, so `llama-thinker` and `thinker` are the
+Query: `model` (**required**; role names and aliases are normalized, so `reasoner` and `tier3` are the
 same endpoint), `priority` (name or number, default `P1_TURN_SUPPORT`), `est_in`, `est_out`.
 Unknown `model` or `priority` → **400**, and the `model` error lists the known endpoints.
 

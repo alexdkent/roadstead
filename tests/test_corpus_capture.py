@@ -38,7 +38,7 @@ async def test_persist_complete_stores_payload_and_response(tmp_path):
     response = {"choices": [{"message": {"content": "hi"}}]}
 
     svc._queue_db.persist_complete(
-        "req_001", "sidekick", "thinker", "sidekick.critic", 1,
+        "req_001", "sidekick", "tier3", "sidekick.critic", 1,
         500, 50, 2.5, 10.0, "ok",
         payload=payload, response=response,
     )
@@ -61,16 +61,16 @@ def test_export_corpus_returns_payload_records(tmp_path):
     response = {"choices": [{"message": {"content": "ok"}}]}
 
     svc._queue_db.persist_complete(
-        "req_002", "forum-agent", "thinker", "forum-agent.proposal_emitter", 3,
+        "req_002", "forum-agent", "tier3", "forum-agent.proposal_emitter", 3,
         6000, 250, 30.0, 5.0, "ok",
         payload=payload, response=response,
     )
     svc._queue_db.persist_complete(
-        "req_003", "forum-agent", "thinker", "forum-agent.proposal_emitter", 3,
+        "req_003", "forum-agent", "tier3", "forum-agent.proposal_emitter", 3,
         6000, 0, 45.0, 5.0, "error",
     )
 
-    corpus = svc._queue_db.export_corpus(hours=1, endpoint="thinker")
+    corpus = svc._queue_db.export_corpus(hours=1, endpoint="tier3")
     assert len(corpus) == 1
     assert corpus[0]["request_id"] == "req_002"
     assert corpus[0]["payload"] == payload
@@ -84,11 +84,11 @@ def test_export_corpus_filters_by_call_site(tmp_path):
 
     payload = {"messages": [{"role": "user", "content": "x"}]}
     svc._queue_db.persist_complete(
-        "req_a", "forum-agent", "thinker", "forum-agent.proposal_emitter", 3,
+        "req_a", "forum-agent", "tier3", "forum-agent.proposal_emitter", 3,
         100, 50, 1.0, 1.0, "ok", payload=payload, response={},
     )
     svc._queue_db.persist_complete(
-        "req_b", "sidekick", "thinker", "sidekick.critic", 1,
+        "req_b", "sidekick", "tier3", "sidekick.critic", 1,
         100, 50, 1.0, 1.0, "ok", payload=payload, response={},
     )
 

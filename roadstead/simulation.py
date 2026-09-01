@@ -481,19 +481,19 @@ class SimRunner:
 
 REALISTIC_AGENTS = [
     AgentProfile("orchestrator", rate_rps=0.5, priority_mix={"P0_REALTIME": 0.3, "P1_TURN_SUPPORT": 0.7},
-                 endpoints=["qwen-composer", "gemma-router", "gemma-greeter"], avg_input_tokens=4000,
+                 endpoints=["tier3", "tier1", "tier1"], avg_input_tokens=4000,
                  avg_output_tokens=500, weight=2.0),
     AgentProfile("knowledge", rate_rps=2.0, priority_mix={"P1_TURN_SUPPORT": 0.4, "P3_INGESTION": 0.6},
-                 endpoints=["qwen-analyst", "bge-m3-embed", "bge-reranker"], avg_input_tokens=3000,
+                 endpoints=["tier2", "embed", "rerank"], avg_input_tokens=3000,
                  avg_output_tokens=200, weight=1.5),
     AgentProfile("forum-agent", rate_rps=0.8, priority_mix={"P3_INGESTION": 1.0},
-                 endpoints=["llama-thinker"], avg_input_tokens=5000, avg_output_tokens=400),
+                 endpoints=["tier3"], avg_input_tokens=5000, avg_output_tokens=400),
     AgentProfile("mail-agent", rate_rps=0.3, priority_mix={"P3_INGESTION": 1.0},
-                 endpoints=["qwen-analyst", "gemma-router"], avg_input_tokens=2000, avg_output_tokens=150),
+                 endpoints=["tier2", "tier1"], avg_input_tokens=2000, avg_output_tokens=150),
     AgentProfile("sidekick", rate_rps=0.2, priority_mix={"P1_TURN_SUPPORT": 0.5, "P3_INGESTION": 0.5},
-                 endpoints=["qwen-analyst", "llama-thinker"], avg_input_tokens=1500, avg_output_tokens=100),
+                 endpoints=["tier2", "tier3"], avg_input_tokens=1500, avg_output_tokens=100),
     AgentProfile("homeassistant", rate_rps=0.1, priority_mix={"P1_TURN_SUPPORT": 0.8, "P3_INGESTION": 0.2},
-                 endpoints=["gemma-greeter", "llama-thinker"], avg_input_tokens=1000, avg_output_tokens=100),
+                 endpoints=["tier1", "tier3"], avg_input_tokens=1000, avg_output_tokens=100),
 ]
 
 
@@ -511,7 +511,7 @@ def _scenario_one_agent_flood() -> Scenario:
     agents = list(REALISTIC_AGENTS)
     agents[0] = AgentProfile(
         "orchestrator", rate_rps=10.0, priority_mix={"P1_TURN_SUPPORT": 1.0},
-        endpoints=["qwen-composer"], avg_input_tokens=4000, avg_output_tokens=500, weight=2.0,
+        endpoints=["tier3"], avg_input_tokens=4000, avg_output_tokens=500, weight=2.0,
     )
     return Scenario("one_agent_flood", duration_s=60, agents=agents)
 
@@ -529,21 +529,21 @@ def _scenario_background_storm() -> Scenario:
 def _scenario_endpoint_loss() -> Scenario:
     return Scenario(
         "endpoint_loss", duration_s=60, agents=list(REALISTIC_AGENTS),
-        endpoint_events=[EndpointEvent(at_s=20, endpoint="qwen-analyst", max_slots=0)],
+        endpoint_events=[EndpointEvent(at_s=20, endpoint="tier2", max_slots=0)],
     )
 
 
 def _scenario_slot_reduction() -> Scenario:
     return Scenario(
         "slot_reduction", duration_s=60, agents=list(REALISTIC_AGENTS),
-        endpoint_events=[EndpointEvent(at_s=20, endpoint="qwen-analyst", max_slots=2)],
+        endpoint_events=[EndpointEvent(at_s=20, endpoint="tier2", max_slots=2)],
     )
 
 
 def _scenario_new_agent() -> Scenario:
     agents = list(REALISTIC_AGENTS) + [
         AgentProfile("new_agent", rate_rps=1.0, priority_mix={"P3_INGESTION": 1.0},
-                     endpoints=["qwen-analyst", "llama-thinker"], avg_input_tokens=3000,
+                     endpoints=["tier2", "tier3"], avg_input_tokens=3000,
                      avg_output_tokens=300),
     ]
     return Scenario("new_agent", duration_s=60, agents=agents)
@@ -552,12 +552,12 @@ def _scenario_new_agent() -> Scenario:
 def _scenario_turn_storm() -> Scenario:
     agents = [
         AgentProfile("orchestrator", rate_rps=3.0, priority_mix={"P0_REALTIME": 0.5, "P1_TURN_SUPPORT": 0.5},
-                     endpoints=["qwen-composer", "gemma-router"], avg_input_tokens=4000,
+                     endpoints=["tier3", "tier1"], avg_input_tokens=4000,
                      avg_output_tokens=500, weight=2.0),
         AgentProfile("knowledge", rate_rps=4.0, priority_mix={"P3_INGESTION": 1.0},
-                     endpoints=["qwen-analyst", "bge-m3-embed"], avg_input_tokens=3000, avg_output_tokens=200),
+                     endpoints=["tier2", "embed"], avg_input_tokens=3000, avg_output_tokens=200),
         AgentProfile("forum-agent", rate_rps=2.0, priority_mix={"P3_INGESTION": 1.0},
-                     endpoints=["llama-thinker"], avg_input_tokens=5000, avg_output_tokens=400),
+                     endpoints=["tier3"], avg_input_tokens=5000, avg_output_tokens=400),
     ]
     return Scenario("turn_storm", duration_s=60, agents=agents)
 
@@ -565,10 +565,10 @@ def _scenario_turn_storm() -> Scenario:
 def _scenario_long_tail() -> Scenario:
     agents = [
         AgentProfile("fast_agent", rate_rps=5.0, priority_mix={"P1_TURN_SUPPORT": 1.0},
-                     endpoints=["gemma-router"], avg_input_tokens=500, avg_output_tokens=50,
+                     endpoints=["tier1"], avg_input_tokens=500, avg_output_tokens=50,
                      timeout_s=5.0),
         AgentProfile("slow_agent", rate_rps=0.5, priority_mix={"P1_TURN_SUPPORT": 1.0},
-                     endpoints=["qwen-composer"], avg_input_tokens=10000, avg_output_tokens=2000,
+                     endpoints=["tier3"], avg_input_tokens=10000, avg_output_tokens=2000,
                      timeout_s=120.0),
     ]
     return Scenario("long_tail", duration_s=60, agents=agents)

@@ -26,7 +26,7 @@ async def _none(*a, **k):
 
 def _body(stream=False):
     return {
-        "agent_id": "a", "endpoint": "llama-thinker", "priority": "P3_INGESTION",
+        "agent_id": "a", "endpoint": "tier3", "priority": "P3_INGESTION",
         "call_site": "t", "payload_type": "chat_completion",
         "payload": {"messages": [{"role": "user", "content": "x"}], "stream": stream},
         "timeout_s": 10.0,
@@ -44,9 +44,9 @@ async def test_cache_hit_counted_in_metrics():
         svc._cache.put("k", {"id": "x", "object": "chat.completion",
                              "choices": [{"message": {"content": "c"}}]})
         svc._cache.cache_key = lambda endpoint, payload: "k"
-        before = svc._metrics.count(endpoint="thinker")
+        before = svc._metrics.count(endpoint="tier3")
         await svc.handle_submit(_body(), _FakeRequest())
-        assert svc._metrics.count(endpoint="thinker") == before + 1
+        assert svc._metrics.count(endpoint="tier3") == before + 1
     finally:
         await svc.shutdown()
 

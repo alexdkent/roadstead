@@ -74,7 +74,7 @@ def _req():
     r = types.SimpleNamespace()
     r.payload_type = "chat_completion"
     r.payload = {"messages": [], "max_tokens": 500, "temperature": 0.85}
-    r.endpoint = "thinker"
+    r.endpoint = "tier3"
     r.request_id = "rid-1"
     r.call_site = "sidekick.craft_song"
     r.timeout_deadline = time.monotonic() + 120
@@ -102,8 +102,8 @@ def _mock_self(backend_call):
     m._persisted = []
     state.queue_db = types.SimpleNamespace(
         persist_complete=lambda *a, **k: m._persisted.append((a, k)))
-    ep = types.SimpleNamespace(role="thinker")
-    state.config = types.SimpleNamespace(endpoints={"thinker": ep})
+    ep = types.SimpleNamespace(role="tier3")
+    state.config = types.SimpleNamespace(endpoints={"tier3": ep})
     state.backend = types.SimpleNamespace(call=backend_call)
     m._maybe_correct_degenerate = C.maybe_correct_degenerate.__get__(m, C)
     return m
@@ -150,11 +150,11 @@ def test_shadow_mode_detects_only():
     backend = _backend_returning()
     m = _mock_self(backend)
     res = _result(DEGEN)
-    os.environ["COLLECTIVE_PROXY_DEGENERATION_SHADOW"] = "1"
+    os.environ["ROADSTEAD_PROXY_DEGENERATION_SHADOW"] = "1"
     try:
         asyncio.run(m._maybe_correct_degenerate(_req(), res))
     finally:
-        os.environ.pop("COLLECTIVE_PROXY_DEGENERATION_SHADOW", None)
+        os.environ.pop("ROADSTEAD_PROXY_DEGENERATION_SHADOW", None)
     assert m.state.degeneration_detected == 1
     assert m.state.degeneration_recovered == 0
     assert backend.calls == []                                # no re-dispatch in shadow
@@ -165,11 +165,11 @@ def test_kill_switch_disables():
     backend = _backend_returning()
     m = _mock_self(backend)
     res = _result(DEGEN)
-    os.environ["COLLECTIVE_PROXY_DEGENERATION_GUARD"] = "off"
+    os.environ["ROADSTEAD_PROXY_DEGENERATION_GUARD"] = "off"
     try:
         asyncio.run(m._maybe_correct_degenerate(_req(), res))
     finally:
-        os.environ.pop("COLLECTIVE_PROXY_DEGENERATION_GUARD", None)
+        os.environ.pop("ROADSTEAD_PROXY_DEGENERATION_GUARD", None)
     assert m.state.degeneration_detected == 0
     assert backend.calls == []
 
@@ -237,4 +237,4 @@ def test_redispatch_metrics_sample_emitted():
     asyncio.run(m._maybe_correct_degenerate(_req(), _result(DEGEN)))
     assert len(samples) == 1
     assert samples[0].status == "degen_retry"
-    assert samples[0].endpoint == "thinker"
+    assert samples[0].endpoint == "tier3"

@@ -27,7 +27,7 @@ GRAMMAR = (
 )
 
 
-def _req(payload, *, stream=False, ptype="chat_completion", endpoint="companion",
+def _req(payload, *, stream=False, ptype="chat_completion", endpoint="tier3",
          rid="r1", call_site="unmanaged.site"):
     r = types.SimpleNamespace()
     r.payload = payload; r.stream = stream; r.payload_type = ptype
@@ -127,16 +127,16 @@ def test_stream_skipped():
 def test_kill_switch_disables(monkeypatch=None):
     import os
     m = _mock_self()
-    old = os.environ.get("COLLECTIVE_PROXY_SHADOW_EGRESS")
-    os.environ["COLLECTIVE_PROXY_SHADOW_EGRESS"] = "off"
+    old = os.environ.get("ROADSTEAD_PROXY_SHADOW_EGRESS")
+    os.environ["ROADSTEAD_PROXY_SHADOW_EGRESS"] = "off"
     try:
         m._shadow_egress_detect(_req(_payload()), _result('not json'))
         assert m._shadow_drop == {}
     finally:
         if old is None:
-            os.environ.pop("COLLECTIVE_PROXY_SHADOW_EGRESS", None)
+            os.environ.pop("ROADSTEAD_PROXY_SHADOW_EGRESS", None)
         else:
-            os.environ["COLLECTIVE_PROXY_SHADOW_EGRESS"] = old
+            os.environ["ROADSTEAD_PROXY_SHADOW_EGRESS"] = old
 
 
 if __name__ == "__main__":

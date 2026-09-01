@@ -29,7 +29,7 @@ import pytest
 from roadstead.backend import empty_completion_error
 
 
-def _gate(content, reasoning, finish, output_tokens, role="llama-thinker"):
+def _gate(content, reasoning, finish, output_tokens, role="tier3"):
     """Drive the REAL gate. Deliberately not a re-implementation: a test that
     copies the logic it checks is a copy that drifts, and precision of this
     message is the entire point of the change."""

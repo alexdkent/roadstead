@@ -7,7 +7,7 @@ Two defects this pins, both live on the `beacon` registration between Phase 0
    registered `P3_INGESTION` while it was still framed as a third evaluation
    surface. After it became the chat brain behind the SPA and SidekickApp, that put
    every turn a human waits on behind ingestion/hygiene batch work and excluded
-   it from `fast_path_reserve_slots`. Measured at the time: `thinker` p95
+   it from `fast_path_reserve_slots`. Measured at the time: `tier3` p95
    background wait 583,017 ms, one trivial call 254.9 s.
 
 2. **A deadline floor ABOVE its own ceiling.** The floor was

@@ -179,13 +179,13 @@ def _run(state, req, result):
 
 
 def _enforce():
-    os.environ["COLLECTIVE_PROXY_SCHEMA_BACKSTOP"] = "1"
-    os.environ.pop("COLLECTIVE_PROXY_SCHEMA_BACKSTOP_SHADOW", None)
+    os.environ["ROADSTEAD_PROXY_SCHEMA_BACKSTOP"] = "1"
+    os.environ.pop("ROADSTEAD_PROXY_SCHEMA_BACKSTOP_SHADOW", None)
 
 
 def _clear_flags():
-    os.environ.pop("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", None)
-    os.environ.pop("COLLECTIVE_PROXY_SCHEMA_BACKSTOP_SHADOW", None)
+    os.environ.pop("ROADSTEAD_PROXY_SCHEMA_BACKSTOP", None)
+    os.environ.pop("ROADSTEAD_PROXY_SCHEMA_BACKSTOP_SHADOW", None)
 
 
 def test_flag_off_is_total_noop():
@@ -269,8 +269,8 @@ def test_retry_still_invalid_fails_loud_deferrable():
 
 
 def test_shadow_detects_only():
-    os.environ["COLLECTIVE_PROXY_SCHEMA_BACKSTOP"] = "1"
-    os.environ["COLLECTIVE_PROXY_SCHEMA_BACKSTOP_SHADOW"] = "1"
+    os.environ["ROADSTEAD_PROXY_SCHEMA_BACKSTOP"] = "1"
+    os.environ["ROADSTEAD_PROXY_SCHEMA_BACKSTOP_SHADOW"] = "1"
     try:
         backend = _backend_returning()
         st = _mock_state(backend)

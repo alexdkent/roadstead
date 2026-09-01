@@ -22,7 +22,7 @@ from roadstead.backend import (
     BackendResponse,
     BackendStreamEvent,
 )
-from roadstead.config import ProxyConfig
+from roadstead.config import ProxyConfig, normalize_endpoint
 from roadstead.service import ProxyService, _ToolCallStreamSanitizer
 
 
@@ -49,7 +49,7 @@ _COMPLETION = {
     "id": "chatcmpl-test",
     "object": "chat.completion",
     "created": 1,
-    "model": "llama-thinker",
+    "model": "tier3",
     "choices": [
         {
             "index": 0,
@@ -111,7 +111,7 @@ async def _collect_stream(resp, timeout: float = 5.0) -> list[str]:
     return frames
 
 
-def _openai_body(*, stream: bool = False, model: str = "llama-thinker") -> dict:
+def _openai_body(*, stream: bool = False, model: str = "tier3") -> dict:
     return {
         "model": model,
         "messages": [{"role": "user", "content": "hello"}],
@@ -507,7 +507,7 @@ async def test_streaming_toolcall_continuations_drop_null_name_end_to_end():
 def _submit_body(*, stream: bool = False) -> dict:
     return {
         "agent_id": "a",
-        "endpoint": "llama-thinker",
+        "endpoint": "tier3",
         "priority": "P3_INGESTION",
         "call_site": "test",
         "payload_type": "chat_completion",
@@ -545,3 +545,40 @@ async def test_internal_submit_envelope_unchanged_streaming():
         assert "[DONE]" not in frames     # internal path never emits OpenAI [DONE]
     finally:
         await svc.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/models — the surface external clients copy a model name FROM
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_v1_models_advertises_the_endpoint_class_not_the_role():
+    """🚨 This route had NO test in this repo and was broken by a refactor of
+    the catalog without a single failure — the class it called had been renamed
+    out from under it. It is also the one north-face surface whose output
+    becomes someone else's config: whatever `id` appears here gets pinned by a
+    client and has to keep resolving.
+
+    The endpoint CLASS is that name. `role` labels the model behind the class
+    for one deployment and is expected to change; advertising it would mint
+    external callers on a name we intend to rename.
+    """
+    svc = ProxyService(ProxyConfig())
+    resp = await svc.handle_models(_FakeRequest())
+    body = json.loads(resp.body)
+    assert resp.status_code == 200
+    assert body["object"] == "list"
+    ids = {row["id"] for row in body["data"]}
+    classes = set(svc._config.endpoints)
+    assert ids == classes, (
+        f"/v1/models advertises {ids - classes} that are not endpoint classes, "
+        f"and omits {classes - ids}")
+    for row in body["data"]:
+        ep = svc._config.endpoints[row["id"]]
+        assert row["max_model_len"] == ep.context_per_slot
+        assert row["object"] == "model"
+    # And every advertised name must resolve back to itself — a client pinning
+    # one has to keep hitting the same endpoint.
+    for name in ids:
+        assert normalize_endpoint(name) == name, (
+            f"{name!r} is advertised but does not normalize to itself")

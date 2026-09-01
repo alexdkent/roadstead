@@ -1,6 +1,6 @@
 """Background-band concurrency cap (fast_path_reserve_slots).
 
-~95% of thinker load is background; the band should be able to use all but a
+~95% of tier3 load is background; the band should be able to use all but a
 small fast-path reserve, scaling with max_slots (not a hard-coded number).
 Intra-band fairness is the DRR scheduler's job, not this cap. The interactive
 reservation still keys off background_floor_slots, so raising the background
@@ -16,7 +16,7 @@ from roadstead.scheduler import Scheduler
 
 def _ep(max_slots: int, reserve: int, cap: int = 0) -> EndpointConfig:
     return EndpointConfig(
-        endpoint_class="thinker", role="llama-thinker",
+        endpoint_class="tier3", role="tier3",
         max_slots=max_slots, fast_path_reserve_slots=reserve,
         dispatch_concurrency_cap=cap,
     )
@@ -25,7 +25,7 @@ def _ep(max_slots: int, reserve: int, cap: int = 0) -> EndpointConfig:
 # --- config: cap = max_slots - reserve, scales, never below floor ---
 
 def test_thinker_default_cap_is_max_slots_minus_one():
-    t = DEFAULT_ENDPOINTS["thinker"]
+    t = DEFAULT_ENDPOINTS["tier3"]
     assert t.fast_path_reserve_slots == 1
     assert t.background_floor_slots == 1          # pinned via background_floor_pct=0.0
     assert t.background_cap_slots == t.max_slots - 1  # 31 of 32 today
@@ -33,13 +33,13 @@ def test_thinker_default_cap_is_max_slots_minus_one():
 
 def test_no_endpoint_floor_starves_interactive():
     """Doctrine guard against the max_slots/background_floor_pct drift that bit
-    the thinker (6→32 slots made the 0.20 floor reserve 6 of 32). For EVERY
+    the tier3 (6→32 slots made the 0.20 floor reserve 6 of 32). For EVERY
     endpoint the background floor must leave at least one slot for an
     interactive/fast-path call, and a reserve-configured endpoint's background
     cap must equal effective_max_slots - reserve. The cap is computed against
     effective_max_slots (NOT max_slots) so a G1 dispatch_concurrency_cap shrinks
     the background ceiling too, preserving the interactive reserve under the cap
-    (companion: effective 3, reserve 1 -> background cap 2). Fails loud if a
+    (tier3: effective 3, reserve 1 -> background cap 2). Fails loud if a
     future topology bump changes a slot count without its dependents."""
     for name, ep in DEFAULT_ENDPOINTS.items():
         assert ep.effective_max_slots <= ep.max_slots, (
@@ -58,15 +58,15 @@ def test_no_endpoint_floor_starves_interactive():
 
 
 def test_companion_dispatch_concurrency_cap():
-    """G1 (2026-06-01): the companion (then Qwen3-Next-80B) was
+    """G1 (2026-06-01): the tier3 (then Qwen3-Next-80B) was
     concurrency-fragile (a llama.cpp KV-seq-removal assertion aborted it
     under full pressure), so a 3-wide ceiling was kept explicit via
     dispatch_concurrency_cap.
 
-    2026-06-05 (1ca82e2f): companion was downsized from 4×98304 to --parallel 3
+    2026-06-05 (1ca82e2f): tier3 was downsized from 4×98304 to --parallel 3
     (3×32768) to free nexus memory for Chatterbox Turbo TTS.
 
-    2026-07-03: companion swapped to Qwen3.5-122B-A10B (a different model —
+    2026-07-03: tier3 swapped to Qwen3.5-122B-A10B (a different model —
     the 80B's specific G1 crash history doesn't carry over) on a newer
     llama.cpp build (b9849). Re-validated via llama-batched-bench at 1/2/4/8
     parallel with no instability found through 8 — see
@@ -79,8 +79,8 @@ def test_companion_dispatch_concurrency_cap():
     cap == max_slots == 8; the interactive reserve is preserved
     (background cap = 8 - 1 = 7).
 
-    2026-08-02: `companion` is no longer an endpoint class — the 122B stanza left
-    the proxy because its class name collided with the `companion` ALIAS of tier3
+    2026-08-02: `tier3` is no longer an endpoint class — the 122B stanza left
+    the proxy because its class name collided with the `tier3` ALIAS of tier3
     (ledger `endpoint-class-alias-collision`). The history above is kept because
     it is the reasoning behind the cap MECHANISM, which is unchanged; the
     assertions now run against a synthetic endpoint with the 122B's final shape
@@ -92,9 +92,9 @@ def test_companion_dispatch_concurrency_cap():
     assert comp.effective_max_slots == 8     # dispatch ceiling (== physical now)
     assert comp.background_cap_slots == 7    # leaves 1 for interactive
     # An uncapped LIVE endpoint is unaffected: effective == physical.
-    thinker = DEFAULT_ENDPOINTS["thinker"]
-    assert thinker.dispatch_concurrency_cap == 0
-    assert thinker.effective_max_slots == thinker.max_slots
+    tier3 = DEFAULT_ENDPOINTS["tier3"]
+    assert tier3.dispatch_concurrency_cap == 0
+    assert tier3.effective_max_slots == tier3.max_slots
 
 
 def test_effective_max_slots_clamps_to_min():
@@ -126,7 +126,7 @@ def test_cap_never_below_floor():
 # --- scheduler: background uses up to the cap; fast-path slot preserved ---
 
 def _bg_active(n: int) -> dict:
-    return {"thinker": {
+    return {"tier3": {
         f"r{i}": SimpleNamespace(request=SimpleNamespace(band=PriorityBand.BACKGROUND))
         for i in range(n)
     }}

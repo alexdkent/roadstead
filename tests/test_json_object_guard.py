@@ -55,7 +55,7 @@ SCHEMA_RF = {"type": "json_schema", "json_schema": {"name": "critic", "schema": 
     "required": ["voice_match", "why"]}}}
 
 
-def _req(payload, *, endpoint="thinker", ptype="chat_completion", stream=False):
+def _req(payload, *, endpoint="tier3", ptype="chat_completion", stream=False):
     r = types.SimpleNamespace()
     r.json_object_stripped = False
     r.payload = payload
@@ -72,7 +72,7 @@ def _mock_self(*, disable_any_whitespace: bool):
     state = types.SimpleNamespace()
     ep = types.SimpleNamespace(backend_engine="vllm",
                                disable_any_whitespace=disable_any_whitespace)
-    state.config = types.SimpleNamespace(endpoints={"thinker": ep})
+    state.config = types.SimpleNamespace(endpoints={"tier3": ep})
     m = types.SimpleNamespace(state=state)
     for name in ("apply_json_object_guard", "request_is_structured",
                  "request_expects_json", "extract_grammar"):
@@ -319,15 +319,13 @@ def test_policy_key_is_in_the_catalog_mapping():
     it is asserted directly against the builder's src/dst tuple list instead —
     the plumbing stays armed for whichever endpoint next needs the flag.
     """
-    src = inspect.getsource(model_catalog.build_endpoint_kwargs)
-    assert "disable_any_whitespace" in src, (
-        "build_endpoint_kwargs no longer maps disable_any_whitespace. Any stanza "
-        "declaring it would be silently dropped — add "
-        '("disable_any_whitespace", "disable_any_whitespace") back to the src/dst '
-        "tuple list in model_catalog.build_endpoint_kwargs"
+    assert "disable_any_whitespace" in model_catalog._POLICY_PASSTHROUGH, (
+        "build_endpoint_kwargs no longer copies disable_any_whitespace. Any "
+        "stanza declaring it would be silently dropped — add it back to "
+        "model_catalog._POLICY_PASSTHROUGH"
     )
     kwargs = model_catalog.build_endpoint_kwargs()
-    assert "thinker" in kwargs, "tier3 (endpoint_class `thinker`) missing from the catalog"
+    assert "tier3" in kwargs, "tier3 (endpoint_class `tier3`) missing from the catalog"
 
 
 def test_models_yaml_flag_reaches_endpoint_config():
@@ -352,7 +350,7 @@ def test_models_yaml_flag_reaches_endpoint_config():
         "--structured-outputs-config. Those two must move together or bare "
         "json_object silently returns '{}' again."
     )
-    other = config.DEFAULT_ENDPOINTS[config.normalize_endpoint("creative")]
+    other = config.DEFAULT_ENDPOINTS[config.normalize_endpoint("tier2")]
     assert other.disable_any_whitespace is False
 
 
@@ -360,8 +358,8 @@ def test_every_alias_of_tier3_resolves_to_the_guarded_endpoint():
     """`tier3` is canonical, but callers still reach it under legacy aliases
     (sidekick's critic passes one). All of them must land on the endpoint carrying the
     flag, or the guard fires for some callers and not others."""
-    for alias in ("tier3", "reasoner", "llama-thinker", "thinker", "composer",
-                  "companion", "qwen-composer", "nexus-companion"):
+    for alias in ("tier3", "reasoner", "tier3", "tier3", "composer",
+                  "tier3", "tier3", "tier3"):
         ep = config.DEFAULT_ENDPOINTS[config.normalize_endpoint(alias)]
         # 🔄 2026-08-22: what this test protects is the alias/class-collision
         # history — every tier3 alias must resolve to the SAME endpoint object.

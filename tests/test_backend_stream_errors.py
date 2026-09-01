@@ -22,7 +22,7 @@ from roadstead.backend import (
 )
 from roadstead.config import EndpointConfig
 
-EP = EndpointConfig(endpoint_class="chat", role="thinker", host="h", port=1234)
+EP = EndpointConfig(endpoint_class="chat", role="tier3", host="h", port=1234)
 
 
 def _pool_with(handler) -> BackendClientPool:

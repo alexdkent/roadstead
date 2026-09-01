@@ -51,15 +51,15 @@ def _make_service(tmp_path) -> ProxyService:
 @pytest.mark.asyncio
 async def test_advice_returns_stats_when_seeded(tmp_path):
     svc = _make_service(tmp_path)
-    _seed_completions(svc._queue_db._conn, "thinker", 1, 40)
+    _seed_completions(svc._queue_db._conn, "tier3", 1, 40)
     svc._bootstrap_timeout_model()
 
     resp = await svc.handle_timeout_advice(
-        _FakeRequest(model="thinker", priority="P1_TURN_SUPPORT", est_in=2000, est_out=256)
+        _FakeRequest(model="tier3", priority="P1_TURN_SUPPORT", est_in=2000, est_out=256)
     )
     assert resp.status_code == 200
     body = json.loads(resp.body.decode())
-    assert body["model"] == "thinker"
+    assert body["model"] == "tier3"
     assert body["priority"] == "P1_TURN_SUPPORT"
     assert body["source"] != "floor"
     assert body["sample_count"] == 40
@@ -72,31 +72,31 @@ async def test_advice_returns_stats_when_seeded(tmp_path):
 @pytest.mark.asyncio
 async def test_advice_normalizes_role_name(tmp_path):
     svc = _make_service(tmp_path)
-    _seed_completions(svc._queue_db._conn, "thinker", 1, 35)
+    _seed_completions(svc._queue_db._conn, "tier3", 1, 35)
     svc._bootstrap_timeout_model()
 
     resp = await svc.handle_timeout_advice(
-        _FakeRequest(model="llama-thinker", priority=1, est_in=2000, est_out=256)
+        _FakeRequest(model="tier3", priority=1, est_in=2000, est_out=256)
     )
     body = json.loads(resp.body.decode())
     assert resp.status_code == 200
-    assert body["model"] == "thinker"
+    assert body["model"] == "tier3"
     assert body["source"] != "floor"
 
 
 @pytest.mark.asyncio
 async def test_advice_cold_model_returns_floor(tmp_path):
     svc = _make_service(tmp_path)
-    # ("gemma-hot" was the original subject here; that endpoint class was
+    # ("tier1" was the original subject here; that endpoint class was
     # decommissioned 2026-06-08, so the cold-floor behaviour is pinned on the
-    # surviving "gemma" class instead.)
+    # surviving "tier1" class instead.)
     resp = await svc.handle_timeout_advice(
-        _FakeRequest(model="gemma", priority="P0_REALTIME", est_in=50, est_out=32)
+        _FakeRequest(model="tier1", priority="P0_REALTIME", est_in=50, est_out=32)
     )
     body = json.loads(resp.body.decode())
     assert resp.status_code == 200
     assert body["source"] == "floor"
-    assert body["recommended_timeout_s"] == 60  # gemma floor (FLOOR_S)
+    assert body["recommended_timeout_s"] == 60  # tier1 floor (FLOOR_S)
 
 
 @pytest.mark.asyncio
@@ -110,12 +110,12 @@ async def test_advice_input_validation(tmp_path):
     assert unknown.status_code == 400
 
     bad_pri = await svc.handle_timeout_advice(
-        _FakeRequest(model="thinker", priority="P9_BOGUS")
+        _FakeRequest(model="tier3", priority="P9_BOGUS")
     )
     assert bad_pri.status_code == 400
 
     bad_int = await svc.handle_timeout_advice(
-        _FakeRequest(model="thinker", priority=1, est_in="abc")
+        _FakeRequest(model="tier3", priority=1, est_in="abc")
     )
     assert bad_int.status_code == 400
 
@@ -127,7 +127,7 @@ async def test_shadow_report_aggregates(tmp_path):
     # 4 rows: 1 would-timeout, applied 300s, recommended 30s.
     for i in range(4):
         svc._queue_db.persist_timeout_shadow(
-            request_id=f"s{i}", endpoint="thinker", priority=1,
+            request_id=f"s{i}", endpoint="tier3", priority=1,
             est_in=2000, est_out=256, actual_out=300,
             actual_total_ms=20000.0, applied_timeout_s=300.0,
             recommended_ms=30000.0, p95_ms=25000.0, median_ms=10000.0,
@@ -141,7 +141,7 @@ async def test_shadow_report_aggregates(tmp_path):
     rows = body["report"]
     assert len(rows) == 1
     row = rows[0]
-    assert row["endpoint"] == "thinker"
+    assert row["endpoint"] == "tier3"
     assert row["samples"] == 4
     assert row["would_timeout"] == 1
     assert row["would_timeout_rate"] == 0.25

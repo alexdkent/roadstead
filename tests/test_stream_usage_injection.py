@@ -78,7 +78,7 @@ def _submit_body(stream_options=None):
     if stream_options is not None:
         payload["stream_options"] = stream_options
     return {
-        "agent_id": "a", "endpoint": "llama-thinker", "priority": "P1_TURN_SUPPORT",
+        "agent_id": "a", "endpoint": "tier3", "priority": "P1_TURN_SUPPORT",
         "call_site": "t", "payload_type": "chat_completion",
         "payload": payload, "timeout_s": 10.0,
     }

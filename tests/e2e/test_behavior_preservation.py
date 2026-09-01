@@ -87,22 +87,22 @@ def _pin_schema_backstop_off(monkeypatch):
 
     The fake backend echoes plain "echo: ..." text, so a grammar/schema case is
     intentionally non-conformant. The production schema-backstop
-    (``COLLECTIVE_PROXY_SCHEMA_BACKSTOP``, ON in the container) would 502 it —
+    (``ROADSTEAD_PROXY_SCHEMA_BACKSTOP``, ON in the container) would 502 it —
     an artifact of the fake backend, not the transform this corpus pins. The
     backstop has its own suite (test_schema_backstop*). The golden baseline was
     captured with the flag OFF (its default), so pin it OFF to keep this file
     hermetic w.r.t. the ambient container env (it reads os.environ live). Fixes
     the container-only 502 in the chat_sync_grammar case after "chat"→classify.
 
-    The always-on structured-validity floor (COLLECTIVE_PROXY_STRUCTURED_VALIDITY,
+    The always-on structured-validity floor (ROADSTEAD_PROXY_STRUCTURED_VALIDITY,
     2026-07-11) is pinned OFF for the same reason: the fake's non-JSON echo on the
     grammar case would 502 under the parse-only floor — an artifact of the fake
     backend, not the transform this corpus pins. The guard has its own suite
     (test_truncation_guard.py). Env is read live per request, so fixture ordering
     vs proxy construction doesn't matter.
     """
-    monkeypatch.setenv("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", "0")
-    monkeypatch.setenv("COLLECTIVE_PROXY_STRUCTURED_VALIDITY", "0")
+    monkeypatch.setenv("ROADSTEAD_PROXY_SCHEMA_BACKSTOP", "0")
+    monkeypatch.setenv("ROADSTEAD_PROXY_STRUCTURED_VALIDITY", "0")
 
 _OPENAI_ENVELOPE_OBJECTS = ("chat.completion", "chat.completion.chunk", "list")
 
@@ -183,10 +183,10 @@ _GRAMMAR_EXTRA = {"extra_body": _CHAT_CASE_D["extra_body"]}
 CASES: List[GoldenCase] = [
     # ---- OpenAI /v1/chat/completions — the byte-identical anchors + faults ----
     GoldenCase("chat_sync_happy", "chat", "sync"),
-    GoldenCase("chat_sync_vllm_happy", "chat", "sync", model="thinker",
+    GoldenCase("chat_sync_vllm_happy", "chat", "sync", model="tier3",
                content="vllm path"),
     GoldenCase("chat_stream_happy", "chat", "stream", content="one two three"),
-    GoldenCase("chat_sync_grammar", "chat", "sync", model="gemma",
+    GoldenCase("chat_sync_grammar", "chat", "sync", model="tier1",
                content="play something mellow for the evening", extra=_GRAMMAR_EXTRA),
     GoldenCase("chat_sync_empty_completion", "chat", "sync",
                fault="empty_completion", fault_max_hits=1),

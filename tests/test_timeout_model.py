@@ -52,8 +52,8 @@ def _seed(model, ep, pri, latency_ms, n, *, est_in=2000, est_out=256, now=1000.0
 
 def test_advise_uses_cell_when_enough_samples():
     m = TimeoutModel(min_samples=5)
-    _seed(m, "thinker", 1, 5000.0, 10)
-    advice = m.advise("thinker", 1, 2000, 256)
+    _seed(m, "tier3", 1, 5000.0, 10)
+    advice = m.advise("tier3", 1, 2000, 256)
     assert advice["source"] == "cell"
     assert advice["sample_count"] == 10
     assert advice["median_ms"] == 5000.0
@@ -65,14 +65,14 @@ def test_advise_falls_back_to_tier_then_floor():
     # 10 samples in each of 4 distinct output buckets, same tier — no
     # single cell/out-bucket reaches 30, but (ep, tier) totals 40.
     for est_out in (64, 256, 1024, 4096):
-        _seed(m, "thinker", 1, 5000.0, 10, est_out=est_out)
-    advice = m.advise("thinker", 1, 2000, 256)
+        _seed(m, "tier3", 1, 5000.0, 10, est_out=est_out)
+    advice = m.advise("tier3", 1, 2000, 256)
     assert advice["source"] == "tier"
     assert advice["sample_count"] == 40
 
     # Same model, unseen tier: the endpoint-level fallback still catches
     # the cross-tier samples (source="endpoint"), not floor.
-    other_tier = m.advise("thinker", 4, 2000, 256)
+    other_tier = m.advise("tier3", 4, 2000, 256)
     assert other_tier["source"] == "endpoint"
 
     # A model with no samples at all → floor only.
@@ -103,28 +103,28 @@ def test_floor_dominates_when_samples_are_fast():
 
 def test_only_ok_samples_counted():
     m = TimeoutModel(min_samples=1)
-    m.record("thinker", 1, 2000, 256, 5000.0, "error", 1000.0)
-    m.record("thinker", 1, 2000, 256, 5000.0, "timeout", 1000.0)
-    m.record("thinker", 1, 2000, 256, 0.0, "ok", 1000.0)  # zero latency skipped
-    assert m.advise("thinker", 1, 2000, 256)["source"] == "floor"
+    m.record("tier3", 1, 2000, 256, 5000.0, "error", 1000.0)
+    m.record("tier3", 1, 2000, 256, 5000.0, "timeout", 1000.0)
+    m.record("tier3", 1, 2000, 256, 0.0, "ok", 1000.0)  # zero latency skipped
+    assert m.advise("tier3", 1, 2000, 256)["source"] == "floor"
 
 
 def test_prune_drops_stale_samples():
     m = TimeoutModel(min_samples=1, window_s=100.0)
-    _seed(m, "thinker", 1, 5000.0, 5, now=1000.0)
-    assert m.advise("thinker", 1, 2000, 256)["source"] == "cell"
+    _seed(m, "tier3", 1, 5000.0, 5, now=1000.0)
+    assert m.advise("tier3", 1, 2000, 256)["source"] == "cell"
     m.prune(now=1000.0 + 101.0)
-    assert m.advise("thinker", 1, 2000, 256)["source"] == "floor"
+    assert m.advise("tier3", 1, 2000, 256)["source"] == "floor"
     assert m.snapshot()["cells"] == 0
 
 
 def test_role_name_normalizes_to_class():
     m = TimeoutModel(min_samples=1)
     # Record under the role name; query by class — same cell.
-    _seed_ep = "llama-thinker"
+    _seed_ep = "tier3"
     for _ in range(5):
         m.record(_seed_ep, 1, 2000, 256, 5000.0, "ok", 1000.0)
-    advice = m.advise("thinker", 1, 2000, 256)
+    advice = m.advise("tier3", 1, 2000, 256)
     assert advice["source"] == "cell"
     assert advice["sample_count"] == 5
 
@@ -210,12 +210,12 @@ def test_size_stretch_only_past_the_reference():
 
 def test_ceiling_tier_bands_and_role_override():
     # interactive tier → interactive band; background tier → background band.
-    assert resolve_ceiling_s("thinker", interactive=True, floor_s=180) == _INTERACTIVE_CEILING_S
-    assert resolve_ceiling_s("thinker", interactive=False, floor_s=180) == _BACKGROUND_CEILING_S
-    # a per-role override wins over the band, on EITHER tier (creative song-
+    assert resolve_ceiling_s("tier3", interactive=True, floor_s=180) == _INTERACTIVE_CEILING_S
+    assert resolve_ceiling_s("tier3", interactive=False, floor_s=180) == _BACKGROUND_CEILING_S
+    # a per-role override wins over the band, on EITHER tier (tier2 song-
     # compose runs at an interactive tier but must keep its generous ceiling).
     assert resolve_ceiling_s(
-        "creative", interactive=True, role_ceilings={"creative": 1800}, floor_s=900,
+        "tier2", interactive=True, role_ceilings={"tier2": 1800}, floor_s=900,
     ) == 1800.0
 
 
@@ -223,7 +223,7 @@ def test_ceiling_never_below_floor():
     # A band tighter than the class floor must be lifted to the floor — a
     # ceiling that strangles below the model's guaranteed deadline would
     # re-introduce the sub-floor-cliff regression.
-    assert resolve_ceiling_s("creative", interactive=True, floor_s=900) == 900.0
+    assert resolve_ceiling_s("tier2", interactive=True, floor_s=900) == 900.0
 
 
 def test_apply_load_and_ceiling_bounds_and_reports_factors():
@@ -245,7 +245,7 @@ def test_apply_load_and_ceiling_bounds_and_reports_factors():
 def test_ceiling_yaml_sync():
     """The per-role ceiling overrides in models.yaml are parsed and non-empty.
 
-    Companion (122B, slow) + creative (long-form author) carry an explicit
+    Companion (122B, slow) + tier2 (long-form author) carry an explicit
     timeout_ceiling_s so the interactive band can't strangle them. This pins
     that the yaml field is wired through build_class_ceilings (mirrors the
     timeout_floor_yaml_sync doctrine)."""

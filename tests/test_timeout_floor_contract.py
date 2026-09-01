@@ -166,7 +166,7 @@ def test_the_per_class_floors_are_deliberately_not_published():
     half of `docs/corpus_and_scrub_plan.md`.
 
     Checks for a table ROW binding a class to a number, not for the class name:
-    §1.4 legitimately names `llama-thinker` and `thinker` while explaining
+    §1.4 legitimately names `tier3` and `tier3` while explaining
     normalization, and a mention is not a disclosure.
     """
     doc = API_DOC.read_text(encoding="utf-8")

@@ -50,59 +50,19 @@ from .config import normalize_endpoint
 # disagrees with the yaml makes the client's sub-floor-honor decision drift from
 # what the server enforces. Keep them equal; test_timeout_floor_yaml_sync pins it.
 FLOOR_S: dict[str, float] = {
-    # (The former "classify" FLOOR_S entry is removed 2026-07-11 — classify/analyst/vision re-homed
-    # onto the boxa `creative` endpoint as ALIASES, so normalize_endpoint() resolves "classify" to
-    # "creative" before this lookup and the "creative" floor below applies. On the dedicated boxa the
-    # cold prefill that motivated the old 180s floor is ~20s at 1807 t/s pp, and vision extract
-    # 15-30s — all well inside the 120s creative floor, with adaptive surge×size widening for big docs.)
-    # companion = the `composer` role, now Qwen3.5-122B (2026-07-03 cutover from
-    # the 80B). Raised 180→360 (commit 35df6545): the 122B is materially slower,
-    # and the old 180s floor was truncating turns + streams under load. Mirrors
-    # models.yaml composer.timeout_floor_s.
-    # HISTORICAL ONLY as of 2026-08-02 — `companion` is no longer an endpoint
-    # class (the 122B backup left the proxy; its class name collided with the
-    # `companion` alias, see models.yaml). normalize_endpoint() now resolves
-    # "companion" to "thinker" in ONE step, so this key is unreachable for new
-    # traffic and the thinker floor below applies. Kept as a tombstone: deleting
-    # it invites someone to re-add `companion` as a class and reintroduce the
-    # collision. Ledger: `endpoint-class-alias-collision`.
-    "companion": 360.0,
-    "thinker": 180.0,
-    # creative (Qwen3.6-35B-A3B abliterated MoE, ~3B active, 6 slots on the Arc Pro boxa). CONSOLIDATED
-    # 2026-07-11: this ONE endpoint now backs THREE roles — `creative`, `companion-lite` (chat loop),
-    # AND the `classify`/`analyst`/vision family (re-homed off anvil) — all pure ALIASES that
-    # normalize to "creative". 120s is a compromise floor across long song-compose, latency-sensitive
-    # chat, and classify text/vision extraction: a stuck turn fails in ~120s instead of 900s while
-    # adaptive surge×size still widens up to the 1800s ceiling for a big song-compose or a big document
-    # vision extract. Mirrors models.yaml creative.timeout_floor_s (bump BOTH in lockstep). (The former
-    # companion-lite AND classify FLOOR_S entries are removed — both resolve via the alias.)
-    "creative": 120.0,
-    # tier2-chat (Qwen3.6-35B-A3B abliterated, 20 slots on jetty's R9700 under
-    # llama.cpp/Vulkan). NEW CLASS 2026-08-19 at the Phase 3 split: `chat`,
-    # `nexus-chat` and `companion-lite` left the `creative` class for this one, so
-    # normalize_endpoint() resolves all three to "tier2-chat" and THIS floor is what
-    # the orchestrator inner loop, the voice lane and Discord chat now get.
-    # Deliberately EQUAL to creative's 120s at the cutover: the split moves aliases,
-    # not callers, and changing the floor in the same commit would confound any
-    # post-cutover latency reading. This lane is purely interactive (long-form
-    # authoring goes to tier3) and decode here is ~1.5x the boxa, so 120 is loose —
-    # right-size it at Phase 5 against the proved workload, together with the yaml.
-    # Mirrors models.yaml tier2-chat.timeout_floor_s (bump BOTH in lockstep).
-    "tier2-chat": 120.0,
-    "gemma": 60.0,
-    # 2026-06-08: the "gemma-hot" endpoint class was removed from DEFAULT_ENDPOINTS
-    # (E2B :9090 decommissioned; gemma-greeter consolidated onto the "gemma"/E4B
-    # backend). The "gemma-hot" legacy-label entry that used to live here was
-    # dropped 2026-07-03: "gemma-hot" is a real catalog alias (of gemma/E4B),
-    # so normalize_endpoint() now resolves it to "gemma" before this dict is
-    # ever consulted, making a separate "gemma-hot" key permanently
-    # unreachable dead code. Tests needing an isolated small-floor target use
-    # "rerank" instead.
-    "rerank": 10.0,
+    # Kept in lockstep with the catalog by test_timeout_model.py::
+    # test_timeout_floor_yaml_sync, which fails if a class here disagrees with
+    # its `timeout_floor_s` or if the two sets of class names diverge.
+    #
+    # A floor is a claim about the SLOWEST reasonable answer, not the fastest:
+    # it exists so a thin sample cannot produce a deadline that kills a call the
+    # model was always going to take that long to finish. Raise one when the
+    # model behind a class gets slower; never lower one to make a graph nicer.
+    "tier3": 180.0,
+    "tier2": 120.0,
+    "tier1": 60.0,
     "embed": 15.0,
-    # ("vision9b": 45.0 dropped 2026-07-03 — the dedicated 8B analyst-vision was
-    # consolidated into `classify`; no role/alias resolves to "vision9b", so the
-    # key was unreachable. Vision now uses the classify floor above.)
+    "rerank": 10.0,
 }
 
 # Fallback floor for an unknown endpoint class.

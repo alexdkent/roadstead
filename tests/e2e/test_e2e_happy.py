@@ -50,10 +50,10 @@ async def test_chat_stream_frames(proxy):
 
 
 async def test_vllm_shape_chat(proxy):
-    # `thinker` is the vLLM class (role llama-thinker) → the proxy applies the
+    # `tier3` is the vLLM class (role tier3) → the proxy applies the
     # vLLM normalization (grammar relocation, enable_thinking) before dispatch;
     # the fake serves it identically. Proves both engine shapes are exercised.
-    resp = await proxy.chat("vllm path", model="thinker")
+    resp = await proxy.chat("vllm path", model="tier3")
     assert resp.status_code == 200
     assert resp.json()["choices"][0]["message"]["content"] == "echo: vllm path"
     assert proxy.total_in_flight() == 0

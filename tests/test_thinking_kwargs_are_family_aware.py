@@ -16,8 +16,8 @@ The live measurements the declarations encode (2026-08-24, through the proxy at
 
     endpoint       model               `thinking`    `enable_thinking`
     tier3          DeepSeek-V4-Flash   ON  (556 ch)  ON  (518 ch)
-    tier2-analyst  Qwen3.8-27B         no-op (0 ch)  ON  (2913 ch)
-    tier2-chat     Qwen3.6-35B         no-op (0 ch)  ON  (2572 ch)
+    tier2  Qwen3.8-27B         no-op (0 ch)  ON  (2913 ch)
+    tier2     Qwen3.6-35B         no-op (0 ch)  ON  (2572 ch)
 """
 import importlib
 import sys
@@ -38,7 +38,7 @@ payload_mod = importlib.import_module("roadstead.providers.payload")
 VLLM, LLAMACPP = providers.VLLM, providers.LLAMACPP
 
 DEEPSEEK = ("thinking", "enable_thinking")   # tier3 (reasoner)
-QWEN = ("enable_thinking",)                  # tier2-analyst / tier2-chat
+QWEN = ("enable_thinking",)                  # tier2 / tier2
 
 
 # ---------------------------------------------------------------------------
@@ -149,12 +149,12 @@ def test_detection_covers_every_known_spelling_not_just_the_declared_one():
 def test_models_yaml_thinking_kwargs_reach_endpoint_config():
     kwargs = model_catalog.build_endpoint_kwargs()
     by_class = {k: v for k, v in kwargs.items()}
-    assert by_class["thinker"]["thinking_kwargs"] == DEEPSEEK, (
+    assert by_class["tier3"]["thinking_kwargs"] == DEEPSEEK, (
         "tier3's declaration did not survive the models.yaml -> EndpointConfig "
         "hop; the proxy would fall back to injecting nothing")
-    for cls in ("creative", "tier2-chat"):
+    for cls in ("tier2", "tier2"):
         assert by_class[cls]["thinking_kwargs"] == QWEN, cls
-    ep = config.EndpointConfig(**by_class["thinker"])
+    ep = config.EndpointConfig(**by_class["tier3"])
     assert ep.thinking_kwargs == DEEPSEEK
 
 
@@ -170,7 +170,7 @@ def test_declared_keys_are_all_names_detection_knows():
 # 4. The opt-in sets the declared key — and its budget is per-request.
 # ---------------------------------------------------------------------------
 
-def _optin_self(thinking_kwargs, engine="vllm", endpoint="thinker"):
+def _optin_self(thinking_kwargs, engine="vllm", endpoint="tier3"):
     state = types.SimpleNamespace()
     ep = types.SimpleNamespace(backend_engine=engine,
                                thinking_kwargs=tuple(thinking_kwargs))
@@ -182,16 +182,16 @@ def _optin_self(thinking_kwargs, engine="vllm", endpoint="thinker"):
     return m
 
 
-def _req(payload, endpoint="thinker"):
+def _req(payload, endpoint="tier3"):
     return types.SimpleNamespace(
         payload=payload, stream=False, payload_type="chat_completion",
         endpoint=endpoint, request_id="r1", call_site="test")
 
 
 def test_optin_sets_the_declared_key_for_the_qwen_family():
-    m = _optin_self(QWEN, engine="llama.cpp", endpoint="creative")
+    m = _optin_self(QWEN, engine="llama.cpp", endpoint="tier2")
     p = {"messages": [], "max_tokens": 800, "thinking": True}
-    m.apply_thinking(_req(p, endpoint="creative"))
+    m.apply_thinking(_req(p, endpoint="tier2"))
     assert p["chat_template_kwargs"] == {"enable_thinking": True}
 
 

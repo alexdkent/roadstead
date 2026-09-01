@@ -1,5 +1,5 @@
 """Stall resilience (2026-06-06): detect a backend that is alive-but-not-
-generating (the thinker contention episode — /health up, generation throughput
+generating (the tier3 contention episode — /health up, generation throughput
 collapsed, requests burning their full timeout on FREE slots) and make it
 VISIBLE, without auto-fast-failing a backend that is only partially degraded.
 """
@@ -38,21 +38,21 @@ def _severity(alerts, name):
 
 def test_endpoint_stalled_fires_on_free_slots_timeout_burst():
     now = time.monotonic()
-    m = _metrics_with_timeouts("thinker", 8, now)  # >= threshold (8)
-    snaps = {"thinker": {"in_flight": 3, "max_slots": 32, "queued": 0, "paused": False}}
+    m = _metrics_with_timeouts("tier3", 8, now)  # >= threshold (8)
+    snaps = {"tier3": {"in_flight": 3, "max_slots": 32, "queued": 0, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
     assert "endpoint_stalled" in _names(alerts)
-    # A non-best-effort backend (thinker) stays ERROR severity.
+    # A non-best-effort backend (tier3) stays ERROR severity.
     assert _severity(alerts, "endpoint_stalled") == "ERROR"
 
 
 def test_no_stall_when_saturated():
     # Slots full + queued ⇒ saturation, not a stall — must NOT fire.
     now = time.monotonic()
-    m = _metrics_with_timeouts("thinker", 8, now)
-    snaps = {"thinker": {"in_flight": 32, "max_slots": 32, "queued": 5, "paused": False}}
+    m = _metrics_with_timeouts("tier3", 8, now)
+    snaps = {"tier3": {"in_flight": 32, "max_slots": 32, "queued": 5, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
@@ -61,8 +61,8 @@ def test_no_stall_when_saturated():
 
 def test_no_stall_below_threshold():
     now = time.monotonic()
-    m = _metrics_with_timeouts("thinker", 5, now)  # < threshold (8)
-    snaps = {"thinker": {"in_flight": 1, "max_slots": 32, "queued": 0, "paused": False}}
+    m = _metrics_with_timeouts("tier3", 5, now)  # < threshold (8)
+    snaps = {"tier3": {"in_flight": 1, "max_slots": 32, "queued": 0, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
@@ -70,13 +70,13 @@ def test_no_stall_below_threshold():
 
 
 def test_no_stall_on_premature_timeout_burst():
-    # Best-effort gemma paths (greeter advisory ~0.9s, sidekick.extract_obs 3.0s) give
-    # up below the gemma 60s floor by design. A burst of those premature
+    # Best-effort tier1 paths (greeter advisory ~0.9s, sidekick.extract_obs 3.0s) give
+    # up below the tier1 60s floor by design. A burst of those premature
     # timeouts with free slots is a CLIENT give-up, not a backend stall — it must
     # NOT manufacture an endpoint_stalled ERROR (the false-alert churn fixed here).
     now = time.monotonic()
-    m = _metrics_with_timeouts("gemma", 8, now, premature=True)
-    snaps = {"gemma": {"in_flight": 0, "max_slots": 2, "queued": 0, "paused": False}}
+    m = _metrics_with_timeouts("tier1", 8, now, premature=True)
+    snaps = {"tier1": {"in_flight": 0, "max_slots": 2, "queued": 0, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
@@ -88,13 +88,13 @@ def test_genuine_timeouts_still_fire_amid_premature_noise():
     # False, best_effort=False) must still surface even when premature give-ups
     # share the window.
     now = time.monotonic()
-    m = _metrics_with_timeouts("gemma", 5, now, premature=True)
+    m = _metrics_with_timeouts("tier1", 5, now, premature=True)
     for _ in range(8):  # genuine, non-premature, non-best-effort (>= threshold)
         m.record(MetricsSample(
-            timestamp=now, endpoint="gemma", agent_id="a", priority="P3_INGESTION",
+            timestamp=now, endpoint="tier1", agent_id="a", priority="P3_INGESTION",
             queue_wait_ms=0.0, backend_latency_ms=0.0, status="timeout",
             slot_seconds=0.0, premature=False, best_effort=False))
-    snaps = {"gemma": {"in_flight": 0, "max_slots": 2, "queued": 0, "paused": False}}
+    snaps = {"tier1": {"in_flight": 0, "max_slots": 2, "queued": 0, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
@@ -102,15 +102,15 @@ def test_genuine_timeouts_still_fire_amid_premature_noise():
 
 
 def test_best_effort_timeouts_excluded_from_stall():
-    # 2026-07-05 gemma stall-burst fix: a burst of best_effort timeouts (a caller
+    # 2026-07-05 tier1 stall-burst fix: a burst of best_effort timeouts (a caller
     # applied a deadline far below the recommended time — greeter advisory ~0.9s,
     # sidekick.extract ~3s) is NOT backend-stall evidence even when non-premature (a
     # proxy-initiated fast-fail on such a path forces premature=False). Well above
     # the fire threshold, it must still NOT manufacture endpoint_stalled — this is
     # the amplifier that latched the real-world bursts.
     now = time.monotonic()
-    m = _metrics_with_timeouts("gemma", 20, now, best_effort=True)
-    snaps = {"gemma": {"in_flight": 0, "max_slots": 2, "queued": 0, "paused": False}}
+    m = _metrics_with_timeouts("tier1", 20, now, best_effort=True)
+    snaps = {"tier1": {"in_flight": 0, "max_slots": 2, "queued": 0, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
@@ -118,12 +118,12 @@ def test_best_effort_timeouts_excluded_from_stall():
 
 
 def test_gemma_stall_is_warning_not_error():
-    # A genuine gemma stall (fair-time timeouts) still fires, but gemma is a
+    # A genuine tier1 stall (fair-time timeouts) still fires, but tier1 is a
     # best-effort router/greeter whose stall degrades gracefully → WARNING, not
     # the ERROR that pages / reads as fleet-degraded.
     now = time.monotonic()
-    m = _metrics_with_timeouts("gemma", 8, now)  # genuine, >= threshold
-    snaps = {"gemma": {"in_flight": 0, "max_slots": 2, "queued": 0, "paused": False}}
+    m = _metrics_with_timeouts("tier1", 8, now)  # genuine, >= threshold
+    snaps = {"tier1": {"in_flight": 0, "max_slots": 2, "queued": 0, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
@@ -154,8 +154,8 @@ def _premature_bg_timeouts(
 
 def test_callsite_timeout_too_tight_fires_on_premature_background_burst():
     now = time.monotonic()
-    m = _premature_bg_timeouts("companion", "orchestrator.summarize", 6, now)
-    snaps = {"companion": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
+    m = _premature_bg_timeouts("tier3", "orchestrator.summarize", 6, now)
+    snaps = {"tier3": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
@@ -169,8 +169,8 @@ def test_callsite_timeout_too_tight_fires_on_premature_background_burst():
 def test_callsite_too_tight_below_threshold_silent():
     # 5 premature background timeouts (< 6) — not yet a storm.
     now = time.monotonic()
-    m = _premature_bg_timeouts("companion", "orchestrator.summarize", 5, now)
-    snaps = {"companion": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
+    m = _premature_bg_timeouts("tier3", "orchestrator.summarize", 5, now)
+    snaps = {"tier3": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
@@ -183,8 +183,8 @@ def test_callsite_too_tight_ignores_interactive_band():
     # must NOT fire, even well above the count threshold.
     now = time.monotonic()
     m = _premature_bg_timeouts(
-        "gemma", "orchestrator.route", 12, now, priority="P1_TURN_SUPPORT")
-    snaps = {"gemma": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
+        "tier1", "orchestrator.route", 12, now, priority="P1_TURN_SUPPORT")
+    snaps = {"tier1": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
@@ -199,11 +199,11 @@ def test_callsite_too_tight_ignores_genuine_background_timeouts():
     m = RollingMetrics(window_s=300.0)
     for _ in range(10):
         m.record(MetricsSample(
-            timestamp=now, endpoint="thinker", agent_id="a", priority="P3_INGESTION",
+            timestamp=now, endpoint="tier3", agent_id="a", priority="P3_INGESTION",
             queue_wait_ms=0.0, backend_latency_ms=0.0, status="timeout",
             slot_seconds=0.0, premature=False, best_effort=False,
             call_site="knowledge_store.judge"))
-    snaps = {"thinker": {"in_flight": 0, "max_slots": 8, "queued": 0, "paused": False}}
+    snaps = {"tier3": {"in_flight": 0, "max_slots": 8, "queued": 0, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
@@ -214,14 +214,14 @@ def test_callsite_too_tight_groups_by_call_site():
     # Two call_sites, each below threshold on its own (4 + 4), must NOT be pooled
     # into one firing — the alarm names ONE offending site, so it groups per site.
     now = time.monotonic()
-    m = _premature_bg_timeouts("companion", "orchestrator.summarize", 4, now)
+    m = _premature_bg_timeouts("tier3", "orchestrator.summarize", 4, now)
     for _ in range(4):
         m.record(MetricsSample(
-            timestamp=now, endpoint="companion", agent_id="a", priority="P4_HYGIENE",
+            timestamp=now, endpoint="tier3", agent_id="a", priority="P4_HYGIENE",
             queue_wait_ms=0.0, backend_latency_ms=0.0, status="timeout",
             slot_seconds=0.0, premature=True, best_effort=False,
             call_site="orchestrator.consolidate"))
-    snaps = {"companion": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
+    snaps = {"tier3": {"in_flight": 0, "max_slots": 4, "queued": 0, "paused": False}}
     alerts = check_alerts(
         endpoint_snapshots=snaps, agent_budgets=[], metrics=m,
         cost_model_samples={}, queue_wal_size=0, now=now)
@@ -268,7 +268,7 @@ async def test_streaming_dispatch_without_consumer_records_completion():
     await svc.startup()
     try:
         req = QueuedRequest.create(
-            agent_id="a", endpoint="thinker", priority="P3_INGESTION",
+            agent_id="a", endpoint="tier3", priority="P3_INGESTION",
             call_site="t", payload_type="chat_completion",
             payload={"messages": [{"role": "user", "content": "x"}],
                      "stream": True},
@@ -280,13 +280,13 @@ async def test_streaming_dispatch_without_consumer_records_completion():
         svc._dispatch_event.set()
 
         for _ in range(200):
-            snap = svc._scheduler.endpoint_snapshot("thinker")
+            snap = svc._scheduler.endpoint_snapshot("tier3")
             if snap["queued"] == 0 and snap["in_flight"] == 0 \
                     and svc._scheduler.stats()["total_completed"] >= 1:
                 break
             await asyncio.sleep(0.01)
 
-        snap = svc._scheduler.endpoint_snapshot("thinker")
+        snap = svc._scheduler.endpoint_snapshot("tier3")
         assert snap["in_flight"] == 0, "slot leaked for the consumer-less stream"
         assert snap["queued"] == 0
         assert svc._scheduler.stats()["total_completed"] == 1

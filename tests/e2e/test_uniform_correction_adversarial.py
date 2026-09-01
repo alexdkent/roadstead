@@ -39,7 +39,7 @@ from roadstead.testing import (
 )
 from roadstead.correction import Correction
 
-FLAG = "COLLECTIVE_PROXY_UNIFORM_CORRECTION"
+FLAG = "ROADSTEAD_PROXY_UNIFORM_CORRECTION"
 
 
 @pytest.fixture(autouse=True)
@@ -52,14 +52,14 @@ def _pin_schema_backstop_off(monkeypatch):
     env. Fixes the container-only 502 in test_sync_door_shadow_egress_wired_
     through_apply after the "chat"→classify (grammar-capable) cutover.
 
-    The always-on structured-validity floor (COLLECTIVE_PROXY_STRUCTURED_VALIDITY,
+    The always-on structured-validity floor (ROADSTEAD_PROXY_STRUCTURED_VALIDITY,
     2026-07-11) is pinned OFF for the same reason: the fake's non-JSON echo on the
     grammar cases (sync 200 assertion + the grammar-stream 'done' flow) would trip
     the parse-only floor — an artifact of the fake, not the uniform-correction
     seams this file tests. The floor has its own suite (test_truncation_guard.py).
     """
-    monkeypatch.setenv("COLLECTIVE_PROXY_SCHEMA_BACKSTOP", "0")
-    monkeypatch.setenv("COLLECTIVE_PROXY_STRUCTURED_VALIDITY", "0")
+    monkeypatch.setenv("ROADSTEAD_PROXY_SCHEMA_BACKSTOP", "0")
+    monkeypatch.setenv("ROADSTEAD_PROXY_STRUCTURED_VALIDITY", "0")
 
 
 # --------------------------------------------------------------------------- #
@@ -238,7 +238,7 @@ async def test_grammar_stream_is_shadow_checked(proxy, monkeypatch):
     reassembled content (requires the shadow-egress kill-switch on) — proving the
     streaming path is no longer a shadow-egress blind spot."""
     monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv("COLLECTIVE_PROXY_SHADOW_EGRESS", "1")
+    monkeypatch.setenv("ROADSTEAD_PROXY_SHADOW_EGRESS", "1")
     st = proxy.svc._correction.state
     st.shadow_drop.clear()
     grammar = (
@@ -263,7 +263,7 @@ async def test_sync_door_shadow_egress_wired_through_apply(proxy, monkeypatch):
     grammar + a non-conformant backend reply tallies a silent drop — i.e. apply
     actually wires the real detector into the sync door. Fails if the step is
     dropped from apply."""
-    monkeypatch.setenv("COLLECTIVE_PROXY_SHADOW_EGRESS", "1")
+    monkeypatch.setenv("ROADSTEAD_PROXY_SHADOW_EGRESS", "1")
     grammar = (
         'root ::= "{" ws "\\"x\\":" ws str ws "}"\n'
         'str ::= "\\"" [^"]* "\\""\n'

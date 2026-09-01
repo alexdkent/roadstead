@@ -112,7 +112,7 @@ stripping on whitespace-banned backends.
 > are shadow-first gates flipped on in production: `runtime_flags.json` carries
 > `context_gate_enforce`, `inject_stream_usage`, `smart_default_timeout`,
 > `unknown_endpoint_enforce` all true, and container env carries
-> `COLLECTIVE_PROXY_{UNIFORM_CORRECTION,SCHEMA_BACKSTOP,ENDPOINT_COOLDOWN}=1`. The one genuinely
+> `ROADSTEAD_PROXY_{UNIFORM_CORRECTION,SCHEMA_BACKSTOP,ENDPOINT_COOLDOWN}=1`. The one genuinely
 > inert gate is `vision_capability_enforce`.
 
 ---

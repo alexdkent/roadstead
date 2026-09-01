@@ -25,7 +25,7 @@ C = correction.Correction
 LIFECYCLE_SRC = Path(importlib.import_module("roadstead.lifecycle").__file__)
 
 
-def _req(payload, *, stream=False, ptype="chat_completion", endpoint="thinker",
+def _req(payload, *, stream=False, ptype="chat_completion", endpoint="tier3",
          rid="r1", call_site="test"):
     r = types.SimpleNamespace()
     r.payload = payload; r.stream = stream; r.payload_type = ptype
@@ -42,7 +42,7 @@ def _mock_self(engine="vllm", thinking_kwargs=("thinking", "enable_thinking")):
     state = types.SimpleNamespace()
     ep = types.SimpleNamespace(backend_engine=engine,
                                thinking_kwargs=tuple(thinking_kwargs))
-    state.config = types.SimpleNamespace(endpoints={"thinker": ep})
+    state.config = types.SimpleNamespace(endpoints={"tier3": ep})
     state.thinking_active = {}
     state.thinking_requests = state.thinking_clean = state.thinking_recovered = 0
     state.thinking_truncated = state.thinking_fallback = state.thinking_noop = 0
@@ -91,7 +91,7 @@ def test_apply_thinking_noop_when_the_model_declares_no_switch():
     the production bail really was `if engine != "vllm": return`. That was
     wrong, not merely conservative — both llama.cpp chat endpoints separate
     reasoning into their own response field perfectly well (measured live:
-    tier2-analyst 2,913 chars, tier2-chat 2,572 chars, `content` clean in
+    tier2 2,913 chars, tier2 2,572 chars, `content` clean in
     both), so `thinking: true` was a SILENT no-op on backends that support it.
     What the proxy actually cannot do is guess the switch's NAME, so that is
     what it now refuses on."""
@@ -254,14 +254,14 @@ def test_finalize_noop_not_counted_without_optin():
 
 
 def test_budget_env_override():
-    os.environ["COLLECTIVE_PROXY_THINKING_BUDGET"] = "12000"
+    os.environ["ROADSTEAD_PROXY_THINKING_BUDGET"] = "12000"
     assert config.thinking_reasoning_budget() == 12000
-    os.environ["COLLECTIVE_PROXY_THINKING"] = "0"
+    os.environ["ROADSTEAD_PROXY_THINKING"] = "0"
     assert config.thinking_enabled() is False
-    os.environ.pop("COLLECTIVE_PROXY_THINKING_BUDGET"); os.environ.pop("COLLECTIVE_PROXY_THINKING")
+    os.environ.pop("ROADSTEAD_PROXY_THINKING_BUDGET"); os.environ.pop("ROADSTEAD_PROXY_THINKING")
 
 
-def _mock_self_forced(reasoning=True, endpoint="creative"):
+def _mock_self_forced(reasoning=True, endpoint="tier2"):
     """Mock `self` for apply_forced_reasoning_budget: one endpoint carrying a
     capabilities dict."""
     state = types.SimpleNamespace()
@@ -277,7 +277,7 @@ def test_forced_reasoning_budget_bumps_small_cap():
     """A forced-reasoning endpoint gets reasoning headroom added to max_tokens so a
     small caller cap (crew turn ~240) can't be eaten by the un-disable-able CoT."""
     m = _mock_self_forced(reasoning=True)
-    req = _req({"max_tokens": 240, "messages": []}, endpoint="creative")
+    req = _req({"max_tokens": 240, "messages": []}, endpoint="tier2")
     m.apply_forced_reasoning_budget(req)
     assert req.payload["max_tokens"] == 240 + config.forced_reasoning_budget()
 
@@ -285,7 +285,7 @@ def test_forced_reasoning_budget_bumps_small_cap():
 def test_forced_reasoning_budget_noop_when_not_reasoning():
     """An endpoint that does NOT force reasoning is left untouched."""
     m = _mock_self_forced(reasoning=False)
-    req = _req({"max_tokens": 240, "messages": []}, endpoint="creative")
+    req = _req({"max_tokens": 240, "messages": []}, endpoint="tier2")
     m.apply_forced_reasoning_budget(req)
     assert req.payload["max_tokens"] == 240
 
@@ -293,7 +293,7 @@ def test_forced_reasoning_budget_noop_when_not_reasoning():
 def test_forced_reasoning_budget_noop_without_cap():
     """No positive max_tokens → nothing to protect (model self-limits)."""
     m = _mock_self_forced(reasoning=True)
-    req = _req({"messages": []}, endpoint="creative")
+    req = _req({"messages": []}, endpoint="tier2")
     m.apply_forced_reasoning_budget(req)
     assert "max_tokens" not in req.payload
 
@@ -305,25 +305,25 @@ def test_forced_reasoning_budget_applies_even_to_tiny_cap():
     failure. Padding makes the warm-up succeed."""
     m = _mock_self_forced(reasoning=True)
     req = _req({"max_tokens": 1, "messages": [{"role": "user", "content": "ok"}]},
-               endpoint="creative")
+               endpoint="tier2")
     m.apply_forced_reasoning_budget(req)
     assert req.payload["max_tokens"] == 1 + config.forced_reasoning_budget()
     # streaming path is covered too (method is stream-agnostic)
-    req2 = _req({"max_tokens": 300, "messages": []}, endpoint="creative", stream=True)
+    req2 = _req({"max_tokens": 300, "messages": []}, endpoint="tier2", stream=True)
     m.apply_forced_reasoning_budget(req2)
     assert req2.payload["max_tokens"] == 300 + config.forced_reasoning_budget()
 
 
 def test_forced_reasoning_budget_env_override():
-    os.environ["COLLECTIVE_PROXY_FORCED_REASONING_BUDGET"] = "700"
+    os.environ["ROADSTEAD_PROXY_FORCED_REASONING_BUDGET"] = "700"
     try:
         assert config.forced_reasoning_budget() == 700
         m = _mock_self_forced(reasoning=True)
-        req = _req({"max_tokens": 100, "messages": []}, endpoint="creative")
+        req = _req({"max_tokens": 100, "messages": []}, endpoint="tier2")
         m.apply_forced_reasoning_budget(req)
         assert req.payload["max_tokens"] == 800
     finally:
-        os.environ.pop("COLLECTIVE_PROXY_FORCED_REASONING_BUDGET")
+        os.environ.pop("ROADSTEAD_PROXY_FORCED_REASONING_BUDGET")
 
 
 if __name__ == "__main__":

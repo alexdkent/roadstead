@@ -25,7 +25,7 @@ from roadstead.coalesce import DeterministicCache
 def test_vllm_moves_grammar_to_structured_outputs():
     # vLLM ignores top-level `grammar`; it must land in structured_outputs.
     payload = {
-        "model": "llama-thinker",
+        "model": "tier3",
         "messages": [{"role": "user", "content": "extract"}],
         "extra_body": {"grammar": "root ::= object"},
     }
@@ -37,7 +37,7 @@ def test_vllm_moves_grammar_to_structured_outputs():
 def test_llamacpp_keeps_top_level_grammar():
     # Default (llama.cpp) backend: grammar stays top-level, no structured_outputs.
     payload = {
-        "model": "llama-thinker",
+        "model": "tier3",
         "messages": [{"role": "user", "content": "extract"}],
         "extra_body": {"grammar": "root ::= object"},
     }
@@ -48,7 +48,7 @@ def test_llamacpp_keeps_top_level_grammar():
 
 def test_normalize_inlines_system_into_messages():
     payload = {
-        "model": "llama-thinker",
+        "model": "tier3",
         "system": "You extract entities. Output JSON only.",
         "messages": [{"role": "user", "content": "Alex met Barbara."}],
     }
@@ -63,7 +63,7 @@ def test_normalize_inlines_system_into_messages():
 
 def test_normalize_lifts_grammar_from_extra_body():
     payload = {
-        "model": "llama-thinker",
+        "model": "tier3",
         "messages": [{"role": "user", "content": "x"}],
         "extra_body": {"grammar": "root ::= object"},
     }
@@ -89,7 +89,7 @@ def test_normalize_noop_for_clean_payload():
     """A payload that's already wire-correct passes through untouched —
     this is the guard that makes the fix safe for working call sites."""
     payload = {
-        "model": "llama-thinker",
+        "model": "tier3",
         "messages": [
             {"role": "system", "content": "already here"},
             {"role": "user", "content": "x"},
@@ -118,7 +118,7 @@ def test_normalize_does_not_mutate_input():
 
 def test_coalesce_merges_adjacent_system_messages_llamacpp():
     payload = {
-        "model": "qwen-composer",
+        "model": "tier3",
         "messages": [
             {"role": "system", "content": "Crew roster + craft."},
             {"role": "system", "content": "You are Nils."},
@@ -132,21 +132,21 @@ def test_coalesce_merges_adjacent_system_messages_llamacpp():
 
 def test_coalesce_left_untouched_on_vllm():
     payload = {
-        "model": "llama-thinker",
+        "model": "tier3",
         "messages": [
             {"role": "system", "content": "A."},
             {"role": "system", "content": "B."},
             {"role": "user", "content": "x"},
         ],
     }
-    out = VLLM.prepare_chat_payload(payload, model_id="llama-thinker")
-    # vLLM (thinker) tolerates multiple system messages — leave them intact.
+    out = VLLM.prepare_chat_payload(payload, model_id="tier3")
+    # vLLM (tier3) tolerates multiple system messages — leave them intact.
     assert [m["role"] for m in out["messages"]] == ["system", "system", "user"]
 
 
 def test_coalesce_noop_for_single_system():
     payload = {
-        "model": "qwen-composer",
+        "model": "tier3",
         "messages": [
             {"role": "system", "content": "one"},
             {"role": "user", "content": "x"},
@@ -160,7 +160,7 @@ def test_coalesce_of_inlined_top_level_system():
     # Top-level `system` inlined in front of a messages list that already opens
     # with a system message must collapse to one (both transforms compose).
     payload = {
-        "model": "qwen-composer",
+        "model": "tier3",
         "system": "leading",
         "messages": [
             {"role": "system", "content": "persona"},
@@ -175,7 +175,7 @@ def test_coalesce_of_inlined_top_level_system():
 
 def test_coalesce_does_not_mutate_input():
     payload = {
-        "model": "qwen-composer",
+        "model": "tier3",
         "messages": [
             {"role": "system", "content": "A."},
             {"role": "system", "content": "B."},
@@ -304,7 +304,7 @@ def test_normalize_consecutive_user_via_full_payload_llamacpp():
     # End-to-end through _normalize_chat_payload (llama.cpp path): consecutive
     # user turns are coalesced so a Mistral/Ministral template doesn't 500.
     payload = {
-        "model": "llama-thinker",
+        "model": "tier3",
         "messages": [
             {"role": "user", "content": "one"},
             {"role": "user", "content": "two"},
@@ -316,7 +316,7 @@ def test_normalize_consecutive_user_via_full_payload_llamacpp():
 
 
 # --- vLLM thinking default: the switch the TARGET MODEL reads, set to off ---
-# 🚨 REWRITTEN 2026-08-24. The header here used to say the thinker was Qwen3.6,
+# 🚨 REWRITTEN 2026-08-24. The header here used to say the tier3 was Qwen3.6,
 # that it emitted chain-of-thought as prose with no <think> tags, and that no
 # reasoning parser was configured. All three were stale: tier3 has been
 # DeepSeek-V4-Flash-0731 since 2026-08-23, served with `--reasoning-parser
@@ -332,7 +332,7 @@ def test_normalize_consecutive_user_via_full_payload_llamacpp():
 # tests/llmproxy/test_thinking_kwargs_are_family_aware.py.
 
 def test_vllm_defaults_the_declared_switch_to_false():
-    payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
+    payload = {"model": "tier3", "messages": [{"role": "user", "content": "x"}]}
     out = VLLM.prepare_chat_payload(payload,
                                   thinking_kwargs=("thinking", "enable_thinking"))
     assert out["chat_template_kwargs"]["thinking"] is False
@@ -342,14 +342,14 @@ def test_vllm_defaults_the_declared_switch_to_false():
 def test_vllm_injects_nothing_when_the_model_declares_no_switch():
     """No declaration → no guess. An unmeasured template must not have a key
     driven at it on the strength of what the LAST model happened to read."""
-    payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
+    payload = {"model": "tier3", "messages": [{"role": "user", "content": "x"}]}
     out = VLLM.prepare_chat_payload(payload)
     assert "chat_template_kwargs" not in out
 
 
 def test_llamacpp_does_not_touch_thinking():
     # vLLM-only: a clean llama.cpp payload passes through untouched.
-    payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
+    payload = {"model": "tier3", "messages": [{"role": "user", "content": "x"}]}
     out = LLAMACPP.prepare_chat_payload(payload)
     assert "chat_template_kwargs" not in out
     assert out == payload
@@ -357,7 +357,7 @@ def test_llamacpp_does_not_touch_thinking():
 
 def test_vllm_preserves_caller_enable_thinking_top_level():
     payload = {
-        "model": "llama-thinker",
+        "model": "tier3",
         "messages": [{"role": "user", "content": "x"}],
         "chat_template_kwargs": {"enable_thinking": True},
     }
@@ -371,7 +371,7 @@ def test_vllm_preserves_caller_enable_thinking_top_level():
 
 def test_vllm_preserves_caller_enable_thinking_in_extra_body():
     payload = {
-        "model": "llama-thinker",
+        "model": "tier3",
         "messages": [{"role": "user", "content": "x"}],
         "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
     }
@@ -381,7 +381,7 @@ def test_vllm_preserves_caller_enable_thinking_in_extra_body():
 
 
 def test_vllm_thinking_default_does_not_mutate_input():
-    payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
+    payload = {"model": "tier3", "messages": [{"role": "user", "content": "x"}]}
     VLLM.prepare_chat_payload(payload)
     assert "chat_template_kwargs" not in payload  # input untouched (corpus capture)
 
@@ -405,7 +405,7 @@ _ANTHROPIC_IMG_MSG = {
 
 def test_normalize_translates_anthropic_image_block():
     payload = {
-        "model": "qwen-analyst",
+        "model": "tier2",
         "system": "You are an image-vision assistant.",
         "messages": [_ANTHROPIC_IMG_MSG],
     }
@@ -425,7 +425,7 @@ def test_normalize_translates_image_without_system():
     # No system/grammar/extra_body — the presence of an image block alone
     # must defeat the early-return guard so the translation still runs.
     payload = {
-        "model": "qwen-analyst",
+        "model": "tier2",
         "messages": [_ANTHROPIC_IMG_MSG],
     }
     out = LLAMACPP.prepare_chat_payload(payload)
@@ -437,7 +437,7 @@ def test_normalize_translates_image_without_system():
 
 
 def test_normalize_vision_does_not_mutate_input():
-    payload = {"model": "qwen-analyst", "messages": [_ANTHROPIC_IMG_MSG]}
+    payload = {"model": "tier2", "messages": [_ANTHROPIC_IMG_MSG]}
     LLAMACPP.prepare_chat_payload(payload)
     # original Anthropic block untouched (corpus capture stores req.payload)
     assert payload["messages"][0]["content"][0]["type"] == "image"
@@ -448,7 +448,7 @@ def test_normalize_passthrough_existing_image_url():
     # A payload already in OAI image_url shape carries no Anthropic image
     # block, so it stays wire-correct and passes through untouched.
     payload = {
-        "model": "qwen-analyst",
+        "model": "tier2",
         "messages": [{
             "role": "user",
             "content": [
@@ -482,11 +482,11 @@ def test_translate_helper_handles_url_source():
 def test_cache_key_differs_when_system_differs():
     cache = DeterministicCache()
     base_msgs = [{"role": "user", "content": "extract from this"}]
-    k1 = cache.cache_key("thinker", {
+    k1 = cache.cache_key("tier3", {
         "temperature": 0, "messages": base_msgs,
         "system": "schema A", "max_tokens": 256,
     })
-    k2 = cache.cache_key("thinker", {
+    k2 = cache.cache_key("tier3", {
         "temperature": 0, "messages": base_msgs,
         "system": "schema B", "max_tokens": 256,
     })
@@ -502,7 +502,7 @@ def test_cache_key_same_when_system_same():
         "system": "same",
         "max_tokens": 256,
     }
-    assert cache.cache_key("thinker", payload) == cache.cache_key("thinker", payload)
+    assert cache.cache_key("tier3", payload) == cache.cache_key("tier3", payload)
 
 
 # --- test harness A/B applies normalization ---

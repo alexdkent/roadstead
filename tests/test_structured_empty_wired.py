@@ -39,7 +39,7 @@ def _submit(content, response_format):
     if response_format is not None:
         payload["response_format"] = response_format
     return {
-        "agent_id": "sidekick", "endpoint": "llama-thinker",
+        "agent_id": "sidekick", "endpoint": "tier3",
         "priority": "P3_INGESTION", "call_site": "auto_approve.critic",
         "payload_type": "chat_completion", "payload": payload,
         "timeout_s": 10.0,
@@ -101,7 +101,7 @@ async def test_a_real_healthy_response_is_not_detected_end_to_end():
         assert svc._state.structured_empty_total == 0
         # …but it IS counted as a healthy denominator sample, which is what
         # makes the rate a rate.
-        assert svc._state.structured_empty_window["thinker"]
+        assert svc._state.structured_empty_window["tier3"]
     finally:
         await svc.shutdown()
 
@@ -116,7 +116,7 @@ async def test_the_counters_surface_on_v1_status():
         rel = status["reliability"]
         assert rel["structured_empty_total"] == 1
         assert rel["structured_empty_by_call_site"]["auto_approve.critic"] == 1
-        assert rel["structured_empty_rate"]["thinker"]["empty"] == 1
+        assert rel["structured_empty_rate"]["tier3"]["empty"] == 1
     finally:
         await svc.shutdown()
 
@@ -147,9 +147,9 @@ async def test_the_rate_gauge_is_published_once_the_floor_is_met():
                 _submit("{}", {"type": "json_object"}), _LoopbackRequest())
         text = (await svc.handle_prometheus_metrics(_LoopbackRequest())).body.decode()
         # render_prometheus normalizes 1.0 -> "1", so match the label+prefix.
-        assert 'llmproxy_structured_empty_rate{endpoint="thinker"} 1' in text
-        assert 'llmproxy_structured_samples_30m{endpoint="thinker"} 20' in text
+        assert 'llmproxy_structured_empty_rate{endpoint="tier3"} 1' in text
+        assert 'llmproxy_structured_samples_30m{endpoint="tier3"} 20' in text
         # …and only for the endpoint that has traffic.
-        assert 'llmproxy_structured_empty_rate{endpoint="gemma"}' not in text
+        assert 'llmproxy_structured_empty_rate{endpoint="tier1"}' not in text
     finally:
         await svc.shutdown()

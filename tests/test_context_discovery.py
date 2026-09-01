@@ -16,7 +16,7 @@ from roadstead.health import Health
 
 
 def _ep(max_slots: int = 4) -> EndpointConfig:
-    return EndpointConfig(endpoint_class="classify", role="qwen-classify", max_slots=max_slots)
+    return EndpointConfig(endpoint_class="classify", role="tier1", max_slots=max_slots)
 
 
 def test_llama_cpp_per_slot_n_ctx_not_redivided():

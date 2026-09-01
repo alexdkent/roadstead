@@ -111,7 +111,7 @@ def seeded(tmp_path):
         # vacuous without it, since that is the only term separating the two.
         pq.persist_complete(
             f"r{i}", "sidekick" if i % 2 else "forum-agent",
-            "thinker" if i % 3 else "creative", "site", 3,
+            "tier3" if i % 3 else "tier2", "site", 3,
             100 + i, 20 + i, 0.5 + i * 0.1, 25.0 + 10.0 * i,
             "ok" if i != 4 else "error", kind="chat")
     pq.flush(timeout=5.0)
@@ -219,7 +219,7 @@ def test_the_em_dash_sentinel_is_unreachable_by_construction(tmp_path):
                 "INSERT INTO proxy_completions "
                 "(request_id, agent_id, endpoint, call_site, priority, status, "
                 " completed_at) VALUES (?,?,?,?,?,?,?)",
-                ("x", None, "thinker", "site", 3, "ok", time.time()))
+                ("x", None, "tier3", "site", 3, "ok", time.time()))
     finally:
         pq.close()
 

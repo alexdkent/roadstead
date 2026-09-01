@@ -102,7 +102,7 @@ def _svc_with_call(call):
 
 def _mk_req(*, timeout_s=60.0, payload=None):
     return QueuedRequest.create(
-        agent_id="a", endpoint="llama-thinker", priority="P3_INGESTION",
+        agent_id="a", endpoint="tier3", priority="P3_INGESTION",
         call_site="t", payload_type="chat_completion",
         payload=payload if payload is not None else {"messages": [{"role": "user", "content": "x"}]},
         timeout_s=timeout_s,
@@ -131,7 +131,7 @@ async def test_backend_call_bounded_to_remaining_deadline():
     req.timeout_deadline = time.monotonic() + 3.0  # only 3s of the 100s budget remains
     _register_future(svc, req)
     decision = DispatchDecision(request=req, queue_wait_ms=0.0, occupancy_at_dispatch=0)
-    await svc._execute_sync(req, svc._config.endpoints["thinker"], decision)
+    await svc._execute_sync(req, svc._config.endpoints["tier3"], decision)
     # bounded to the remaining deadline (~3s), NOT a fresh 100s
     assert 2.0 < captured["timeout_s"] <= 3.0, captured
 
@@ -145,14 +145,14 @@ async def test_transient_unavailable_retried_then_ok():
     async def fake_call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise BackendUnavailable("backend thinker unreachable")
+            raise BackendUnavailable("backend tier3 unreachable")
         return BackendResponse(200, _COMPLETION, 0.01, 5, 2, finish_reason="stop")
 
     svc = _svc_with_call(fake_call)
     req = _mk_req(timeout_s=60.0)
     fut = _register_future(svc, req)
     decision = DispatchDecision(request=req, queue_wait_ms=0.0, occupancy_at_dispatch=0)
-    await svc._execute_sync(req, svc._config.endpoints["thinker"], decision)
+    await svc._execute_sync(req, svc._config.endpoints["tier3"], decision)
     assert calls["n"] == 2          # retried once
     assert fut.result()["status"] == "ok"
 
@@ -164,14 +164,14 @@ async def test_empty_completion_retried():
     async def fake_call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise BackendError(502, "backend thinker returned empty completion (no content)")
+            raise BackendError(502, "backend tier3 returned empty completion (no content)")
         return BackendResponse(200, _COMPLETION, 0.01, 5, 2, finish_reason="stop")
 
     svc = _svc_with_call(fake_call)
     req = _mk_req(timeout_s=60.0)
     fut = _register_future(svc, req)
     decision = DispatchDecision(request=req, queue_wait_ms=0.0, occupancy_at_dispatch=0)
-    await svc._execute_sync(req, svc._config.endpoints["thinker"], decision)
+    await svc._execute_sync(req, svc._config.endpoints["tier3"], decision)
     assert calls["n"] == 2
     assert fut.result()["status"] == "ok"
 
@@ -188,7 +188,7 @@ async def test_4xx_not_retried():
     req = _mk_req(timeout_s=60.0)
     fut = _register_future(svc, req)
     decision = DispatchDecision(request=req, queue_wait_ms=0.0, occupancy_at_dispatch=0)
-    await svc._execute_sync(req, svc._config.endpoints["thinker"], decision)
+    await svc._execute_sync(req, svc._config.endpoints["tier3"], decision)
     assert calls["n"] == 1          # deterministic 4xx → no retry
     assert fut.result()["status"] == "error"
 
@@ -208,7 +208,7 @@ async def test_structured_truncation_fails_loud():
                            "response_format": {"type": "json_object"}})
     fut = _register_future(svc, req)
     decision = DispatchDecision(request=req, queue_wait_ms=0.0, occupancy_at_dispatch=0)
-    await svc._execute_sync(req, svc._config.endpoints["thinker"], decision)
+    await svc._execute_sync(req, svc._config.endpoints["tier3"], decision)
     r = fut.result()
     assert r["status"] == "error"
     assert "truncated structured output" in r["error"]
@@ -226,7 +226,7 @@ async def test_freeform_truncation_returned_ok():
     req = _mk_req(payload={"messages": [{"role": "user", "content": "x"}]})  # free-form
     fut = _register_future(svc, req)
     decision = DispatchDecision(request=req, queue_wait_ms=0.0, occupancy_at_dispatch=0)
-    await svc._execute_sync(req, svc._config.endpoints["thinker"], decision)
+    await svc._execute_sync(req, svc._config.endpoints["tier3"], decision)
     r = fut.result()
     assert r["status"] == "ok"      # free-form truncation is benign — return it
     assert r["response"]["choices"][0]["message"]["content"] == "a long capped reply"
@@ -255,10 +255,10 @@ async def _started_svc():
 async def test_circuit_open_fast_fails_interactive():
     svc = await _started_svc()
     try:
-        svc._endpoint_health["thinker"] = {
+        svc._endpoint_health["tier3"] = {
             "healthy": False, "consecutive_failures": 5, "unhealthy_since": time.monotonic()}
         body = {
-            "agent_id": "a", "endpoint": "llama-thinker", "priority": "P0_REALTIME",
+            "agent_id": "a", "endpoint": "tier3", "priority": "P0_REALTIME",
             "call_site": "t", "payload_type": "chat_completion",
             "payload": {"messages": [{"role": "user", "content": "x"}]}, "timeout_s": 10.0,
         }
@@ -280,10 +280,10 @@ async def test_circuit_open_defers_background_to_timeout():
         async def _health_down(*a, **k):
             return False
         svc._backend.probe_health = _health_down
-        svc._endpoint_health["thinker"] = {
+        svc._endpoint_health["tier3"] = {
             "healthy": False, "consecutive_failures": 5, "unhealthy_since": time.monotonic()}
         body = {
-            "agent_id": "a", "endpoint": "llama-thinker", "priority": "P3_INGESTION",
+            "agent_id": "a", "endpoint": "tier3", "priority": "P3_INGESTION",
             "call_site": "t", "payload_type": "chat_completion",
             "payload": {"messages": [{"role": "user", "content": "x"}]}, "timeout_s": 0.3,
         }

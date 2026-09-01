@@ -2,7 +2,7 @@
 
 A streaming call that is actively emitting tokens is not hung, and must not be
 killed by a wall clock. Live evidence that it was: agent_id=lan-generic,
-endpoint=thinker, layer=stream, P3_INGESTION — three consecutive kills at
+endpoint=tier3, layer=stream, P3_INGESTION — three consecutive kills at
 elapsed_s=539.999 against applied_timeout_s=540.0 on a 123,466-token prompt,
 plus one at elapsed_s=145.078 where 30 + 115077/1000 = 145.08 (the TTFT
 watchdog firing during a legitimate prefill).
@@ -59,7 +59,7 @@ def _body(*, timeout_s: float | None = None, priority: str = "P3_INGESTION"):
     PROXY-chosen (``deadline_is_default``) — that omission is the whole axis
     these tests turn on, so it is never incidental."""
     body = {
-        "agent_id": "a", "endpoint": "llama-thinker", "priority": priority,
+        "agent_id": "a", "endpoint": "tier3", "priority": priority,
         "call_site": "t", "payload_type": "chat_completion",
         "payload": {"messages": [{"role": "user", "content": "x"}], "stream": True},
     }
@@ -136,7 +136,7 @@ def _capture_streaming_requests(svc: ProxyService) -> list[QueuedRequest]:
 
 async def _wait_slot_freed(svc: ProxyService, timeout_s: float = 5.0) -> None:
     async def go():
-        while svc._scheduler.endpoint_snapshot("thinker")["in_flight"] > 0:
+        while svc._scheduler.endpoint_snapshot("tier3")["in_flight"] > 0:
             await asyncio.sleep(0.02)
     await asyncio.wait_for(go(), timeout=timeout_s)
 
@@ -384,13 +384,13 @@ async def test_hard_cap_is_configurable_from_models_yaml(monkeypatch):
     await svc.startup()
     try:
         req = QueuedRequest.create(
-            agent_id="a", endpoint="thinker", priority="P3_INGESTION",
+            agent_id="a", endpoint="tier3", priority="P3_INGESTION",
             call_site="t", payload_type="chat_completion",
             payload={"messages": [{"role": "user", "content": "x"}], "stream": True},
             timeout_s=30.0, deadline_is_default=True,
         )
         assert svc._lifecycle._stream_hard_cap_s(req) == 3600.0
-        svc._state.stream_hard_caps["thinker"] = 1234.0
+        svc._state.stream_hard_caps["tier3"] = 1234.0
         assert svc._lifecycle._stream_hard_cap_s(req) == 1234.0
     finally:
         await svc.shutdown()
@@ -407,7 +407,7 @@ async def test_interactive_band_gets_the_tighter_cap():
     try:
         def _req(priority):
             return QueuedRequest.create(
-                agent_id="a", endpoint="thinker", priority=priority,
+                agent_id="a", endpoint="tier3", priority=priority,
                 call_site="t", payload_type="chat_completion",
                 payload={"messages": [{"role": "user", "content": "x"}],
                          "stream": True},
@@ -493,7 +493,7 @@ async def test_client_disconnect_aborts_producer_and_frees_slot():
         # The producer was cancelled and its slot reclaimed, despite the stream
         # still having 'work' to do and no deadline anywhere near expiring.
         await _wait_slot_freed(svc)
-        assert svc._scheduler.endpoint_snapshot("thinker")["in_flight"] == 0
+        assert svc._scheduler.endpoint_snapshot("tier3")["in_flight"] == 0
         assert svc._slot_leak_reclaimed >= 1
     finally:
         await svc.shutdown()

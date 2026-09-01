@@ -17,7 +17,7 @@ _DEFAULT_TIMEOUT_S = 180.0
 
 # Phase 5a — upper bound on the server-side SMART default deadline (used only
 # when the smart_default_timeout flag is on, for callers that omit timeout_s).
-# Mirrors the client's COLLECTIVE_TIMEOUT_ADVICE_CAP_S (1800s) so server + client
+# Mirrors the client's ROADSTEAD_TIMEOUT_ADVICE_CAP_S (1800s) so server + client
 # agree, and guards against a heavy-tailed background cell (recommended =
 # p99*margin) yielding a pathological multi-hour deadline.
 _SMART_DEFAULT_CAP_S = 1800.0

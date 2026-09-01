@@ -13,7 +13,7 @@ for a cold cell — but it silently inverts the advice at the top end:
   * a LARGER request lands in a sparse high out-bucket, falls through to
     ``tier``, and is advised off an aggregate dominated by small, fast calls.
 
-Measured on the live proxy, ``thinker`` @ P3_INGESTION (2026-07-29):
+Measured on the live proxy, ``tier3`` @ P3_INGESTION (2026-07-29):
 
     est_out 8192  ->  459s   (source=tier_out, n=107)
     est_out 9000  ->  227s   (source=tier,     n=8682)
@@ -46,20 +46,20 @@ from roadstead.timeout_model import TimeoutModel, _OUT_EDGES
 
 
 def _model(**kw) -> TimeoutModel:
-    return TimeoutModel(margin=1.5, min_samples=30, floors={"thinker": 60.0}, **kw)
+    return TimeoutModel(margin=1.5, min_samples=30, floors={"tier3": 60.0}, **kw)
 
 
 def _fill(m: TimeoutModel, *, out_tokens: int, n: int, latency_ms: float,
           in_tokens: int = 400, pri: int = 3, now: float = 1000.0) -> None:
     for _ in range(n):
-        m.record("thinker", pri, in_tokens, out_tokens, latency_ms, "ok", now)
+        m.record("tier3", pri, in_tokens, out_tokens, latency_ms, "ok", now)
 
 
 def _live_shape() -> TimeoutModel:
     """The measured live condition, reproduced.
 
     Two properties have to hold together or the inversion does not appear, and
-    both are true of the real `thinker` P3 distribution:
+    both are true of the real `tier3` P3 distribution:
 
       * the mid out-bucket (2048..8191) is well-sampled and SLOW — those are real
         multi-thousand-token generations;
@@ -85,8 +85,8 @@ def _live_shape() -> TimeoutModel:
 
 def test_the_exact_live_inversion_no_longer_happens() -> None:
     m = _live_shape()
-    mid = m.advise("thinker", 3, 400, 6000)["recommended_ms"]
-    big = m.advise("thinker", 3, 400, 9000)["recommended_ms"]
+    mid = m.advise("tier3", 3, 400, 6000)["recommended_ms"]
+    big = m.advise("tier3", 3, 400, 9000)["recommended_ms"]
     assert big >= mid, (
         f"asking for MORE output was advised LESS time ({big:.0f}ms < {mid:.0f}ms) "
         "— this is the inversion that made every truncation retry a guaranteed "
@@ -97,9 +97,9 @@ def test_the_fixture_really_does_reproduce_the_inversion() -> None:
     """Guard on the guard: prove the raw ladder WOULD invert here, so the test
     above cannot pass vacuously. ``_advise_at`` is the pre-guard behaviour."""
     m = _live_shape()
-    floor = m.floor_ms("thinker")
-    raw_mid = m._advise_at("thinker", 3, 0, 3, floor)[3]   # out-bucket 3 (2048..8191)
-    raw_big = m._advise_at("thinker", 3, 0, 4, floor)[3]   # out-bucket 4 (>= 8192)
+    floor = m.floor_ms("tier3")
+    raw_mid = m._advise_at("tier3", 3, 0, 3, floor)[3]   # out-bucket 3 (2048..8191)
+    raw_big = m._advise_at("tier3", 3, 0, 4, floor)[3]   # out-bucket 4 (>= 8192)
     assert raw_big < raw_mid, (
         f"fixture does not reproduce the defect (raw {raw_big:.0f} >= {raw_mid:.0f}) "
         "— the monotonicity test above would pass even with the guard removed")
@@ -116,7 +116,7 @@ def test_advice_is_monotonic_across_every_out_bucket_boundary() -> None:
 
     prev = 0.0
     for eo in sorted(set(probes)):
-        rec = m.advise("thinker", 3, 400, eo)["recommended_ms"]
+        rec = m.advise("tier3", 3, 400, eo)["recommended_ms"]
         assert rec >= prev - 1e-6, (
             f"advice DROPPED at est_out={eo}: {rec:.0f}ms after {prev:.0f}ms")
         prev = rec
@@ -127,12 +127,12 @@ def test_the_lift_is_reported_so_a_starved_bucket_is_visible() -> None:
     high bucket is a number that happens to look fine."""
     m = _live_shape()
 
-    big = m.advise("thinker", 3, 400, 9000)
+    big = m.advise("tier3", 3, 400, 9000)
     assert "monotonic_lift_from_out_bucket" in big, (
         "the guard lifted the advice but left no trace — a dashboard cannot tell "
         "a genuinely fast high bucket from a starved one")
 
-    mid = m.advise("thinker", 3, 400, 6000)
+    mid = m.advise("tier3", 3, 400, 6000)
     assert "monotonic_lift_from_out_bucket" not in mid, (
         "the guard must be silent when it changes nothing")
 
@@ -144,7 +144,7 @@ def test_a_genuinely_well_sampled_high_bucket_is_left_alone() -> None:
     _fill(m, out_tokens=6000, n=100, latency_ms=100_000.0)
     _fill(m, out_tokens=12000, n=100, latency_ms=400_000.0)
 
-    big = m.advise("thinker", 3, 400, 12000)
+    big = m.advise("tier3", 3, 400, 12000)
     assert big["source"] in ("cell", "tier_out"), big["source"]
     assert big["recommended_ms"] == pytest.approx(400_000.0 * 1.5, rel=0.15)
     assert "monotonic_lift_from_out_bucket" not in big
@@ -152,7 +152,7 @@ def test_a_genuinely_well_sampled_high_bucket_is_left_alone() -> None:
 
 def test_the_floor_still_applies_on_a_completely_cold_model() -> None:
     m = _model()
-    a = m.advise("thinker", 3, 400, 9000)
+    a = m.advise("tier3", 3, 400, 9000)
     assert a["recommended_ms"] == pytest.approx(60_000.0)
     assert a["sample_count"] == 0
 
@@ -162,7 +162,7 @@ def test_reported_source_and_sample_count_describe_the_requested_bucket() -> Non
     actually landed, or the shadow report stops being diagnostic."""
     m = _live_shape()
 
-    big = m.advise("thinker", 3, 400, 9000)
+    big = m.advise("tier3", 3, 400, 9000)
     assert big["source"] == "tier", big["source"]
     assert big["sample_count"] == 8030, big["sample_count"]
     # ...but the recommendation came from the slower, better-supported bucket

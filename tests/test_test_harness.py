@@ -75,12 +75,12 @@ def test_export_corpus_for_replay(tmp_path):
     response = {"choices": [{"message": {"content": "test response"}}]}
 
     q.persist_complete(
-        "req_001", "forum-agent", "thinker", "forum-agent.proposal_emitter", 3,
+        "req_001", "forum-agent", "tier3", "forum-agent.proposal_emitter", 3,
         6000, 250, 30.0, 5.0, "ok",
         payload=payload, response=response,
     )
 
-    corpus = q.export_corpus(hours=1, endpoint="thinker")
+    corpus = q.export_corpus(hours=1, endpoint="tier3")
     assert len(corpus) == 1
     assert corpus[0]["payload"]["messages"][0]["content"] == "test prompt"
     assert corpus[0]["response"]["choices"][0]["message"]["content"] == "test response"

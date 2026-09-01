@@ -123,18 +123,18 @@ async def test_admin_routes_deny_lan_allow_loopback():
     lan, loop = "10.0.0.42", "127.0.0.1"
 
     # Pause/resume.
-    resp = await svc.handle_admin_endpoint_pause("gemma", _IpReq(lan, "POST"), pause=True)
+    resp = await svc.handle_admin_endpoint_pause("tier1", _IpReq(lan, "POST"), pause=True)
     assert resp.status_code == 403
-    resp = await svc.handle_admin_endpoint_pause("gemma", _IpReq(loop, "POST"), pause=True)
+    resp = await svc.handle_admin_endpoint_pause("tier1", _IpReq(loop, "POST"), pause=True)
     assert resp.status_code == 200
-    await svc.handle_admin_endpoint_pause("gemma", _IpReq(loop, "POST"), pause=False)
+    await svc.handle_admin_endpoint_pause("tier1", _IpReq(loop, "POST"), pause=False)
 
     # Flags.
     assert (await svc.handle_admin_flags(_IpReq(lan, "GET"))).status_code == 403
     assert (await svc.handle_admin_flags(_IpReq(loop, "GET"))).status_code == 200
 
     # Maintenance annotate + list.
-    assert (await svc.handle_maintenance(_IpReq(lan, "POST", {"endpoint": "gemma"}))).status_code == 403
+    assert (await svc.handle_maintenance(_IpReq(lan, "POST", {"endpoint": "tier1"}))).status_code == 403
     assert (await svc.handle_maintenance_list(_IpReq(lan, "GET"))).status_code == 403
     assert (await svc.handle_maintenance_list(_IpReq(loop, "GET"))).status_code == 200
 
@@ -161,7 +161,7 @@ async def test_inference_routes_still_open_to_lan():
     try:
         import asyncio as _aio
         resp = await _aio.wait_for(svc.handle_openai_chat(
-            {"model": "llama-thinker", "max_tokens": 8,
+            {"model": "tier3", "max_tokens": 8,
              "messages": [{"role": "user", "content": "hi"}]},
             _IpReq("10.0.0.42", "POST")), timeout=10.0)
         assert resp.status_code == 200  # LAN inference unaffected by the tightening

@@ -72,7 +72,7 @@ REQUIRED_SCHEMA = {
 }
 
 
-def _req(payload, *, endpoint="thinker", call_site="auto_approve.critic",
+def _req(payload, *, endpoint="tier3", call_site="auto_approve.critic",
          stripped=False, ptype="chat_completion"):
     r = types.SimpleNamespace()
     r.payload = dict(payload)
@@ -117,8 +117,8 @@ def test_case1_literal_empty_brace_is_detected():
     assert m.state.structured_empty_total == 1
     assert m.state.structured_empty_by_call_site == {"auto_approve.critic": 1}
     rates = lp_obs.structured_empty_rates(m.state.structured_empty_window, 0.0)
-    assert rates["thinker"]["empty"] == 1
-    assert rates["thinker"]["n"] == 1
+    assert rates["tier3"]["empty"] == 1
+    assert rates["tier3"]["n"] == 1
 
 
 def test_case2_vacuously_satisfying_object_is_detected():
@@ -148,7 +148,7 @@ def test_case3_legitimately_empty_but_valid_does_NOT_alarm():
     m.detect_structured_empty(_req(p), _result('{"facts": []}'))
     assert m.state.structured_empty_total == 0
     rates = lp_obs.structured_empty_rates(m.state.structured_empty_window, 0.0)
-    assert rates["thinker"] == {
+    assert rates["tier3"] == {
         "n": 1, "empty": 0, "rate": 0.0, "top_call_site": None,
         "evaluated": False,
     }
@@ -161,7 +161,7 @@ def test_case4_normal_response_does_NOT_alarm():
     m.detect_structured_empty(_req(p), _result('{"facts": ["a", "b"]}'))
     assert m.state.structured_empty_total == 0
     rates = lp_obs.structured_empty_rates(m.state.structured_empty_window, 0.0)
-    assert rates["thinker"]["n"] == 1 and rates["thinker"]["empty"] == 0
+    assert rates["tier3"]["n"] == 1 and rates["tier3"]["empty"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +290,7 @@ def test_event_reaches_the_registered_degradation_sink():
     assert "cannot tell this from a real answer" in event["impact"]
     # The fields are what make the event actionable: without them an operator
     # knows something returned nothing, but not who asked or which backend.
-    assert event["model"] == "thinker"
+    assert event["model"] == "tier3"
     assert event["agent"] == "sidekick"
     assert event["call_site"] == "auto_approve.critic"
     assert event["stream"] is False
@@ -343,7 +343,7 @@ def test_event_carries_the_greppable_marker_and_caller_identity(caplog):
     assert "LLMPROXY_STRUCTURED_EMPTY" in line
     assert "agent=sidekick" in line
     assert "call_site=auto_approve.critic" in line
-    assert "model=thinker" in line
+    assert "model=tier3" in line
 
 
 # ---------------------------------------------------------------------------

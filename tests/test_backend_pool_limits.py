@@ -1,6 +1,6 @@
 """Phase 1 hardening — backend connection-pool sizing.
 
-The historic flat ``max_connections=20`` starved the 32-slot thinker: at
+The historic flat ``max_connections=20`` starved the 32-slot tier3: at
 >20 concurrent dispatches httpx queued requests on its own pool (pool=5.0s)
 and failed them as PoolTimeout even though the backend had free slots. Pins:
 
@@ -28,7 +28,7 @@ from roadstead.config import EndpointConfig
 
 def _thinker_cfg(max_slots=32) -> EndpointConfig:
     return EndpointConfig(
-        endpoint_class="thinker", role="llama-thinker",
+        endpoint_class="tier3", role="tier3",
         max_slots=max_slots, context_per_slot=131072,
         host="127.0.0.1", port=1, backend_engine="vllm",
     )

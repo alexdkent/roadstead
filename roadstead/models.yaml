@@ -1,1934 +1,292 @@
 # ===========================================================================
-# THE model naming + capability AUTHORITY for the whole fleet.
+# Roadstead catalog — the backends this gateway knows about.
 #
-# This file is owned by the LLM proxy and is the SINGLE SOURCE OF TRUTH for
-# every model the fleet runs — chat / embed / rerank / vision / speech / media.
-# The proxy routing table, the framework client port+alias maps, the gateway
-# facade, the telemetry UNITS, the dispatcher registry, the model cards, the
-# frontend catalog and the `inferctl models` CLI all DERIVE from this file
-# (see originfleet/llmproxy/model_catalog.py). Do not hand-maintain those
-# copies — edit HERE.
+# 🚨 THIS FILE IS AN EXAMPLE. The fleet below is invented and its addresses are
+# RFC 5737 documentation addresses (192.0.2.0/24), which exist so that nobody
+# mistakes them for real ones. The SCHEMA is Roadstead's contract; the DATA is
+# yours. Point ROADSTEAD_MODELS_YAML at your own file and this one stops being
+# loaded.
 #
-# Naming strategy: FUNCTION-BASED. The top-level key names the JOB
-# (router / analyst / composer / reasoner / creative / embed / rerank / ocr /
-# tts / stt / imagegen / ...). The model family is an ATTRIBUTE that may change
-# without renaming the role. Old names live on under `aliases:` so existing
-# callers keep working through a compat window.
+# It is also what the test suite runs against, so it is a worked example that
+# stays correct rather than a snippet in a README that rots.
 #
 # ---------------------------------------------------------------------------
-# WHEN YOU ADD / MOVE / RENAME / RETIRE A MODEL — edit THIS file first, then:
-#   add     → set status:active; drop a systemd unit on the box + `sync-to-*`;
-#             add the name to the vLLM `--served-model-name` list if vLLM;
-#             verify the frontend catalog row renders (parity gate);
-#             confirm telemetry UNITS probe + dashboard tile appear.
-#   move    → change host/port here; edit the unit + redeploy that box.
-#   rename  → change the key; move the old name into `aliases:` (auto-resolves).
-#   retire  → set status:decommissioned; disable/remove the unit; drop the
-#             served-model-name alias.
-# The doctrine test (tests/framework/test_model_naming_doctrine.py) FAILS if a
-# role string / served-model-name / port can't resolve to an entry here, so a
-# forgotten location can't merge silently. Full checklist: `model-selection` skill.
+# TWO SECTIONS, AND THE SPLIT IS THE POINT
+#
+#   providers:  HOW TO REACH A BACKEND, AND HOW TO SPEAK TO IT.
+#               One entry per backend process or remote service: its engine
+#               (which adapter in roadstead/providers/ drives it), its address,
+#               and its credential if it needs one.
+#
+#   endpoints:  A ROUTABLE UNIT OF CAPACITY, WITH POLICY.
+#               Slots, per-slot context, timeout floors and ceilings,
+#               capabilities, band behaviour, failover. Each names the provider
+#               it lives behind.
+#
+# A local provider hosts ONE endpoint, because a llama.cpp or vLLM server serves
+# one model. A remote provider hosts MANY, because it fronts a catalogue and the
+# base URL and credential are the same for all of them. Declaring the connection
+# once is the whole reason these are two sections and not one flat list.
+#
 # ---------------------------------------------------------------------------
+# PROVIDER FIELDS
+#   engine        llama.cpp | vllm | openrouter | shim
+#                 Resolved to an adapter in roadstead/providers/. An unknown
+#                 value falls back to llama.cpp rather than failing, so a typo
+#                 degrades to the common shape instead of taking an endpoint
+#                 offline. `shim` is a non-OpenAI FastAPI service (embed /
+#                 rerank) — it resolves to llama.cpp and pairs with
+#                 policy.skip_discovery.
+#   host, port    Local address. `host` may name a key in the `hosts:` table
+#                 below, or be a literal address.
+#   base_url      General address; WINS over host/port and is the only form
+#                 that can carry a scheme or a base path. Remote providers.
+#   api_key_env   The NAME of the environment variable holding the API key.
+#                 🚨 NEVER the key itself — a key in this file is a key in the
+#                 git history. Read at request time, so rotating the secret
+#                 needs no restart.
 #
-# Field reference (per entry):
-#   kind            chat | embed | rerank | ocr | tts | stt | diarize | stream | media
-#   status          active | on_demand | planned | deprecated | decommissioned
-#                   (planned = name/port reserved but NOT deployed — not live)
-#   aliases         every legacy / shorthand name that must resolve to this entry
-#   host            nexus | anvil | nasbox   (resolved to IP via meta.hosts + env)
-#   port            backend port on `host`
-#   proxy_endpoint  true if this role OWNS the DEFAULT_ENDPOINTS[endpoint_class]
-#                   row (chat/embed/rerank roles routed by the proxy). false for
-#                   facade-only (ocr/tts/stt/...) and media (dispatcher) roles.
-#   endpoint_class  the proxy QoS class (only for proxy_endpoint / shared roles)
-#   role            the proxy EndpointConfig.role / telemetry role string (the
-#                   pre-rename canonical — kept until the call-site sweep lands)
-#   backend_engine  llama.cpp | vllm | shim | openrouter
-#                   Resolved to a provider (roadstead/providers/) — an unknown
-#                   value falls back to llama.cpp rather than failing, which is
-#                   what the old `!= "vllm"` branches always did.
-#   base_url        REMOTE backends only: the full base URL, which supersedes
-#                   host/port (they cannot express a scheme or a base path).
-#                   e.g. https://openrouter.ai/api/v1
-#   api_key_env     REMOTE backends only: the NAME of the environment variable
-#                   holding the API key. NEVER the key itself — a key in this
-#                   file is a key in the git history.
-#   served_model_names  vLLM --served-model-name tokens that MUST match here.
-#                   For a remote provider fronting a CATALOGUE, the first entry
-#                   is the model slug this endpoint routes on (e.g.
-#                   openai/gpt-oss-120b) — there is nothing to discover, so it
-#                   is seeded from here.
+# ENDPOINT FIELDS
+#   The YAML key IS the endpoint class: what callers address, what the
+#   scheduler accounts against, and what telemetry is keyed on.
 #
-#   A remote stanza, for reference (Roadstead can dispatch to one today; making
-#   it *spill* under the same admission decision is roadmap Workstream D):
-#
-#     spill-openrouter:
-#       kind: chat
-#       status: planned
-#       proxy_endpoint: true
-#       endpoint_class: spill
-#       role: spill
-#       backend_engine: openrouter
-#       base_url: https://openrouter.ai/api/v1
-#       api_key_env: OPENROUTER_API_KEY
-#       served_model_names: [openai/gpt-oss-120b]
-#       slots: 4              # a POLICY cap on our own concurrency, not a
-#                             # discovered capacity — remote capacity is elastic
-#                             # and is governed by cost, not by occupancy.
-#       capabilities: {streaming: true, tool_calling: true}
-#   context_per_slot    proxy EndpointConfig seed (live value comes from /props)
-#   context_window      framework chunker/preflight default (_DEFAULT_CONTEXT_WINDOW)
-#   slots               max_slots seed
-#   timeout_floor_s     per-class floor (llmproxy/timeout_model.FLOOR_S)
-#   timeout_ceiling_s   per-role override of the adaptive-timeout upper bound (else the
-#                       interactive/background tier band; llmproxy/timeout_model.resolve_ceiling_s)
-#   stream_hard_cap_s   per-role override of the ABSOLUTE cap on a proxy-chosen STREAMING
-#                       deadline that is being extended by token progress (else the band
-#                       default; llmproxy/constants._STREAM_HARD_CAP_*). Never applies to an
-#                       explicit caller deadline, which stays a hard wall.
-#   policy.*            EndpointConfig knobs (reserve / floor_pct / cap / affinity / skip_discovery)
-#   capabilities.*      vision / streaming / reasoning / tool_calling / structured_output
-#   dispatcher_capability   media: the GenerationCapability key the dispatcher uses
-#   unit                media: systemd unit name
-#   token_speed         approx decode throughput / latency note (advisory)
+#   provider          which provider serves it
+#   kind              chat | embed | rerank
+#   status            active | on_demand | planned | retired
+#                     Only active and on_demand are ROUTED. `planned` documents
+#                     a name and a shape without dispatching to it.
+#   role              telemetry/model role string (defaults to the class)
+#   aliases           every legacy or shorthand name that must resolve here
+#   model             for a provider fronting a CATALOGUE, the slug to route on.
+#                     Ignored for a provider that serves one model and names it
+#                     — that is discovered, and a config copy would go stale in
+#                     silence.
+#   slots             max_slots SEED. Discovered at runtime where the engine
+#                     publishes it (llama.cpp); config-authoritative where it
+#                     does not (vLLM, and every remote provider).
+#   context_per_slot  seed; live value comes from discovery where available
+#   timeout_floor_s   per-class floor — the ENFORCED authority, seeding
+#                     TimeoutModel. A thin sample can never produce a deadline
+#                     below it.
+#   timeout_ceiling_s per-class override of the adaptive-timeout upper bound
+#   stream_hard_cap_s per-class override of the ABSOLUTE cap on a PROXY-CHOSEN
+#                     streaming deadline being extended by token progress.
+#                     Never applies to an explicit caller deadline.
+#   failover_to       endpoint class to degrade to when this one is unhealthy.
+#                     Ignored unless the target is itself routed.
+#   capabilities.*    vision | reasoning | streaming | tool_calling |
+#                     structured_output
+#   policy.*          EndpointConfig knobs — see _POLICY_PASSTHROUGH in
+#                     model_catalog.py. ⚠️ A policy key that is not in that
+#                     tuple is SILENTLY DROPPED.
 # ===========================================================================
 
-meta:
-  hosts:
-    nexus: 10.0.0.6
-    anvil: 10.0.0.3
-    anvil2: 10.0.0.29     # tier3 rank 1 (TP=2); serves no port of its own
-    nasbox: 10.0.0.10
-    kestrel-speech: 10.0.0.13
-    kestrel-perception: 10.0.0.18
-    # BUILT AND SERVING (2026-08-18/19). The R9700 box serving `tier2-chat`
-    # (llama.cpp/Vulkan, CTnnn, :30000). Not yet ROUTED — see the stanza below.
-    # The DHCP reservation MAC in infra/firewall/host_inventory.yaml was captured
-    # at first boot and corrected to 38:05:25:3a:91:bf, and applied live to
-    # OPNsense; forward + reverse DNS resolve. Runbook:
-    # infra/jetty/tier2-chat/README.md
-    jetty: 10.0.0.27
+hosts:
+  # An indirection so an address changes in one place. Optional: a provider may
+  # put a literal address in `host` instead.
+  llm-small: 192.0.2.11
+  llm-mid: 192.0.2.12
+  llm-large: 192.0.2.13
+  llm-util: 192.0.2.14
 
-  # =========================================================================
-  # THE PLACEMENT CHARTER — what each inference vehicle is FOR.
-  #
-  # `hosts` above says WHERE a model runs. This says WHAT A HOST IS FOR, and
-  # — the part that keeps getting re-litigated — what its spare capacity is
-  # RESERVED for. Headroom on an inference host is never "available"; it is
-  # always already spent on something (KV, a swap slot, a co-resident voice
-  # model). "Box X looks underutilized" is NOT a placement argument here, and
-  # `meta.idle_silicon` below records the accelerators that are idle ON PURPOSE
-  # so they stop being rediscovered as free capacity.
-  #
-  # ENFORCED by tests/llmproxy/test_inference_placement_doctrine.py: every live
-  # (active / on_demand) entry's host must be charter-declared, its `kind` must
-  # be admitted by that vehicle, and its `status` must be an admitted residency
-  # for that kind. Vehicles with `exclusive_roles` must hold EXACTLY those roles
-  # and nothing else.
-  #
-  # Field reference (per vehicle):
-  #   hosts           keys of meta.hosts this vehicle owns
-  #   charter         one line: the job this silicon exists to do
-  #   admits          {kind: [status, ...]} — the kinds allowed here, and at
-  #                   which residency. `active` = always-on resident;
-  #                   `on_demand` = loaded for a job, then unloaded.
-  #   exclusive_roles OPTIONAL. If present, the set of live model keys on these
-  #                   hosts must EQUAL this list — a closed appliance.
-  #   headroom_is     what the free memory/compute is already committed to.
-  #   forbids         the negative rule, in one line.
-  #
-  # TO PLACE SOMETHING NEW: find the vehicle whose charter already covers the
-  # job. If none does, that is a decision for the operator — widen a charter
-  # deliberately (and say why in `charter`), never quietly by adding a stanza.
-  # =========================================================================
-  vehicles:
 
-    tier3:
-      hosts: [anvil, anvil2]
-      charter: >-
-        The deep tier. One model — the largest and most capable the fleet can
-        self-host — served tensor-parallel across both GB10s as a SINGLE
-        appliance over the direct 200GbE ConnectX-7 DAC. Reasoning, synthesis,
-        long context, agentic loops.
-      admits:
-        chat: [active]
-      exclusive_roles: [reasoner]
-      headroom_is: >-
-        tier3's KV pool (~1.7M tokens at 1M context, gpu-memory-utilization
-        0.85). The ~242 GB across the pair is not a budget with room in it —
-        weights are 155 GiB and the rest is cache. Measured headroom under load
-        is ~8 GiB, and two hard-hangs at ~0 free needed an operator power cycle.
-      forbids: >-
-        Everything else. D6 (operator decision, 2026-08-20) makes this a
-        single-purpose appliance: nothing else may be scheduled onto either box.
-        embed/rerank/tier1/imagegen all MOVED OFF, and the media generators were
-        retired, specifically to pay for the KV above. anvil2's compute is in
-        the hardware census but is NOT available capacity.
+providers:
 
-    tier2-chat:
-      hosts: [jetty]
-      charter: >-
-        The conversational lane, and only that — Sidekick's chat turn, the glasses
-        lane, Discord's chat turn. A ~30 GB MoE chosen for TTFT and tokens/s at
-        concurrency, because a human is waiting. Text only.
-      admits:
-        chat: [active]
-      exclusive_roles: [tier2-chat]
-      headroom_is: >-
-        the 448K shared KV pool across 20 slots. Slot count IS the product here:
-        this endpoint is sized for burst concurrency on a live conversation, not
-        for a high average load.
-      forbids: >-
-        Anything that adds latency or memory pressure to the chat lane. This box
-        is GO DARK / NO FALLBACK by design — chat surfaces refuse the turn rather
-        than fail over — so a co-tenant that wedges it takes every conversational
-        surface in the fleet with it. (The two dsh builder CTs are guests of the
-        Proxmox HOST, not of this GPU, and hold their own LAN addresses.)
-
-    tier2-analyst:
-      hosts: [nasbox]
-      charter: >-
-        The worker tier. A ~30 GB DENSE, natively-multimodal model on the fleet's
-        only vision-capable endpoint: extraction, classification, all document and
-        photo vision, long-form authoring (songs, DJ patter), and the agent work
-        that can afford to wait. Also the automatic tier3 failover target for
-        agents opted in via `degrade_ok`.
-      admits:
-        chat: [active]
-      exclusive_roles: [tier2-analyst]
-      headroom_is: >-
-        6 slots at 256K shared context with q8_0 KV and MTP speculative
-        decoding, on the FORKED `llamacpp-boxa:mmvq32` image (2026-08-30, for
-        beacon subagent concurrency). `slots x (1 + n_draft)` must stay under
-        the ggml-SYCL MMVQ ceiling — 32 on this image via
-        GGML_SYCL_MMVQ_MAX_BATCH, but only 8 on stock :server-intel, so a
-        stock rollback must drop --parallel to 4 in the same change.
-        `fast_path_reserve_slots: 2` keeps 2 slots for the classify/vision
-        family; background (subagent) concurrency is 4.
-      forbids: >-
-        A second resident model on the boxa, and any workload that competes with
-        the vision projector. This is the fleet's SLOWEST generative tier on
-        decode (~38 tok/s at c1) — deliberately, because it is the dense
-        multimodal one. Do not place a latency-sensitive job here to "spread
-        load"; that is what tier2-chat is for.
-
-    tier1:
-      hosts: [kestrel-perception]
-      charter: >-
-        The decision BEFORE the work — cheap, fast classification, tool routing
-        and short-context calls on a ~4B dense model, co-resident with the fleet's
-        text-to-speech voices on one small dedicated card. Both jobs are chosen
-        for being cheap and never contending.
-      admits:
-        chat: [active]
-        tts: [active]
-      exclusive_roles: [router, classifier, tts]
-      headroom_is: >-
-        the co-residency margin between the LLM and TTS on a 12 GB A2000. It has
-        already been spent once: a retired OCR unit left enabled here held 1516
-        MiB — exactly the margin tier1 needed — and OOM-crash-looped it 86 times
-        after the next reboot.
-      forbids: >-
-        A third resident model. Also do not "use up" tier1's unclaimed
-        capability (Gemma-4-E4B is natively multimodal with a 128K context; we
-        serve it text-only at 16K) — that headroom is what keeps it cheap and
-        non-contending, which is the entire role.
-
-    nexus:
-      hosts: [nexus]
-      charter: >-
-        Two jobs. (1) ALWAYS-ON RETRIEVAL AND PERCEPTION — embed, rerank, OCR
-        and streaming ASR: small, latency-bounded services that every other tier
-        depends on and that must fail independently of the CUDA stack. (2) THE
-        ON-DEMAND SWAP POOL — image generation, 3D-print mesh generation and
-        future GPU-assisted work that is NOT needed continuously, brokered as
-        leases by nexus-dispatcher (:9201) with lazy weight load and idle
-        unload. It is also the fleet's experimentation box.
-      admits:
-        embed: [active]
-        rerank: [active]
-        ocr: [active]
-        stt: [active]
-        media: [on_demand]
-      headroom_is: >-
-        THE PRODUCT. Free memory on nexus is not slack — it is the swap pool
-        that lets an on-demand service load its weights at all. Measured: with a
-        122B resident, moving a 7 GB image checkpoint onto the GPU took ~700
-        SECONDS instead of seconds. That contention is why the 122B was removed
-        outright rather than kept cold.
-      forbids: >-
-        Any always-on resident LLM (note `chat` is absent from `admits` above),
-        and any always-on service that is not retrieval or perception. This is
-        the box builders most often propose as "underutilized" — it is
-        deliberately kept with room to swap. EXPERIMENTS are welcome and run
-        UNREGISTERED; the moment something earns a stanza in this file it is a
-        fleet service and needs a charter that admits it. Note also that nexus
-        already carries four mutually-incompatible venvs (embed / rerank / OCR /
-        imagegen) — a fifth tenant is a fifth dependency tree, not just memory.
-
-    kestrel-speech:
-      hosts: [kestrel-speech]
-      charter: >-
-        The speech + audio-media edge — batch speech-to-text (CPU), diarization
-        and DJ stem separation on the Iris Xe iGPU. Not an LLM vehicle; listed so
-        the charter covers every host in meta.hosts.
-      admits:
-        stt: [active]
-        stream: [active]
-        diarize: [on_demand]
-      headroom_is: >-
-        CPU for parakeet (STT runs on the CPU here, not the iGPU) and the iGPU
-        for the on-demand audio jobs.
-      forbids: >-
-        LLM serving. The Iris Xe is ~2.3 TFLOPS with no tensor units; it is a
-        media accelerator, not an inference tier.
-
-  # =========================================================================
-  # KNOWN-IDLE SILICON — deliberately unused, do not "discover" it.
-  #
-  # These accelerators show up in the hardware census (docs/fleet_hardware_
-  # inventory.md) and look like free capacity. They are not proposals. Each row
-  # is a decision that was already made; reopening one is an operator call, not
-  # a builder's optimisation. Operator position (2026-08-29): the idle NPUs are
-  # accepted, and that is fine for now.
-  # =========================================================================
-  idle_silicon:
-    - what: nasbox on-package NPU (Arrow Lake AI Boost) + Arc Xe iGPU (64 EU)
-      host: nasbox
-      why_idle: >-
-        Freed by the mid-2026 workload inversion when the speech stack moved to
-        Kestrel, and left free on purpose. The hub's job is orchestration and
-        storage; its one inference role is tier2-analyst on the discrete boxa.
-        No serving stack for the NPU is worth the maintenance today.
-    - what: NVIDIA RTX 4060 Ti (8 GB)
-      host: nasbox
-      why_idle: >-
-        NOT idle — passed through to the Windows1 gaming VM. Reserved, not spare.
-        It is the single most frequently mis-proposed "free GPU" in the fleet.
-    - what: AMD Raphael iGPU (2 CU RDNA2, 2 GB carve-out)
-      host: jetty
-      why_idle: >-
-        ~0.56 TFLOPS with a 2 GB carve-out — too small to serve anything, and
-        any tenant on this box risks the go-dark chat lane.
-    - what: Grace CPU cores (20c per node) on the tier3 pair
-      host: anvil
-      why_idle: >-
-        Present in the census, unavailable by D6. Both nodes are a closed tier3
-        appliance; CPU work here competes with vLLM for the unified memory pool.
-    - what: tier1's unclaimed model capability (native image+audio input, 128K context)
-      host: kestrel-perception
-      why_idle: >-
-        Served text-only at 16K on purpose. The unused capability is what keeps
-        tier1 cheap and non-contending on a shared 12 GB card.
-  # Provider context-window values preserved VERBATIM for callers/DB rows that
-  # are not (yet) covered by a role entry. anthropic is the no-op v2 fallback;
-  # the nexus-* legacy values are intentionally the OLD numbers — un-migrated
-  # DB rows fall back here until llm_provider._migrate_provider_names() renames
-  # them on boot. (nexus-companion/nexus-gemma differ from their live roles.)
-  extra_context_windows:
-    anthropic: 200000
-    nexus-companion: 16384
-    nexus-gemma: 16384
-
-models:
-
-  # ---------------------------------------------------------------- chat / reasoning
-
-  # classify / analyst / vision: RE-HOMED onto the boxa `creative` endpoint 2026-07-11 (three-role
-  # consolidation) — the anvil `llama-classify.service` (Qwen3.6-35B-A3B+mmproj on the GB10 :9092)
-  # is STOPPED + disabled, and role names `classify`/`qwen-classify`/`chat`/`nexus-chat`/`analyst`/
-  # `qwen-analyst`/`analyst-vision`/`qwen-vision-8b`/`qwen-vision-9b`/`vision-8b` are now ALIASES of
-  # the single boxa `creative` endpoint (see the creative stanza above + the `decommissioned:` block).
-  # Keeping ONE stanza at ONE URL keeps 6-slot capacity accounting correct. This frees the anvil
-  # GB10 for imagegen/videogen (classify no longer evicts them) and fixes classify's ~36s p95
-  # queue-wait. Same weights/mmproj as before, same 32K chunking policy (creative.context_window),
-  # reasoning-off, grammar tool-calling — behavior-preserving for classify callers.
-
-  router:
-    kind: chat
-    status: active
-    proxy_endpoint: true
-    endpoint_class: gemma
-    role: gemma-router
-    aliases: [router, tier1, gemma-router, gemma, nexus-gemma]   # tier1 = canonical (2026-07-30 tier migration). `router` is the entry's own KEY and must be listed here too — build_role_aliases() reads `aliases` only, so without it a call for role `router` 404s at the proxy (see test_every_canonical_name_is_dispatchable).
-    host: kestrel-perception
+  small-box:
+    engine: llama.cpp
+    host: llm-small
     port: 9091
-    backend_engine: llama.cpp
-    systemd_unit: ""              # 2026-07-30: MOVED to Kestrel A2000 as docker container `gemma-tier1` (not a systemd unit)
-    probe_kind: llama
-    model_family: Gemma-4-E4B-it
-    quant: Q4_K_XL
-    context_per_slot: 16384
-    context_window: 16384
-    slots: 4                          # 2026-07-12: 2->4 (--parallel 4, --ctx-size 65536 on anvil:9091). 2 slots couldn't absorb bursts from the many cheap gemma callers (greeter advisory every turn + sidekick.extract_pad/obs + tool routers + classify), spiking tail latency into their aggressive per-call timeouts. E4B is tiny (~4.3GB) with ample anvil headroom; live value still comes from /props.
-    timeout_floor_s: 60
-    policy:
-      # The identity of the WEIGHTS behind this endpoint, checked every poll
-      # against what the backend actually reports (backend.probe_model_fingerprint).
-      # Mismatch raises the `model_fingerprint_drift` WARNING.
-      #
-      # 🚨 THIS IS THE GUARD THAT WOULD HAVE CAUGHT 2026-08-23. Every
-      # model-dependent line on this stanza — thinking_kwargs,
-      # thinking_budget_ratio, disable_any_whitespace, documented_max_num_seqs,
-      # model_family — is a claim about specific weights, and the served model
-      # id CANNOT detect the weights changing (tier3 answers to the fixed alias
-      # `llama-thinker` whatever is loaded behind it). Measured live 2026-08-24.
-      # No `ftype` in this build's meta — absent fields are simply omitted from the
-      # fingerprint rather than guessed, so the string stays whatever the backend can tell us.
-      #
-      # UPDATE THIS IN THE SAME EDIT AS THE MODEL. A stale value here is loud
-      # (an alert), which is the entire point — the previous failure was silent.
-      model_fingerprint: "params=7518069290;vocab=262144"
-      fast_path_reserve_slots: 1    # 2026-07-29: 0(default)->1. THE lever for this endpoint's
-                                    # bursty tail. With reserve 0, background_cap_slots collapses
-                                    # to background_floor_slots = max(1, int(slots*0.20)) — which is
-                                    # 1 at 4 slots AND STILL 1 at 8 (config.py:261-277). So the
-                                    # background band (this endpoint's dominant traffic: kv4
-                                    # audit/dedup ~138k reqs + temporal ~52k, both P3_INGESTION)
-                                    # ran ONE-AT-A-TIME no matter how many slots the backend had.
-                                    # reserve:1 -> background_cap = slots-1 = 3 now, 7 if/when the
-                                    # unit goes --parallel 8. Raising --parallel WITHOUT this is a
-                                    # no-op for those callers. Do NOT set reserve:0 with
-                                    # background_floor_pct:1.0 to "free" the last slot — that breaks
-                                    # the anti-starvation invariant (test_background_cap.py); see
-                                    # the composer policy block above for the same lesson.
-      documented_max_num_seqs: 4    # llama.cpp --parallel in llama-gemma.service. Keep EQUAL to
-                                    # `slots` above — health.py:242 raises a standing max_slots_drift
-                                    # WARNING (into /v1/status.alerts + the health-verifier chip) on mismatch.
-                                    # Bump BOTH to 8 in the same change that edits the unit.
-      # NOTE: `min_expected_slots` is deliberately NOT set here — it is absent from the
-      # policy key mapping in model_catalog.py:245-255, so a models.yaml value is silently
-      # DROPPED. EndpointConfig defaults it to 1 (config.py), which makes the CRITICAL guard
-      # at health.py:549 ("discovered N slots, expected >= M") unreachable fleet-wide: no
-      # entry can raise it above 1. Arming it is a code change, not config.
-    capabilities:
-      vision: false
-      streaming: false
-      # 2026-08-01: false -> TRUE. This declares an OBSERVED property of the deployed
-      # backend, not a wish. Gemma-4's template emits a reasoning trace on constrained
-      # output and ignores BOTH documented off-switches — measured against the live
-      # backend, `--reasoning off` (already set on the container) and
-      # chat_template_kwargs {"enable_thinking": false} each still produced 482 chars.
-      # `--reasoning-budget 0` on the container helps a lot but is NOT sufficient: it
-      # clamps some prompts to 0 reasoning chars and leaves others at 285. So the
-      # container flag stays (it cuts the common case) and this flag is the SAFETY NET.
-      #
-      # reasoning:true + backend_engine llama.cpp => model_catalog sets
-      # forces_reasoning, and apply_forced_reasoning_budget reserves
-      # forced_reasoning_budget() tokens of answer headroom ON TOP of the caller's cap.
-      # That is robust where suppression is not: it does not need the model to stop
-      # reasoning, only to have room left afterwards. Callers budgeting 96-120 tokens
-      # (mail-agent.classify_triage, attachments.image_classify) were failing 73-100%
-      # of the time without it.
-      #
-      # The cap is a CEILING, not a target — a call that does not reason still stops on
-      # its own, so plain routing calls pay nothing.
-      reasoning: true
-      tool_calling: true
-      structured_output: grammar
-    token_speed: {note: "cheap classify; first-token fast"}
-    purpose: Tier-1.5 LLM router + cheap classification / tool routing.
-    when_used:
-      - Tool routers (temporal / health-verifier / research), email + proposal classify
-      - knowledge audit/dedup classifiers
-    # NULLED 2026-08-20 with § 9, which made `fallback:` load-bearing. It said
-    # `classifier`, which is a role on THIS SAME E4B backend (see the note
-    # below) — as advisory metadata that meant "the greeter is the cheap
-    # fallback role", but as a failover declaration it would mean "when this
-    # endpoint is down, route to itself", which is not a failover.
-    #
-    # The value was harmless in practice — `classifier` is `proxy_endpoint:
-    # false`, so the derivation in build_endpoint_kwargs() skips it and arms
-    # nothing. That is exactly why it is nulled rather than left: it is a latent
-    # trap that would arm a self-referential failover the day somebody made the
-    # classifier stanza routable. Only ONE failover pair is designed and tested:
-    # tier3 -> tier2-analyst.
-    fallback: null
-    notes: |
-      Since 2026-06-08 this E4B backend ALSO serves the `classifier`
-      (gemma-greeter) role — the E2B-hot :9090 was decommissioned.
+    notes: >
+      A small always-resident model on modest hardware. llama.cpp publishes
+      real slot counts and per-slot context on /props, so this endpoint's
+      capacity is DISCOVERED and the seeds below are only a cold start.
 
-  classifier:
+  mid-box:
+    engine: llama.cpp
+    host: llm-mid
+    port: 9196
+
+  large-box:
+    engine: vllm
+    host: llm-large
+    port: 8000
+    notes: >
+      vLLM publishes max_model_len and nothing else about capacity —
+      --max-num-seqs is not on the API — so `slots` here is
+      CONFIG-AUTHORITATIVE, with policy.documented_max_num_seqs mirroring the
+      launch flag so the drift reconciler can notice a disagreement.
+
+  embed-shim:
+    engine: shim
+    host: llm-util
+    port: 9087
+
+  rerank-shim:
+    engine: shim
+    host: llm-util
+    port: 9084
+
+  openrouter:
+    engine: openrouter
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    notes: >
+      One remote provider, many endpoints — the reason providers and endpoints
+      are separate sections. Its endpoints are `planned` below: they document
+      the shape without being routed, because a deployment that has not set
+      $OPENROUTER_API_KEY should not have an endpoint in its routing table that
+      cannot serve. Flip one to `active` once the key is in the environment.
+      🚨 Remote capacity is not local capacity: a remote provider publishes no
+      occupancy, so `slots` there is a policy cap on OUR OWN concurrency, not a
+      discovered capacity.
+
+
+endpoints:
+
+  tier1:
+    provider: small-box
     kind: chat
-    status: active
-    proxy_endpoint: false            # shares the `gemma` endpoint with `router`
-    endpoint_class: gemma
-    role: gemma-greeter
-    aliases: [gemma-greeter, gemma-hot, nexus-gemma-hot]
-    host: kestrel-perception
-    port: 9091
-    backend_engine: llama.cpp
-    model_family: Gemma-4-E4B-it
-    quant: Q4_K_XL
+    role: tier1
+    aliases: [router, small, fast-chat, classify]
+    slots: 4
     context_per_slot: 16384
-    context_window: 4096             # legacy greeter default (small prompts)
-    slots: 2
     timeout_floor_s: 60
     capabilities:
-      vision: false
-      streaming: false
-      reasoning: false
+      reasoning: true          # → forces_reasoning: llama.cpp has no proxy-side
+                               #   kill switch, so this model's CoT is
+                               #   unconditional and the submit path reserves
+                               #   answer headroom on top of the caller's cap.
+      streaming: true
       tool_calling: true
-      structured_output: grammar
-    token_speed: {note: "cheap classify; rare fallback path"}
-    purpose: Tier-1.5 router/classifier fallback (greeter); lands on the E4B backend.
-    when_used:
-      - tool_router fallback (health-verifier / temporal), chip narration
-    fallback: router
-    notes: |
-      Two logical roles (router + classifier) legitimately SHARE one physical
-      backend (E4B :9091). proxy_endpoint:false — `router` owns the `gemma`
-      DEFAULT_ENDPOINTS row; this entry only contributes gemma-greeter→gemma to
-      ROLE_TO_CLASS + its own context window.
-
-  # ==========================================================================
-  # ✅ APPLIED 2026-08-22 — tier3 IS DeepSeek-V4-Flash-0731, TP=2 across
-  #   anvil (rank 0, :9083) + anvil2 (rank 1, headless), over a direct
-  #   200GbE ConnectX-7 DAC. Plan: docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md
-  #
-  #   Five places the DRAFTED block was WRONG, all corrected by measurement.
-  #   Recorded because each cost real time and would otherwise be re-derived:
-  #
-  #   1. KV dtype is `fp8_ds_mla`, NOT `nvfp4_ds_mla` (D4's assumption).
-  #      nvfp4_ds_mla is implemented ONLY by the B12X_MLA_SPARSE backend, and that
-  #      path is gated behind _is_glm_moe_dsa_model() plus a calibrated per-layer
-  #      scales file for a 78-layer GLM stack. It is a GLM path, not a DeepSeek-V4
-  #      one. Forcing it does not fail cleanly -- it resolves away to another
-  #      backend that then asserts about fp8 layouts, three layers from the cause.
-  #   2. D4's 1M profile SURVIVED anyway. The plan predicted fp8 would cost the
-  #      1M context (~500K). Measured pool: 1,717,142 tokens, 1.64x margin, and a
-  #      994,120-token needle-in-haystack retrieved correctly.
-  #   3. B12X_MLA_SPARSE is STRUCTURALLY UNUSABLE for this checkpoint: it accepts
-  #      block_size exactly [64], the sliding-window group needs [256], so no
-  #      common size exists ("No common block size for 64"). FLASHINFER_MLA_SPARSE_DSV4
-  #      @ block 256 is the only coherent combination.
-  #   4. slots is 6, not the drafted 20 carried over from Laguna.
-  #   5. gpu-memory-utilization is 0.85, ratcheted from OUR TP=2 measurement, not
-  #      the planned 0.78 -- at 0.78 the engine REFUSES TO BOOT at 1M ctx (KV
-  #      available 9.41 GiB vs 11.04 GiB needed for one 1M request).
-  #
-  #   The serve config is vendored at infra/anvil/vllm/v4flash/ (tier3_env.sh
-  #   holds the engine args; the two launchers are thin). Laguna stays on disk and
-  #   as `vllm-tier3-laguna.service` on anvil until Phase 6 -- it is the only
-  #   same-class rollback.
-  # ==========================================================================
-
-  reasoner:
-    kind: chat
-    status: active
-    proxy_endpoint: true
-    endpoint_class: thinker
-    role: llama-thinker
-    # `reasoner` is this stanza's YAML key but was NOT a resolvable dispatch name
-    # (build_role_to_class registers role + aliases, never the key), so callers
-    # passing model="reasoner" 404'd with unknown_endpoint. Registered as an alias
-    # so the semantic role name resolves to the live anvil thinker backend.
-    # tier3 = canonical (2026-07-30 tier migration). `composer`/`companion`/`qwen-composer`/
-    # `nexus-companion` were MOVED here from the nexus 122B stanza on 2026-07-30 — Phase B
-    # step 4, "point composer/companion/reasoner/thinker aliases at tier3". Laguna is now the
-    # single heavy tier. The abliterated 122B's `tier3_backup` stanza (nexus, on_demand,
-    # `proxy_endpoint: false`) is REMOVED (2026-08-20) — it was manual-recovery-only and never
-    # actually served (see `fallback:` below), and the same day's tier3->tier2-analyst failover
-    # replaced automatically what it existed to provide by hand. The abliterated weights/unit
-    # are being retired on nexus too; there is no longer a way to reach that capability
-    # through the proxy.
-    # Thinking: see the dispatch-side treatment landed in `50e2b6c50` — the key
-    # is `chat_template_kwargs.thinking` because the serve script pins
-    # `{"thinking": false}`, and `enable_thinking` works only incidentally
-    # (V4's template accepts both). dsh sends the same key per-model via
-    # `infra/dsh/plugins/collective-llm`.
-    aliases: [tier3, reasoner, llama-thinker, thinker, composer, companion, qwen-composer, nexus-companion]
-    host: anvil          # PRIMARY = rank 0, the box that serves `port` below
-    # tier3 is the fleet's FIRST model spanning two boxes. anvil2 is rank 1 of
-    # the V4-Flash TP=2 pair: --headless, serves no port of its own, and is
-    # reachable only over the direct 200GbE DAC. It is listed here so surfaces
-    # that show WHERE a model runs cannot claim tier3 lives on one box — the
-    # Inference page card said exactly that until 2026-08-22, and would have kept
-    # saying `anvil · healthy` with anvil2 dead.
-    # Health for anvil2 itself comes from health-verifier's host_inventory (node_exporter
-    # on :9100), NOT from here — meta.hosts is only a name->IP map.
-    co_hosts: [anvil2]
-    port: 9083
-    backend_engine: vllm
-    # `vllm-tier3.service` WRAPS the docker container (same pattern the retired
-    # vllm-thinker.service used). VERIFIED ON THE BOX 2026-08-25:
-    #   anvil  (rank 0) vllm-tier3.service        ExecStart=/opt/tier3/serve_v4flash_head.sh
-    #   anvil2 (rank 1) vllm-tier3-worker.service ExecStart=/opt/tier3/serve_v4flash_worker.sh
-    # The head script `source`s /opt/tier3/tier3_env.sh (the vendored copy of that env
-    # file is infra/anvil/vllm/v4flash/tier3_env.sh — it is SOURCED, not the ExecStart).
-    # 🚨 This comment previously said ExecStart=/opt/anvil-bench/serve_tier3_prod.sh.
-    # That is the LAGUNA ROLLBACK script — still on disk, NOT what runs. Corrected
-    # 2026-08-25; it had contradicted the note at `slots:` further down this same stanza.
-    # ExecStop=docker stop vllm-tier3.
-    # ⚠️ This field must be a REAL systemd unit — the anvil telemetry collector probes it with
-    # `systemctl is-active`, and build_telemetry_units() DROPS any probed role with an empty
-    # systemd_unit, which means NO health probe, NO metrics and NO health-verifier monitoring. It was ""
-    # from the Phase B cutover until 2026-07-31, so tier3 ran unmonitored for that window;
-    # test_model_naming_doctrine::test_telemetry_derive_is_complete is the guard.
-    # The old `vllm-thinker` unit AND `vllm-thinker-watchdog` are stopped + DISABLED (there is
-    # deliberately no watchdog on tier3) — do not send restart tooling at them.
-    systemd_unit: vllm-tier3
-    probe_kind: vllm
-    served_model_names: [llama-thinker, thinker, tier3, reasoner, claude-sonnet-4-5, llama]
-    model_family: DeepSeek-V4-Flash-0731 (sparse MoE, 284B total / 13B active) + in-model DSpark MTP drafter
-    quant: MXFP4 routed experts (quantization-aware TRAINED, not post-hoc) + FP8 attention/dense/shared
-    # Sparse MoE: 256 experts, top-10, 48 layers, hidden 3072.
-    # 2026-08-03: these were previously ~6B/~120B, DERIVED from config.json on the belief that
-    # poolside publish no parameter count. They DO — the launch material states 118B total /
-    # 8B active — so these are now the vendor's numbers, not ours. The derived figures were in
-    # the right neighbourhood but the active count was ~25% low, which matters when it is used
-    # to reason about decode cost.
-    params: {active: 13B, total: 284B}
-    # 262144 = the SERVED window (--max-model-len) = THIS CHECKPOINT's ceiling. Raised
-    # 131072 -> 262144 on 2026-07-30 with an explicit --kv-cache-memory of 26 GiB.
-    #
-    # ⚠️ CORRECTION: 262144 is NOT "Laguna's native context, unscaled" — an earlier version of
-    # this comment said that and it was wrong twice over.
-    #   * It IS rope-scaled: `rope_parameters.full_attention` is YaRN with factor 32.0 over an
-    #     original_max_position_embeddings of 8192 (8192 x 32 = 262144).
-    #   * The BASE repo `poolside/Laguna-S-2.1` ships YaRN factor **128.0 = 1,048,576 (1M)**.
-    #     The INT4 and NVFP4 quants ship factor 32.0 instead. Weights are identical and YaRN is
-    #     an inference-time RoPE transform, so 1M is a CONFIG cap here, not a weights limit —
-    #     see the `laguna-1m-context` note about raising it (KV, not config, is the real bound:
-    #     the pool holds 670,750 tokens, so ~670K is the practical ceiling regardless).
-    #
-    # Never go BELOW the retired 27B's 131072 without saying so out loud: the context gate
-    # starts 422-ing requests that used to succeed, which is a silent capability regression
-    # (caught 2026-07-30 by test_context_gate + test_timeout_events as `assert 422 == 200`).
-    #
-    # --max-model-len does NOT reserve memory; it only permits longer requests. Paged
-    # attention allocates what a request actually uses, so typical ~8k traffic is unaffected
-    # and only several CONCURRENT full-length requests contend for the pool.
-    #
-    # Raised to 700000 on 2026-07-30 via `--hf-overrides`, using the BASE repo's rope_parameters
-    # VERBATIM (attention_factor is YaRN-factor-dependent — 1.4852 at factor 128 vs 1.3466 at 32
-    # — so it must be copied, never hand-computed).
-    # 1,048,576 and it is REAL: validated end-to-end 2026-08-22 with a needle-in-
-    # haystack at 994,120 prompt tokens, retrieved correctly from mid-depth.
-    # Measured KV pool 1,717,142 tokens => 1.64x margin at full context.
-    # 🚨 A ~1M call costs ~974s of PREFILL -- OVER the inherited
-    # _INTERACTIVE_CEILING_S = 600, under _BACKGROUND_CEILING_S = 1800.
-    # Measured prefill curve (OURS): 32K 2,153 t/s . 133K ~1,980 . 273K 1,742 .
-    # 548K 1,351 . 994K 1,020 -- the 600s interactive ceiling is crossed at roughly
-    # 650-700K tokens. Ultra-long context is BACKGROUND-ONLY, measured not assumed.
-    context_per_slot: 1048576
-    # ⚠️ 700000 is a MEMORY bound, not a model bound. vLLM: "estimated maximum model length is
-    # 723472" at our 26 GiB KV. The MODEL reaches 1,048,576, but that needs 37.16 GiB of KV and
-    # the only ~11 GiB spare is the DFlash drafter — so 1M costs ~half the decode speed
-    # (28-30 t/s -> ~15). Deliberately not taken.
-    #
-    # ⚠️ ULTRA-LONG IS BACKGROUND-ONLY. A 578,400-token request measured 794 s end-to-end
-    # (prefill 729 tok/s — HALF the 1,426 tok/s seen at 213K; it degrades with length).
-    # timeout_model caps interactive (P0-P2) at _INTERACTIVE_CEILING_S = 600 s, so an
-    # interactive caller is killed around ~430K tokens. P3/P4 get 1800 s and fit. Anything
-    # sending >400K MUST be background priority or it will time out.
-    #
-    # ✅ FIXED 2026-08-03 — this block used to warn that timeout_model.size_stretch SATURATED
-    # at "size_max=4.0 x the 16384 top edge = 65,536 tokens" (the arithmetic was also wrong: 5 x
-    # 16384 = 81,920), so a 578K prompt got the SAME 3.0x stretch as an 82K one. It was prose-only
-    # with no guard, and it duly came true: a live 123,466-token `pool` prompt was killed three
-    # times at exactly 540 s (= the 180 s thinker floor x a clamped 3.0x). size_stretch is now
-    # superlinear in calibrated size UNITS and reaches 9.0x at 700K; _IN_EDGES gained
-    # 32768/65536/131072/262144 so long context has real empirical cells instead of sharing one
-    # bucket with 17K calls. Pinned by tests/llmproxy/test_timeout_sizing.py.
-    #
-    # ⚠️ The interactive/background split above still stands and is now the binding constraint
-    # for long prompts: ultra-long remains BACKGROUND-ONLY.
-    # 32768 is the ADMISSION/chunking value and is deliberately NOT the model's
-    # window. The model serves 1,048,576 (see context_per_slot above, validated to
-    # 994,120 real tokens) and infra/common/model_cards.yaml records THAT number.
-    # The two disagree by 32x on purpose. Do not 'fix' this to 1048576: it would
-    # change proxy admission and trip test_tier3_serve_script_doctrine.py.
-    context_window: 32768            # fleet chunkers size against 32K on purpose
-    # 6 = the backend's HARD cap (`--max-num-seqs 6` in the COMMON_ARGS array of
-    # infra/anvil/vllm/v4flash/tier3_env.sh — NOT serve_tier3_prod.sh, which is now
-    # only the Laguna rollback). vLLM does NOT expose --max-num-seqs over its API, so
-    # this seed is the ONLY source of the proxy's admission ceiling; a stale value
-    # over-admits (the surplus just queues at the backend, bypassing the proxy's DRR
-    # fairness — a stale 32 once over-admitted the thinker by 12).
-    # NOTE: llama.cpp roles self-correct via /props; vLLM ones like this do NOT — the
-    # shadow reconciler warns on drift. Keep EQUAL to tier3_env.sh, which
-    # test_tier3_serve_script_doctrine.py pins bidirectionally.
-    #
-    # 2026-08-22: 20 -> 6 at the V4-Flash TP=2 cutover. This is the validated 1M
-    # profile's value, not a carry-over: max_num_seqs is a SCHEDULER concurrency cap,
-    # and at 1M context the measured KV pool (1,717,142 tokens) admits only ~1.64
-    # concurrent max-length requests anyway. Per-step activation stays bounded by
-    # --max-num-batched-tokens 8192. Unlike Laguna's DFlash drafter, DSpark is
-    # IN-MODEL (layers 40-42) so there is no separate drafter allocating outside
-    # --gpu-memory-utilization — the mechanism that hard-hung this box twice.
-    slots: 6
-    timeout_floor_s: 180
     policy:
-      # The identity of the WEIGHTS behind this endpoint, checked every poll
-      # against what the backend actually reports (backend.probe_model_fingerprint).
-      # Mismatch raises the `model_fingerprint_drift` WARNING.
-      #
-      # 🚨 THIS IS THE GUARD THAT WOULD HAVE CAUGHT 2026-08-23. Every
-      # model-dependent line on this stanza — thinking_kwargs,
-      # thinking_budget_ratio, disable_any_whitespace, documented_max_num_seqs,
-      # model_family — is a claim about specific weights, and the served model
-      # id CANNOT detect the weights changing (tier3 answers to the fixed alias
-      # `llama-thinker` whatever is loaded behind it). Measured live 2026-08-24.
-      # vLLM reports the weights PATH as `/v1/models[0].root`.
-      #
-      # UPDATE THIS IN THE SAME EDIT AS THE MODEL. A stale value here is loud
-      # (an alert), which is the entire point — the previous failure was silent.
-      model_fingerprint: "/srv/models/deepseek-v4-flash-0731"
-      # Which chat-template variable switches REASONING on this model. Read by
-      # llmproxy/config.py EndpointConfig.thinking_kwargs; the proxy injects
-      # `<key>: false` here by default and a caller opts in per request with the
-      # proxy's `thinking:` control field.
-      #
-      # 🚨 KEEP THIS NEXT TO `model_family` ABOVE AND CHANGE IT WITH THE MODEL.
-      # This endpoint's switch was hardcoded to Qwen's `enable_thinking` in
-      # backend.py, and the 2026-08-23 swap Qwen3.6 -> DeepSeek-V4-Flash sailed
-      # past 15 cutover gates without one of them noticing, because V4's
-      # template happens to accept BOTH names and the serve script separately
-      # pins `--default-chat-template-kwargs '{"thinking":false}'`. Measured
-      # 2026-08-24: `thinking:true` -> 556 chars of reasoning, `enable_thinking:
-      # true` -> 518 chars, i.e. both live. `thinking` is the name the template
-      # and the serve script actually agree on, so it leads the list.
-      #
-      # BOTH are listed because both are MEASURED to work on this template, not
-      # as a hedge — and listing both keeps this convergent with the opt-in the
-      # Songs lane landed in `bccff2c45`, which deliberately sets both. Drop
-      # `enable_thinking` here the day tier3 moves to a template that does not
-      # read it; that is a one-line edit in the same block as `model_family`,
-      # which is the whole point of declaring it here.
-      thinking_kwargs: [thinking, enable_thinking]
-      background_floor_pct: 0.0
       fast_path_reserve_slots: 1
-      # Step 4c: the backend's real --max-num-seqs (serve_tier3_prod.sh). Keep
-      # EQUAL to `slots` above; the shadow reconciler warns if they drift (the
-      # 32-vs-20 class). Update BOTH whenever serve_tier3_prod.sh changes.
-      documented_max_num_seqs: 6
-      # 2026-08-23: fraction of a request's max_tokens the model may spend on
-      # REASONING. MIRRORS `--reasoning-config` in the vendored head launcher
-      # (infra/anvil/vllm/v4flash/serve_tier3_v4flash_head.sh); vLLM honours
-      # `thinking_token_budget` ONLY when the server was launched with that flag and
-      # 400s the whole request otherwise, so this declaration is not a tuning knob —
-      # it is a statement about how the backend was started. Pinned script⟺catalog in
-      # BOTH directions by test_tier3_serve_script_doctrine.py.
-      #
-      # WHY IT EXISTS. Measured 2026-08-23, N=2, interleaved, streaming: with no cap
-      # this model's natural reasoning length is BIMODAL — sometimes ~7-8k tokens and
-      # a clean answer, sometimes past a 12,000-token ceiling with `content: ""` and
-      # finish=length, which is 8-13 minutes of compute returning nothing. That is
-      # very likely the "sporadic tier3 502" this file has recorded as unexplained;
-      # `empty_completion_error` already names the shape. The cap bounds that TAIL.
-      # It does not shorten the median, and it is deliberately generous for that
-      # reason: at 0.6 of a 32,768-token request it clamps to the 16,000 ceiling and
-      # never fires on a normal call.
-      #
-      # It COMPLEMENTS Correction.apply_thinking, which ADDS 8000 tokens of headroom
-      # on the proxy's own `thinking: true` opt-in — that makes the allowance bigger,
-      # this stops reasoning consuming all of it. Different callers, both needed: dsh
-      # sets chat_template_kwargs directly and never sends the opt-in field.
-      thinking_budget_ratio: 0.6
-      # 2026-08-01: MIRRORS a host-side serve-script launch flag the proxy cannot
-      # introspect — exactly like `documented_max_num_seqs` above. The flag is
-      # `--structured-outputs-config '{"backend":"guidance","disable_any_whitespace":true}'`
-      # in the VENDORED script `infra/anvil/vllm/serve_tier3_prod.sh` (anvil runs
-      # its own copy at /opt/anvil-bench/serve_tier3_prod.sh — the two must change
-      # together). test_tier3_serve_script_doctrine.py pins script⟺catalog in BOTH
-      # directions, so removing the server flag forces removing this declaration.
-      #
-      # Why the proxy needs to KNOW: with whitespace banned, the two-character
-      # document `{}` is a legal, complete, zero-whitespace JSON object — so a BARE
-      # `response_format:{"type":"json_object"}` makes `{}` the greedy path and every
-      # such call returns it with finish_reason=stop. Measured live 2026-08-01 on this
-      # endpoint with sidekick's real critic prompt: no response_format -> 549 chars of valid
-      # JSON; bare json_object -> `{}` (2 chars); strict json_schema with `required` ->
-      # 241 chars of valid JSON. Correction.apply_json_object_guard reads this flag and
-      # STRIPS bare json_object (it does not substitute a permissive schema — `{}`
-      # satisfies `{"type":"object"}` with no `required`, so the bug would survive).
-      # Regression ledger: `tier3-json-object-empty-brace`.
-      # disable_any_whitespace DELIBERATELY ABSENT (it was true for Laguna).
-      # Ledger `disable_any_whitespace_is_declared_in_the_catalog`: banning
-      # whitespace makes a bare `json_object` grammar legal to close immediately,
-      # so tier3 returned "{}" -- 2 chars, and VALID -- 10/10. The V4 serve script
-      # passes NO --structured-outputs-config, and structured output measured 10/10
-      # well-formed and non-empty without it (2026-08-22). The doctrine test pins
-      # script <-> catalog bidirectionally, so these two stay absent together.
-      # § 9.7 — minimum time spent in degraded mode (serving from `fallback:`)
-      # before returning here, even once this endpoint is healthy again AND the
-      # degraded cohort has drained to zero.
-      #
-      # NOT redundant with the drain, which is the mistake it exists to prevent:
-      # drain alone means a tier3 flapping every 30s produces a model flip at
-      # every request boundary every 30s. 120s is a STARTING value, not a
-      # measured one — re-derive it from the observed flap interval the first
-      # time this fires in anger, and say so in the plan doc when you do.
-      # ⚠️ A policy key not listed in model_catalog.build_endpoint_kwargs()'s
-      # copy tuple is SILENTLY DROPPED; this one is pinned by
-      # test_failover.py::test_dwell_reaches_endpoint_config.
-      failover_dwell_s: 120
-    capabilities:
-      vision: false
-      streaming: true
-      # Hybrid thinking model, OFF by default at the server
-      # (--default-chat-template-kwargs '{"thinking":false}'); callers opt IN per
-      # request via chat_template_kwargs {"thinking": true}. Verified 2026-08-22.
-      # 🚨 The response key is `reasoning`. `reasoning_content` is ALWAYS EMPTY on
-      # this runtime -- a client reading it sees nothing and concludes reasoning is
-      # broken. Opposite polarity to the Laguna trap, identical shape.
-      # 🚨 Do NOT flip the default ON: reasoning spends the budget BEFORE content,
-      # and tier3's measured mean output is 172 tokens/req. At max_tokens=200
-      # thinking returned EMPTY content 3/5; at 400, 1/5; at 800+, 0/5. Opt-in
-      # lanes should use max_tokens >= 800. Also measured: with thinking ON a
-      # structured call emits a reasoning field 8/8 (vLLM #41132) -- pure overhead
-      # on extraction paths, so keep structured calls thinking-off.
-      reasoning: true
-      tool_calling: true
-      structured_output: auto      # no --structured-outputs-config; see policy note above
-    # OURS, measured 2026-08-22 warm, stream:false, reading usage.completion_tokens
-    # (streamed deltas under spec-decode count steps/s and under-report ~4x):
-    # code 61.1 t/s, prose 32.8 t/s. Incumbent Laguna measured 43.9 / 30.6.
-    # DSpark acceptance 47.9% pooled over 2,022 drafts, effective k=5.
-    token_speed: {decode_tok_s_at_1: 61, aggregate_tok_s_full: 120}
-    purpose: Heavy MoE reasoning + agentic-coding tier (tier3 — the fleet's deepest model), TP=2 across anvil + anvil2.
-    when_used:
-      - knowledge extraction, news synthesis, thread/device enrichment
-      - browser-broker default, forum-agent thread summary
-    # 🚨 `fallback:` IS NOW LOAD-BEARING (§ 9 of the anvil2/V4-Flash plan,
-    # implemented 2026-08-20). It was advisory metadata that nothing consumed
-    # for routing — this stanza's own comments said so, and the tier3_backup it
-    # named was `proxy_endpoint: false`, i.e. a declared backup that could not
-    # serve. It now declares the endpoint CLASS this one degrades to while it is
-    # unhealthy: opted-in callers (llmproxy/agents.yaml `degrade_ok`) are served
-    # by tier2-analyst instead of getting a 503, and everyone else gets the same
-    # clean 503 as before, labelled and with Retry-After.
-    #
-    # `creative` is tier2-analyst's endpoint class (the boxa, :9196). It is NOT
-    # registered as an alias of anything here: aliasing is precisely what made
-    # `tier3-backup -> companion -> thinker` non-idempotent and served every
-    # backup request from tier3 itself (ledger `endpoint-class-alias-collision`).
-    #
-    # Guards: test_failover.py::test_declared_fallbacks_resolve_to_live_endpoints
-    # (a fallback must name a LIVE, ACTIVE proxy endpoint — the moment a field
-    # becomes load-bearing it needs a guard or it rots back into a comment) and
-    # test_model_naming_doctrine.py::test_catalog_loads_and_is_consistent.
-    fallback: creative
-    notes: |
-      TIER 3 — DeepSeek-V4-Flash-0731 on vLLM, TENSOR-PARALLEL ACROSS TWO BOXES:
-      anvil (10.0.0.3) is rank 0 and serves :9083; anvil2 (10.0.0.29) is rank 1
-      and is --headless, serving no port of its own. They are joined by a direct
-      200GbE ConnectX-7 DAC (no switch). Image is pinned BY DIGEST to
-      eugr/spark-vllm-b12x@sha256:52f8e633… (nightly-20260822); the serve config is
-      infra/anvil/vllm/v4flash/tier3_env.sh. DSpark MTP is IN-MODEL (no separate
-      drafter checkpoint) at num_speculative_tokens=5. Weights are on each node's
-      LOCAL NVMe at /srv/models/deepseek-v4-flash-0731 (155.44 GiB per node) — NOT
-      the nasbox share, so tier3 no longer fails to boot when that share is away.
+      documented_max_num_seqs: 4
 
-      Measured at cutover 2026-08-22 (warm, stream:false, usage.completion_tokens —
-      streamed deltas under spec-decode count steps/s and under-report ~4x):
-      decode 61.1 t/s code / 32.8 t/s prose; DSpark acceptance 73.8% on code and
-      28.5% on prose (the pooled figure is workload-dependent, so quote the split);
-      prefix-cache hit 99% on a repeated 21K prefix; mixed-traffic c4 soak 328 req,
-      0 errors, ~83 t/s aggregate / ~21 per-stream. Full 1M context VALIDATED with a
-      994,120-token needle-in-haystack retrieved correctly from mid-depth.
-
-      ⚠️ A ~1M call costs ~974s of PREFILL, over the inherited 600s interactive
-      ceiling — ultra-long context is BACKGROUND-ONLY. See context_per_slot above.
-
-      --- history below refers to the RETIRED Laguna S 2.1, kept for archaeology ---
-      TIER 3 was Laguna S 2.1 INT4 on vLLM (anvil/GB10, sm_121a image
-      ghcr.io/timothystewart6/vllm-gb10), with the MATCHED Laguna-S-2.1-DFlash-INT4
-      drafter at num_speculative_tokens=3. Replaced the dense Qwen3.6-27B NVFP4 on
-      2026-07-30. Weights lived on the NVMe-backed `llmmodels` share (67 GB + 2.1 GB).
-
-      Measured at cutover: decode 29.9 t/s, DFlash acceptance 43.1% (2.29 tok/forward),
-      prefix-cache hit 64-70%. Prefix caching WORKS here — it was structurally 0% on
-      Qwen3.5's DeltaNet hybrid — which matters a lot on a prefill-dominated load.
-
-      KV sizing is EXPLICIT: `--kv-cache-memory 27917287424` (26 GiB) rather than letting the
-      util number decide what is left over. Measured 2026-07-30: 670,750 KV tokens
-      (~41.6 KiB/token), 2.56x concurrency at a full 256K request.
-
-      ⚠️ Host headroom is **~8 GiB under load, NOT the ~12 GiB you see just after startup** —
-      the idle figure is measured before KV blocks are actually touched, and it drops once real
-      traffic populates the pool. Budget against 8. That is the number to use before deciding
-      anything else can move onto this box: the two hard-hangs happened at ~0 GiB free, and on
-      a unified-memory box the reserve IS the recovery path (no shell ⇒ no `docker rm` ⇒
-      operator power cycle). Do NOT take another 6 GiB on the strength of the idle number.
-      Prefer this lever over --gpu-memory-utilization: util is "whatever remains after weights,
-      activation and cudagraphs", which is exactly what makes it easy to get wrong when a
-      drafter is also allocating outside the budget. vLLM prints the suggested value at startup.
-
-      🚨 `disable_any_whitespace: true` IS LOAD-BEARING — do not drop it (fixed 2026-07-31).
-      Without it, structured output RUNS AWAY on whitespace. A real durability-gate pass
-      produced, 10 times out of 10:
-          completion_tokens = 1540 (the entire budget)
-          real content      = 54 chars: `{"notes": [{"n": 1, "holds": true`
-          trailing          = 3032 chars of pure whitespace (2274 spaces, 758 \n)
-      The model reaches a STRUCTURAL position — where a `,` must precede the next
-      required key — and the grammar also permits whitespace there, so greedy decoding
-      emits whitespace until the budget dies. `disable_any_whitespace` removes that
-      freedom. After: 0/10 runaway, median 7.6 s (was 29 s), no measured cost to plain
-      chat (2.17 s / ~25 tok/s, unchanged).
-
-      `maxLength` IS and always WAS enforced — at 20/40/60/80/100/120 the longest emitted
-      string equals the bound EXACTLY, before and after the fix. Anyone reporting
-      "tier3 ignores maxLength" has met THIS bug, not a bound failure.
-
-      What it is NOT, all measured, so nobody re-runs these:
-        * NOT the backend — `xgrammar` reproduced it 10/10 too (and is otherwise worse).
-        * NOT speculative decoding — 10/10 with DFlash disabled (and disabling it costs
-          ~26 -> ~19 tok/s, so it stays ON).
-        * NOT temperature (2/3 at 0.7), NOT item count (3/3 at maxItems=6+minItems=6),
-          NOT `additionalProperties`.
-        * A synthetic schema reproduced only ~2/50 — DO NOT conclude "fine" from a toy.
-      Proxy-side fallback if the flag is ever unavailable: `frequency_penalty=0.2` gave
-      4/4 clean (0.5 over-corrects). Do NOT use `stop` on runs of whitespace — it fires
-      on pretty-printed JSON indentation and truncates at ~14 tokens.
-
-      ⚠️ Why this hid for so long: the proxy turns the truncation into a 502 and callers
-      turn a 502 into "", so a silently-dead gate looks exactly like "the model had
-      nothing to say". Each occurrence also burned 30-60 s of a tier3 slot.
-      The backend/flags are server-level; they CANNOT be overridden per request —
-      verified, all three override shapes were ignored or rejected.
-
-      🚨 `--long-prefill-token-threshold 1024` IS SLOT FAIRNESS (2026-07-31).
-      It caps how many prefill tokens ONE request may take per scheduler step, BEFORE
-      the shared `--max-num-batched-tokens 8192` budget is applied
-      (vllm/v1/core/sched/scheduler.py:507). Without it a single giant prefill owns the
-      whole budget for ~25 consecutive steps and nothing else prefills at all.
-
-      Measured with one 100K-token request in flight alongside short interactive ones.
-      Read the WORST short request, not the median — the median hides it completely,
-      because only the FIRST short request is starved and the rest run free:
-
-          threshold   worst short   long request
-          none(8192)     45.26 s       49.2 s     <- one caller stalled 100x
-          4096            9.76 s       49.1 s
-          2048            4.16 s       50.0 s
-          1024            1.86 s       51.5 s     <- CHOSEN
-
-      1024 buys a 24x better interactive tail for 4.7% on the giant. That is the right
-      direction because this stanza ALREADY declares ultra-long traffic background-only,
-      and a 45 s stall reads to a caller as a hang and blows _INTERACTIVE_CEILING_S.
-
-      🚨 ATTENTION BACKEND IS FLASHINFER, AND THAT IS DELIBERATE (2026-08-04).
-      `docs/inference_thinker_triton_attn_fix.md` (2026-06-03) moved the THEN-current
-      model to TRITON_ATTN. Do not carry that conclusion to Laguna S 2.1 — it was
-      measured on Qwen3.6-27B where the two tied. Head-to-head on THIS model, identical
-      prompts, 3 reps:
-
-          backend       small conc1   200k decode   200k cold TTFT   worst-short
-          triton_attn      26.0          5.1 t/s        10.95 s         7.81 s
-          FLASHINFER       25.6         10.7 t/s         7.06 s         3.54 s
-
-      Small context ties; FlashInfer is 2.1x on long-context decode and 2.2x better on
-      the interactive tail (the giant occupies the engine 133 s vs 272 s). Overnight
-      big-context work is exactly where triton loses.
-      ALSO: that doc's mechanism (`VLLM_ATTENTION_BACKEND=...`) is a SILENT NO-OP on
-      vLLM 0.26.1 — the env var does not exist in the package. Forcing triton now needs
-      the CLI flag PLUS `attention_backend` inside `--speculative-config` (the draft
-      model otherwise falls through to priority selection, and FLASHINFER wins).
-
-      ⛔ TWO TUNING FLAGS THAT CANNOT WORK HERE — do not retry (each costs a 40-min
-      window to rediscover, because both present as a boot hang, not an error):
-        * `--moe-backend triton` (Poolside's OWN published recipe) ->
-          `ValueError: moe_backend='triton' is not supported for WNA16 MoE.
-           Expected one of ['marlin','humming','flashinfer_trtllm','emulation']`.
-          Their recipe assumes a different quantization; ours is WNA16 -> MARLIN.
-        * `--kv-cache-dtype-skip-layers sliding_window` (vLLM's own recommended FP8
-          variant) -> `AssertionError: page_size_padded >= unpadded_page_size_bytes`
-          in `unify_kv_cache_spec_page_size`. Mixed fp8/bf16 KV yields unequal page
-          sizes the hybrid coordinator cannot unify — a direct consequence of this
-          model's 12 full + 36 sliding attention split.
-      Idle short latency was 0.30 s at every setting — normal traffic pays nothing.
-      Our real distribution (1157 reqs) is 96% <=10k tokens, 0.7% >50k, so the giants
-      this protects against are rare but severe.
-
-      ⚠️ `--max-num-partial-prefills` / `--max-long-partial-prefills` are NOT usable:
-      vLLM's V1 engine raises `NotImplementedError: Concurrent Partial Prefill is not
-      supported` at startup (engine/arg_utils.py `_check_feature_supported`) and
-      crash-loops. The fields exist on the legacy SchedulerConfig, which makes them look
-      available — they are not. Only the threshold is honoured. Don't re-try them.
-
-      🚨 TWO LOAD-BEARING FLAGS. Neither is cosmetic. ⚠️ They are gated by
-      `tier3_gates.py`, which lives ONLY on anvil (`/opt/anvil-bench/`) and is NOT in
-      this repo — so neither CI nor ship.sh can run it, and nothing here will catch a
-      regression in these two flags. Treat the text below as the authority and verify
-      against serve_tier3_prod.sh on the box.
-      ⚠️ Both entries below were WRONG until 2026-07-31 and each would have sent a reader
-      to "correct" the live config into a broken state. Verify against
-      serve_tier3_prod.sh, which is the truth.
-
-      1. `--default-chat-template-kwargs '{"enable_thinking": false}'` — FALSE, not true.
-         The mechanism is real: Laguna's chat template defaults enable_thinking=true,
-         while vLLM's DeepSeekV3-derived `poolside_v1` reasoning parser defaults it
-         FALSE and then installs an IdentityReasoningParser that separates NOTHING, so
-         any caller sending no chat_template_kwargs — EVERY fleet caller — got raw
-         chain-of-thought plus a stray `</think>` inside `content`.
-         But setting it TRUE (the first fix, which this comment used to prescribe) is
-         WORSE: the model then spends the whole budget reasoning and returns NOTHING.
-         Measured: max_tokens=120 thinking=true -> out=120, finish=length, content_len=0,
-         status=ok — no error, no alert, callers just got empty strings.
-         FALSE fixes both: no thinking is generated, so there is nothing to leak.
-         The reason the leak "fix" looked verified was an ABSENCE assertion
-         (`"</think>" not in content`), which an empty string also satisfies. Gate G4
-         must assert a POSITIVE property (non-empty, finish_reason=stop) too.
-         🚨 WHEN A CALLER OPTS IN (`thinking: true`), TWO THINGS SUPPRESS THE <think>
-         IT ASKED FOR — both silently, both looking exactly like "the model chose not
-         to reason". Measured 2026-08-02 against this endpoint, streamed, one unique
-         payload per request so nothing came from the proxy's identical-payload cache
-         (the first cut of the history row WAS cache-confounded — three identical
-         102-char replies — so re-check that before trusting a repeat):
-             [user]                    reasoned 4/4   (1321-3339 chars)
-             [user, assistant, user]   reasoned 0/4   <- ONE prior assistant turn
-             [system, user]            reasoned 1/4   (vs 4/4 without a system role)
-         The system-message case is the known template quirk, and the proxy's fold
-         (correction.fold_system_for_thinking) RAISES the rate without closing it.
-         The HISTORY case is not documented anywhere else and is the harder one:
-         treat `thinking: true` as a FIRST-TURN capability here. Any multi-turn
-         caller that opts in gets reasoning on turn 1 and silently never again.
-         Nothing in the proxy compensates for this today — a wrong guess would
-         corrupt replayed history, so it is surfaced to the user instead (the
-         Playground warns at the toggle and on any zero-reasoning turn).
-         ⚠️ Also: reasoning streams as `delta.reasoning` on this backend, NOT
-         `delta.reasoning_content`. A reader matching only the latter drops the whole
-         reasoning stream and reports zero while usage shows the tokens were spent.
-      2. `--gpu-memory-utilization 0.81` is the live value; the old "0.72 is a HARD
-         CEILING" line described a DIFFERENT configuration and no longer applies.
-         When util sized the KV pool, 0.72 was the ceiling and 0.78 + a drafter
-         hard-hung anvil twice on 2026-07-30, each needing an operator power cycle.
-         We now pass `--kv-cache-memory 27917287424` (26 GiB), which sizes the pool
-         DIRECTLY, so util is a bound rather than the allocator and 0.81 is stable
-         (re-measured 2026-07-31 at 20 slots: 11 GiB free after load).
-         ⚠️ The underlying HAZARD is unchanged and is about the MECHANISM, not the
-         number: a spec-decode drafter allocates OUTSIDE the util budget. Re-measure
-         headroom after any change that adds concurrency or a drafter.
-
-      Structured outputs use the `guidance` backend (see `structured_output: guidance`
-      below) — NOT llama.cpp GBNF, which is the `creative`/tier2 stanza's backend.
-      Verified 2026-07-31 with a real json_schema call: 29 tokens, finish_reason=stop,
-      valid parseable JSON.
-
-      TRUNCATION, re-measured after the disable_any_whitespace fix (2026-07-31):
-        pre-fix : 0.104% overall (28 / 26,993 per 24h), dominated by the runaway
-        post-fix: 0.155% overall (11 / 7,095 per 4h) — but the COMPOSITION inverted
-                  and that is the number that matters:
-                    * structured truncation is now 1 in 7,095 = 0.014%
-                    * 8 of the 11 are `structured=False` — plain generations hitting
-                      a small cap, i.e. CALLER under-budgeting, not a tier3 defect
-                    * 6 of those 8 were one burst from `lan-generic.openai_compat`
-                      at max_tokens=512 inside 5 seconds
-        The single structured case was `forum-agent.thread_summary`, which uses
-        `response_format: {"type":"json_object"}` (no schema, 800-token cap) — a long
-        summary hitting its budget, not a structural-position runaway.
-      ⚠️ Do NOT read the overall rate going 0.104% -> 0.155% as a regression. The
-      runaway class it was measuring is gone (the real gate went 10/10 -> 0/10); what
-      is left is a different, caller-side phenomenon that the earlier number was
-      never isolating.
-      Known log noise: `discord.schema_smoke` truncates repeatedly at max_tokens=96,
-      which is a smoke test with a deliberately tiny budget — it is not a fault, but
-      it does dilute this signal.
-
-      Tool calling and reasoning both use `poolside_v1` (Laguna's template is
-      GLM-derived: `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>`).
-      Served window is 32K (down from the 27B's 128K), matching the fleet chunkers.
-
-  tier2-chat:
-    # ✅ LIVE AND ROUTED (Phase 3 cutover, 2026-08-19). `chat`, `nexus-chat` and
-    # `companion-lite` resolve HERE now — that is the voice lane and Discord's conversational
-    # turn. Bare `tier2` stayed on the analyst (see below).
-    # (The orchestrator inner chat loop was the third consumer until it was DELETED on
-    # 2026-08-29; the remaining two are why this endpoint still exists.)
-    #
-    # What is actually running: the SAME abliterated Qwen3.6-35B-A3B Heretic Q4_K_M that
-    # `tier2-analyst` serves on the boxa — no requantisation, no persona change — on jetty's
-    # Radeon AI PRO R9700 under **llama.cpp b10488 / Vulkan (RADV GFX1201)**. 20 slots, 448K
-    # shared f16 KV pool, `--kv-unified`, ~30.0 GiB of 31.9.
-    #
-    # 🚫 SGLang was built end-to-end on this card, measured, and DROPPED (operator decision
-    # 2026-08-18): decode 27.7 vs 125.7 tok/s, and it self-limited to max_running_requests=2 on
-    # KV capacity, giving p95 5,430 ms at 8 concurrent — WORSE than the 2,688 ms p95 defect this
-    # split exists to fix. Do not re-propose it without new evidence.
-    #
-    # Measured vs the incumbent boxa: prefill ~3.8× (3,443 vs 911 tok/s p50), decode ~1.5×
-    # (123-127 vs 82.2 tok/s), two-family warm TTFT 157/164 ms with both prefixes resident.
-    # Every number and the full tuning sweep: infra/jetty/tier2-chat/README.md.
-    #
-    # 🚨 DEGRADATION IS FLEET-WIDE GO DARK (operator decision 2026-08-18). When this endpoint is
-    # unreachable every chat surface REFUSES the turn and says so — no fallback to tier2-analyst,
-    # none to tier3. That is deliberate: it forecloses the working-fallback-hides-a-dead-primary
-    # pattern. It also makes jetty a fleet-wide SPOF by design, so §8.0 of the plan turns five
-    # reliability items into REQUIREMENTS — the startup throughput probe most of all, because
-    # ROCm#6347 fixes decode throughput at process spawn silently and "up but permanently slow"
-    # is precisely the failure go-dark does NOT catch.
-    #
-    # ✅ Port 30000 CONFIRMED live (kept from the SGLang plan; llama.cpp is bound to it via a
-    # NAT shim, so `host: jetty, port: 30000` is literally true and verified end-to-end).
-    # ✅ Gate A is retired as written — it asked for SGLang prefill. Both engines were measured
-    # on the real card with our actual abliterated Qwen3.6; llama.cpp won. See the runbook.
-    # ✅ Gate G CLOSED — `infra/jetty/tier2-chat/bootgate.py` runs as ExecStartPost and asserts one
-    # server, decode >= 90 tok/s and real schema enforcement, restarting the unit if any fails.
-    # "Up but permanently slow" answers /health perfectly, so the boot gate and the health-verifier
-    # `llm_tier_dispatch` probe (slow_after_s: 8) are what catch it — /readyz structurally cannot.
+  tier2:
+    provider: mid-box
     kind: chat
-    status: active                  # ROUTED 2026-08-19 (Phase 3 cutover)
-    proxy_endpoint: true
-    endpoint_class: tier2-chat      # its OWN class — `creative` stays with the analyst. A class
-                                    # string is what `timeout_model.FLOOR_S`, `usage_rates` and
-                                    # `DEFAULT_ENDPOINTS` key off, so a new class is a mirrored
-                                    # edit in all three (test_timeout_floor_yaml_sync is loud).
-    role: tier2-chat
-    # ⚠️ `tier2-chat` MUST be listed here even though it is the entry's KEY — build_role_aliases()
-    # iterates `aliases` ONLY, so the key alone would 404 at the proxy (measured 2026-08-18 on
-    # `tier2-analyst`; pinned by test_every_canonical_name_is_dispatchable).
-    #
-    # MOVED HERE 2026-08-19 from `tier2-analyst`: `chat`, `nexus-chat` and `companion-lite`.
-    # 🚨 `companion-lite` now carries exactly ONE live caller: the VOICE LANE
-    # (`agents/voice/service.py` LLM_ROLE). It also carried the orchestrator inner chat loop
-    # until that engine was deleted 2026-08-29 (orchestrator gut). Said explicitly because the
-    # old comment named the dead loop FIRST, which reads as "retire this with the loop" — it is
-    # not retired, and pulling it would silently take the voice lane's model with it.
-    # 🚨 Bare `tier2` DELIBERATELY does NOT move (operator decision 2026-08-19). It also carries
-    # discord's ATTRIBUTION/SELF_STATE/NIGHTSHIFT/ARC_MODEL_ROLE (`agents/discord/_common.py`),
-    # song_studio and ~10 tools, all of which must stay on the analyst. Discord's CHAT turn got
-    # its OWN role instead — `_common.CHAT_MODEL_ROLE = "tier2-chat"`.
-    aliases: [tier2-chat, chat, nexus-chat, companion-lite]
-    host: jetty
-    port: 30000
-    backend_engine: llama.cpp      # NOT sglang — built, measured and dropped 2026-08-18
-    probe_kind: llama
-    model_family: Qwen3.6-35B-A3B (abliterated, Heretic) — MoE 35B total / ~3B active
-    quant: Q4_K_M                   # the same file the boxa serves — no requantisation
-    params: {active: 3B, total: 35B}
-    context_per_slot: 262144        # STARTUP SEED — the capacity poller overwrites from /props.
-                                    # llama.cpp reports n_ctx_slot=262144 (the model's own limit);
-                                    # under `--kv-unified` the real bound is the SHARED 448K pool,
-                                    # i.e. the SUM of live conversations, ~22.4K per slot at 20.
-    context_window: 32768           # POLICY, not slot size — same 32K the fleet chunkers size
-                                    # against on tier2-analyst, so moving an alias here changes
-                                    # no caller's chunking.
-    slots: 20                       # llama.cpp -np 20, shared 448K f16 KV pool (~30.0 of 31.9 GiB)
-    timeout_floor_s: 120            # HELD EQUAL to tier2-analyst's floor on purpose: this cutover
-                                    # moves aliases, not callers, and a floor change at the same
-                                    # time would confound any post-cutover latency reading.
-                                    # Right-sizing is Phase 5, after the workload is proved.
-                                    # (mirrors timeout_model FLOOR_S["tier2-chat"] — bump BOTH.)
-    # NOTE: no `timeout_ceiling_s` override, deliberately — unlike tier2-analyst this lane has no
-    # inherently long-running caller (long-form authoring goes to tier3, operator decision
-    # 2026-08-18), so the standard interactive/background bands apply.
-    policy:
-      # The identity of the WEIGHTS behind this endpoint, checked every poll
-      # against what the backend actually reports (backend.probe_model_fingerprint).
-      # Mismatch raises the `model_fingerprint_drift` WARNING.
-      #
-      # 🚨 THIS IS THE GUARD THAT WOULD HAVE CAUGHT 2026-08-23. Every
-      # model-dependent line on this stanza — thinking_kwargs,
-      # thinking_budget_ratio, disable_any_whitespace, documented_max_num_seqs,
-      # model_family — is a claim about specific weights, and the served model
-      # id CANNOT detect the weights changing (tier3 answers to the fixed alias
-      # `llama-thinker` whatever is loaded behind it). Measured live 2026-08-24.
-      # Still the abliterated Qwen3.6-35B-A3B; note this is the number tier2-analyst USED to
-      # report, which is exactly why the two stanzas must each carry their own.
-      #
-      # UPDATE THIS IN THE SAME EDIT AS THE MODEL. A stale value here is loud
-      # (an alert), which is the entire point — the previous failure was silent.
-      model_fingerprint: "params=34660610688;vocab=248320;ftype=Q4_K - Medium"
-      # Qwen3.6's template reads ONLY `enable_thinking` — measured 2026-08-24
-      # against this endpoint: `enable_thinking:true` -> 2,572 chars of
-      # reasoning cleanly separated into the response's reasoning field, while
-      # DeepSeek's `thinking:true` is a silent NO-OP (0 chars). The mirror image
-      # of the reasoner above, which is exactly why the key is declared per
-      # model instead of hardcoded once in the proxy.
-      #
-      # The proxy does NOT inject a default here: this backend is launched with
-      # `--chat-template-kwargs '{"enable_thinking":false}'`, so OFF is already
-      # the server-side default and a per-request injection would only add a way
-      # to get it wrong. The declaration earns its keep on the OTHER two paths —
-      # honouring a caller's pin, and `Correction.apply_thinking`'s opt-in.
-      thinking_kwargs: [enable_thinking]
-      # llama.cpp -np. Keep EQUAL to `slots: 20`; the shadow reconciler warns on drift.
-      documented_max_num_seqs: 20
-      # 🚨 MOVED HERE 2026-08-19 from `tier2-analyst`, in the same commit as the alias move.
-      # It marks the CONVERSATIONAL ROLE, and the conversational role now lives on jetty: with
-      # go-dark there is no fallback, so `/readyz` must fail closed here or the proxy would keep
-      # accepting work for a dead box and no chat surface could refuse and say so (§8.0 req 4).
-      # Leaving it on the analyst would have pointed fleet readiness at the box the chat lane no
-      # longer uses. Exactly one endpoint may carry it — test_exactly_one_endpoint_is_conversational.
-      readiness_critical: true
+    role: tier2
+    aliases: [chat, analyst]
+    slots: 6
+    context_per_slot: 262144
+    timeout_floor_s: 120
+    # 🚨 NO timeout_ceiling_s, deliberately, and no vision. This is the
+    # conversational lane: interactive turns only, so it takes the interactive
+    # band (600s) rather than the long-form one. "No 1,800-second jobs on the
+    # chat lane" is a property enforced HERE, at the timeout layer, rather than
+    # asserted in a plan — and `tier3` below is its counterpart. Collapsing the
+    # two would make the vision gate and the ceiling split both untestable.
     capabilities:
-      vision: false                 # vision lives on tier2-analyst; this lane is text-only
       streaming: true
-      reasoning: false
       tool_calling: true
       structured_output: true
-    purpose: |
-      RESERVED. The fleet-wide conversational model — the orchestrator inner chat loop, the
-      voice assistant lane, and Discord's conversational turns. Long-form authoring does NOT
-      come here: it goes to tier3 (operator decision 2026-08-18), which keeps this lane purely
-      interactive with no 1800s jobs competing with a chat turn.
-    notes: |
-      SERVING since 2026-08-18, ROUTED since the Phase 3 cutover 2026-08-19. Runbook (config +
-      every measured number): infra/jetty/tier2-chat/README.md. Design, gates and phasing:
-      originfleet/docs/tier2_split_architecture_2026-08.md.
-      🚨 EDITING THIS STANZA CHANGES NOTHING UNTIL THE PROXY AND GATEWAY RESTART. The catalog is
-      cached per process (model_catalog._cache) and config.DEFAULT_ENDPOINTS is built at import,
-      so a yaml edit is invisible to every surface — including the SPA Inference page, which
-      keeps rendering the OLD model with no error at all. Restart `llmproxy` AND `gateway`
-      (single-agent restarts, the preferred path). Checklist: plan doc §9b.
-      Liveness is watched by fleet-health `jetty-tier2-chat` (infra/fleet-health/services.yaml)
-      and, now that this endpoint is active, by the health-verifier `llm_tier_dispatch` scenario, whose
-      `roles:` list gained `tier2-chat` in the same commit — without that the fleet's whole
-      conversational lane would have gone unprobed while the analyst box kept reading green.
-      🚫 Do NOT pin callers to a slot via `id_slot`. Measured 2026-08-19 on the deployed config:
-      pinning the spoken lane to slot 0 gave 790 ms TTFT after a burst vs 204 ms unpinned
-      (~3.9x WORSE, 14/14 pinned trials cold). llama.cpp has no server-side slot reservation,
-      so a pin is a label, not an allocation. Detail: the runbook's "Reserving a slot" section.
-
-  # RENAMED 2026-08-18: `creative` → `tier2-analyst` (operator decision — every official role
-  # carries the `tier` designator). This is a NAME change only. `role:` and `endpoint_class:`
-  # below are DELIBERATELY still `creative`, because they are what the wire and the code key off:
-  # the llama.cpp container runs `-a creative`, and `timeout_model.FLOOR_S`, `usage_rates` and
-  # `DEFAULT_ENDPOINTS` are all keyed by the class string. Changing those is a code sweep plus a
-  # backend restart; changing the catalog key is neither. `creative` stays in `aliases:` so every
-  # existing caller keeps resolving (schema rule: rename → change the key, old name → aliases).
-  #
-  # 🚨 THE SPLIT HAPPENED 2026-08-19 (Phase 3). The CHAT aliases — `companion-lite`, `chat`,
-  # `nexus-chat` — LEFT this stanza for `tier2-chat` on jetty, and `readiness_critical` went
-  # with them. What is left here is the ANALYST lane. When you read a number or a rationale
-  # below that argues from "this endpoint also serves the chat loop", it predates the split.
-  # Plan: originfleet/docs/tier2_split_architecture_2026-08.md §7, §9.
-  tier2-analyst:
-    # ✅ DEPLOYED 2026-08-19 (Phase 4): **Qwen3.8-27B** replaced Qwen3.6-35B-A3B here. Dense
-    # 27B, native vision (no separate VL), built-in MTP head. Every field below now describes
-    # what the boxa is ACTUALLY serving; they were flipped in the same commit as the swap.
-    #
-    # The LIVE serve config (canonical copy: infra/nasbox-vllm-xpu/serve_creative_llamacpp.sh).
-    # 🆕 2026-08-30: the mmvq_cap FORKED IMAGE (`llamacpp-boxa:mmvq32`, built at b10499
-    # 6d05498 + infra/nasbox-vllm-xpu/mmvq_cap/mmvq_cap.patch) came OFF THE SHELF — operator
-    # decision, to give beacon subagent work more analyst concurrency. It raises ggml-SYCL's
-    # MMVQ ceiling via env `GGML_SYCL_MMVQ_MAX_BATCH=32`, which is what makes 6 slots + MTP
-    # legal (slots x (1+n_draft) = 12 <= 32; the stock image caps at 8 and falls off a
-    # dequant cliff above it). ⚠️ FORK TAX: on every llama.cpp upgrade this image must be
-    # REBUILT (recipe: mmvq_cap/README.md) — a floating :server-intel pull will silently
-    # reinstate the 8-column cliff and 6 slots would then be a throughput DISASTER.
-    #   -m /models/qwen38-27b/Q4_0.gguf --mmproj /models/qwen38-27b/mmproj-bf16.gguf
-    #   -ngl 99 -c 262144 --parallel 6 --kv-unified
-    #   -fa on -ctk q8_0 -ctv q8_0 -b 4096 -ub 2048 --cache-ram 32768
-    #   --spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-type-k q8_0 --spec-draft-type-v q8_0
-    #   --image-min-tokens 1024 --jinja --chat-template-kwargs '{"enable_thinking":false}'
-    # The full native 262,144 unified pool STILL FITS at 6 slots with MTP on (loaded ~56 s,
-    # the fits-fine range; the two cheap oversized-config tells are in the serve script).
-    # `--cache-ram 32768` (host-RAM prompt cache, was the 8 GiB default) added the same day:
-    # the log showed 3,545 evictions of 300-900 MiB entries — repeat-prefix callers (beacon
-    # subagents) were losing warm prefixes to churn. Host RAM only (box has ~122 GB free).
-    #
-    # 🚨 THREE THINGS THAT MUST NOT BE CHANGED CASUALLY:
-    #  1. `enable_thinking:false` is the fleet DEFAULT because analyst/classify/vision callers
-    #     don't want CoT. (The old claim here — that thinking-on breaks response_format via
-    #     #20345 — was STALE: fixed upstream 2026-03-10, re-measured 2026-08-23; grammar binds
-    #     with thinking on. Thinking is opted into per request; see the serve script.)
-    #  2. Q4_0 not Q4_K_M. For a DENSE model on SYCL, Q4_0 decode is 26% faster — the INVERSE
-    #     of the MoE law recorded in memory `reference_boxa_backend_and_moe_fit`.
-    #  3. Stay on SYCL: measured 1.9x prefill / 1.5x decode over Vulkan on this card (§8.1h).
-    #  4. `--kv-unified` is REQUIRED — it makes `-c` ONE shared pool across the 6 slots
-    #     instead of a per-slot allocation demanding 6x the memory.
-    kind: chat
-    status: active                  # PINNED always-resident on the boxa. Standalone docker container `llamacpp-creative-boxa` (--restart always) on :9196 — no dispatcher/systemd; proxy dispatches directly, capacity self-discovered via /props. Launched by infra/nasbox-vllm-xpu/serve_creative_llamacpp.sh, which is the canonical config. Since the 2026-08-19 Phase 4 swap it runs ONE Qwen3.8-27B DENSE container (+mmproj) backing TWO lanes — `creative` (long-form/song authoring) and the `classify`/`analyst`/vision family — plus bare `tier2`. HISTORY: it backed a THIRD role, `companion-lite` (the chat loop), until Phase 3 moved that to jetty the same day; before 2026-07-11 the box ran a Trinity-Mini/Gemma-4-26B two-container split and classify lived on the anvil llama-classify.service (stopped). Not evictable (dedicated card).
-    proxy_endpoint: true
-    # 🚨 NAMING — THIS ENDPOINT'S NAME IS `tier2-analyst` (the key above). The two
-    # `creative` strings below are the RETIRED name and are DELIBERATELY KEPT.
-    # Read this before "cleaning them up": each is load-bearing for a different
-    # reason, and neither is cosmetic.
-    #
-    #   endpoint_class — the proxy's endpoint IDENTITY. It is what `/v1/status`
-    #     keys, what `/v1/timeouts` reports, and what is PERSISTED into every
-    #     `proxy_completions` / `proxy_timeouts` row. Renaming it is a DATA
-    #     MIGRATION, not a rename: `usage_rates.py` must keep resolving the old
-    #     string or billing queries over historical rows raise on an unknown
-    #     endpoint (that file says so itself), this endpoint's cost history would
-    #     split across two names exactly like the real 2026-08-19 tier2-chat
-    #     split did — but here describing ONE lane, not two — and
-    #     `knowledge_store/roles.py:PRODUCTION_CHAT_CLASSES` is a hardcoded frozenset
-    #     that would silently lose a production class.
-    #   role — the PRE-DISCOVERY wire model id (`effective_model_id` =
-    #     `served_model_id or role`). The boxa container is launched `-a creative`,
-    #     so before /v1/models discovery populates `served_model_id` this is the
-    #     only correct value to send; renaming it would 400 the backend in exactly
-    #     the window where nothing else can tell you why.
-    #
-    # CONSEQUENCE, and it has already misled a session (2026-08-23): every raw
-    # proxy surface reports the RETIRED name, so anyone reading /v1/status or the
-    # timeouts ledger and repeating what it says will quote `creative`. The
-    # DISPLAY layer is already correct — `cache_stats.chat_endpoint_labels()`
-    # derives from this entry's key and yields `creative -> tier2-analyst`, which
-    # is what the Inference page shows. Pinned by
-    # `test_tier2_analyst_naming_doctrine.py`.
-    endpoint_class: creative
-    role: creative
-    # 🚨 `tier2-analyst` MUST be listed here even though it is the entry's KEY. The proxy's
-    # dispatch map comes from build_role_aliases(), which iterates `aliases` ONLY and maps each
-    # to `role:` — the catalog key never enters it. Measured 2026-08-18: with the key alone, a
-    # live call for role `tier2-analyst` got `404 unknown_endpoint` (known: creative, embed,
-    # gemma, rerank, thinker) while `creative`/`tier2` answered fine. cat.canonical() resolving
-    # the name is NOT evidence that the proxy will route it.
-    aliases: [tier2-analyst, creative, tier2, deckard, deckard-31b, qwen-classify, classify, analyst-vision, qwen-vision-8b, qwen-vision-9b, vision-8b, qwen-analyst, analyst]   # 🚨 SPLIT 2026-08-19 (Phase 3): `companion-lite`, `chat` and `nexus-chat` LEFT this list for `tier2-chat` on jetty. What remains is the ANALYST lane — the creative/long-form voice plus the whole classify/analyst/vision family (re-homed off anvil :9092 in the 2026-07-11 consolidation). All pure ALIASES of the single endpoint so no caller changes AND slots aren't double-counted (two stanzas at one URL would double-count the 6 slots). deckard/deckard-31b are HISTORICAL anvil NVFP4 rollback aliases (the deployed model is NOT a DECKARD finetune). `creative` became an alias in the 2026-08-18 rename. ⚠️ Bare `tier2` DELIBERATELY STAYS HERE (operator decision, re-affirmed 2026-08-19 at the cutover) — it has live callers that are NOT chat: discord attribution/self-state/nightshift/arc (agents/discord/_common.py), sidekick/song_studio.py:425, discord_schema_smoke, llm_benchmark, external_facade and ~10 tools. Re-pointing a live alias at a different model is the exact July `companion` failure, so Discord's chat turn was given its OWN role (`tier2-chat`) instead of `tier2` being moved under everybody else.
-    host: nasbox
-    port: 9196
-    backend_engine: llama.cpp
-    probe_kind: llama
-    served_model_names: [creative, deckard-31b, deckard]   # `creative` = the LIVE boxa llama.cpp server (-a creative); `deckard`/`deckard-31b` = the DORMANT anvil rollback (serve_deckard.sh, on anvil) — declared so the naming-doctrine test covers them. `companion-lite` is a ROUTING alias, NOT a served -a name — the container runs `-a creative`.
-    model_family: Qwen3.8-27B — DENSE 27B, 3:1 hybrid (48 Gated-DeltaNet linear-attention + 16 full-attention), natively multimodal, Q4_0 GGUF
-    quant: Q4_0                      # NOT Q4_K_M — the dense law inverts the MoE law on SYCL (see above)
-    params: {total: 27B}             # dense: no active/total split
-    context_per_slot: 262144         # llama.cpp `-c 262144 --parallel 6 --kv-unified` — ONE SHARED 262,144-token pool (the model's full native context), NOT a per-slot allocation: it bounds the SUM of live conversations. Sized by measurement 2026-08-19, never inherited — the incumbent's 393216 does not fit this model and degraded the endpoint to ~3 tok/s with /health green. Three things bought this pool, largest first: dropping MTP (auto-fit 59,648 -> 206,592), q8_0 KV instead of f16 (-> 262,144, measured free on this DENSE model though it was slower on the MoE), and dropping -b 8192 -ub 4096. Verified at this size with 6 CONCURRENT 3-image requests (41s, all correct — faster than the same test at 131,072, because more KV means less eviction).
-    context_window: 32768            # fleet chunkers size against 32K on purpose (policy, not slot size) — same policy classify used, so re-homing classify here changes no chunk sizing
-    slots: 6                         # llama.cpp --parallel 6 — 🆕 RAISED 4 -> 6 on 2026-08-30 by taking the mmvq_cap ceiling patch OFF THE SHELF (operator decision: beacon subagent capacity). The bound is unchanged in KIND: slots x (1 + n_draft) must stay <= the ggml-SYCL MMVQ ceiling, which the forked image `llamacpp-boxa:mmvq32` raises to 32 via env GGML_SYCL_MMVQ_MAX_BATCH=32 (6 x 2 = 12 <= 32). 🚨 ON THE STOCK :server-intel IMAGE THE CEILING IS 8 AND 6 SLOTS + MTP IS A THROUGHPUT DISASTER (~80% decode loss past the cliff, /health green throughout) — if this endpoint is ever rolled back to a stock image, slots must drop to 4 IN THE SAME CHANGE. Patch, rebuild recipe, gates and raw numbers: infra/nasbox-vllm-xpu/mmvq_cap/ + docs/boxa_speculative_decoding_2026-08.md. The shadow reconciler warns if this drifts from actual --parallel.
-    timeout_floor_s: 120            # compromise: this endpoint serves BOTH long creative song-compose AND latency-sensitive classify/vision/tool calls. 120s min-budget; adaptive surge×size widens to the ceiling for big song-compose, and a stuck call fails in ~120s instead of 900s. (mirrors timeout_model FLOOR_S["creative"] — bump BOTH in lockstep.) The chat-loop half of this compromise left with `companion-lite` on 2026-08-19; held at 120 through the cutover so a latency reading is not confounded by two changes at once — re-derive at Phase 5.
-    timeout_ceiling_s: 1800         # inherently long-running (long-form gen); a role override so the generous background band applies on EVERY tier (song-compose runs at an interactive tier). Adaptive surge×size widens up to here.
     policy:
-      # The identity of the WEIGHTS behind this endpoint, checked every poll
-      # against what the backend actually reports (backend.probe_model_fingerprint).
-      # Mismatch raises the `model_fingerprint_drift` WARNING.
-      #
-      # 🚨 THIS IS THE GUARD THAT WOULD HAVE CAUGHT 2026-08-23. Every
-      # model-dependent line on this stanza — thinking_kwargs,
-      # thinking_budget_ratio, disable_any_whitespace, documented_max_num_seqs,
-      # model_family — is a claim about specific weights, and the served model
-      # id CANNOT detect the weights changing (tier3 answers to the fixed alias
-      # `llama-thinker` whatever is loaded behind it). Measured live 2026-08-24.
-      # llama.cpp reports a `meta` block; `n_params` is the field carrying the signal — this
-      # box went 35B-A3B MoE -> dense 27B on 2026-08-19, i.e. 34660610688 -> 27320697856.
-      #
-      # UPDATE THIS IN THE SAME EDIT AS THE MODEL. A stale value here is loud
-      # (an alert), which is the entire point — the previous failure was silent.
-      model_fingerprint: "params=27320697856;vocab=248320;ftype=Q4_0"
-      # Qwen3.8's template reads ONLY `enable_thinking`, same as tier2-chat —
-      # measured 2026-08-24 against this endpoint: `enable_thinking:true` ->
-      # 2,913 chars of reasoning in a separate field with clean `content`, while
-      # `thinking:true` is a silent no-op (0 chars). Reasoning SEPARATES
-      # correctly here, so the opt-in is genuinely available on this endpoint —
-      # it just was not reachable before 2026-08-24 (`apply_thinking` returned
-      # early on every non-vLLM engine).
-      #
-      # No proxy-side default injection: launched with
-      # `--chat-template-kwargs '{"enable_thinking":false}'`. See tier2-chat.
-      thinking_kwargs: [enable_thinking]
       background_floor_pct: 0.0
-      fast_path_reserve_slots: 2     # 2 of SIX slots again since 2026-08-30 (the 2026-08-21 slot drop made it 2 of 4), so background concurrency is back to 4 — which is the point of the six-slot raise: beacon subagent work rides the background band. The interactive GUARANTEE (the classify/analyst/vision family, discord's attribution+self-state gates, the ~10 tool callers on bare `tier2`) keeps its 2 reserved slots so none is head-of-line blocked behind background work. If interactive p95_wait rises under sustained subagent load, raise this to 3 before touching slots.
-      # llama.cpp --parallel. Keep EQUAL to `slots: 6` above; the shadow reconciler warns on drift.
-      documented_max_num_seqs: 6
-      # 🚨 `readiness_critical` LEFT THIS STANZA 2026-08-19, in the same commit as the alias
-      # move — it is now on `tier2-chat`. It marks the CONVERSATIONAL role, and after the split
-      # this box no longer serves one: it serves creative/long-form authoring plus the
-      # classify/analyst/vision family. 503-ing fleet readiness because song-compose or a
-      # classify extract is down is a different, wrong claim — which is also why the flag was
-      # never derived from `kind: chat` (that spans tier1 router through tier3 reasoner).
-      # Exactly one endpoint may carry it; test_exactly_one_endpoint_is_conversational pins that.
+      fast_path_reserve_slots: 2
+      # A llama.cpp weights fingerprint: /v1/models publishes `meta`, which the
+      # proxy folds into this short stable string. Compared for EQUALITY against
+      # what discovery finds — never parsed.
+      model_fingerprint: params=27000000000;vocab=151936;ftype=Q4_K - Medium
+      readiness_critical: true # THE conversational lane, singular: /readyz
+                               # fails closed when this one is unhealthy.
+      thinking_kwargs: [enable_thinking]
+
+  tier3:
+    provider: large-box
+    kind: chat
+    role: tier3
+    aliases: [reasoner, thinker, composer, creative, vision]
+    slots: 6
+    context_per_slot: 131072
+    timeout_floor_s: 180
+    timeout_ceiling_s: 1800    # long-form work runs here, on an interactive
+                               # tier: a generous upper bound that overrides the
+                               # band. The counterpart to tier2's absence of one.
+    failover_to: tier2         # degrade to the mid tier, never chain further.
     capabilities:
-      vision: true                  # mmproj loaded (mmproj-bf16.gguf, 861 MB) — classify's vision callers (attachments stage-2, knowledge_store intake, browser_broker perceive./vision.) route here now. 🚨 The old "verified 2026-07-11: perfect OCR + shape/number extraction, ~79 t/s vision decode" claim was measured on the Qwen3.6-35B-A3B MoE that this endpoint STOPPED serving at the 2026-08-19 Phase-4 swap — it is not a current number for the dense Qwen3.8-27B and is REMOVED rather than carried. Vision correctness was re-gated at the swap (see docs/tier2_split_architecture_2026-08.md §8.1a-i); vision THROUGHPUT on the dense model has not been re-measured. Text decode on the current model is 26-39 tok/s single-stream (docs/tier_benchmark_baseline_2026-08.md, 2026-08-26).
+      vision: true             # an mmproj / vision tower is loaded. DEFAULTS
+                               # FALSE elsewhere on purpose — a stanza that
+                               # forgets it gets a warning, never an outage.
+      reasoning: true          # vLLM CAN switch reasoning off, so this does NOT
+                               # set forces_reasoning — the proxy defaults the
+                               # switch below to false and reasoning is opt-in
+                               # per call.
       streaming: true
-      reasoning: false              # Describes the SERVER DEFAULT, not a model limit: Qwen3.8 IS a reasoning checkpoint and CoT is disabled via `--jinja --chat-template-kwargs '{"enable_thinking":false}'` (VERIFIED 2026-08-19: 0 reasoning_content). Callers opt IN per request — dsh's `tier2-analyst-think` does. 🔴 The trailing claim here ("llama.cpp #20345 silently disables enforcement on this family when thinking is on") was STALE and is REMOVED: #20345 was fixed 2026-03-10 (PR #20223), five months before this endpoint's b10499. Re-measured 2026-08-23 on the live endpoint, a forced-enum probe stayed CONSTRAINED with thinking on at both xhigh and low (N=1 per arm, one small enum schema — enough to refute "silently disabled", not to certify every schema). 🚨 Thinking on WITHOUT `reasoning_effort` means `xhigh`, the model's maximum: the template does `reasoning_effort|default('xhigh')`. Legal values xhigh/medium/low; anything else raises and errors the request. See the serve script's constant 5.
-      tool_calling: grammar         # GBNF grammar-constrained. Qwen3.8 also ENFORCES `tool_choice: required`, which the Qwen3.6 incumbent did not (measured 2026-08-19); abstains correctly on tool_choice auto.
-      structured_output: grammar    # llama.cpp GBNF / response_format json_schema. NOTE: give structured calls a generous max_tokens.
-    token_speed: {note: "Qwen3.8-27B dense Q4_0 on the boxa (forked llamacpp-boxa:mmvq32 = b10499 + mmvq_cap.patch), 🆕 6 slots + MTP speculative decoding since 2026-08-30 / 262144 shared kv-unified pool, q8_0 KV, cache-ram 32768. Measured live on the DEPLOYED config at the 2026-08-30 cutover, aggregate decode tok/s at concurrency 1/2/4/6: 38.8 / 61.1 / 79.6 / 87.6, draft acceptance 74-81% (reproduces the 08-21 shelf numbers within 2%). ⚠️ A staggered-arrival workload measures LOWER (71.7 at c6 with overlapping prefills) — the clean-wave number is a ceiling, not a promise. -ub 4096 was RE-TESTED at this config 2026-08-30 and REJECTED: prefill +14-23% but decode -12-16% with a GTT-spill fit warning, and it would double the prompt-cache reuse floor to ~4100 tokens. Prior 4-slot stock-image config (2026-08-21..30): 38.4 / 62.7 / 76.0 / 82.8 at c1-4, queueing above 4. SUPERSEDED PRE-2026-08-21 NUMBERS, kept for comparison: prefill 624 tok/s @2K, 810 @8K; decode AGGREGATE 23.7 tok/s at 1 stream -> 64.4 at 6 (per-stream 26.6 -> 12.0). Why 4 slots and MTP together: the '2.6x worse at six' measurement is real, but its cause is ggml-SYCL's 8-column MMVQ limit, NOT batching (corrected 2026-08-21, see docs/boxa_speculative_decoding_2026-08.md). Above ne[1] = slots x (1+n_draft) = 8 the backend dequantizes the whole weight tensor per call per layer, and the SAME cliff fires with spec decode OFF at 9 concurrent (76.6 -> 13.6 tok/s). '--parallel 4 --spec-draft-n-max 1' holds ne[1] <= 8 by construction. The old claim that MTP's draft state was the single biggest consumer of KV headroom is ALSO wrong: that cost scaled with SLOTS, and at 4 slots the full 262,144 pool still fits with MTP on. 🚨 SINGLE-STREAM, measured 2026-08-26 through the llm_benchmark harness: decode 26-39 tok/s, cold prefill 619-856 tok/s, cold TTFT 1.4s at 860 input tokens rising to 15.6s at 13,387 — this is the fleet's SLOWEST generative tier, and any guidance calling 'creative' one of the faster tiers predates the Phase-4 swap. See docs/tier_benchmark_baseline_2026-08.md. An aggregate decode number is NOT what one caller feels, and a single-stream number is NOT this endpoint's throughput — it serves four."}
-    purpose: |
-      The boxa analyst model — ONE Qwen3.8-27B dense (+mmproj) serving TWO lanes: (1) the
-      creative / counterpoint generative voice (songs, DJ patter), and (2) the fleet
-      text-classify + VISION tier (classify/analyst family). Bare `tier2` also lands here.
-      🚨 It no longer serves the chat loop: `companion-lite` left for `tier2-chat` on jetty at
-      the 2026-08-19 Phase 3 cutover, and the model itself was swapped off Qwen3.6-35B-A3B at
-      Phase 4 the same day. This box is the fleet's ONLY vision tier — jetty has no mmproj.
-    when_used:
-      - sidekick song authoring (theme/hook/expand), dj crew speaker voice
-      - discord attribution / self-state / nightshift / arc gates and ~10 tools, via `tier2`
-      - (NOT the inner chat loop — `companion-lite` moved to jetty 2026-08-19)
-      - Tier-1.5/Tier-2 text classification (sidekick.extract_pad fallback, temporal.daily_summary, mail-agent.email_recent_overview, orchestrator.autonomous_chat-agent.reflect, forum-agent.peer_playbook) via the classify alias
-      - attachments stage-2 full-resolution image extraction; knowledge_store ground-truth PII/document intake; browser_broker vision-routed capabilities (perceive./vision./insurance./portal.) via the vision aliases
-    # 🚨 LITERAL null, and it must stay null (2026-08-20, § 9). This stanza said
-    # `tier3_backup` for the same reason `reasoner` did — as advisory metadata
-    # naming an endpoint that was `proxy_endpoint: false` and could not serve.
-    # Now that `fallback:` actually routes, a value here would ARM a
-    # tier2-analyst → somewhere failover that was never designed, decided or
-    # tested. Only ONE direction is authorised: tier3 → tier2-analyst.
-    #
-    # In particular do NOT set `thinker` to make it reciprocal. This endpoint is
-    # the failover TARGET; pointing it back at the source declares a pair that
-    # reads as a loop to anyone auditing it, and the case it appears to solve —
-    # both endpoints sick — is already handled (failover refuses to enter
-    # degraded mode when the target is unhealthy, and never chains a second hop).
-    fallback: null
-    notes: |
-      🚨 CURRENT STATE (re-stated 2026-08-26 — the paragraphs below this one had gone stale in the
-      present tense through TWO swaps, while every structured field on this stanza was kept correct).
-      DEPLOYED MODEL: dense `Qwen3.8-27B`, Q4_0, NOT abliterated — swapped in at Phase 4 on
-      2026-08-19, replacing the abliterated (Heretic) Qwen3.6-35B-A3B MoE. Live fingerprint
-      `params=27320697856;vocab=248320;ftype=Q4_0` (verified against /v1/status 2026-08-26).
-      SERVING: 4 slots (`--parallel 4`) with MTP speculative decoding ON since 2026-08-21, one
-      shared `-c 262144 --kv-unified` pool, q8_0 KV — NOT the 6 slots / 393216 / f16 KV described
-      below. See `slots:` above for why 4 is a CORRECTNESS bound, not a capacity choice.
-      ROLES: `creative` + the `classify`/`analyst`/vision family + bare `tier2`. `companion-lite`,
-      `chat` and `nexus-chat` LEFT this endpoint at Phase 3 (2026-08-19) for `tier2-chat` on jetty
-      — the orchestrator inner chat loop is NOT served here any more.
-      PERFORMANCE: 26-39 tok/s single-stream decode, 619-856 tok/s cold prefill — the fleet's
-      SLOWEST generative tier (docs/tier_benchmark_baseline_2026-08.md, 2026-08-26). Do not quote
-      the MoE-era 86-97 tok/s / 817-1501 tok/s figures for this endpoint.
-      Still true across both models: ONE standalone always-on docker container
-      `llamacpp-creative-boxa` (`ghcr.io/ggml-org/llama.cpp:server-intel`, SYCL/level_zero:0,
-      --restart always) on the Intel Arc Pro boxa (10.0.0.10:9196); ALL non-`creative` roles are
-      ALIASES of this one endpoint, and keeping ONE stanza at ONE URL keeps slot accounting correct
-      (two stanzas at one URL would double-count). Reasoning DISABLED via `--jinja
-      --chat-template-kwargs '{"enable_thinking":false}'` (re-verified 2026-08-19: 0
-      reasoning_content). llama.cpp disables `--cache-reuse` when an mmproj is loaded (logged at
-      boot); cross-turn token reuse is off, but `--slot-prompt-similarity 0.5` still routes each
-      request to its warm slot. NO dispatcher, NO systemd — docker owns lifecycle; depends on the
-      /mnt/cache/llm mount.
-      ── HISTORICAL, describing the 2026-07-11..2026-08-19 MoE loadout; superseded above ──
-      CONSOLIDATED 2026-07-11 (three roles → one model): the container backed `creative`,
-      `companion-lite` (orchestrator chat loop) AND the `classify`/`analyst`/vision family
-      (re-homed off anvil). Model was the abliterated Qwen3.6-35B-A3B MoE (35B total / ~3B
-      active), Q4_K_M GGUF + native mmproj (mmproj-bf16.gguf, 861 MB) on the /mnt/cache/llm NVMe;
-      vision verified 2026-07-11 at ~79 t/s. Launch was
-      `-ngl 99 -c 393216 --parallel 6 -fa on -ctk f16 -ctv f16 --mmproj …` => 65536 ctx/slot,
-      ~30.5 GiB resident of the 32GB card.
-      CANONICAL LAUNCH + per-flag rationale: `infra/nasbox-vllm-xpu/serve_creative_llamacpp.sh`.
-      This SUPERSEDED (a) the prior two-model creative/chat split (Trinity-Mini :9196 + Gemma-4-26B-A4B
-      :9197 — old `llamacpp-companion-lite-boxa` container STOPPED), AND (b) the anvil
-      `llama-classify.service` (Qwen3.6-35B-A3B+mmproj on the GB10 :9092 — STOPPED + disabled; the
-      GB10 is now free for imagegen/videogen, and classify no longer has to evict them). Moving the
-      light classify model OFF the contended anvil card also fixes classify's ~36s p95 queue-wait.
-      ROLLBACK: git-revert `serve_creative_llamacpp.sh` + re-run `serve_companion-lite_llamacpp.sh` +
-      re-enable `llama-classify.service` on anvil + revert these stanzas (all prior GGUFs remain
-      staged). The `deckard`/`deckard-31b` aliases remain declared for the naming-doctrine;
-      serve_deckard.sh (anvil) is unaffected.
+      tool_calling: true
+      structured_output: true
+    policy:
+      background_floor_pct: 0.0
+      fast_path_reserve_slots: 1
+      documented_max_num_seqs: 6
+      failover_dwell_s: 120
+      # 🚨 The spelling is per MODEL FAMILY, not per engine — it is a
+      # chat-template variable. Declaring both names is right for a family whose
+      # template reads either; declaring the wrong one makes thinking a silent
+      # no-op. Never hardcode it.
+      thinking_kwargs: [thinking, enable_thinking]
+      # Fraction of max_tokens reasoning may consume. 🚨 This is a DECLARATION
+      # OF A LAUNCH FLAG, not a tuning knob: vLLM 400s the entire request if
+      # `thinking_token_budget` arrives at a server started without
+      # `--reasoning-config`. Set it only if that flag is on the serve command.
+      thinking_budget_ratio: 0.6
+      # A vLLM weights fingerprint: /v1/models publishes `root`, the weights
+      # PATH — not `id`, which is the operator's --served-model-name and stays
+      # put across a swap, so an alert keyed on it could never fire.
+      #
+      # 🚨 Declaring a thinking switch WITHOUT a fingerprint is the half of the
+      # pair that cannot notice it went stale: the switch is a claim about a
+      # model, and nothing else would tell you the model changed underneath it.
+      # test_model_swap_guards.py pins that they travel together. Change this
+      # when you change the weights — an alert on first start means the
+      # declaration and the backend already disagree, which is the alert working.
+      model_fingerprint: /srv/models/example-reasoner-2026-01
 
-  # classify/analyst/vision: RETIRED as distinct stanzas 2026-07-11 — MERGED into
-  # `creative` above as ALIASES (keeping ONE stanza at ONE URL keeps slot accounting correct).
-  # 🚨 companion-lite is NO LONGER among them: it left for `tier2-chat` on jetty at Phase 3
-  # (2026-08-19), so the orchestrator inner chat loop is NOT served here. And the merged model is
-  # the dense Qwen3.8-27B (Phase 4, 2026-08-19), not the abliterated Qwen3.6-35B-A3B MoE this
-  # comment used to name. classify/analyst/vision callers target their usual
-  # role names — all now resolve to the creative endpoint (:9196). The anvil llama-classify.service
-  # is stopped+disabled. See the creative stanza's `aliases:` + notes, and the `decommissioned:` block.
-
-  # ---------------------------------------------------------------- retrieval
   embed:
+    provider: embed-shim
     kind: embed
-    status: active
-    proxy_endpoint: true
-    endpoint_class: embed
-    role: bge-m3-embed
-    aliases: [embed, bge-m3-embed]   # `embed` is the entry's own KEY and must be listed — build_role_aliases() reads `aliases` only, so without it a call for role `embed` 404s at the proxy (see test_every_canonical_name_is_dispatchable).
-    host: nexus             # 2026-07-30: MOVED anvil -> nexus (ROCm/gfx1151) for hardware diversity
-    port: 9087
-    backend_engine: shim
-    systemd_unit: bge-m3-embed
-    probe_kind: health
-    model_family: BGE-M3 (dense + sparse + colbert)
-    quant: fp16
-    context_per_slot: 8192
+    role: embed
+    aliases: [embeddings]
     slots: 4
+    context_per_slot: 8192
     timeout_floor_s: 15
     policy:
-      skip_discovery: true          # FastAPI shim — no /props or /v1/models
-    capabilities:
-      vision: false
-      streaming: false
-      structured_output: none
-    token_speed: {note: "hybrid embed, one forward pass"}
-    purpose: Dense/sparse/colbert hybrid embeddings for retrieval (the canonical fleet embed).
-    when_used:
-      - knowledge ingest + retrieval, forum-agent similarity gate, dedup
-    fallback: null
-    notes: |
-      NOT OpenAI-compatible — POST /embed returning dense+sparse+colbert. The
-      nexus CPU copy (:8091) was removed 2026-06-05; this is the nexus GPU
-      copy (ROCm/gfx1151), which is a different thing — do not confuse them.
-      Moved off anvil 2026-07-30 for hardware/vendor diversity: retrieval now
-      fails independently of CUDA-stack generation. Measured cost, accepted:
-      query (12 tok) 17.3 -> 31.0 ms, chunk 1.20x, long chunk ~parity,
-      batch x16 marginally faster on nexus. ROCm loses on small latency-bound
-      calls and catches up when batched.
+      skip_discovery: true     # a FastAPI shim with no /props and no
+                               # /v1/models: without this the poller 404s both
+                               # probes every cycle, forever.
 
   rerank:
+    provider: rerank-shim
     kind: rerank
-    status: active
-    proxy_endpoint: true
-    endpoint_class: rerank
-    role: bge-reranker
-    aliases: [bge-reranker, rerank, nexus-rerank]
-    host: nexus             # 2026-07-30: MOVED anvil -> nexus (ROCm/gfx1151) for hardware diversity
-    port: 9084
-    backend_engine: shim
-    systemd_unit: bge-reranker-shim
-    probe_kind: infinity
-    model_family: BGE-Reranker v2-m3 (cross-encoder)
-    quant: fp16
-    context_per_slot: 8192
+    role: rerank
     slots: 1
+    context_per_slot: 8192
     timeout_floor_s: 10
     policy:
-      background_floor_pct: 0.0
       skip_discovery: true
+      background_floor_pct: 0.0
+
+  # --- remote spill, documented but not routed (see the provider's notes) ----
+
+  spill-chat:
+    provider: openrouter
+    kind: chat
+    status: planned
+    model: openai/gpt-oss-120b
+    slots: 4
+    context_per_slot: 131072
+    timeout_floor_s: 120
     capabilities:
-      vision: false
-      streaming: false
-      structured_output: none
-    token_speed: {note: "cross-encode candidate batch"}
-    purpose: Late-stage retrieval candidate reranking.
-    when_used:
-      - knowledge retrieval rerank stage
-    fallback: null
-    notes: |
-      Cohere-style POST /rerank (not OpenAI). Upstream `infinity-bge-reranker`
-      (:9085) is the INTERNAL backend behind this shim — not a public role.
-      Moved off anvil 2026-07-30 for hardware/vendor diversity (see `embed`).
-      Measured cost, accepted — ROCm's penalty is WORST on small candidate
-      lists, which is the common kv4-recall shape:
-        5 cand 45.9 -> 133.8 ms | 10 cand 38.5 -> 141.1 ms (3.66x)
-        25 cand 99.9 -> 181.7 ms | 50 cand 159.1 -> 335.7 ms
-      ⚠️ The nexus venvs are NOT rebuildable from anvil's pip freeze, and the
-      two services need CONFLICTING versions — rerank wants transformers 4.57.6
-      + numpy 1.26.4, embed wants transformers 5.8.1 + numpy 2.4.5. They live in
-      SEPARATE venvs (/opt/rerankenv, /opt/rocmtest/venv) for that reason; do not
-      merge them. infinity_emb 0.0.77 also needs a stale `optimum/bettertransformer/`
-      tree that PyPI optimum 2.1.0 no longer ships.
+      streaming: true
+      tool_calling: true
 
-  # ---------------------------------------------------------------- vision / OCR
-  ocr:
-    kind: ocr
-    # ✅ 2026-07-31: BACK UP, on nexus (Phase E). It had been stopped since 2026-07-30 — switched
-    # off on the A2000 to free VRAM for tier1/gemma (gemma needs 3817 MiB; only 1404 MiB was free
-    # with OCR resident). Phase B stopping the nexus 122B freed ~100 GiB, which is what let it
-    # come back here. Verified end-to-end on ROCm: a probe image containing "INVOICE AX-4471 /
-    # 842.10 GBP / 31 March 2026" round-tripped correctly in 5.4 s.
-    status: active
-    proxy_endpoint: false           # facade-only (gateway), not a proxy LLM role
-    role: got-ocr
-    aliases: [got-ocr, got_ocr]
-    # nexus (Strix Halo, ROCm/gfx1151) as of 2026-07-31 — unit `nexus-got-ocr`, isolated venv
-    # at /opt/got-ocr/.venv. Was kestrel-perception (A2000/CUDA) 2026-07-02..2026-07-30.
-    # ⚠️ transformers is PINNED 4.45.2 there: GOT-OCR2_0's trust_remote_code modeling breaks on
-    # newer. That conflicts with nexus's embed (5.8.1), rerank (4.57.6) and imagegen (5.14.1)
-    # venvs — four services, four venvs, do not consolidate.
-    host: nexus
-    port: 8087
-    backend_engine: shim
-    # `nexus-got-ocr` on nexus since 2026-07-31 (was `ocr-unit` on the A2000).
-    # Telemetry probes this with `systemctl is-active` — a stale unit name silently drops
-    # the role from derived UNITS (no health probe / metrics / health-verifier), the same way an empty
-    # systemd_unit did for tier3.
-    systemd_unit: nexus-got-ocr
-    probe_kind: health
-    model_family: GOT-OCR-2.0
-    quant: fp16
+  spill-reasoning:
+    provider: openrouter
+    kind: chat
+    status: planned
+    model: deepseek/deepseek-r1
+    slots: 2
+    context_per_slot: 163840
+    timeout_floor_s: 180
     capabilities:
-      vision: true
-      structured_output: none
-    purpose: Primary OCR (document/image text extraction).
-    when_used:
-      - attachments + email document OCR
-    fallback: classify               # updated 2026-07-03 (was analyst — stale since the vision split)
-    notes: |
-      Reached via the gateway facade, not make_nexus_client. Ran on nexus (ROCm)
-      through 2026-07-01; relocated to Kestrel's OCR VM (10.0.0.18, CUDA)
-      2026-07-02. nexus's copy left running as rollback during soak.
-
-  # ---------------------------------------------------------------- speech
-  tts:
-    kind: tts
-    status: active
-    proxy_endpoint: false
-    role: orpheus-tts
-    aliases: [orpheus-tts, orpheus]
-    host: kestrel-perception             # RELOCATED off nexus 2026-07-02 (Kestrel OCR VM, CUDA)
-    port: 8098
-    slots: 4                           # llama.cpp backbone --parallel 4 (bumped from nexus's 2->3->4)
-    backend_engine: shim
-    systemd_unit: orpheus-tts
-    probe_kind: health
-    model_family: Orpheus 8-voice (Llama-3.2-3B + SNAC)
-    purpose: Text-to-speech — DJ + voice replies.
-    when_used:
-      - dj crew voice, speech-frame replies
-    fallback: null
-    notes: |
-      Backbone `orpheus-llama` (Llama-3.2-3B) on :8096 emits SNAC codes;
-      orpheus-tts (:8098) is the front. Replaced chatterbox-tts (2026-06-07).
-      Ran on nexus (Vulkan, --parallel 2) through 2026-07-01; relocated to
-      Kestrel's OCR VM (10.0.0.18, CUDA, --parallel 4) 2026-07-02/03.
-      nexus's copy left running as rollback during soak.
-
-  stt:
-    kind: stt
-    status: active
-    proxy_endpoint: false
-    role: whisper-1
-    aliases: [whisper-1, whisper]
-    host: kestrel-speech                # RELOCATED off Nasbox 2026-07-03 (Kestrel CTnnn iGPU)
-    port: 8086
-    slots: 1                          # single-worker ThreadPoolExecutor(max_workers=1) — sequential
-    backend_engine: shim
-    model_family: parakeet-tdt-0.6b-v3 (onnx-asr, CPU)
-    purpose: Speech-to-text transcription (speech unit).
-    when_used:
-      - Tideway transcription, voice intake, Wyoming ASR for HA
-    fallback: null
-    notes: |
-      Speech STT migrated off whisper to NVIDIA parakeet-tdt-0.6b-v3 (onnx-asr,
-      CPU EP) 2026-07-18 (STT_BACKEND=parakeet) — off the contended iGPU; instant
-      rollback STT_BACKEND=whisper. The DJ song-lyrics transcribe unit (/transcribe)
-      STAYS on whisper-large-v3-turbo-int8 (LYRICS_BACKEND=whisper) — see the
-      lyrics-transcribe block below. Runs on Kestrel CTnnn "audio" (10.0.0.13),
-      relocated nexus→Nasbox 2026-06-12 → Kestrel 2026-07-03.
-
-  diarize:
-    kind: diarize
-    status: on_demand
-    proxy_endpoint: false
-    role: diarize-gpu
-    aliases: [diarize-gpu, nexus-diarize-gpu]
-    host: kestrel-speech                # RELOCATED off Nasbox 2026-07-03 (Kestrel CTnnn iGPU)
-    port: 8086
-    slots: 1                          # single-worker ThreadPoolExecutor(max_workers=1) — sequential
-    backend_engine: shim
-    model_family: DiariZen (WavLM, OpenVINO)
-    dispatcher_capability: diarize
-    unit: diarize-gpu.service
-    purpose: Speaker diarization.
-    when_used:
-      - multi-speaker transcript attribution
-    fallback: null
-    notes: |
-      Gated by DIARIZE_ENABLED (default off). Ran on the Nasbox iGPU (10.0.0.10:8086,
-      OpenVINO) 2026-06-12 through 2026-07-02; relocated to Kestrel CTnnn "audio"
-      (10.0.0.13, same image/port) 2026-07-03, reached via the gateway facade.
-      Nasbox's copy left running as rollback during soak. The anvil dispatcher
-      row was removed 2026-06-16 (build_dispatcher_entries excludes non-anvil
-      hosts), so this is no longer a anvil-dispatcher capability.
-
-  stream:
-    kind: stream
-    status: active
-    proxy_endpoint: false
-    role: nexus-stream
-    aliases: [nexus-stream, stream]
-    host: kestrel-speech                # RELOCATED off Nasbox 2026-07-03 (Kestrel CTnnn iGPU)
-    port: 8190
-    wyoming_port: 10300
-    backend_engine: shim
-    model_family: nexus-stream audio mux (WS + OpenAI batch + Wyoming TCP)
-    purpose: Speech audio mux / streaming relay (+ Wyoming bridge for Home Assistant).
-    when_used:
-      - real-time voice capture pipeline, HA Wyoming ASR
-    fallback: null
-    notes: |
-      Ran on Nasbox (10.0.0.10) :8190 + Wyoming :10300 2026-06-12 through
-      2026-07-02; relocated to Kestrel CTnnn "audio" (10.0.0.13, same
-      image/port) 2026-07-03. Nasbox's copy left running as rollback during soak.
-
-  asr:
-    kind: stt
-    status: active
-    proxy_endpoint: false
-    role: nexus-asr
-    aliases: [nexus-asr, asr]
-    host: nexus
-    port: 9088
-    slots: 1
-    quant: q8_0
-    # 🔑 `systemd_unit` (no .service) is the TELEMETRY field — it is what
-    # build_telemetry_units() reads to probe a unit on the box. `unit:` below is
-    # the DISPATCHER-brokered field; every other entry using it is kind: media,
-    # and nexus-asr is a plain always-on service, not dispatcher-managed. They
-    # are different fields and setting only the second one leaves the service
-    # declared but unprobed — which is what shipped first.
-    systemd_unit: nexus-asr
-    probe_kind: health
-    backend_engine: llama.cpp (Vulkan)
-    unit: nexus-asr.service
-    health_path: /health
-    model_family: nemotron-3.5-asr-streaming-0.6b
-    purpose: Streaming multilingual ASR for the spoken conversation lane.
-    when_used:
-      - the voice lane (agents/voice), driven by the phone microphone
-    fallback: null
-    notes: |
-      🚨 DIALLED DIRECT, not through the proxy — the lane opens a WebSocket to
-      :9088/v1/realtime itself (docs/asr_api.md §7; the gateway facade cannot
-      carry a WS upgrade). Declared here anyway because this file is the
-      AUTHORITY the Inference page and the nexus telemetry lane read: an
-      ACTIVE unit that is undeclared here renders as a generic system_service
-      with no throughput/latency capability, and `inference_page_audit` has
-      been carrying a standing WARN about exactly that.
-
-      No `endpoint_class`, deliberately: this is not a proxy endpoint class, so
-      it must not enter ROLE_TO_CLASS (`build_role_to_class` skips entries
-      without one). The rollup key stays `asr` — `normalize_endpoint` strips
-      the `nexus-` prefix — which is what the gateway's usage join now
-      accounts for (`_usage_row_for`).
-
-      fallback: null is LITERAL. The English-only model was deleted at the
-      2026-08-18 swap with nothing behind it; multilingual costs +0.87 pp of
-      English WER (3.10 → 3.97 %, n=200) and that trade is permanent and
-      accepted. The lane pins a language by default (a LOCK, not an accuracy
-      control — pinned en-US and `auto` scored identically); pinning the WRONG
-      language returns an EMPTY transcript, not a wrong one.
-
-  # ---------------------------------------------------------------- media / generation
-  # All dispatcher-managed, on-demand (GPU-slot lease). Keyed by
-  # dispatcher_capability; `unit` is the systemd unit the dispatcher brokers.
-  imagegen:
-    kind: media
-    status: on_demand
-    proxy_endpoint: false
-    role: flux1-imagegen
-    aliases: [flux1-imagegen, anvil-imagegen, nexus-imagegen]
-    # 2026-07-31 Phase E: MOVED anvil -> nexus (ROCm/gfx1151), unit `nexus-imagegen`.
-    # anvil's copy was DELETED with its 166 GB of weights — it is not a rollback target.
-    # The `anvil-imagegen` alias is nevertheless KEPT (2026-08-30): it is DATA, not a name.
-    # It is still the tenant key `anvil_dispatcher`'s MODEL_REGISTRY brokers the GPU slot
-    # under, and health-verifier's catalog-drift scenario reconciles against it. Dropping it here
-    # while the dispatcher side is unrenamed would break that join, so both sides move
-    # together or not at all — the package/dir/deploy-path rename of 2026-08-30 deliberately
-    # stopped short of it.
-    host: nexus
-    port: 9210
-    backend_engine: shim
-    dispatcher_capability: image_diffusers
-    dispatcher_capability_aliases: [image_fast, image_hq]
-    dispatcher_unit_key: nexus-imagegen
-    unit: nexus-imagegen.service
-    manage_process: false            # self-managing; dispatcher brokers the slot only
-    health_path: /healthz
-    warmup_sec: 15
-    model_family: Diffusers (Flux / SDXL, ~150 swappable checkpoints)
-    purpose: On-demand image generation.
-    when_used:
-      - Image Studio, sidekick/dj artwork
-    fallback: null
-    notes: |
-      Hosts ~150 swappable checkpoints behind one FastAPI — the per-checkpoint
-      sub-registry lives in infra/imagegen/models.yaml (a finer
-      granularity; NOT folded into this authority). On nexus that sub-registry is
-      /opt/imagegen/registry.yaml (25 rows, 16 with weights present) plus
-      /opt/imagegen/loras.yaml (103 LoRAs).
-
-      🚨 REQUIRES A GPU-SLOT DISPATCHER. imagegen leases a slot from `nexus-dispatcher`
-      (:9201) before committing VRAM; without it EVERY generate fails immediately with
-      "dispatcher /ensure unreachable". That dispatcher was ported from anvil with the
-      service — it is not optional infrastructure.
-
-      ⚠️ BULK `to("cuda")` IS PATHOLOGICALLY SLOW ON gfx1151 — OPEN ISSUE, NOT YET ROOT-CAUSED.
-      Measured 2026-07-31 on a 7 GiB SDXL checkpoint: disk 4.1 GB/s, `from_pretrained` 0.4 s,
-      then `to("cuda")` runs >400 s ALONE on an idle box (97 GiB free) and 10-25 min under
-      load. That is ~4-17 MB/s for a copy that on a UNIFIED-memory part should barely copy at
-      all. Ruled OUT by measurement, each disproved in turn:
-        * HSA_ENABLE_SDMA — same slowness at 0 and 1.
-        * the venv — /opt/rocmtest/venv (no torchvision) is equally slow.
-        * GPU contention — still slow with the box quiet and nothing else loaded.
-      🔑 STRONG LEAD: the earlier "SDXL is fine on nexus, 18 s" result was per-IMAGE
-      GENERATION, not load, and it used `enable_model_cpu_offload()` — which streams layers on
-      demand and therefore NEVER performs a bulk to("cuda"). Generation itself is healthy
-      (~20 s/image). So the cost is specifically the fully-resident bulk transfer the service
-      does, and offload may sidestep it entirely. Worth testing before accepting the timeouts
-      below as permanent.
-      ⚠️ Do NOT claim parity with anvil: anvil can no longer load these checkpoints at all
-      (tier3 leaves ~8 GiB against a ~22 GiB need), so no same-model baseline exists. An earlier
-      revision of this note asserted "not a regression from the move" on the strength of
-      anvil's registry comment about 17-24 GB DiT models — a different, much larger class.
-      That claim was not supported and has been withdrawn.
-      Same-checkpoint reuse IS cheap (SDXL variants 15-20 s once resident). Mitigated in the unit: IMAGEGEN_IDLE_UNLOAD_S=5400 and
-      IMAGEGEN_GENERATION_TIMEOUT_S=3600 — the service counts model LOAD inside the
-      generation deadline, so the default 960 s failed healthy loads.
-
-      Also on nexus: HSA_ENABLE_SDMA=0 (gfx1151 libhsa segfault), diffusers needs
-      variant="fp16", and a /models -> /srv/models/imagegen symlink covers aux paths that are
-      hardcoded absolute with no env override (e.g. hand_detect).
-
-  meshgen:
-    kind: media
-    status: on_demand
-    proxy_endpoint: false
-    role: hunyuan3d-meshgen
-    aliases: [hunyuan3d-meshgen, nexus-meshgen, mesh_generate]
-    # NEW 2026-08-11, promoted from the D13 experiment (E1/E3 in
-    # mesh_generation_nexus_design.md): shape-only, hy3dpaint/ (the texture
-    # half — the half that fails on ROCm and printing does not need) never
-    # installed. 10/10 generations, 10/10 watertight, 10/10 winding-consistent,
-    # median 505s, on torch==2.13.0+rocm7.2 / torchvision==0.28.0+rocm7.2 — the
-    # SAME matched pair `imagegen` already validates on this box.
-    host: nexus
-    port: 9212
-    backend_engine: shim
-    dispatcher_capability: mesh_generate
-    dispatcher_unit_key: nexus-meshgen
-    unit: nexus-meshgen.service
-    manage_process: false            # self-managing; dispatcher brokers the slot only
-    health_path: /healthz
-    warmup_sec: 15
-    model_family: Hunyuan3D-2.1 (hy3dshape, shape-only)
-    purpose: On-demand image-to-mesh generation (raw geometry, no gate/repair).
-    when_used:
-      - Workshop / prusa organic-lane mesh generation (image -> mesh)
-    fallback: null
-    notes: |
-      RAW GENERATION ONLY — image in, mesh out. Does NOT gate, scale or repair
-      its own output; a caller wanting a printable mesh composes THIS service
-      with CTnnn's own `POST /gate` (mesh in, Measurement + GateVerdict out —
-      built concurrently, mesh_generation_nexus_design.md E-results III), a
-      separate service on a separate host. Neither service calls the other.
-      A caller MUST NOT treat a mesh from this service as print-ready on its
-      own. Measured gate pass rate pre-repair-ladder (E1/E3, offline harness):
-      20% first try, 30-40% after a scale/thicken ladder that the design doc's
-      own verdict says NOT to build (E3: "Do not build the thickening rung" —
-      the residual refusals are a measurement artifact of CTnnn's 8000-face wall
-      probe, not real thinness). Treat this entry as a raw geometry generator,
-      not a finished printability pipeline.
-
-      🚨 REQUIRES A GPU-SLOT DISPATCHER, same as imagegen — leases from
-      `nexus-dispatcher` (:9201) before committing VRAM. UNLIKE imagegen it
-      does NOT stay resident between jobs: the lease is held for the duration
-      of ONE generation only (~505s measured) and released immediately after,
-      because reload cost (~14s) is trivial against generation time — see
-      nexus_meshgen/server.py's module docstring for the full lease-chaining
-      rationale (a caller sequencing imagegen -> meshgen must let imagegen's
-      own request complete and release before calling meshgen; never hold one
-      dispatcher lease open while acquiring the other in the same task, which
-      is the reentrant deadlock this design avoids structurally).
-
-      Own venv (/opt/meshgen-venv) — nexus's per-service venvs are mutually
-      incompatible, do not consolidate. hy3dshape source + weights (13.8 GB:
-      HF cache + hy3dgen's own second copy) are NOT vendored by
-      infra/nexus/scripts/manifest.sh (too large); only the FastAPI server
-      package (nexus_meshgen/) is tracked there. octree_resolution=512 is
-      the non-negotiable default (256 is 2x nozzle width on a 0.4mm nozzle).
-
-      NEW 2026-08-12: `POST /generate` takes an optional `generator` field
-      (default "hunyuan3d-2.1"; "triposg" selectable, unknown value = 400)
-      and a new `POST /preprocess` returns the conditioning image with no
-      generation and no lease. TripoSG runs in its OWN subprocess/venv
-      (/opt/triposg-venv, weights at /srv/models/triposg, ~23.5 GB) and is
-      NOT a separate catalog entry here — see mesh_generation_nexus_design.md
-      E-results IX for why (one service, one host:port, one dispatcher
-      capability; the generator choice is a body parameter on this same
-      route, not a second routable model). Measured typical_s: hunyuan 535,
-      triposg 132 (~4x, not the ~11x first inferred from diffusion-time-alone).
-
-  # ---------------------------------------------------------------------------
-  # 🗑️  THE ANVIL MEDIA TIER WAS REMOVED HERE, 2026-08-20. Five stanzas went:
-  #     video (ltx2-videogen, :9211) · musicgen (:9220) · stem (htdemucs, :9221)
-  #     lyrics (:9222) · audio-variation (vampnet, :9223)
-  #
-  # WHY: operator decision D6 — DeepSeek-V4-Flash becomes the ONLY thing running on
-  # anvil + anvil2, which become a single-purpose tier3 appliance. Nothing else
-  # may be scheduled onto either box. See
-  # docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md.
-  #
-  # WHAT WAS ACTUALLY THERE, measured before removal — the four audio ones were
-  # DECLARED BUT NEVER REAL: ports 9220-9223 were not listening, `vampnet` had no
-  # unit file at all, the other three units were inactive+disabled, and the four
-  # capabilities (music_generate / stem_separate / lyrics_transcribe /
-  # audio_variation) had ZERO callers anywhere in the repo. Only `video` was ever
-  # live, and it had served zero requests in the 7 days before it was retired.
-  #
-  # 🔎 A clue worth keeping: the unit names declared HERE (musicgen.service,
-  # htdemucs.service, …) never matched the names anvil_dispatcher brokered them
-  # under (anvil-musicgen, anvil-htdemucs, …). A capability whose declared unit
-  # name does not match the name its broker uses can never start — which is most
-  # likely WHY these were never installed. If you add an on-demand model, assert
-  # those two names are equal.
-  #
-  # 🚨 STEM SEPARATION AND LYRICS ARE NOT GONE FROM THE FLEET. A separate, LIVE
-  # HTDemucs/lyrics deployment runs on kestrel CTnnn (OpenVINO iGPU) and the DJ agent
-  # calls it DIRECTLY at 10.0.0.13:8086 — it never went through this catalog or the
-  # anvil dispatcher. Do not "restore" these stanzas thinking the capability was
-  # lost; it was duplicated here and never worked.
-  # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Decommissioned — kept for HISTORY only (not loaded into any routing table).
-# `inferctl models --all` and audits surface these with their retirement note.
-# ---------------------------------------------------------------------------
-decommissioned:
-  classify-anvil:
-    aliases: [qwen-classify, classify, chat, nexus-chat]
-    host: anvil
-    port: 9092
-    retired: 2026-07-11
-    notes: |
-      The anvil `llama-classify.service` (Qwen3.6-35B-A3B UD-Q4_K_M + native mmproj on the GB10
-      CUDA, :9092, kv-unified 131072/4 slots, evictable co-tenant of the imagegen/videogen
-      dispatcher). RE-HOMED onto the always-resident boxa `creative` endpoint (:9196) in the
-      2026-07-11 three-role consolidation (creative + companion-lite + classify on one abliterated
-      Qwen3.6-35B-A3B). Its role names — `classify`/`qwen-classify`/`chat`/`nexus-chat` plus the
-      analyst/vision aliases below — are now ALIASES of `creative`. Motivation: creative is used
-      ~6.4x more than classify, so classify was the light model; moving it to its own card fixes its
-      ~36s p95 queue-wait AND frees the anvil GB10 for imagegen/videogen (no more eviction dance).
-      The anvil unit is stopped+disabled (unit file + GGUF kept for rollback); the classify eviction
-      coupling in anvil_dispatcher/classify_evict.py is disabled and imagegen's idle-unload timeout
-      was relaxed since nothing competes for the card now. Behavior-preserving: same weights/mmproj,
-      same 32K chunking policy, reasoning-off, grammar tool-calling. Prior history (nexus->anvil
-      migration 2026-07-09, the 2026-07-02 3-way classify bake-off, the 2026-07-03 vision
-      consolidation) is in git + the bench_results/ docs referenced by the old analyst entries below.
-  analyst:
-    aliases: [qwen-analyst]
-    host: nexus
-    port: 8080
-    retired: 2026-07-03
-    notes: |
-      Qwen3-VL-30B-A3B-Instruct — fully replaced by `classify` (Qwen3.6-35B-A3B
-      + mmproj, :8091), same day as the composer 122B swap and the
-      analyst-vision consolidation below. Nexus runs exactly TWO models:
-      `composer` (:8081) and `classify` (:8091) — no third on-demand/fallback
-      tier. `llama-vision.service` is stopped+disabled on nexus (unit file +
-      GGUF kept on disk for rollback only, per the repo's stated rollback
-      doctrine — NOT a routinely-reachable escalation path). Freed ~17.7 GiB
-      of GTT, which — combined with the analyst-vision consolidation — is
-      what makes the composer 122B swap's memory budget viable; see
-      infra/nexus/runbooks/amdgpu_vm_memory_leak_2026-07-03.md for the full
-      memory-accounting story. `qwen-analyst`'s aliases resolved to `classify`,
-      which itself re-homed to the boxa `creative` endpoint 2026-07-11 (see
-      `classify-anvil` above) — so they now resolve to `creative`; no caller
-      code changes needed.
-  analyst-vision:
-    aliases: [qwen-vision-8b, qwen-vision-9b, vision-8b]
-    host: nexus
-    port: 8082
-    retired: 2026-07-03
-    notes: |
-      Dedicated Qwen3-VL-8B-Instruct vision tier (llama-vision-8b.service).
-      Consolidated into `classify` (Qwen3.6-35B-A3B's native mmproj) after a
-      vision A/B found no substantial quality edge — see
-      infra/nexus/bench_results/vision_consolidation_qwen36_35b_20260703.md.
-      Its aliases resolved to `classify`, which re-homed to the boxa `creative`
-      endpoint 2026-07-11 (see `classify-anvil` above) — so they now resolve
-      to `creative`; no caller code changes needed.
-  gemma-hot:
-    aliases: [llama-gemma-hot]
-    host: anvil
-    port: 9090
-    retired: 2026-06-08
-    notes: Gemma-4-E2B hot router. Consolidated onto the E4B `router`/`classifier` (:9091).
-  chatterbox-tts:
-    host: nexus
-    port: 8088
-    retired: 2026-06-07
-    notes: Replaced by `tts` (orpheus-tts). Itself replaced sesame-tts.
-  sesame-tts:
-    host: anvil
-    port: 9122
-    retired: 2026-05-22
-    notes: Removed in v3; TTS consolidated onto nexus Orpheus.
-  bge-m3-embed-cpu:
-    host: nexus
-    port: 8091
-    retired: 2026-06-05
-    notes: CPU embed copy. `embed` (anvil :9087) is the canonical fleet embed.
-  nexus-diarize:
-    host: nexus
-    port: 8089
-    retired: 2026-05-22
-    notes: Streaming diarize. Superseded by Nasbox `diarize`.
-  nexus-diarize-offline:
-    host: nexus
-    port: 8092
-    retired: 2026-05-22
-    notes: Offline-batch diarize. Superseded by Nasbox `diarize`.
+      reasoning: true
+      streaming: true

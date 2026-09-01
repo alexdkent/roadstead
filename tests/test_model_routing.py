@@ -2,7 +2,7 @@
 
 The proxy used to route purely by the caller's client role and forward the
 payload's `model` unchanged — so a thinker-role client asking for
-`model="qwen-analyst"` landed on the vLLM thinker backend, which 404s on a
+`model="tier2"` landed on the vLLM tier3 backend, which 404s on a
 model name it doesn't serve. These tests pin the fix: the requested model
 selects the endpoint, and vLLM backends receive their served model id.
 """
@@ -28,14 +28,14 @@ def _svc() -> ProxyService:
 def test_requested_model_wins_when_known_and_different():
     svc = _svc()
     ep = svc._resolve_endpoint({
-        "endpoint": "llama-thinker",  # thinker client
+        "endpoint": "tier3",  # tier3 client
         "payload_type": "chat_completion",
-        "payload": {"model": "qwen-analyst"},  # but asks for qwen-analyst
+        "payload": {"model": "tier2"},  # but asks for tier2
     })
-    # qwen-analyst (30B) fully decommissioned 2026-07-03; after the 2026-07-11
+    # tier2 (30B) fully decommissioned 2026-07-03; after the 2026-07-11
     # boxa one-model consolidation its legacy alias (like classify/analyst/vision)
-    # resolves to the `creative` endpoint (boxa :9196), not a distinct endpoint.
-    assert ep == "creative"  # routed to creative, not thinker
+    # resolves to the `tier2` endpoint (boxa :9196), not a distinct endpoint.
+    assert ep == "tier2"  # routed to tier2, not tier3
 
 
 def test_no_override_when_model_matches_submit_endpoint():
@@ -43,43 +43,43 @@ def test_no_override_when_model_matches_submit_endpoint():
     ep = svc._resolve_endpoint({
         "endpoint": "classify",
         "payload_type": "chat_completion",
-        # both `classify` (submit endpoint) and `qwen-analyst` (model) alias to
-        # `creative` post-2026-07-11 consolidation → they match, no override.
-        "payload": {"model": "qwen-analyst"},
+        # both `classify` (submit endpoint) and `tier2` (model) alias to
+        # `tier2` post-2026-07-11 consolidation → they match, no override.
+        "payload": {"model": "tier2"},
     })
-    assert ep == "creative"
+    assert ep == "tier2"
 
 
 def test_falls_back_when_model_absent():
     svc = _svc()
     ep = svc._resolve_endpoint({
-        "endpoint": "llama-thinker",
+        "endpoint": "tier3",
         "payload_type": "chat_completion",
         "payload": {"messages": []},
     })
-    assert ep == "thinker"
+    assert ep == "tier3"
 
 
 def test_falls_back_when_model_unknown():
     svc = _svc()
     ep = svc._resolve_endpoint({
-        "endpoint": "llama-thinker",
+        "endpoint": "tier3",
         "payload_type": "chat_completion",
         "payload": {"model": "gpt-4-turbo"},  # not a known endpoint
     })
-    assert ep == "thinker"
+    assert ep == "tier3"
 
 
 def test_embeddings_and_rerank_untouched():
     svc = _svc()
     # embeddings: non-chat payload_type short-circuits
     assert svc._resolve_endpoint({
-        "endpoint": "bge-m3-embed", "payload_type": "embedding",
+        "endpoint": "embed", "payload_type": "embedding",
         "payload": {"texts": ["x"]},
     }) == "embed"
     # rerank: model='bge' is not a known endpoint even if it were chat
     assert svc._resolve_endpoint({
-        "endpoint": "bge-reranker", "payload_type": "rerank",
+        "endpoint": "rerank", "payload_type": "rerank",
         "payload": {"model": "bge"},
     }) == "rerank"
 
@@ -88,9 +88,9 @@ def test_reconcile_logs_loudly(caplog):
     svc = _svc()
     with caplog.at_level(logging.WARNING):
         svc._resolve_endpoint({
-            "endpoint": "llama-thinker",
+            "endpoint": "tier3",
             "payload_type": "chat_completion",
-            "payload": {"model": "qwen-analyst"},
+            "payload": {"model": "tier2"},
             "caller_id": "orchestrator/orchestrator.autonomous_chat-agent.reflect/s1",
             "call_site": "orchestrator.autonomous_chat-agent.reflect",
         })
@@ -101,23 +101,23 @@ def test_reconcile_logs_loudly(caplog):
 def test_resolved_endpoint_flows_into_queued_request():
     svc = _svc()
     body = {
-        "endpoint": "llama-thinker",
+        "endpoint": "tier3",
         "payload_type": "chat_completion",
-        "payload": {"model": "qwen-analyst", "messages": []},
+        "payload": {"model": "tier2", "messages": []},
     }
     req = QueuedRequest.create(
         agent_id="notifier", endpoint=svc._resolve_endpoint(body),
         priority="P4_HYGIENE", call_site="orchestrator.autonomous_chat-agent.reflect",
         payload_type="chat_completion", payload=body["payload"],
     )
-    assert req.endpoint == "creative"
+    assert req.endpoint == "tier2"
 
 
 # ----- effective_model_id -----
 
 def test_effective_model_id_falls_back_to_role():
-    ep = EndpointConfig(endpoint_class="thinker", role="llama-thinker")
-    assert ep.effective_model_id == "llama-thinker"
+    ep = EndpointConfig(endpoint_class="tier3", role="tier3")
+    assert ep.effective_model_id == "tier3"
     ep.served_model_id = "qwen3.6-27b-nvfp4"
     assert ep.effective_model_id == "qwen3.6-27b-nvfp4"
 
@@ -126,18 +126,18 @@ def test_effective_model_id_falls_back_to_role():
 
 def test_vllm_forces_served_model_id():
     out = VLLM.prepare_chat_payload(
-        {"model": "qwen-analyst", "messages": [{"role": "user", "content": "hi"}]},
-        model_id="llama-thinker")
-    assert out["model"] == "llama-thinker"
+        {"model": "tier2", "messages": [{"role": "user", "content": "hi"}]},
+        model_id="tier3")
+    assert out["model"] == "tier3"
 
 
 def test_llamacpp_model_left_untouched():
-    payload = {"model": "qwen-analyst", "messages": [{"role": "user", "content": "hi"}]}
-    out = LLAMACPP.prepare_chat_payload(payload, model_id="llama-thinker")
-    assert out["model"] == "qwen-analyst"  # llama.cpp ignores it; we don't touch it
+    payload = {"model": "tier2", "messages": [{"role": "user", "content": "hi"}]}
+    out = LLAMACPP.prepare_chat_payload(payload, model_id="tier3")
+    assert out["model"] == "tier2"  # llama.cpp ignores it; we don't touch it
 
 
 def test_vllm_noop_when_model_already_correct():
-    payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "hi"}]}
-    out = VLLM.prepare_chat_payload(payload, model_id="llama-thinker")
-    assert out["model"] == "llama-thinker"
+    payload = {"model": "tier3", "messages": [{"role": "user", "content": "hi"}]}
+    out = VLLM.prepare_chat_payload(payload, model_id="tier3")
+    assert out["model"] == "tier3"

@@ -16,7 +16,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-os.environ.setdefault("COLLECTIVE_AGENT_NAME", "llmproxy")
+os.environ.setdefault("ROADSTEAD_AGENT_NAME", "llmproxy")
 
 import json
 
@@ -40,7 +40,7 @@ logger = logging.getLogger("roadstead")
 # MUST stay ABOVE the client's keepalive (llm_proxy_client._CLIENT_KEEPALIVE_EXPIRY_S,
 # 4.5s) with margin, so the CLIENT always retires idle connections first — the proxy
 # never yanks a socket an agent is about to reuse. test_proxy_keepalive_invariant pins it.
-PROXY_SERVER_KEEPALIVE_S = int(os.environ.get("COLLECTIVE_PROXY_SERVER_KEEPALIVE_S", "30"))
+PROXY_SERVER_KEEPALIVE_S = int(os.environ.get("ROADSTEAD_PROXY_SERVER_KEEPALIVE_S", "30"))
 
 
 async def _on_invalid_json(request: Request, exc: Exception) -> JSONResponse:
@@ -68,15 +68,37 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def warn_on_retired_env_vars() -> list[str]:
+    """Say something when a `COLLECTIVE_*` variable is still set.
+
+    🚨 Every environment variable was renamed `COLLECTIVE_* -> ROADSTEAD_*` on
+    2026-08-31 (CHANGELOG: a recorded break). The dangerous half of that rename
+    is not the flags that stop working — it is that they stop working IN
+    SILENCE: an operator who had turned a correction layer OFF gets it back ON,
+    a tuned keepalive reverts to the default, and nothing anywhere says so. The
+    old names are NOT honoured, deliberately — two spellings for one switch is
+    how they end up disagreeing — but an unread one is worth a loud line.
+
+    Returns the retired names found, so a test can prove this fires.
+    """
+    stale = sorted(k for k in os.environ if k.startswith("COLLECTIVE_"))
+    for name in stale:
+        logging.getLogger(__name__).warning(
+            "IGNORED: %s is a retired variable name and has no effect. Rename it "
+            "to %s.", name, "ROADSTEAD_" + name[len("COLLECTIVE_"):])
+    return stale
+
+
 def build_app(config: ProxyConfig | None = None) -> Starlette:
     """Build the Starlette app.  Usable from tests without running uvicorn."""
+    warn_on_retired_env_vars()
     if config is None:
         data_dir = os.environ.get(
             "LLM_PROXY_DATA_DIR",
-            os.path.join(os.environ.get("COLLECTIVE_HOT_ROOT", "/tmp"), "agents", "llmproxy"),
+            os.path.join(os.environ.get("ROADSTEAD_HOT_ROOT", "/tmp"), "agents", "llmproxy"),
         )
         os.makedirs(data_dir, exist_ok=True)
-        log_dir = os.path.join(os.environ.get("COLLECTIVE_HOT_ROOT", "/tmp"), "logs")
+        log_dir = os.path.join(os.environ.get("ROADSTEAD_HOT_ROOT", "/tmp"), "logs")
         os.makedirs(log_dir, exist_ok=True)
 
         config = ProxyConfig(
@@ -267,7 +289,7 @@ def _test_cli() -> None:
     # `sim` defines no --db (pure in-process); replay/ab do. getattr keeps the
     # shared path computation from AttributeError-ing the sim mode.
     db_path = getattr(args, "db", None) or os.path.join(
-        os.environ.get("COLLECTIVE_HOT_ROOT", "/tmp"),
+        os.environ.get("ROADSTEAD_HOT_ROOT", "/tmp"),
         "agents", "llmproxy", "queue.db",
     )
 

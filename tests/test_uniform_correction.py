@@ -28,7 +28,7 @@ sys.path.insert(0, str(REPO))
 correction = importlib.import_module("roadstead.correction")
 C = correction.Correction
 
-FLAG = "COLLECTIVE_PROXY_UNIFORM_CORRECTION"
+FLAG = "ROADSTEAD_PROXY_UNIFORM_CORRECTION"
 
 # Object-root grammar {"x": "<str>"} — verify_conformance flags non-JSON / fences
 # / wrong-keys as silent drops (mirrors test_shadow_egress).
@@ -39,7 +39,7 @@ GRAMMAR = (
 )
 
 
-def _req(payload=None, *, ptype="chat_completion", endpoint="companion",
+def _req(payload=None, *, ptype="chat_completion", endpoint="tier3",
          rid="r1", call_site="unmanaged.site"):
     r = types.SimpleNamespace()
     r.payload = payload if payload is not None else {"messages": []}

@@ -183,9 +183,9 @@ def test_division_by_zero_guard(qdb):
 def test_all_null_endpoint_is_na_not_zero(qdb):
     """An endpoint that only ever saw NULL rows reads n/a, never 0%."""
     for i in range(4):
-        _chat_row(qdb, f"l{i}", endpoint="companion", cached=None)
+        _chat_row(qdb, f"l{i}", endpoint="tier3", cached=None)
     ep = next(e for e in qdb.cache_attribution()["by_endpoint"]
-              if e["endpoint"] == "companion")
+              if e["endpoint"] == "tier3")
     assert ep["hit_rate"] is None
     assert ep["attributed_calls"] == 0
     assert ep["unattributed_calls"] == 4
@@ -329,7 +329,7 @@ async def test_north_face_hostile_caller_cannot_corrupt_attribution(proxy):
     attr = proxy.svc._queue_db.cache_attribution(window_s=3600)
     # The proxy normalizes model="chat" to its endpoint CLASS, so attribution
     # rows land under the resolved name — derived, not hardcoded: that target has
-    # moved twice (→ "classify" 2026-07-03, → "creative" 2026-07-11 boxa
+    # moved twice (→ "classify" 2026-07-03, → "tier2" 2026-07-11 boxa
     # consolidation). A bare `next()` on the stale name raised StopIteration
     # INSIDE an async test, which asyncio re-reports as an opaque
     # "coroutine raised StopIteration" — so the default below keeps a missing row

@@ -46,7 +46,7 @@ _COMPLETION = {
 
 def _enqueue(pq, rid, timeout_s=60.0):
     req = QueuedRequest.create(
-        agent_id="a", endpoint="llama-thinker", priority="P3_INGESTION",
+        agent_id="a", endpoint="tier3", priority="P3_INGESTION",
         call_site="t", payload_type="chat_completion",
         payload={"messages": []}, timeout_s=timeout_s,
         caller_id="goose/recipe", request_id=rid)
@@ -93,7 +93,7 @@ def test_async_writer_applies_writes(tmp_path):
     pq.start_async_writer()
     assert pq._writer is not None and pq._writer.is_alive()
     pq.persist_complete(
-        "rid1", "agentA", "thinker", "site", 3, 10, 5, 0.2, 0.0, "ok",
+        "rid1", "agentA", "tier3", "site", 3, 10, 5, 0.2, 0.0, "ok",
         finish_reason="stop")
     pq.flush(timeout=5.0)
     rows = pq.recent_requests(10)
@@ -107,11 +107,11 @@ def test_async_writer_applies_writes(tmp_path):
 def test_cleanup_removes_old_rows(tmp_path):
     db = str(tmp_path / "q.db")
     pq = PersistentQueue(db)  # no writer → synchronous
-    pq.persist_complete("old", "a", "thinker", "s", 3, 1, 1, 0.1, 0.0, "ok")
+    pq.persist_complete("old", "a", "tier3", "s", 3, 1, 1, 0.1, 0.0, "ok")
     pq._conn.execute(
         "UPDATE proxy_completions SET completed_at=? WHERE request_id=?",
         (time.time() - 86400 * 30, "old"))  # 30 days old
-    pq.persist_complete("fresh", "a", "thinker", "s", 3, 1, 1, 0.1, 0.0, "ok")
+    pq.persist_complete("fresh", "a", "tier3", "s", 3, 1, 1, 0.1, 0.0, "ok")
     pq.cleanup_old_completions(max_age_s=86400 * 7)
     ids = {r["request_id"] for r in pq.recent_requests(10)}
     assert "old" not in ids and "fresh" in ids
@@ -139,7 +139,7 @@ async def _started_svc():
 
 def _body(priority, timeout_s=10.0):
     return {
-        "agent_id": "a", "endpoint": "llama-thinker", "priority": priority,
+        "agent_id": "a", "endpoint": "tier3", "priority": priority,
         "call_site": "t", "payload_type": "chat_completion",
         "payload": {"messages": [{"role": "user", "content": "x"}]},
         "timeout_s": timeout_s,
@@ -179,7 +179,7 @@ async def test_interactive_never_shed():
 async def test_unhealthy_backend_raises_endpoint_paused_alert():
     svc = await _started_svc()
     try:
-        svc._endpoint_health["thinker"] = {
+        svc._endpoint_health["tier3"] = {
             "healthy": False, "consecutive_failures": 5, "unhealthy_since": time.monotonic()}
         svc._evaluate_alerts(time.monotonic())
         names = {a["name"] for a in svc._alerts}

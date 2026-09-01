@@ -77,7 +77,7 @@ async def _started_service() -> ProxyService:
     async def fake_call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
         return BackendResponse(status_code=200, body={
             "id": "x", "object": "chat.completion", "created": 1,
-            "model": "llama-thinker",
+            "model": "tier3",
             "choices": [{"index": 0, "message": {"role": "assistant",
                          "content": "ok"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
@@ -113,11 +113,11 @@ async def test_submit_bad_priority_and_timeout_does_not_500():
     try:
         body = {
             "agent_id": "test",
-            "endpoint": "thinker",
+            "endpoint": "tier3",
             "priority": "P3_BACKGROUND",       # would have 500'd before
             "timeout_s": "soon",               # un-coercible → default
             "call_site": "test",
-            "payload": {"model": "llama-thinker",
+            "payload": {"model": "tier3",
                         "messages": [{"role": "user", "content": "hi"}],
                         "max_tokens": 8},
         }
@@ -212,8 +212,8 @@ async def test_known_roles_and_aliases_pass_the_gate():
     svc._backend.call = ok_call
     await svc.startup()
     try:
-        for role in ("bge-m3-embed", "bge-reranker", "llama-thinker",
-                     "qwen-composer", "nexus-chat", "gemma-greeter", "chat"):
+        for role in ("embed", "rerank", "tier3",
+                     "tier3", "tier2", "tier1", "chat"):
             body = _submit_body(role)
             body["timeout_s"] = 10.0
             resp = await asyncio.wait_for(

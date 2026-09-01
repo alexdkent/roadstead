@@ -29,7 +29,7 @@ def _svc() -> ProxyService:
 async def test_invalid_grammar_fails_loud_422():
     svc = _svc()
     body = {
-        "agent_id": "forum-agent", "endpoint": "thinker",
+        "agent_id": "forum-agent", "endpoint": "tier3",
         "priority": "P3_INGESTION", "call_site": "forum-agent.proposal_emitter",
         "payload_type": "chat_completion",
         "payload": {
@@ -61,7 +61,7 @@ async def test_valid_multiline_grammar_normalized_in_place():
         "extra_body": {"grammar": grammar},
     }
     body = {
-        "agent_id": "knowledge", "endpoint": "thinker",
+        "agent_id": "knowledge", "endpoint": "tier3",
         "priority": "P1_TURN_SUPPORT", "call_site": "knowledge.extract_entities",
         "payload_type": "chat_completion", "payload": payload, "timeout_s": 10.0,
     }
@@ -69,7 +69,7 @@ async def test_valid_multiline_grammar_normalized_in_place():
     # first and mutates payload. We assert the mutation, not the dispatch.
     from roadstead.scheduler import QueuedRequest
     req = QueuedRequest.create(
-        agent_id="knowledge", endpoint="thinker", priority="P1_TURN_SUPPORT",
+        agent_id="knowledge", endpoint="tier3", priority="P1_TURN_SUPPORT",
         call_site="knowledge.extract_entities", payload_type="chat_completion",
         payload=payload, timeout_s=10.0,
     )
@@ -84,7 +84,7 @@ async def test_no_grammar_passes_through():
     svc = _svc()
     from roadstead.scheduler import QueuedRequest
     req = QueuedRequest.create(
-        agent_id="sidekick", endpoint="gemma", priority="P1_TURN_SUPPORT",
+        agent_id="sidekick", endpoint="tier1", priority="P1_TURN_SUPPORT",
         call_site="sidekick.proxy_client", payload_type="chat_completion",
         payload={"messages": [{"role": "user", "content": "hi"}]}, timeout_s=10.0,
     )
@@ -99,7 +99,7 @@ def test_grammar_result_cached():
         "extra_body": {"grammar": 'root ::= "x"\n'},
     }
     req = QueuedRequest.create(
-        agent_id="a", endpoint="thinker", priority="P1_TURN_SUPPORT",
+        agent_id="a", endpoint="tier3", priority="P1_TURN_SUPPORT",
         call_site="t", payload_type="chat_completion", payload=payload, timeout_s=10.0,
     )
     svc._process_grammar(req)

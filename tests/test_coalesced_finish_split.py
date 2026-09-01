@@ -47,7 +47,7 @@ from roadstead.service import ProxyService
 
 def _coalesced(content=" it.", finish="stop"):
     return {"id": "x", "object": "chat.completion.chunk", "created": 1,
-            "model": "llama-thinker",
+            "model": "tier3",
             "choices": [{"index": 0, "delta": {"content": content},
                          "logprobs": None, "finish_reason": finish,
                          "stop_reason": None}]}
@@ -150,7 +150,7 @@ def _backend(final_chunk: dict, plain: str):
 
 
 def _body():
-    return {"agent_id": "beacon", "endpoint": "llama-thinker",
+    return {"agent_id": "beacon", "endpoint": "tier3",
             "priority": "P1_TURN_SUPPORT", "call_site": "t",
             "payload_type": "chat_completion",
             "payload": {"messages": [{"role": "user", "content": "x"}], "stream": True},

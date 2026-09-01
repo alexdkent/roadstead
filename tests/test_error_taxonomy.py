@@ -45,7 +45,7 @@ class _Req:
     headers: dict = {}
 
 
-def _body(endpoint="llama-thinker", **payload_extra):
+def _body(endpoint="tier3", **payload_extra):
     return {
         "agent_id": "a", "endpoint": endpoint, "priority": "P3_INGESTION",
         "call_site": "t", "payload_type": "chat_completion",
@@ -70,7 +70,7 @@ async def test_draining_is_deferrable_with_code():
 async def test_circuit_open_and_paused_are_deferrable_with_codes():
     svc = ProxyService(ProxyConfig())
     # Auto-circuit trip.
-    svc._endpoint_health["thinker"]["healthy"] = False
+    svc._endpoint_health["tier3"]["healthy"] = False
     resp = await svc.handle_submit({**_body(), "priority": "P1_TURN_SUPPORT"}, _Req())
     body = json.loads(resp.body)
     assert resp.status_code == 503
@@ -78,8 +78,8 @@ async def test_circuit_open_and_paused_are_deferrable_with_codes():
     assert carries_deferral_marker(body["error"])  # "circuit open"
 
     # Operator drain reads as draining, still deferrable.
-    svc._endpoint_health["thinker"]["healthy"] = True
-    svc._paused_endpoints.add("thinker")
+    svc._endpoint_health["tier3"]["healthy"] = True
+    svc._paused_endpoints.add("tier3")
     resp = await svc.handle_submit({**_body(), "priority": "P1_TURN_SUPPORT"}, _Req())
     body = json.loads(resp.body)
     assert resp.status_code == 503

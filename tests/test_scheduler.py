@@ -38,9 +38,9 @@ def _make_scheduler(
 
 def _req(
     agent_id: str = "agent_a",
-    # qwen-analyst (30B) fully decommissioned 2026-07-03; after the 2026-07-11
-    # boxa consolidation `classify` is itself an alias normalizing to the
-    # `creative` endpoint class — the default endpoint here resolves there.
+    # An ALIAS on purpose, not a class: the scheduler is handed whatever the
+    # caller said, so the default request exercises normalization on the way in.
+    # `classify` resolves to the `tier1` class in the example catalog.
     endpoint: str = "classify",
     priority: str = "P1_TURN_SUPPORT",
     call_site: str = "test",
@@ -65,8 +65,8 @@ class TestPriorityBandOrdering:
         sched, *_ = _make_scheduler()
         now = time.monotonic()
 
-        bg = _req(agent_id="bg_agent", endpoint="llama-thinker", priority="P3_INGESTION", now=now)
-        fg = _req(agent_id="fg_agent", endpoint="llama-thinker", priority="P0_REALTIME", now=now + 0.001)
+        bg = _req(agent_id="bg_agent", endpoint="tier3", priority="P3_INGESTION", now=now)
+        fg = _req(agent_id="fg_agent", endpoint="tier3", priority="P0_REALTIME", now=now + 0.001)
 
         sched.enqueue(bg)
         sched.enqueue(fg)
@@ -79,8 +79,8 @@ class TestPriorityBandOrdering:
         sched, *_ = _make_scheduler()
         now = time.monotonic()
 
-        bg = _req(agent_id="bg_agent", endpoint="llama-thinker", priority="P4_HYGIENE", now=now)
-        fg = _req(agent_id="fg_agent", endpoint="llama-thinker", priority="P2_POST_TURN", now=now + 0.001)
+        bg = _req(agent_id="bg_agent", endpoint="tier3", priority="P4_HYGIENE", now=now)
+        fg = _req(agent_id="fg_agent", endpoint="tier3", priority="P2_POST_TURN", now=now + 0.001)
 
         sched.enqueue(bg)
         sched.enqueue(fg)
@@ -258,9 +258,9 @@ class TestPickAgentDRR:
 
 class TestBackgroundFloor:
     def test_background_gets_floor_during_interactive_flood(self):
-        # `chat` aliases to the `creative` endpoint class post-2026-07-11 boxa
+        # `chat` aliases to the `tier2` endpoint class post-2026-07-11 boxa
         # consolidation; the max_slots override keys on the class name.
-        sched, config, _, bm = _make_scheduler(endpoints={"creative": 4})
+        sched, config, _, bm = _make_scheduler(endpoints={"tier2": 4})
         now = time.monotonic()
 
         # 4 interactive requests
@@ -279,7 +279,7 @@ class TestBackgroundFloor:
         endpoints_used = [d.request.agent_id for d in decisions]
         priorities = [d.request.priority for d in decisions]
 
-        # bg floor for creative is 20% of 4 = 1 slot reserved for background
+        # bg floor for tier2 is 20% of 4 = 1 slot reserved for background
         # so interactive should get at most 3 slots, bg gets 1
         interactive_count = sum(1 for p in priorities if p <= LLMPriority.P1_TURN_SUPPORT)
         bg_count = sum(1 for p in priorities if p >= LLMPriority.P3_INGESTION)
@@ -290,9 +290,10 @@ class TestBackgroundFloor:
 
 class TestConcurrencyAwareAdmission:
     def test_respects_max_slots(self):
-        # classify aliases to the `creative` endpoint class (2026-07-11 boxa
-        # consolidation); the max_slots override keys on the class name.
-        sched, *_ = _make_scheduler(endpoints={"creative": 2})
+        # `classify` aliases to the `tier1` endpoint class, and the max_slots
+        # override keys on the CLASS — so the two have to agree or the cap under
+        # test is not the cap the requests hit.
+        sched, *_ = _make_scheduler(endpoints={"tier1": 2})
         now = time.monotonic()
 
         # Submit 5 requests
@@ -302,7 +303,7 @@ class TestConcurrencyAwareAdmission:
         decisions = sched.tick(now + 0.01)
         # Should dispatch at most 2 (max_slots)
         assert len(decisions) <= 2
-        assert sched.active_count("creative") == len(decisions)
+        assert sched.active_count("tier1") == len(decisions)
 
 
 class TestTimeout:
@@ -353,7 +354,7 @@ class TestInflightSnapshot:
     def test_inflight_snapshot_lists_dispatched_requests(self):
         sched, *_ = _make_scheduler()
         now = time.monotonic()
-        req = _req(agent_id="agent_a", endpoint="qwen-analyst", now=now)
+        req = _req(agent_id="agent_a", endpoint="tier2", now=now)
         sched.enqueue(req)
         # Not yet dispatched → not in-flight.
         assert sched.inflight_snapshot(now)["requests"] == []
@@ -364,10 +365,10 @@ class TestInflightSnapshot:
         assert len(reqs) == 1
         row = reqs[0]
         assert row["request_id"] == req.request_id
-        # qwen-analyst (30B) fully decommissioned 2026-07-03; after the
+        # tier2 (30B) fully decommissioned 2026-07-03; after the
         # 2026-07-11 boxa consolidation its legacy alias normalizes to the
-        # `creative` endpoint class.
-        assert row["endpoint"] == "creative"
+        # `tier2` endpoint class.
+        assert row["endpoint"] == "tier2"
         # `backend` = the actual host:port doing the processing (UI "Endpoint");
         # `served_model` = the model the backend answers to. Both derived from
         # the endpoint config so the In-Flight view can show model + endpoint.
@@ -376,12 +377,12 @@ class TestInflightSnapshot:
         assert row["agent"] == "agent_a"
         assert row["input_tokens"] > 0          # context size flowing through
         assert 0.9 <= row["elapsed_s"] <= 1.2   # ~1s since dispatch
-        assert snap["per_endpoint"]["creative"]["in_flight"] == 1
+        assert snap["per_endpoint"]["tier2"]["in_flight"] == 1
 
     def test_inflight_snapshot_drops_completed(self):
         sched, *_ = _make_scheduler()
         now = time.monotonic()
-        req = _req(agent_id="agent_a", endpoint="qwen-analyst", now=now)
+        req = _req(agent_id="agent_a", endpoint="tier2", now=now)
         sched.enqueue(req)
         sched.tick(now + 0.01)
         assert len(sched.inflight_snapshot(now)["requests"]) == 1
@@ -394,7 +395,7 @@ class TestInflightSnapshot:
             now + 0.5,
         )
         assert sched.inflight_snapshot(now + 0.6)["requests"] == []
-        assert sched.inflight_snapshot(now + 0.6)["per_endpoint"]["creative"]["in_flight"] == 0
+        assert sched.inflight_snapshot(now + 0.6)["per_endpoint"]["tier2"]["in_flight"] == 0
 
 
 class TestQueuedRequestsAccessor:
@@ -411,7 +412,7 @@ class TestQueuedRequestsAccessor:
     def test_empty_when_no_queued(self):
         sched, *_ = _make_scheduler()
         assert sched.queued_requests(
-            "qwen-analyst",
+            "tier2",
             (PriorityBand.INTERACTIVE, PriorityBand.FOREGROUND)) == []
 
     def test_band_agent_fifo_order_and_band_filter(self):
@@ -419,15 +420,15 @@ class TestQueuedRequestsAccessor:
         now = time.monotonic()
         # Two INTERACTIVE agents (a: 2 reqs FIFO, b: 1), one FOREGROUND (c),
         # one BACKGROUND (d) that must be excluded when only INT+FG requested.
-        ia1 = _req(agent_id="a", endpoint="qwen-analyst",
+        ia1 = _req(agent_id="a", endpoint="tier2",
                    priority="P1_TURN_SUPPORT", now=now)
-        ia2 = _req(agent_id="a", endpoint="qwen-analyst",
+        ia2 = _req(agent_id="a", endpoint="tier2",
                    priority="P1_TURN_SUPPORT", now=now)
-        ib1 = _req(agent_id="b", endpoint="qwen-analyst",
+        ib1 = _req(agent_id="b", endpoint="tier2",
                    priority="P1_TURN_SUPPORT", now=now)
-        fc1 = _req(agent_id="c", endpoint="qwen-analyst",
+        fc1 = _req(agent_id="c", endpoint="tier2",
                    priority="P2_POST_TURN", now=now)
-        bd1 = _req(agent_id="d", endpoint="qwen-analyst",
+        bd1 = _req(agent_id="d", endpoint="tier2",
                    priority="P3_INGESTION", now=now)
         for r in (ia1, ia2, ib1, fc1, bd1):
             sched.enqueue(r)
@@ -444,7 +445,7 @@ class TestQueuedRequestsAccessor:
     def test_snapshot_is_stable_under_cancel_during_iteration(self):
         sched, *_ = _make_scheduler()
         now = time.monotonic()
-        reqs = [_req(agent_id="a", endpoint="qwen-analyst",
+        reqs = [_req(agent_id="a", endpoint="tier2",
                      priority="P1_TURN_SUPPORT", now=now) for _ in range(3)]
         for r in reqs:
             sched.enqueue(r)

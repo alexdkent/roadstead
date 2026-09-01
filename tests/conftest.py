@@ -167,6 +167,17 @@ STUBBED_PROBES = {
     # it at import time and calls it unbound — see
     # test_provider_openrouter.py, which does exactly that against a local fake.
     "probe_json": None,
+    # 🚨 Added 2026-08-31 after it hung the unit suite. `probe_prefix_cache` was
+    # on the "deliberately unstubbed" list, whose note said to stub it "if it
+    # ever starts being called from the poller on a real host". It always was —
+    # `health.compute_cache_stats` scrapes it every cache-stats tick — and the
+    # only thing hiding it was that the old catalog's addresses were on a LAN
+    # that answered or refused fast. The example catalog uses RFC 5737
+    # documentation addresses, which BLACKHOLE: every tick then paid the full
+    # 5s connect timeout on the event loop and the poller stopped cycling.
+    # A probe that reads as "cannot tell" is the safe stub; the e2e suite
+    # restores the real one on the instance, where it points at a local fake.
+    "probe_prefix_cache": None,
     "probe_props": None,
     "probe_models": None,
     "probe_vllm_capacity": None,

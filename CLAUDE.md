@@ -177,7 +177,7 @@ roadstead/          the package (32 modules + providers/)
   queue.py          durable event log + THE single writer thread
   backend.py        south face TRANSPORT: pools, deadlines, error taxonomy, SSE relay
   providers/        south face ENGINES: llama.cpp | vllm | openrouter (see below)
-  model_catalog.py  reads models.yaml — the naming/capability authority
+  model_catalog.py  reads models.yaml — providers + endpoints (see below)
   hooks.py          the integration seam (see below)
   testing/          SHIPPED test doubles — the programmable fake backend
   __main__.py       entrypoint
@@ -188,6 +188,20 @@ docs/               specs, plan, evaluation, ledger
 
 The three `pure computation, no I/O` modules are the crown jewels and the easiest to test — keep
 them that way.
+
+**`models.yaml` has two sections, and the split is load-bearing.** `providers:` is *how to reach a
+backend and how to speak to it* — engine, address, credential. `endpoints:` is *a routable unit of
+capacity with policy* — slots, context, floors, capabilities, failover — each naming its provider.
+A local provider hosts ONE endpoint (a llama.cpp or vLLM server serves one model); a remote provider
+hosts MANY, and declaring its base URL and key once is why the sections are separate.
+
+🚨 **The shipped catalog is an EXAMPLE** — `tier1`/`tier2`/`tier3`/`embed`/`rerank` plus two
+`planned` remote endpoints, on RFC 5737 documentation addresses. It is what the suite runs against,
+so it is a worked example that cannot rot. Point `ROADSTEAD_MODELS_YAML` at your own file.
+**Comments throughout this package cite measurements taken on a real fleet under ITS names**
+(`gemma`, `creative`, `tier2-chat`, `llama-thinker`, specific model and box names). Those are
+records of what was measured — do not "fix" them to match the example, and do not read them as
+references to classes that exist here.
 
 **`providers/` is where engine differences live, and nowhere else.** A provider owns the two things
 backends genuinely disagree about: what a request must look like to be accepted
@@ -254,6 +268,15 @@ remove.
 ## 🚨 Before this repo goes public
 
 It is **private** and must stay private until the scrub in `docs/corpus_and_scrub_plan.md` is done.
-The tree and its 282 commits of history contain private LAN topology (`10.0.0.x`), real host names,
-and a `models.yaml` describing actual hardware. **Scrubbing the working tree is not enough — it is in
-the history**, which means another `git filter-repo` pass. Read that plan before changing visibility.
+
+**S2 is done** (2026-08-31): `models.yaml` is a generic example on RFC 5737 addresses, and the
+schema redesign that had to happen anyway went in with it. `usage_rates.py` lost its fleet model
+anchors in the same pass.
+
+**S1 and S3 are not.** `acl.py` still ships `10.0.0.x` seed registrations (19 lines), and
+`config.py`, `on_demand.py`, `test_harness.py` and four test files still carry addresses or host
+names. Run `git grep -n '10\.0\.0\.'` for the live list.
+
+🚨 **And scrubbing the working tree is not enough — it is in the history**, across 282 commits, which
+means another `git filter-repo` pass (S6, last, because it invalidates every SHA). Read that plan
+before changing visibility.

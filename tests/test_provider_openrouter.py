@@ -375,29 +375,26 @@ def test_the_registry_resolves_it():
 def test_a_remote_stanza_reaches_endpoint_config(tmp_path):
     """🚨 `build_endpoint_kwargs` copies a fixed set of keys, and a key it does
     not know is SILENTLY DROPPED — the failure mode models.yaml warns about in
-    its own comments. Three of the four keys here are new, and a remote endpoint
-    missing any of them is a llama.cpp endpoint pointed at nothing.
+    its own comments. A remote endpoint missing any of these is a llama.cpp
+    endpoint pointed at nothing.
 
-    The engine mirror is the subtle one: it used to read `== "vllm"`, which
-    would have dropped `openrouter` on the floor and produced an endpoint that
-    resolved to the DEFAULT provider — i.e. one that would have tried to POST
-    /v1/chat/completions, unauthenticated, at openrouter.ai."""
+    It also pins the section split: the CONNECTION comes from the provider and
+    the POLICY from the endpoint, so an endpoint stanza never repeats a base URL
+    or a key name."""
     from roadstead import model_catalog
 
     yaml_path = tmp_path / "models.yaml"
     yaml_path.write_text(
-        "meta:\n"
-        "  hosts: {}\n"
-        "models:\n"
-        "  spill-openrouter:\n"
-        "    kind: chat\n"
-        "    proxy_endpoint: true\n"
-        "    endpoint_class: spill\n"
-        "    role: spill\n"
-        "    backend_engine: openrouter\n"
+        "providers:\n"
+        "  openrouter:\n"
+        "    engine: openrouter\n"
         "    base_url: https://openrouter.ai/api/v1\n"
         "    api_key_env: OPENROUTER_API_KEY\n"
-        f"    served_model_names: [{MODEL}]\n"
+        "endpoints:\n"
+        "  spill:\n"
+        "    provider: openrouter\n"
+        "    kind: chat\n"
+        f"    model: {MODEL}\n"
         "    slots: 4\n",
         encoding="utf-8")
     cat = model_catalog.load_catalog(yaml_path, force=True)
@@ -414,31 +411,78 @@ def test_a_remote_stanza_reaches_endpoint_config(tmp_path):
         "a POLICY cap on our own concurrency, not a discovered capacity")
 
 
-def test_a_local_stanza_is_unaffected_by_the_generalised_engine_mirror(tmp_path):
-    """The negative control. `shim` and a decorated `llama.cpp (Vulkan)` still
-    resolve to the default provider and are still not mirrored, so nothing about
-    a local endpoint moved when the mirror stopped reading `== "vllm"`."""
+def test_one_remote_provider_serves_many_endpoints(tmp_path):
+    """The reason providers and endpoints are separate sections. A local
+    provider is one server serving one model; a remote one fronts a catalogue,
+    so its credential and base URL are declared ONCE and each endpoint adds only
+    which model it routes on."""
     from roadstead import model_catalog
 
     yaml_path = tmp_path / "models.yaml"
     yaml_path.write_text(
-        "meta:\n"
-        "  hosts: {box: 10.0.0.1}\n"
-        "models:\n"
-        "  local-chat:\n"
-        "    kind: chat\n"
-        "    proxy_endpoint: true\n"
-        "    endpoint_class: chat\n"
-        "    role: chat\n"
+        "providers:\n"
+        "  openrouter:\n"
+        "    engine: openrouter\n"
+        "    base_url: https://openrouter.ai/api/v1\n"
+        "    api_key_env: OPENROUTER_API_KEY\n"
+        "endpoints:\n"
+        "  spill-fast:\n"
+        "    provider: openrouter\n"
+        "    model: vendor/small\n"
+        "    slots: 8\n"
+        "  spill-deep:\n"
+        "    provider: openrouter\n"
+        "    model: vendor/large\n"
+        "    slots: 2\n",
+        encoding="utf-8")
+    kw = model_catalog.build_endpoint_kwargs(
+        model_catalog.load_catalog(yaml_path, force=True))
+    fast, deep = EndpointConfig(**kw["spill-fast"]), EndpointConfig(**kw["spill-deep"])
+    assert fast.backend_url == deep.backend_url == "https://openrouter.ai/api/v1"
+    assert fast.api_key_env == deep.api_key_env == "OPENROUTER_API_KEY"
+    assert fast.effective_model_id == "vendor/small"
+    assert deep.effective_model_id == "vendor/large"
+    assert (fast.max_slots, deep.max_slots) == (8, 2)
+
+
+def test_planned_endpoints_are_documented_but_not_routed(tmp_path):
+    """The shipped catalog carries remote endpoints nobody has a credential for.
+    They must document the shape without entering the routing table — an
+    endpoint that cannot serve is worse than no endpoint."""
+    from roadstead import model_catalog
+
+    cat = model_catalog.load_catalog(force=True)
+    planned = [e.name for e in cat.endpoints.values() if not e.routed]
+    assert planned, "the example lost its planned remote endpoints"
+    kw = model_catalog.build_endpoint_kwargs(cat)
+    for name in planned:
+        assert name not in kw, f"{name} is planned but was routed anyway"
+
+
+def test_a_local_stanza_is_unaffected_by_the_generalised_engine_mirror(tmp_path):
+    """The negative control. `shim` and a decorated `llama.cpp (Vulkan)` still
+    resolve to the default provider and are still not mirrored, so nothing about
+    a local endpoint moved when the mirror stopped reading `== "vllm"`. The
+    address still arrives, now from the provider section."""
+    from roadstead import model_catalog
+
+    yaml_path = tmp_path / "models.yaml"
+    yaml_path.write_text(
+        "hosts: {box: 192.0.2.1}\n"
+        "providers:\n"
+        "  local:\n"
+        "    engine: llama.cpp (Vulkan)\n"
         "    host: box\n"
         "    port: 9000\n"
-        "    backend_engine: llama.cpp (Vulkan)\n"
+        "endpoints:\n"
+        "  chat:\n"
+        "    provider: local\n"
         "    slots: 4\n",
         encoding="utf-8")
-    cat = model_catalog.load_catalog(yaml_path, force=True)
-    kw = model_catalog.build_endpoint_kwargs(cat)["chat"]
+    kw = model_catalog.build_endpoint_kwargs(
+        model_catalog.load_catalog(yaml_path, force=True))["chat"]
     assert "backend_engine" not in kw
     assert "base_url" not in kw and "api_key_env" not in kw
     ep = EndpointConfig(**kw)
     assert provider_for(ep) is LLAMACPP
-    assert ep.backend_url == "http://10.0.0.1:9000"
+    assert ep.backend_url == "http://192.0.2.1:9000"

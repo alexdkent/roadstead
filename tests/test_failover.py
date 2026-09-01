@@ -1,4 +1,4 @@
-"""§ 9 — tier3 → tier2-analyst failover.
+"""§ 9 — tier3 → tier2 failover.
 
 Covers the tests § 9.9 of `docs/anvil2_tier3_deepseek_v4_flash_plan_2026-08.md`
 says this change owes, plus the two "silently dropped config key" guards the
@@ -35,8 +35,8 @@ from roadstead.model_catalog import build_endpoint_kwargs, load_catalog  # noqa:
 from roadstead.scheduler import QueuedRequest  # noqa: E402
 from roadstead.service import ProxyService  # noqa: E402
 
-SRC = "thinker"      # tier3
-TGT = "creative"     # tier2-analyst
+SRC = "tier3"      # tier3
+TGT = "tier2"     # tier2
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +113,7 @@ def test_degrade_ok_reaches_agent_config():
     assert cfgs["beacon"].degrade_ok is True, (
         "beacon lost its tier3 failover opt-in — during a tier3 outage every "
         "Beacon turn goes back to a hard 503 instead of degrading to "
-        "tier2-analyst")
+        "tier2")
     # Default-deny is the property that matters most, so assert it on a real
     # agent that IS in the file (i.e. the parser ran for it) rather than on an
     # absent key, which would pass even if the parser were dead.
@@ -141,37 +141,28 @@ def test_fallback_resolves_to_a_failover_target():
 
 
 def test_declared_fallbacks_resolve_to_live_endpoints():
-    """DOCTRINE (§ 9.9). Every non-null `fallback:` on a routable stanza must
-    name a LIVE, ACTIVE proxy endpoint.
+    """DOCTRINE. Every non-empty `failover_to:` must name a ROUTED endpoint.
 
-    `fallback:` was advisory metadata nothing consumed for months, and the value
-    it carried (`tier3_backup`) pointed at a stanza with `proxy_endpoint: false`
-    — a declared backup that physically could not serve. The moment a field
-    becomes load-bearing it needs a guard, or it rots back into a comment and
-    the failover target silently becomes nothing.
+    It was advisory metadata nothing consumed for months, and the value it
+    carried pointed at a stanza that could not serve — a declared backup that
+    physically was not there. The moment a field becomes load-bearing it needs a
+    guard, or it rots back into a comment and the failover target silently
+    becomes nothing.
     """
     cat = load_catalog()
-    live = {e.endpoint_class for e in cat.proxy_endpoints()
-            if e.endpoint_class and e.status == "active"}
-    # Scoped to PROXY endpoints: those are the only stanzas whose `fallback:`
-    # can arm a failover (build_endpoint_kwargs only walks proxy_endpoints).
-    # A non-routable stanza's fallback stays advisory and is covered by
-    # test_model_naming_doctrine.py::test_catalog_loads_and_is_consistent,
-    # which asserts only that it resolves to something.
-    for e in cat.proxy_endpoints():
-        if not e.fallback:
+    routed = {e.name for e in cat.routed()}
+    for e in cat.routed():
+        if not e.failover_to:
             continue
-        target = cat.entry(e.fallback)
-        assert target is not None, (
-            f"{e.name}: fallback {e.fallback!r} resolves to nothing")
-        assert target.proxy_endpoint, (
-            f"{e.name}: fallback {e.fallback!r} is not a proxy endpoint — it "
-            f"cannot serve, so this arms a failover at a dead backend")
-        assert target.endpoint_class in live, (
-            f"{e.name}: fallback {e.fallback!r} -> class "
-            f"{target.endpoint_class!r} is not live+active")
-        assert target.endpoint_class != e.endpoint_class, (
-            f"{e.name}: fallback points at its own endpoint class")
+        assert e.failover_to in routed, (
+            f"{e.name}: failover_to {e.failover_to!r} is not a routed endpoint "
+            f"— it cannot serve, so this arms a degrade at a dead backend")
+        assert e.failover_to != e.name, (
+            f"{e.name}: failover_to points at itself")
+        target = cat.endpoints[e.failover_to]
+        assert not target.failover_to, (
+            f"{e.name} -> {target.name} -> {target.failover_to}: failover never "
+            f"chains; a reciprocal or transitive pair reads as a loop")
 
 
 def test_failover_does_not_touch_endpoint_name_resolution():
@@ -183,11 +174,11 @@ def test_failover_does_not_touch_endpoint_name_resolution():
     from tier3 itself. Assert the property directly, and assert that a rerouted
     request's endpoint still round-trips.
     """
-    for name in ("thinker", "creative", "tier3", "tier2", "tier2-analyst",
-                 "reasoner", "companion"):
+    for name in ("tier3", "tier2", "tier3", "tier2", "tier2",
+                 "reasoner", "tier3"):
         once = normalize_endpoint(name)
         assert normalize_endpoint(once) == once, f"{name} is not idempotent"
-    # `creative` must not have acquired an alias pointing back at the source.
+    # `tier2` must not have acquired an alias pointing back at the source.
     assert normalize_endpoint(TGT) == TGT
     assert normalize_endpoint(SRC) == SRC
 
