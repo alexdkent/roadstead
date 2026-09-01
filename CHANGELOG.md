@@ -8,6 +8,65 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Added — a read-only admin scope, and the audit trail (Workstream H)
+
+Landed 2026-09-01. Two changes to what an admin identity *is*, landed together because they touch the
+same three files and answer halves of one question: the read views report a **state**, and a state
+cannot say who put it there; and an operator who wanted somebody to be able to *look* had to give
+them the ability to change everything.
+
+**`admin_readonly` — a narrowing that can never widen.**
+
+- A credential with `admin: true, admin_readonly: true` reaches every `GET` on the management plane
+  and is refused, with a 403 that says why, on everything else. On a key without `admin` it is a
+  **400 at enrolment**, not a silent no-op: an operator who wrote it believes they issued a safer
+  credential than they have.
+- **The read/write split comes from the HTTP method**, not from a list of write routes — a route list
+  is a second thing to keep in step with `routes.py`, and when it falls behind the failure is silent
+  and widening. It lives in the shared gate, so the four control routes that predate the management
+  plane inherit it without a line of their own.
+- **`identity.py` decides, everything else renders.** `IdentityResolver.admin_denial` owns which of
+  the three refusals applies; `deny_non_admin` renders it. An AST guard fails if `may_admin_write` or
+  `admin_readonly` is read anywhere but `identity.py` — a second place deciding what a scope permits
+  is the shape of the `_remote_ip` that had to be removed from `management.py`.
+- Spelled `:readonly` in the shared identity grammar, so `ROADSTEAD_API_KEYS` and `ROADSTEAD_ACL`
+  express it too. 🚨 **A narrowing beats an overlapping grant**: `127.0.0.1=ops:admin:readonly` is
+  read-only even though loopback is a built-in admin net. If the widest grant won, that line would
+  silently be a full grant for every operator who wrote it.
+
+**`GET /rs/v1/admin/audit` — who changed what, and when.**
+
+- **Every mutating admin route records**, including flags, pause, resume and maintenance, which touch
+  no overlay state and would otherwise record nothing. A trail covering only some of them is worse
+  than none, because a reader assumes completeness. The completeness guard is driven from
+  `routes.py`, not from a list: all **11** mutating admin routes, both spellings.
+- **A record names the credential and never carries one** — `key_id`, never the key or the digest.
+  Both the key label and the address are recorded always: a record with an address and no `key_id`
+  means an address-derived admin made the change, which is meaningful and slightly alarming, and
+  collapsing them into one actor string would hide which factor authorized it.
+- **It reports its own limits as data**: `persisted` (in-memory is the default), `dropped`,
+  `capacity`. It is an operator-facing change trail, not a security log of record — and says so,
+  rather than presenting itself as complete while being neither durable nor unbounded.
+- Written on the loop, persisted off it. The overlay lock moved onto the overlay, because two modules
+  write that file now and a lock owned by one of them serialises half the writers.
+
+**Three bugs, and two of them were found by RUNNING the page.** The suite was green for all three.
+
+1. A control-route record only reached disk if a *later* overlay write happened — so the most recent
+   entry, the one an operator looks for after an incident, was the one a restart lost. A drain is
+   taken in a hurry, often right before the restart that would drop the record of it.
+2. The Fleet view's Pause/Resume was the one write control not wrapped in the scope guard. It
+   rendered, it worked, and a read-only operator would have learned their scope from a 403 *after*
+   clicking. There is now a test that finds every write control from the HTTP method it sends and
+   requires it guarded.
+3. 🚨 `render()` fired before `primeChrome()` resolved, so the **first paint had no scope** and the
+   guard defaulted to allowed — every write control live for a read-only operator until the 30-second
+   heartbeat. The first paint is the one somebody clicks.
+
+`docs/api.md` §1.5, §3.3 and a new §3.8; two rows in §3's route table.
+`tests/test_admin_audit.py`. Twenty mutations, every guard observed going red by assertion — no
+timeouts, no collection errors.
+
 ### Fixed — one context-fit predicate, and the dead fourth copy of it
 
 Landed 2026-09-01. "Does this request fit in this much context?" was written out by hand at four

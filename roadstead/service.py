@@ -606,6 +606,9 @@ class ProxyService:
     async def handle_admin_providers(self, request: Request) -> Response:
         return await self._management.handle_admin_providers(request)
 
+    async def handle_admin_audit(self, request: Request) -> Response:
+        return await self._management.handle_admin_audit(request)
+
     async def handle_admin_ui(self, request: Request) -> Response:
         return await self._management.handle_admin_ui(request)
 

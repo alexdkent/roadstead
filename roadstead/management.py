@@ -218,7 +218,8 @@ EDITABLE_QUOTA_FIELDS = (
 
 #: Fields a ``POST /rs/v1/admin/keys`` accepts.
 _KEY_CREATE_FIELDS = frozenset({
-    "agent_id", "priority", "min_timeout_s", "admin", "id", "key_sha256",
+    "agent_id", "priority", "min_timeout_s", "admin", "admin_readonly",
+    "id", "key_sha256",
 })
 
 
@@ -236,6 +237,7 @@ class AdminOverlay:
                  environment or in a keys file, which this layer cannot edit but
                  must still be able to switch off. See :meth:`apply`.
     ``agents``   per-caller quota overrides, field by field.
+    ``audit``    who changed what, and when. See :meth:`record`.
 
     ``path=None`` keeps everything in memory: the changes apply, nothing
     survives a restart, and every response says so.
@@ -243,17 +245,41 @@ class AdminOverlay:
 
     #: Top-level keys the file may carry. An unknown one is REPORTED rather than
     #: dropped, for the reason this whole module exists.
-    _FILE_SECTIONS = frozenset({"version", "keys", "revoked", "agents"})
+    _FILE_SECTIONS = frozenset({"version", "keys", "revoked", "agents", "audit"})
+
+    #: How many audit records to keep. Bounded because this is an append-only
+    #: list on a long-lived process and the store is rewritten whole on every
+    #: change — an unbounded trail turns each edit into a progressively larger
+    #: synchronous file write. The oldest go first, and the read view says how
+    #: many were dropped rather than presenting a truncated log as a complete
+    #: one. 🚨 This is an operator-facing change trail, NOT a security audit log
+    #: of record: it cannot outlive its own bound and `docs/api.md` §3.8 says so.
+    _AUDIT_MAX = 500
 
     def __init__(self, path: str | Path | None = None) -> None:
         self._path = Path(path) if path else None
         self.keys: list[dict] = []
         self.revoked: list[str] = []
         self.agents: dict[str, dict] = {}
+        #: Newest LAST, matching the file. Bounded by ``_AUDIT_MAX``.
+        self.audit: list[dict] = []
+        #: How many records fell off the front, in this process and in every
+        #: one before it. Persisted, so the count survives the restart it
+        #: describes.
+        self.audit_dropped: int = 0
         #: Per-agent values the CONFIG FILE set, captured in :meth:`apply`
         #: before any override lands. What makes "declared vs in force"
         #: reportable after the two have been merged into one object.
         self.declared_agents: dict[str, dict] = {}
+        # Serialises overlay writes. An asyncio.Lock, NOT a threading one: it
+        # orders two coroutines' read-modify-write of the same file on one loop
+        # and holds across the `to_thread` that does the I/O. It guards no
+        # in-memory scheduler state, which is what CLAUDE.md forbids locking.
+        # 🚨 It lives HERE rather than on one handler because TWO modules now
+        # persist this file — the management plane and the four control routes
+        # that predate it — and a lock owned by one of them serialises only half
+        # the writers.
+        self._lock = asyncio.Lock()
         self._load()
 
     # ---- persistence ----------------------------------------------------
@@ -311,6 +337,13 @@ class AdminOverlay:
         if isinstance(agents, dict):
             self.agents = {str(k): dict(v) for k, v in agents.items()
                            if isinstance(v, dict)}
+        audit = raw.get("audit", {})
+        if isinstance(audit, dict):
+            self.audit = [e for e in audit.get("entries", []) if isinstance(e, dict)]
+            try:
+                self.audit_dropped = int(audit.get("dropped", 0))
+            except (TypeError, ValueError):
+                self.audit_dropped = 0
         logger.info("admin overlay: %d runtime key(s), %d revocation(s), "
                     "%d caller override(s) from %s",
                     len(self.keys), len(self.revoked), len(self.agents),
@@ -333,6 +366,8 @@ class AdminOverlay:
                     "keys": self.keys,
                     "revoked": self.revoked,
                     "agents": self.agents,
+                    "audit": {"entries": self.audit,
+                              "dropped": self.audit_dropped},
                 },
                 indent=1, sort_keys=True,
             ))
@@ -358,6 +393,7 @@ class AdminOverlay:
                 min_timeout_s=(None if entry.get("min_timeout_s") is None
                                else float(entry["min_timeout_s"])),
                 admin=bool(entry.get("admin", False)),
+                admin_readonly=bool(entry.get("admin_readonly", False)),
                 key_id=str(entry["id"]) if entry.get("id") else None,
                 source="runtime",
             )
@@ -396,6 +432,47 @@ class AdminOverlay:
 
     def set_agent(self, agent_id: str, fields: dict) -> None:
         self.agents.setdefault(agent_id, {}).update(fields)
+
+    async def persist_async(self) -> dict:
+        """Persist off-loop, serialised, and describe the outcome.
+
+        🚨 The caller has ALREADY applied its change in memory. This only decides
+        whether the change survives a restart — see the module docstring on why
+        an unpersistable change is still a change.
+        """
+        async with self._lock:
+            reason = self.unwritable_reason()
+            if reason is not None:
+                return {"persisted": False, "reason": reason}
+            await asyncio.to_thread(self.persist)
+            # Re-check: `persist` swallows its own errors so a bad disk cannot
+            # break a response, which means "it ran" is not "it worked".
+            return {"persisted": self.unwritable_reason() is None,
+                    "store": self.path}
+
+    def record(self, entry: dict) -> None:
+        """Append one audit record. **Call on the loop.**
+
+        🚨 In-memory only, deliberately, and this is the shape the concurrency
+        invariant forces (CLAUDE.md: *mutate on the loop, persist off it*). The
+        record lands here synchronously — it is a list append — and reaches the
+        disk on the ``persist()`` that the same handler was already going to do
+        through ``asyncio.to_thread``. Writing the trail with its own file write
+        would put I/O on the loop for every control action, and doing it off-loop
+        separately would let a record land after the change it describes was
+        already reported to the caller.
+
+        A consequence worth naming: when the store is unwritable the trail
+        applies and does not survive, exactly like the change it records. That
+        is disclosed by the read view rather than fixed — a trail that refused
+        to record an action the plane had already taken would make the log
+        *less* truthful, not more.
+        """
+        self.audit.append(entry)
+        if len(self.audit) > self._AUDIT_MAX:
+            dropped = len(self.audit) - self._AUDIT_MAX
+            del self.audit[:dropped]
+            self.audit_dropped += dropped
 
 
 def _coerce_priority(raw: Any) -> LLMPriority:
@@ -516,6 +593,19 @@ def validate_key_create(body: Any) -> dict:
         if not isinstance(body["admin"], bool):
             raise Invalid("admin must be a JSON boolean")
         out["admin"] = body["admin"]
+    if "admin_readonly" in body:
+        if not isinstance(body["admin_readonly"], bool):
+            raise Invalid("admin_readonly must be a JSON boolean")
+        # 🚨 Refused rather than accepted-and-ignored. `admin_readonly` NARROWS
+        # `admin`; on a key that has no admin scope it changes nothing, and an
+        # operator who wrote it believes they have issued a safer credential
+        # than they have. Same reason an unknown field is a 400 on this surface
+        # rather than a silent drop.
+        if body["admin_readonly"] and not out.get("admin", False):
+            raise Invalid(
+                "admin_readonly narrows the admin scope and grants nothing on "
+                "its own — set admin: true beside it, or omit it")
+        out["admin_readonly"] = body["admin_readonly"]
     if body.get("id") is not None:
         key_id = str(body["id"]).strip()
         if not key_id:
@@ -544,11 +634,6 @@ class ManagementApi:
     def __init__(self, state: "ProxyState", http: "ProxyHttpHandlers") -> None:
         self.state = state
         self._http = http
-        # Serialises overlay writes. An asyncio.Lock, NOT a threading one: it
-        # orders two coroutines' read-modify-write of the same file on one loop,
-        # and holds across the `to_thread` that does the I/O. It guards no
-        # in-memory scheduler state, which is what CLAUDE.md forbids locking.
-        self._store_lock = asyncio.Lock()
         #: The UI asset, read once off-loop and then held. None until first served.
         self._ui_html: str | None = None
 
@@ -562,22 +647,27 @@ class ManagementApi:
         self._http.audit_admin_ip(route, remote_ip)
         return self._http.deny_non_admin(request, remote_ip)
 
-    async def _persist(self) -> dict:
-        """Persist the overlay off-loop and describe the outcome.
+    def _record(self, request: Request, action: str, target: str,
+                detail: dict) -> None:
+        """Write one audit record. **On the loop**, before ``_persist``.
 
-        🚨 The caller has ALREADY applied the change in memory. This only decides
-        whether it survives a restart — see the module docstring on why an
-        unpersistable change is still a change.
+        Ordering is load-bearing: the record is appended in memory first so it
+        rides the same off-loop write as the change it describes. A trail
+        persisted separately, afterwards, can be missing the last entry after a
+        crash — and the last entry is the one an operator is looking for.
         """
-        overlay = self.state.admin_overlay
-        reason = overlay.unwritable_reason()
-        if reason is not None:
-            return {"persisted": False, "reason": reason}
-        await asyncio.to_thread(overlay.persist)
-        # Re-check: `persist` swallows its own errors so a bad disk cannot break
-        # a response, which means "it ran" is not "it worked".
-        return {"persisted": overlay.unwritable_reason() is None,
-                "store": overlay.path}
+        self.state.admin_overlay.record({
+            "at": time.time(),
+            "action": action,
+            "target": target,
+            "actor": self.state.identity.actor(request),
+            "detail": detail,
+        })
+
+    async def _persist(self) -> dict:
+        """Persist the overlay off-loop. The lock lives on the overlay now,
+        because the control routes in ``http_handlers`` persist it too."""
+        return await self.state.admin_overlay.persist_async()
 
     # ---- config: what you wrote vs what is in force ----------------------
 
@@ -597,6 +687,11 @@ class ManagementApi:
         acl = self.state.acl
         proxies = self.state.identity.proxies
         return JSONResponse({
+            # 🚨 Who you are and what that permits, from the ONE place that
+            # decides it. The UI disables its write controls from this rather
+            # than working it out — a page whose write affordances are live and
+            # whose writes 403 is worse than one that shows them disabled.
+            "you": self.state.identity.admin_scope(request),
             "sources": {
                 "catalog": {
                     "path": os.environ.get("ROADSTEAD_MODELS_YAML", "")
@@ -630,6 +725,14 @@ class ManagementApi:
                     "env_var": "ROADSTEAD_ADMIN_NETS",
                     "builtin": acl.builtin_admin_nets(),
                     "operator": acl.operator_admin_nets(),
+                    # 🚨 A subset of `operator`, and reported rather than left
+                    # to be inferred from its absence. A narrowed net looks
+                    # exactly like a full one in the list above, and the whole
+                    # §3.5 argument is that two sources agreeing most of the
+                    # time is where the expensive failures live: an operator
+                    # auditing "who can change things" must not have to go back
+                    # to the environment string to find out.
+                    "readonly": acl.readonly_admin_nets,
                 },
                 "runtime_flags": {"path": self.state.config.runtime_flags_path},
                 "admin_store": {
@@ -678,6 +781,7 @@ class ManagementApi:
             priority=_coerce_priority(spec.get("priority")),
             min_timeout_s=spec.get("min_timeout_s"),
             admin=bool(spec.get("admin", False)),
+            admin_readonly=bool(spec.get("admin_readonly", False)),
             key_id=spec.get("id"),
             source="runtime",
         )
@@ -698,11 +802,23 @@ class ManagementApi:
             "priority": spec.get("priority", LLMPriority.P3_INGESTION.name),
             "min_timeout_s": spec.get("min_timeout_s"),
             "admin": bool(spec.get("admin", False)),
+            "admin_readonly": bool(spec.get("admin_readonly", False)),
             "created_at": time.time(),
         }
         self.state.admin_overlay.add_key(record)
-        async with self._store_lock:
-            outcome = await self._persist()
+        # 🚨 The record carries the key's POLICY and never its `key_sha256`.
+        # The overlay stores the digest because it has to replay the enrolment
+        # on restart; the audit trail has no such need, and a digest is a
+        # working credential to anyone who can compute one.
+        self._record(request, "key.enrol", key_id, {
+            "agent_id": spec["agent_id"],
+            "priority": record["priority"],
+            "min_timeout_s": record["min_timeout_s"],
+            "admin": record["admin"],
+            "admin_readonly": record["admin_readonly"],
+            "secret_generated": secret is not None,
+        })
+        outcome = await self._persist()
 
         payload = {
             "key_id": key_id,
@@ -710,6 +826,7 @@ class ManagementApi:
             "priority": record["priority"],
             "min_timeout_s": record["min_timeout_s"],
             "admin": record["admin"],
+            "admin_readonly": record["admin_readonly"],
             **outcome,
         }
         if secret is not None:
@@ -756,8 +873,13 @@ class ManagementApi:
             return _error("invalid_request_error",
                           f"no key with id {key_id!r} is registered", 404)
         self.state.admin_overlay.revoke_key(key_id)
-        async with self._store_lock:
-            outcome = await self._persist()
+        self._record(request, "key.revoke", key_id, {
+            # Where the key was DECLARED, which is what decides whether the
+            # revocation survives a restart on its own.
+            "declared_in": source,
+            "registry_now_empty": not registry.configured,
+        })
+        outcome = await self._persist()
         payload = {"revoked": key_id, "source": source, **outcome}
         warnings: list[str] = []
         if not registry.configured:
@@ -861,8 +983,8 @@ class ManagementApi:
                 max_balance=fields.get("max_balance_ss"),
             )
         self.state.admin_overlay.set_agent(agent_id, fields)
-        async with self._store_lock:
-            outcome = await self._persist()
+        self._record(request, "caller.quota", agent_id, dict(fields))
+        outcome = await self._persist()
         return JSONResponse({
             "agent_id": agent_id,
             "changed": fields,
@@ -1021,6 +1143,47 @@ class ManagementApi:
         })
 
     # ---- providers ------------------------------------------------------
+
+    async def handle_admin_audit(self, request: Request) -> Response:
+        """GET — who changed what, and when.
+
+        The fifth reporting seam, and the one that answers the question the other
+        four cannot: they all report a *state*, and a state cannot say who put it
+        there. `/rs/v1/admin/config` shows a quota that is not what the file
+        says; only this says which credential moved it and at what time.
+
+        🚨 It reports its own LIMITS as data, not in prose an operator has to
+        know to look for. ``persisted`` says whether the trail survives a
+        restart — an in-memory-only trail is the default, because no admin store
+        is configured by default — and ``dropped`` says how many records the
+        bound has discarded. A trail that presented itself as complete while
+        being neither durable nor unbounded would be the `finish_reason` repair
+        again: a thing that looks like an answer and silences the question.
+
+        Newest FIRST here, oldest first on disk. The file is append-only and the
+        reader wants the most recent change.
+        """
+        denied = self._gate(f"{PREFIX}/audit", request)
+        if denied is not None:
+            return denied
+        overlay = self.state.admin_overlay
+        try:
+            limit = int(request.query_params.get("limit", "100"))
+        except (TypeError, ValueError):
+            limit = 100
+        limit = min(max(limit, 1), overlay._AUDIT_MAX)
+        entries = list(reversed(overlay.audit))[:limit]
+        return JSONResponse({
+            "entries": entries,
+            "count": len(entries),
+            "held": len(overlay.audit),
+            "capacity": overlay._AUDIT_MAX,
+            # 🚨 Both halves of "you cannot rely on this as a log of record".
+            "dropped": overlay.audit_dropped,
+            "persisted": overlay.writable,
+            "store": overlay.path,
+            "reason": overlay.unwritable_reason(),
+        })
 
     async def handle_admin_providers(self, request: Request) -> Response:
         """GET — providers and endpoints: declared, discovered, and in force."""

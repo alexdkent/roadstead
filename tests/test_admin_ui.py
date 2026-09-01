@@ -298,6 +298,11 @@ async def test_every_field_the_ui_reads_exists_in_a_real_response(tmp_path, monk
     await sample(svc.handle_admin_callers(_Req()))
     await sample(svc.handle_admin_key(
         _Req(method="DELETE", path_params={"key_id": created["key_id"]})))
+    # LAST, deliberately: every mutation above records, so the audit view's rows
+    # are sampled from a trail this test actually caused rather than one it
+    # constructed. A view sampled against a hand-built response is a view pinned
+    # to the test's idea of the shape, not the server's.
+    await sample(svc.handle_admin_audit(_Req()))
     samples.append(_completed_frame_keys())
 
     reachable: set[str] = set()

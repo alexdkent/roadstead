@@ -92,6 +92,12 @@ class IPIdentityMap:
         # address is checked against THIS list only — see
         # ``identity.IdentityResolver.resolve``.
         self._operator_admin_nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        # 🚨 Nets whose admin grant is READ-ONLY. A subset of the two lists
+        # above, never a third source of grants: an address reaches this list
+        # only by having been registered as admin in the same breath, so
+        # membership here can only ever take the mutating half away. See
+        # :meth:`is_admin_readonly` for why matching it WINS over a full grant.
+        self._readonly_admin_nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 
     def register(
         self,
@@ -110,10 +116,17 @@ class IPIdentityMap:
         except ValueError:
             logger.warning("invalid IP/subnet in ACL: %s", ip_or_subnet)
 
-    def register_admin_net(self, ip_or_subnet: str) -> None:
+    def register_admin_net(self, ip_or_subnet: str, *, readonly: bool = False) -> None:
         """Extend the admin allow-list. Identity and PRIORITY are untouched —
         granting admin to a host must never quietly promote its inference
-        traffic into a better band."""
+        traffic into a better band.
+
+        ``readonly=True`` grants the admin scope and immediately narrows it to
+        reads. It is one call rather than two because the two facts arrive
+        together, from one ``=ops:admin:readonly`` entry, and a host that ended
+        up in the readonly list without being in an admin list at all would be
+        a grant nobody wrote.
+        """
         try:
             net = ipaddress.ip_network(ip_or_subnet, strict=False)
         except ValueError:
@@ -121,6 +134,8 @@ class IPIdentityMap:
             return
         self._admin_nets.append(net)
         self._operator_admin_nets.append(net)
+        if readonly:
+            self._readonly_admin_nets.append(net)
 
     def _lookup(self, remote_ip: str) -> _Registration | None:
         """Resolve an IP to its registration, or None if unregistered.
@@ -204,6 +219,11 @@ class IPIdentityMap:
         """The nets an operator added, via ``ROADSTEAD_ADMIN_NETS`` or ``:admin``."""
         return [str(net) for net in self._operator_admin_nets]
 
+    @property
+    def readonly_admin_nets(self) -> list[str]:
+        """The subset of those whose grant is narrowed to reads."""
+        return [str(net) for net in self._readonly_admin_nets]
+
     def is_admin(self, remote_ip: str, *, trust_builtin_nets: bool = True) -> bool:
         """Admin surfaces (drain/pause, maintenance windows, runtime flags,
         calls-log ingest) accept loopback + docker-internal sources, plus
@@ -237,12 +257,32 @@ class IPIdentityMap:
         nets = self._admin_nets if trust_builtin_nets else self._operator_admin_nets
         return any(addr in net for net in nets)
 
+    def is_admin_readonly(self, remote_ip: str) -> bool:
+        """Whether this address's admin grant is narrowed to READS.
+
+        🚨 Matching a read-only net WINS over also matching a full-admin one,
+        including a built-in. The alternative — full wins — makes
+        ``127.0.0.1=ops:admin:readonly`` silently a full grant, because loopback
+        is a built-in admin net and every operator writing that line is on it.
+        A narrowing that the widest overlapping grant can cancel is not a
+        narrowing; it is a comment.
+
+        Unlike :meth:`is_admin` this takes no ``trust_builtin_nets``: the
+        built-ins grant admin and never narrow it, so there is nothing here for
+        a forwarded address to lose.
+        """
+        try:
+            addr = ipaddress.ip_address(remote_ip)
+        except ValueError:
+            return False
+        return any(addr in net for net in self._readonly_admin_nets)
+
     @classmethod
     def from_env(cls) -> "IPIdentityMap":
         """Build from the environment. Ships no registrations of its own.
 
         ``ROADSTEAD_ACL`` entries are comma-separated
-        ``ip_or_subnet=agent_id[:priority][:min_timeout_s][:admin]``, e.g.::
+        ``ip_or_subnet=agent_id[:priority][:min_timeout_s][:admin][:readonly]``, e.g.::
 
             ROADSTEAD_ACL=192.0.2.9=tideway:P3_INGESTION,192.0.2.0/24=lan:P3_INGESTION:1800
 
@@ -251,7 +291,8 @@ class IPIdentityMap:
         so their order does not matter and any of them may be omitted. ``admin``
         on an entry ALSO adds that address to the admin nets, which is the one
         place the two decisions are made together, because an operator writing
-        ``=ops:admin`` plainly means both.
+        ``=ops:admin`` plainly means both. ``:readonly`` beside it narrows that
+        grant to reads.
 
         ``ROADSTEAD_ADMIN_NETS`` is a comma-separated CIDR list for hosts that
         need the control plane but no inference identity.
@@ -275,15 +316,17 @@ class IPIdentityMap:
                     if entry:
                         logger.warning(
                             "%s: skipping malformed entry %r (expected "
-                            "<ip-or-subnet>=<agent_id>[:priority][:min_timeout_s][:admin])",
+                            "<ip-or-subnet>=<agent_id>[:priority]"
+                            "[:min_timeout_s][:admin][:readonly])",
                             var, entry)
                     continue
                 ip_part, spec = entry.split("=", 1)
-                agent_id, priority, floor, admin = parse_identity_spec(spec.strip())
+                agent_id, priority, floor, admin, readonly = parse_identity_spec(
+                    spec.strip())
                 ip_part = ip_part.strip()
                 acl.register(ip_part, agent_id, priority, min_timeout_s=floor)
                 if admin:
-                    acl.register_admin_net(ip_part)
+                    acl.register_admin_net(ip_part, readonly=readonly)
 
         for net in os.environ.get("ROADSTEAD_ADMIN_NETS", "").split(","):
             net = net.strip()

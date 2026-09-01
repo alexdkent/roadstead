@@ -29,6 +29,7 @@ Provides:
   - GET  /rs/v1/admin/callers   — per-caller identity, quota, DRR, spend
   - PATCH /rs/v1/admin/callers/{agent_id} — edit one caller's quota
   - GET  /rs/v1/admin/providers — providers + endpoints: declared vs in force
+  - GET  /rs/v1/admin/audit     — who changed what, and when
   - GET  /rs/v1/admin/ui        — the operator UI (only when ROADSTEAD_ADMIN_UI)
   - GET  /rs/v1/admin/stream    — the SSE stream, aliased for the UI's EventSource
   - GET  /health           — health check
@@ -182,6 +183,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_admin_providers(request: Request) -> Response:
         return await svc.handle_admin_providers(request)
 
+    async def handle_admin_audit(request: Request) -> Response:
+        return await svc.handle_admin_audit(request)
+
     async def handle_admin_ui(request: Request) -> Response:
         return await svc.handle_admin_ui(request)
 
@@ -259,6 +263,10 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         Route(f"{ADMIN_PREFIX}/callers/{{agent_id}}", handle_admin_caller,
               methods=["PATCH"]),
         Route(f"{ADMIN_PREFIX}/providers", handle_admin_providers, methods=["GET"]),
+        # Every mutating admin route records here. A READ, so a read-only admin
+        # scope reaches it — which is the point: the operator who cannot change
+        # anything is often exactly the one auditing what changed.
+        Route(f"{ADMIN_PREFIX}/audit", handle_admin_audit, methods=["GET"]),
         # The four control routes that predate the management plane, served at
         # the new prefix TOO. They keep their `/v1/admin/*` spelling because §3
         # published it and external consumers read it; the alias exists so an

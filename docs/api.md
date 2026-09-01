@@ -153,7 +153,12 @@ and the budget holder.** It is established in one of three ways, in strict prece
 
 A key carries its own default `priority`, an optional `min_timeout_s` deadline floor, and an
 optional `admin` scope, so all four facts travel with the caller rather than with the machine it
-runs on.
+runs on. Rows 1 and 2 share one grammar —
+`agent_id[:priority][:min_timeout_s][:admin][:readonly]`, segments recognised by **shape** so their
+order does not matter — because an operator writing `ROADSTEAD_ACL` and `ROADSTEAD_API_KEYS` in one
+compose file should not have to learn two spellings of the same facts. `:readonly` **narrows** the
+admin scope to reads (§3.3) and grants nothing on its own; written without `:admin` it is warned
+about rather than silently ignored.
 
 Three rules, each of which is a decision rather than an implementation detail:
 
@@ -578,6 +583,7 @@ is not an error: see §3.2.
 | `GET /rs/v1/admin/callers` | Per caller: identities, quota (declared vs in force), DRR budget, spend, live occupancy. |
 | `PATCH /rs/v1/admin/callers/{agent_id}` | Edit one caller's quota (§3.4). Partial; absent fields untouched. |
 | `GET /rs/v1/admin/providers` | Providers and endpoints: declared vs discovered capacity, credential presence, prices, health. |
+| `GET /rs/v1/admin/audit` | Who changed what, and when (§3.8). Reports its own bound and durability. |
 | `POST /rs/v1/admin/endpoints/{ep}/pause` · `POST /v1/admin/endpoints/{ep}/pause` | Drain an endpoint: background defers, interactive fast-fails, the poller stops probing. Auto-opens an annotated PLANNED maintenance window. |
 | `POST /rs/v1/admin/endpoints/{ep}/resume` · `POST /v1/admin/endpoints/{ep}/resume` | Re-probe, **re-discover capacity**, drain the deferred queue, close the window. |
 | `GET`/`POST /rs/v1/admin/flags` · `GET`/`POST /v1/admin/flags` | Read/flip runtime flags; persisted to JSON, survives restart. |
@@ -642,6 +648,22 @@ silently overwrites the first.
 **Revocation is never refused on provenance grounds.** A key declared in `ROADSTEAD_API_KEYS` or a
 keys file can be revoked at runtime and the revocation survives a restart — but this plane cannot
 edit an environment, so the response warns that the declaration will outlive the reason it is dead.
+
+🚨 **`admin_readonly` NARROWS `admin`, and can never widen anything.** A credential with
+`admin: true, admin_readonly: true` reaches every `GET` on the management plane and is refused, with
+a 403 that says why, on every method that is not one. It is refused at enrolment when `admin` is not
+set beside it — on a non-admin key the field changes nothing, and an operator who wrote it believes
+they have issued a safer credential than they have. The same narrowing is spelled `:readonly` in the
+shared identity grammar (§1.5), so `ROADSTEAD_API_KEYS` and `ROADSTEAD_ACL` express it too.
+
+The read/write split is taken from the **HTTP method** — `GET`, `HEAD` and `OPTIONS` read, everything
+else mutates — and not from a list of write routes. A route list is a second thing to keep in step
+with the table above, and when it falls behind, the failure is silent and in the widening direction.
+
+🚨 **An address may be narrowed the same way, and a narrowing beats an overlapping grant.**
+`127.0.0.1=ops:admin:readonly` in `ROADSTEAD_ACL` is read-only even though loopback is a built-in
+admin net: if the widest overlapping grant won, that line would silently be a full grant, since every
+operator writing it is on loopback. A narrowing another grant can cancel is not a narrowing.
 
 🚨 **Keys are flat, and that is the answer to team-level quotas rather than a gap in it.** The quota
 holder, the DRR fair share and the spend cap are all keyed on `agent_id`, never on the key — so
@@ -723,6 +745,42 @@ directory the page was challenged in. Same handler, same gate.
 ⚠️ **`GET /v1/stream` is admin-gated as of 2026-09-01** and was not before. A frame there names the
 caller, endpoint, tokens and timing of every call the fleet serves — the live form of
 `/rs/v1/admin/callers`, which has been gated since it existed. Recorded in `CHANGELOG.md`.
+
+### 3.8 The audit trail 🚨
+
+`GET /rs/v1/admin/audit`. The fifth reporting seam, and the one the other four cannot be: they all
+report a **state**, and a state cannot say who put it there. §3.5 shows a quota that is not what the
+file says; only this says which credential moved it, and when.
+
+**Every mutating admin route records, including the four that predate this plane.** Flags,
+pause, resume and maintenance do not touch the admin overlay and would otherwise record nothing — and
+a trail covering only the routes that happen to persist would be worse than none, because an operator
+reading it assumes completeness. *"Who paused `tier2`"* is exactly the question it would silently
+fail to answer. `tests/test_admin_audit.py` drives every mutating admin route in the table above and
+fails if one records nothing.
+
+**A record names the credential, never carries one.** `actor` is `{key_id, agent_id, source,
+address}` — the same rule that governs every other readout here: not the key, not the digest.
+Both the key label and the address are recorded **always**, even though one is usually redundant: a
+record showing an address and no `key_id` means an address-derived admin made the change, which is a
+meaningful and slightly alarming thing to find, and collapsing them into one actor string would hide
+which factor actually authorized it.
+
+🚨 **It reports its own limits as data, not as prose you have to know to look for.** `persisted` says
+whether the trail survives a restart — **in-memory is the default**, because no admin store is
+configured by default — and `dropped` counts the records the bound (`capacity`, 500) has discarded.
+It is an operator-facing change trail, **not a security log of record**: it cannot outlive its own
+bound, and a trail that presented itself as complete while being neither durable nor unbounded would
+be the `finish_reason` repair again — a thing that looks like an answer and silences the question.
+
+**A record is written on the loop and reaches disk off it**, riding the same `to_thread` write as the
+change it describes (CLAUDE.md: *mutate on the loop, persist off it*). One consequence follows and is
+not treated as a bug: when the store is unwritable the trail applies and does not survive, exactly
+like the change it records. A trail that refused to record an action the plane had already taken
+would make the log *less* truthful, not more.
+
+It is a `GET`, so a **read-only** admin scope (§3.3) reaches it — which is the point. The operator who
+cannot change anything is often exactly the one auditing what changed.
 
 ### 3.6 `/v1/fleet/*` analytics — response schemas
 

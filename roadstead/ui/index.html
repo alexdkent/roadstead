@@ -207,6 +207,7 @@ const API = {
   callers:     "/rs/v1/admin/callers",
   caller:      (id) => "/rs/v1/admin/callers/" + encodeURIComponent(id),
   providers:   "/rs/v1/admin/providers",
+  audit:       "/rs/v1/admin/audit",
   flags:       "/rs/v1/admin/flags",
   maintenance: "/rs/v1/admin/maintenance",
   pause:       (ep) => "/rs/v1/admin/endpoints/" + encodeURIComponent(ep) + "/pause",
@@ -256,6 +257,40 @@ function pick(obj, path, dflt) {
     cur = cur[seg];
   }
   return cur === undefined ? dflt : cur;
+}
+
+/* ---------------------------------------------------------------------------
+ * THE WRITE GUARD.
+ *
+ * 🚨 A page whose write controls are live and whose writes 403 is worse than one
+ * that shows them disabled: the operator learns their scope from a failure,
+ * having already typed the change. The server is still the enforcer — this is a
+ * courtesy, not a control — which is exactly why it defaults to ALLOWED when the
+ * field is absent. A UI that disabled itself against a server that does not
+ * publish the field would be a page that cannot be used, and the refusal it is
+ * anticipating would have been a clean 403 anyway.
+ *
+ * The scope is read, never derived: `you.may_write` comes from the one place
+ * that decides what an admin scope permits (identity.IdentityResolver), and the
+ * page does not know that `admin_readonly` exists.
+ * ------------------------------------------------------------------------- */
+function mayWrite() { return pick(state.config, "you.may_write", true) !== false; }
+
+/** Disable a write control when the scope is read-only, and say why on hover. */
+function guarded(node) {
+  if (mayWrite()) return node;
+  node.setAttribute("disabled", "");
+  node.setAttribute("title", "this credential has read-only admin scope");
+  return node;
+}
+
+/** The banner a read-only operator sees at the top of every writable view. */
+function readonlyNote() {
+  if (mayWrite()) return null;
+  return el("div", { class: "notice" }, el("div", { class: "d" },
+    el("b", { text: "Read-only admin scope" }),
+    " — every view here is available and every control is disabled. Widening it "
+    + "means issuing a different credential, not changing an address allowlist."));
 }
 
 async function api(path, opts) {
@@ -394,18 +429,21 @@ async function viewFleet(root) {
       el("td", { class: "num", text: util === undefined || util === null ? "—" : util + "%" }),
       el("td", { class: "num", text: fmt.n(pick(e, "recent_timeouts")) }),
       el("td", {},
-        el("button", {
+        guarded(el("button", {
           class: "act" + (paused ? "" : " danger"),
           onclick: () => control(paused ? API.resume(name) : API.pause(name),
                                  paused ? {} : { reason: "paused from the management UI" }),
           text: paused ? "Resume" : "Pause",
-        })));
+        }))));
   });
   root.append(el("section", {},
     el("h2", { text: "Endpoints" }),
     el("p", { class: "lede", text: "Slots are the unit of fairness. Pausing drains an endpoint: background work defers, interactive work fast-fails, and the restart is tagged as planned so its timeout burst does not read as an incident." }),
     rows.length ? table(["endpoint", "state", "slots", "queued", "p50 wait", "p95 wait", "util", "timeouts 5m", ""], rows)
-                : empty("no endpoints configured")));
+                : empty("no endpoints configured"),
+    // Wherever a control is disabled, say why in the same section. A disabled
+    // button with no explanation reads as a bug in the page.
+    readonlyNote()));
 
   root.append(el("section", {},
     el("h2", { text: "Live" }),
@@ -469,6 +507,7 @@ async function viewGap(root) {
   const honoured = pick(c, "sources.trusted_proxies.forwarded_headers_honoured", false);
   const builtinNets = pick(c, "sources.admin_nets.builtin", []);
   const operatorNets = pick(c, "sources.admin_nets.operator", []);
+  const readonlyNets = pick(c, "sources.admin_nets.readonly", []);
   root.append(el("section", {},
     el("h2", { text: "Who can reach this" }),
     el("p", { class: "lede", text: "X-Forwarded-For is a caller-supplied string and is read only from an address you trusted. Configuring one also withdraws the BUILT-IN loopback/docker admin grant from forwarded requests — \"it arrived on loopback\" stops meaning \"somebody is already on the machine\" the moment a front door exists." }),
@@ -482,7 +521,10 @@ async function viewGap(root) {
           honoured ? [" ", tag("not applied to forwarded requests", "warn")] : null)),
       el("tr", {}, el("td", { text: "admin nets (yours)" }),
         el("td", {}, operatorNets.length
-          ? operatorNets.map((n) => [el("code", { text: n }), " "])
+          // 🚨 A narrowed net looks exactly like a full one in a flat list, and
+          // "who can CHANGE things" is the question this row is read for.
+          ? operatorNets.map((n) => [el("code", { text: n }),
+              readonlyNets.includes(n) ? [" ", tag("read-only", "")] : null, " "])
           : tag("none — admin by key only, for a forwarded caller", "warn"))),
     ])));
 }
@@ -499,7 +541,8 @@ async function viewKeys(root) {
                             : tag("no keys — a presented key is IGNORED and the address decides", "warn"),
       pick(k, "require_key") ? tag("a key is required", "ok") : tag("a key is optional", ""),
       pick(k, "store.writable", true) ? null
-        : tag("overlay read-only: " + pick(k, "store.reason", ""), "bad"))));
+        : tag("overlay read-only: " + pick(k, "store.reason", ""), "bad")),
+    readonlyNote()));
 
   const rows = pick(k, "keys", []).map((row) => {
     const floor = pick(row, "min_timeout_s");
@@ -508,16 +551,21 @@ async function viewKeys(root) {
       el("td", {}, el("code", { text: pick(row, "agent_id", "?") })),
       el("td", {}, tag(pick(row, "priority", "—"))),
       el("td", { class: "num", text: floor === null || floor === undefined ? "—" : floor + "s" }),
-      el("td", {}, pick(row, "admin") ? tag("admin", "warn") : ""),
+      // 🚨 A narrowed admin key is NOT the same badge as a full one. Collapsing
+      // them would make the two indistinguishable at exactly the glance an
+      // operator takes when auditing who can change things.
+      el("td", {}, pick(row, "admin")
+        ? (pick(row, "admin_readonly") ? tag("admin (read)", "") : tag("admin", "warn"))
+        : ""),
       // 🚨 Where the key was DECLARED, not where it is stored. An env-declared
       // key can be revoked now and comes back on restart; the response says so
       // and this column is why an operator is not surprised by it.
       el("td", {}, tag(pick(row, "source", "file"))),
       el("td", { text: fmt.when(pick(row, "created_at")) }),
-      el("td", {}, el("button", {
+      el("td", {}, guarded(el("button", {
         class: "act danger", text: "Revoke",
         onclick: () => revoke(pick(row, "key_id"), pick(row, "agent_id")),
-      })));
+      }))));
   });
   root.append(el("section", {},
     rows.length ? table(["key id", "agent_id", "priority", "floor", "scope", "declared in", "created", ""], rows)
@@ -531,8 +579,11 @@ async function viewKeys(root) {
       field("priority", select("nk-prio", ["P0_REALTIME", "P1_TURN_SUPPORT", "P2_POST_TURN", "P3_INGESTION", "P4_HYGIENE"], "P3_INGESTION")),
       field("min_timeout_s", el("input", { id: "nk-floor", type: "number", step: "1", placeholder: "none", style: "width:110px" })),
       field("key id", el("input", { id: "nk-id", placeholder: "auto" })),
-      field("admin", el("input", { id: "nk-admin", type: "checkbox" })),
-      el("button", { class: "act", text: "Enrol", onclick: enrol }))));
+      field("admin", guarded(el("input", { id: "nk-admin", type: "checkbox" }))),
+      // Narrows the box beside it and grants nothing alone — the server refuses
+      // it without `admin`, so the page does not pretend otherwise.
+      field("read-only", guarded(el("input", { id: "nk-admin-ro", type: "checkbox" }))),
+      guarded(el("button", { class: "act", text: "Enrol", onclick: enrol })))));
 }
 function field(label, control) { return el("label", { class: "f" }, label, control); }
 function select(id, options, value) {
@@ -546,6 +597,10 @@ async function enrol() {
   const id = $("#nk-id").value.trim();
   if (id) body.id = id;
   if ($("#nk-admin").checked) body.admin = true;
+  if ($("#nk-admin-ro").checked) {
+    if (!body.admin) { banner("bad", "read-only narrows the admin scope — tick admin beside it, or leave it off."); return; }
+    body.admin_readonly = true;
+  }
   if (!body.agent_id) { banner("bad", "agent_id is required."); return; }
   try {
     const res = await api(API.keys, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -597,7 +652,8 @@ async function viewCallers(root) {
     el("p", { class: "lede", text: "Quota is shown three ways: what is in force, what the file declared, and what this API changed. An override reads as a difference rather than as a label. Spend and savings are never summed — one is an invoice, the other is capacity that was free." }),
     rows.length ? table(["agent_id", "identities", "weight", "band", "degrade", "spill",
                          "daily cap", "spent today", "avoided", "drr balance", ""], rows)
-                : empty("no callers yet")));
+                : empty("no callers yet"),
+    readonlyNote()));
 }
 /* 🚨 A quota cell shows a PAIR only when something actually overrode the file.
  *
@@ -645,7 +701,7 @@ function callerRow(row) {
     el("td", { class: "num", text: fmt.usd(pick(row, "spend.spent_today_usd")) }),
     el("td", { class: "num", text: fmt.usd(pick(row, "spend.avoided_usd")) }),
     el("td", { class: "num", text: drr === undefined || drr === null ? "—" : fmt.n(drr, 1) }),
-    el("td", {}, el("button", { class: "act", text: "Edit", onclick: () => editCaller(row) })));
+    el("td", {}, guarded(el("button", { class: "act", text: "Edit", onclick: () => editCaller(row) }))));
 }
 function editCaller(row) {
   const q = pick(row, "quota.in_force", {});
@@ -659,7 +715,7 @@ function editCaller(row) {
       field("daily_spend_usd", el("input", { id: "eq-cap", type: "number", step: "0.01", value: q.daily_spend_usd ?? "", style: "width:120px" })),
       field("degrade_ok", el("input", { id: "eq-degrade", type: "checkbox", checked: !!q.degrade_ok })),
       field("spill_ok", el("input", { id: "eq-spill", type: "checkbox", checked: !!q.spill_ok })),
-      el("button", { class: "act", text: "Apply", onclick: () => patchCaller(row.agent_id) }),
+      guarded(el("button", { class: "act", text: "Apply", onclick: () => patchCaller(row.agent_id) })),
       el("button", { class: "act", text: "Cancel", onclick: () => banner("") })));
   $("#banner").replaceChildren(box);
   window.scrollTo({ top: 0, behavior: "smooth" });
@@ -765,8 +821,9 @@ async function viewControl(root) {
     table(["flag", "state", ""], Object.entries(flags).sort().map(([name, on]) => el("tr", {},
       el("td", {}, el("code", { text: name })),
       el("td", {}, on ? tag("on", "ok") : tag("off", "")),
-      el("td", {}, el("button", { class: "act", text: on ? "Turn off" : "Turn on",
-        onclick: () => setFlag(name, !on) })))))));
+      el("td", {}, guarded(el("button", { class: "act", text: on ? "Turn off" : "Turn on",
+        onclick: () => setFlag(name, !on) })))))),
+    readonlyNote()));
 
   let windows = { windows: [] };
   try { windows = await api(API.maintenance); } catch (e) { /* no persistence backend is not an error here */ }
@@ -777,7 +834,7 @@ async function viewControl(root) {
       field("endpoint", el("input", { id: "mw-ep", placeholder: "tier1 or *" })),
       field("reason", el("input", { id: "mw-reason", placeholder: "model swap", style: "width:220px" })),
       field("backdate (s)", el("input", { id: "mw-dur", type: "number", placeholder: "open now", style: "width:120px" })),
-      el("button", { class: "act", text: "Record", onclick: recordWindow })),
+      guarded(el("button", { class: "act", text: "Record", onclick: recordWindow }))),
     pick(windows, "windows", []).length
       ? table(["endpoint", "started", "ended", "reason", "operator"],
           pick(windows, "windows", []).map((w) => el("tr", {},
@@ -816,6 +873,49 @@ async function control(path, body) {
   } catch (e) { reportError(e); }
 }
 
+/* --- Audit -------------------------------------------------------------
+ * The fifth reporting seam. The other four report a STATE, and a state cannot
+ * say who put it there — the gap view shows a quota that is not what the file
+ * says, and only this says which credential moved it and when.
+ * --------------------------------------------------------------------- */
+async function viewAudit(root) {
+  const a = await api(API.audit);
+  const entries = pick(a, "entries", []);
+
+  root.append(el("section", {},
+    el("h2", { text: "Audit" }),
+    el("p", { class: "lede", text: "Every mutating admin route records here, including the four control routes that predate this plane — a trail covering only some of them would be worse than none, because a reader assumes completeness. A record names the credential and never carries one." }),
+    el("div", { class: "row" },
+      // 🚨 The limits, as data. An in-memory trail is the DEFAULT (no admin
+      // store is configured by default) and the bound discards silently unless
+      // it is counted. A trail that presented itself as complete while being
+      // neither durable nor unbounded would be a thing that looks like an
+      // answer and silences the question.
+      pick(a, "persisted") ? tag("persisted to " + pick(a, "store", ""), "ok")
+        : tag("in memory only — " + pick(a, "reason", "no admin store"), "warn"),
+      tag(pick(a, "held", 0) + " of " + pick(a, "capacity", 0) + " held"),
+      pick(a, "dropped", 0) ? tag(pick(a, "dropped") + " dropped (oldest first)", "warn") : null)));
+
+  root.append(el("section", {},
+    entries.length
+      ? table(["when", "action", "target", "by key", "as", "from", "detail"],
+          entries.map((e) => el("tr", {},
+            el("td", { text: fmt.when(pick(e, "at")) }),
+            el("td", {}, tag(pick(e, "action", "?"))),
+            el("td", {}, el("code", { text: pick(e, "target", "") })),
+            // 🚨 Both halves, always. A record with an address and no key id
+            // means an address-derived admin made the change — a meaningful and
+            // slightly alarming thing to find, and invisible if the two were
+            // collapsed into one actor string.
+            el("td", {}, pick(e, "actor.key_id")
+              ? el("code", { text: pick(e, "actor.key_id") })
+              : tag("no key", "warn")),
+            el("td", {}, el("code", { text: pick(e, "actor.agent_id", "—") })),
+            el("td", {}, el("code", { text: pick(e, "actor.address", "—") })),
+            el("td", {}, el("code", { text: JSON.stringify(pick(e, "detail", {})) })))))
+      : empty("nothing recorded yet — every key, quota, flag, drain and maintenance change lands here")));
+}
+
 /* ---- tabs + lifecycle ------------------------------------------------- */
 
 const TABS = [
@@ -825,6 +925,7 @@ const TABS = [
   { id: "callers",   label: "Callers",   view: viewCallers },
   { id: "providers", label: "Providers", view: viewProviders },
   { id: "control",   label: "Control",   view: viewControl },
+  { id: "audit",     label: "Audit",     view: viewAudit },
 ];
 let current = (location.hash || "#fleet").slice(1);
 if (!TABS.some((t) => t.id === current)) current = "fleet";
@@ -903,15 +1004,25 @@ window.addEventListener("hashchange", () => {
   if (h && h !== current && TABS.some((t) => t.id === h)) { current = h; render(); }
 });
 
-render().then(uptimePill);
-primeChrome();
+/* 🚨 primeChrome FIRST, and AWAITED, because it carries `you.may_write`.
+ *
+ * The write guard defaults to ALLOWED when the field is absent — it must, or a
+ * server that does not publish it yields a page nobody can use. So rendering
+ * before the config lands paints every write control LIVE for a read-only
+ * operator: correct after the first heartbeat, wrong for the first paint, and
+ * the first paint is the one somebody clicks. Found by loading the page as a
+ * read-only admin. Every test was green; the buttons rendered, worked, and were
+ * refused by the server after the click, which is the failure the guard exists
+ * to prevent. The cost of fixing it is one local request before first paint.
+ */
+primeChrome().then(render).then(uptimePill);
 connect();
 /* A slow heartbeat, not a poll: the stream carries what changes quickly, and
  * this only catches what it does not — a config edit made from a terminal, an
  * endpoint that went unhealthy between metrics frames. 30s is chosen to be
  * boring; a dashboard on a fast cadence is exactly the load that finds a
  * concurrency violation, which is the other constraint this page has. */
-setInterval(() => { if (!document.hidden) { render(); primeChrome(); } }, 30000);
+setInterval(() => { if (!document.hidden) { primeChrome().then(render); } }, 30000);
 </script>
 </body>
 </html>

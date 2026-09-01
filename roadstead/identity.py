@@ -115,8 +115,8 @@ def parse_identity_spec(
     spec: str,
     *,
     default_priority: LLMPriority = LLMPriority.P3_INGESTION,
-) -> tuple[str, LLMPriority, float | None, bool]:
-    """Parse ``agent_id[:priority][:min_timeout_s][:admin]`` in any order.
+) -> tuple[str, LLMPriority, float | None, bool, bool]:
+    """Parse ``agent_id[:priority][:min_timeout_s][:admin][:readonly]`` in any order.
 
     ONE grammar for both registries, deliberately: an operator configuring
     ``ROADSTEAD_ACL`` and ``ROADSTEAD_API_KEYS`` in the same compose file should
@@ -128,8 +128,15 @@ def parse_identity_spec(
     order does not matter and a missing one is simply absent:
 
     * ``admin``                → the admin scope
+    * ``readonly``             → NARROWS that scope to reads (see below)
     * anything numeric         → ``min_timeout_s`` (the per-identity deadline floor)
     * anything else            → a priority, by NAME
+
+    🚨 ``readonly`` only ever NARROWS. It is meaningless without ``admin`` —
+    a non-admin identity cannot reach an admin surface to read it either — and
+    it is warned about rather than dropped in silence, because a scope segment
+    that quietly does nothing is exactly the shape of an operator believing a
+    credential is safer than it is.
 
     🚨 A priority must be spelled by name (``P1_TURN_SUPPORT``), not by ordinal.
     ``LLMPriority.coerce`` accepts an int, but a bare ``3`` here is
@@ -145,11 +152,15 @@ def parse_identity_spec(
     priority = default_priority
     min_timeout_s: float | None = None
     admin = False
+    readonly = False
     for segment in parts[1:]:
         if not segment:
             continue
         if segment.lower() == "admin":
             admin = True
+            continue
+        if segment.lower() == "readonly":
+            readonly = True
             continue
         try:
             min_timeout_s = float(segment)
@@ -161,9 +172,14 @@ def parse_identity_spec(
         except ValueError:
             logger.warning(
                 "identity spec %r: ignoring unrecognised segment %r (expected a "
-                "priority NAME, a numeric min_timeout_s, or 'admin')",
+                "priority NAME, a numeric min_timeout_s, 'admin' or 'readonly')",
                 spec, segment)
-    return agent_id, priority, min_timeout_s, admin
+    if readonly and not admin:
+        logger.warning(
+            "identity spec %r: 'readonly' has no effect without 'admin' — it "
+            "NARROWS the admin scope to reads and does not grant anything",
+            spec)
+    return agent_id, priority, min_timeout_s, admin, readonly
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +203,13 @@ class Principal:
     min_timeout_s: float | None = None
     #: Whether this identity may reach the admin/control surfaces.
     admin: bool = False
+    #: 🚨 NARROWS ``admin`` to reads. Never widens: an identity without ``admin``
+    #: is not granted anything by this being False, and an identity with it can
+    #: only ever lose the mutating half. The asymmetry is the same one
+    #: ``substitution`` follows and the same one per-key IP binding will — a
+    #: scope that could grant what the operator withheld is the self-asserted
+    #: ``agent_id`` bug in another costume.
+    admin_readonly: bool = False
     #: How this identity was established: ``api_key`` (authenticated) or ``ip``
     #: (a weak second factor). The two are NOT interchangeable — see the module
     #: docstring's third rule; ``authenticated`` is the property to branch on.
@@ -205,6 +228,28 @@ class Principal:
         capability, never a name.
         """
         return self.source == "api_key"
+
+    @property
+    def may_admin_write(self) -> bool:
+        """Whether this identity may MUTATE through an admin surface.
+
+        🚨 Branch on this, never on ``admin and not admin_readonly`` spelled out
+        at a call site — that is the two-copies-of-a-predicate shape that
+        ``cost_model.context_fit`` exists to answer, and this one decides an
+        authorization. It is also why the field is a narrowing: an identity that
+        is not ``admin`` at all can never reach True here however
+        ``admin_readonly`` is set.
+        """
+        return self.admin and not self.admin_readonly
+
+
+#: HTTP methods that only READ. Anything else is treated as a mutation by the
+#: admin gate — DEFAULT-DENY, so a method nobody anticipated is refused to a
+#: read-only identity rather than waved through. Derived from the METHOD rather
+#: than from a list of write routes on purpose: a route list is a second thing
+#: to keep in step with ``routes.py``, and the failure when it falls behind is
+#: silent and in the widening direction.
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 @dataclass(frozen=True)
@@ -286,6 +331,7 @@ class KeyRegistry:
         priority: LLMPriority = LLMPriority.P3_INGESTION,
         min_timeout_s: float | None = None,
         admin: bool = False,
+        admin_readonly: bool = False,
         key_id: str | None = None,
         source: str = "file",
     ) -> str | None:
@@ -326,11 +372,20 @@ class KeyRegistry:
                 label, self._by_digest[digest].agent_id, agent_id)
             return None
         _warn_if_floor_exceeds_ceiling(label, agent_id, priority, min_timeout_s)
+        if admin_readonly and not admin:
+            # Same disclosure as the spec grammar's: the field did not grant
+            # anything and did not take anything away, and an operator who
+            # believes otherwise has a wrong idea of what this credential can do.
+            logger.warning(
+                "api key %s for %r sets admin_readonly without admin — it "
+                "NARROWS the admin scope and grants nothing on its own",
+                label, agent_id)
         self._by_digest[digest] = Principal(
             agent_id=agent_id,
             priority=priority,
             min_timeout_s=min_timeout_s,
             admin=admin,
+            admin_readonly=admin_readonly,
             source="api_key",
             key_id=label,
         )
@@ -378,6 +433,13 @@ class KeyRegistry:
                     "priority": p.priority.name,
                     "min_timeout_s": p.min_timeout_s,
                     "admin": p.admin,
+                    # Reported beside `admin` rather than folded into it: an
+                    # operator auditing who can change things needs to see WHICH
+                    # of the admin credentials can, and one collapsed field
+                    # ("admin: read") would make a full-admin key and a
+                    # read-only one indistinguishable at a glance in the UI.
+                    "admin_readonly": p.admin_readonly,
+                    "may_write": p.may_admin_write,
                     # Where the registration came from, so an operator can tell
                     # a runtime enrolment from a line in the environment.
                     "source": self._provenance.get(d, {}).get("source", "file"),
@@ -424,13 +486,15 @@ class KeyRegistry:
                 if entry:
                     logger.warning(
                         "ROADSTEAD_API_KEYS: skipping malformed entry (expected "
-                        "<key>=<agent_id>[:priority][:min_timeout_s][:admin])")
+                        "<key>=<agent_id>[:priority][:min_timeout_s][:admin]"
+                        "[:readonly])")
                 continue
             secret, spec = entry.split("=", 1)
-            agent_id, priority, floor, admin = parse_identity_spec(spec.strip())
+            agent_id, priority, floor, admin, readonly = parse_identity_spec(
+                spec.strip())
             self.register(secret=secret.strip(), agent_id=agent_id,
                           priority=priority, min_timeout_s=floor, admin=admin,
-                          source="env")
+                          admin_readonly=readonly, source="env")
 
     #: Fields a keys-file entry may set. 🚨 A key NOT in this set is reported,
     #: not dropped in silence: an unreachable knob looks exactly like a policy
@@ -438,7 +502,8 @@ class KeyRegistry:
     #: ``model_catalog._POLICY_PASSTHROUGH`` and ``load_agent_configs`` have both
     #: already had once each.
     _FILE_FIELDS = frozenset({
-        "id", "agent_id", "key", "key_sha256", "priority", "min_timeout_s", "admin",
+        "id", "agent_id", "key", "key_sha256", "priority", "min_timeout_s",
+        "admin", "admin_readonly",
     })
 
     def _load_file(self, path: str | Path) -> None:
@@ -491,6 +556,7 @@ class KeyRegistry:
                 priority=priority,
                 min_timeout_s=(float(floor) if floor is not None else None),
                 admin=bool(entry.get("admin", False)),
+                admin_readonly=bool(entry.get("admin_readonly", False)),
                 key_id=(str(entry["id"]) if entry.get("id") else None),
             ):
                 loaded += 1
@@ -921,6 +987,11 @@ class IdentityResolver:
             # says so in ROADSTEAD_ADMIN_NETS — or, better, issues an admin key,
             # which works from anywhere and is revocable.
             admin=self.acl.is_admin(ip, trust_builtin_nets=not address.forwarded),
+            # A narrowing the operator wrote on the SAME entry that granted the
+            # scope (`=ops:admin:readonly`). It is not gated on `forwarded`: the
+            # forwarding rule above withdraws a grant, and withdrawing a
+            # narrowing would widen one.
+            admin_readonly=self.acl.is_admin_readonly(ip),
             source="ip",
         ))
 
@@ -946,9 +1017,109 @@ class IdentityResolver:
         identity's — inheriting the host's would mean a key could only ever
         widen access, never narrow it, which makes a scoped key worthless on the
         machine it runs on.
+
+        Says nothing about whether the request may CHANGE anything — see
+        :meth:`admin_denial`, which is what a gate should call.
         """
         res = self.resolve(request)
         return bool(res.principal and res.principal.admin)
+
+    def actor(self, request: Any) -> dict:
+        """Who is acting, in a form safe to write to an audit record.
+
+        🚨 NEVER a credential — not the key, not the digest, on the same rule
+        that governs every other management readout. ``key_id`` is the public
+        label the registry already publishes, and publishing it is the point: a
+        trail that could not name the credential would have to be keyed on the
+        address instead, which is the factor this design treats as the weak one.
+
+        BOTH halves are recorded, always. ``key_id`` is None for an
+        address-derived admin, and a record showing an address and no key is a
+        meaningful — and slightly alarming — thing for an operator to find.
+        Collapsing them into one "actor" string would hide which factor actually
+        authorized the change.
+
+        Lives here because "who is this" is an identity fact and because the
+        address must come from :meth:`client_ip`. A caller assembling its own
+        actor dict is how ``management.py`` grew a second ``_remote_ip``.
+        """
+        principal = self.resolve(request).principal
+        return {
+            "key_id": principal.key_id if principal else None,
+            "agent_id": principal.agent_id if principal else None,
+            "source": principal.source if principal else "unknown",
+            "address": self.client_ip(request),
+        }
+
+    def admin_scope(self, request: Any) -> dict:
+        """What this request's admin scope permits, as a readout.
+
+        Exists so nothing outside this module has to read ``admin_readonly`` or
+        ``may_admin_write`` to find out — the management plane publishes this
+        verbatim and the UI disables its write controls from it, and both would
+        otherwise be re-deciding what a scope permits. ``tests/
+        test_admin_audit.py`` fails if either field is read anywhere else.
+        """
+        principal = self.resolve(request).principal
+        return {
+            "key_id": principal.key_id if principal else None,
+            "agent_id": principal.agent_id if principal else None,
+            "source": principal.source if principal else "unknown",
+            "admin": bool(principal and principal.admin),
+            "may_write": bool(principal and principal.may_admin_write),
+        }
+
+    def admin_denial(self, request: Any) -> Denial | None:
+        """THE admin authorization decision. ``None`` to proceed.
+
+        🚨 This module owns what a scope permits, and this is the method that
+        says so. A gate that resolved the principal and then decided for itself
+        whether a read-only identity may POST would be a second place deciding —
+        which is the thing ``identity.py`` exists to prevent, and the reason
+        ``management.py``'s own ``_remote_ip`` had to be removed.
+
+        THREE refusals, and they mean three different things:
+
+        * a presented credential that does not resolve — 401, from
+          :meth:`resolve`. Conflating it with the 403 below would tell an
+          operator whose key was revoked that their *host* was not allowed,
+          sending them to fix the wrong file.
+        * a resolved identity without the admin scope — 403, and its message is
+          byte-identical to what this surface has always returned.
+        * an admin identity narrowed to reads, asking to write — 403, with its
+          OWN message. It must not reuse the one above: "access denied for
+          198.51.100.4" tells an operator holding a deliberately read-only
+          credential to go and change an ACL, which is both wrong and, if they
+          succeed, the narrowing undone.
+
+        The read/write split is taken from the HTTP METHOD (:data:`SAFE_METHODS`)
+        rather than from a list of mutating routes. A route list is a second
+        thing to keep in step with ``routes.py``, and when it falls behind the
+        failure is silent and in the widening direction.
+        """
+        resolved = self.resolve(request)
+        if not resolved.ok:
+            return resolved.denial
+        principal = resolved.principal
+        if not principal.admin:
+            return Denial(
+                code="access_denied",
+                status=403,
+                message=f"access denied for {self.client_ip(request)}",
+            )
+        method = str(getattr(request, "method", "GET") or "GET").upper()
+        if method not in SAFE_METHODS and not principal.may_admin_write:
+            return Denial(
+                code="access_denied",
+                status=403,
+                message=(
+                    f"this credential has read-only admin scope: {method} is a "
+                    f"mutation and is refused, while every GET on this surface "
+                    f"is allowed. The scope is a NARROWING written on the "
+                    f"identity itself — widening it means issuing a different "
+                    f"credential, not changing an address allowlist"),
+            )
+        return None
 
 
 def _require_key_from_env() -> bool:

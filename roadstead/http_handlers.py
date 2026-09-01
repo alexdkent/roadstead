@@ -809,6 +809,9 @@ class ProxyHttpHandlers:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         logger.warning("runtime flags updated by %s: %s", remote_ip, body)
+        await self.record_admin_change(
+            request, "flags.set", ",".join(sorted(str(k) for k in body)),
+            {str(k): v for k, v in body.items()})
         return JSONResponse({"flags": updated})
     async def handle_admin_endpoint_pause(
         self, endpoint: str, request: Request, *, pause: bool,
@@ -865,6 +868,9 @@ class ProxyHttpHandlers:
                 "endpoint %s RESUMED by operator (%s) — poller will re-probe / "
                 "recover / re-discover capacity; deferred queue draining",
                 ep, remote_ip)
+        await self.record_admin_change(
+            request, "endpoint.pause" if pause else "endpoint.resume", ep,
+            {"reason": reason} if pause else {})
         return JSONResponse({
             "endpoint": ep,
             "paused": ep in self.state.paused_endpoints,
@@ -946,6 +952,9 @@ class ProxyHttpHandlers:
         logger.warning(
             "maintenance window(s) recorded by operator (%s): %s reason=%r",
             remote_ip, [r["endpoint"] for r in recorded], reason)
+        await self.record_admin_change(
+            request, "maintenance.record",
+            ",".join(r["endpoint"] for r in recorded), {"reason": reason})
         return JSONResponse({"recorded": recorded})
     async def handle_maintenance_list(self, request: Request) -> Response:
         """List maintenance windows overlapping the last ``hours`` (default 24).
@@ -1383,26 +1392,67 @@ class ProxyHttpHandlers:
     def deny_non_admin(self, request: Request, remote_ip: str) -> Response | None:
         """The admin gate: ``None`` to proceed, otherwise the refusal to return.
 
-        TWO refusals, and they mean different things. A presented credential
-        that does not resolve is a 401 from the identity layer and says so —
-        conflating it with the 403 below would tell an operator whose key was
-        revoked that their *host* was not allowed, sending them to fix the wrong
-        file. A resolved identity without the admin scope is the 403, whose body
-        is byte-identical to what this surface has always returned.
+        RENDERS the decision, does not make it. ``IdentityResolver.admin_denial``
+        owns which of the three refusals applies and why — including whether a
+        read-only admin scope permits this METHOD — because a second place
+        deciding what a scope permits is what ``identity.py`` exists to prevent.
+        Every admin surface in the package funnels through here, so the
+        read/write split arrives at all seven call sites and at the four legacy
+        control routes without a route list to keep in step.
 
-        🚨 An authenticated non-admin identity is refused even from a host in the
-        admin nets — ``IdentityResolver.is_admin`` explains why a scoped key must
-        be able to narrow access and not only widen it.
+        ``remote_ip`` is now only the audit label; the refusal message comes from
+        the resolver, which resolves the address itself through the one place
+        allowed to.
         """
-        resolved = self.state.identity.resolve(request)
-        if not resolved.ok:
-            return JSONResponse(
-                {"error": resolved.denial.message, "code": resolved.denial.code},
-                status_code=resolved.denial.status)
-        if not resolved.principal.admin:
-            return JSONResponse(
-                {"error": f"access denied for {remote_ip}"}, status_code=403)
-        return None
+        denial = self.state.identity.admin_denial(request)
+        if denial is None:
+            return None
+        # The 403 for a non-admin identity is byte-identical to what this
+        # surface has always returned — no `code`, because adding one would
+        # change a body docs/api.md §2 makes stable.
+        if denial.status == 403 and denial.message == f"access denied for {remote_ip}":
+            return JSONResponse({"error": denial.message}, status_code=403)
+        return JSONResponse(
+            {"error": denial.message, "code": denial.code},
+            status_code=denial.status)
+
+    async def record_admin_change(self, request: Request, action: str,
+                                  target: str, detail: dict) -> None:
+        """Append one audit record for a control action taken through THIS module.
+
+        The four control routes that predate the management plane
+        (flags, pause, resume, maintenance) mutate without touching the admin
+        overlay, so nothing else would record them. 🚨 A change trail that
+        covered only the routes that happen to persist through the overlay would
+        be worse than none: an operator reading it assumes completeness, and
+        "who paused tier2" is exactly the question it would silently fail to
+        answer. ``tests/test_admin_audit.py`` drives every mutating admin route
+        in ``routes.py`` and fails if one records nothing.
+
+        Appended ON THE LOOP and persisted OFF it, the same shape the management
+        plane follows. 🚨 It persists here rather than riding a later write:
+        these routes change no overlay state of their own, so nothing else would
+        flush the record, and the LAST entry — the one an operator is looking
+        for after an incident — would be the one a restart lost.
+
+        Never raises. An audit write that could fail a drain would make the trail
+        a reason the control plane stops working, which is a worse failure than
+        the one it protects against.
+        """
+        overlay = getattr(self.state, "admin_overlay", None)
+        if overlay is None:
+            return
+        try:
+            overlay.record({
+                "at": time.time(),
+                "action": action,
+                "target": target,
+                "actor": self.state.identity.actor(request),
+                "detail": detail,
+            })
+            await overlay.persist_async()
+        except Exception:  # noqa: BLE001 — the trail must not break the control
+            logger.debug("admin audit record failed", exc_info=True)
 
     def audit_admin_ip(self, route: str, remote_ip: str) -> None:
         """Track source IPs per admin-ish route (exposed on /v1/status) and log
