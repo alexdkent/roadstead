@@ -24,7 +24,13 @@ TOOLS = Path(__file__).resolve().parents[1] / "tools"
 
 
 def _tool_modules() -> list[Path]:
-    return sorted(p for p in TOOLS.glob("*.py") if not p.name.startswith("_"))
+    # RECURSIVE. It was `glob` until 2026-08-31, which missed
+    # tools/docker_stop_probe/entrypoint.py — a module that used to start a
+    # server and call uvicorn.run() at import time, so widening the sweep would
+    # have hung the suite. That module is import-safe now (everything behind
+    # main()), which is what makes the recursion safe rather than the other way
+    # round. Keep both properties: scripts stay import-safe, this stays rglob.
+    return sorted(p for p in TOOLS.rglob("*.py") if not p.name.startswith("_"))
 
 
 def test_the_tools_directory_is_not_empty():
