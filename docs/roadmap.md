@@ -441,21 +441,48 @@ test asserts it), and the only server-side work is an asset read that goes **off
 **~~Still open in G: one scope, and no audit trail.~~ Both closed 2026-09-01 by H** — and the UI is
 what made them urgent, exactly as predicted here.
 
-**~~Still open in G: a browser-driven test.~~ DECIDED 2026-09-01: no, and the reason usually given
-for it is wrong.**
+**~~Still open in G: a browser-driven test.~~ ~~DECIDED 2026-09-01: no.~~ 🚨 That decision was
+made twice on two different reasons and BOTH were wrong. Corrected 2026-09-01: nothing in this
+repo's conventions forbids one. It is open on cost, which is a different question and a much
+weaker one.**
 
-🚨 **The dependency argument does not hold, and citing it should stop.** "It must not drag a frontend
-toolchain into a package whose dependency list is six" is about the **runtime** list —
+**Reason one, retired: the dependency argument.** "It must not drag a frontend toolchain into a
+package whose dependency list is six" is about the **runtime** list —
 `tests/test_admin_ui.py::test_the_dependency_list_did_not_grow_a_frontend` reads
 `project.dependencies` and asserts exactly those six, plus the absence of `package.json` /
-`node_modules` / a bundler config. A test-time browser driver is a **dev** dependency, in a list that
-already carries three, and it would violate none of that. A decision resting on a reason that does
-not survive reading the test it cites is the shape of every entry in `docs/ledger.md`.
+`node_modules` / a bundler config. A test-time browser driver is a **dev** dependency and violates
+none of it.
 
-**The real constraint is the suite's promise**, stated in `CLAUDE.md`: `pip install -e '.[dev]'` then
-`pytest` — *no fleet, no network, no backends required*. A browser driver needs a browser binary
-fetched over the network at install time. That is a second install step, an offline failure mode, and
-a new class of flake, for every contributor, to cover **one page**.
+**Reason two, also retired: the suite's promise.** The replacement argument was `pip install -e
+'.[dev]'` then `pytest` — *no fleet, no network, no backends* — broken by a browser binary fetched
+at install time. 🚨 **It does not survive reading `pyproject.toml`, which is the same failure as
+reason one: an argument from a document nobody re-read.** That file already carries
+`addopts = "-m 'not wire_fidelity'"` and a registered `wire_fidelity` marker, for tests needing a
+**real inference engine** — precisely the class of test that cannot run in the default environment.
+The repo already answered this question and answered it with a marker.
+
+So the promise constrains **the default `pytest` run and the `dev` extra**, not the repository. A
+`browser` marker deselected by default, with the driver in its own extra rather than in `dev`,
+leaves `pip install -e '.[dev]' && pytest` doing exactly what it does today: no browser fetched, no
+browser test run, no new flake, offline still fine. The seven `wire_fidelity` tests are the proof by
+construction — they sit in this repo right now under exactly that arrangement.
+
+🚨 **And this correction was RUN rather than reasoned, because reasoning from the document is what
+produced two wrong answers already.** A `browser`-marked test added temporarily on 2026-09-01, with
+`addopts = "-m 'not wire_fidelity and not browser'"`: deselected by the default run, selected by
+`-m browser`, and the existing `wire_fidelity` deselection unaffected (8 deselected, 7 + 1). Then
+reverted. The mechanism does what the correction claims.
+
+**What is actually left is a cost judgement, and it should be argued as one.** A browser test is
+permitted; it is not obviously *worth it*. Against: a driver to keep current, a second CI lane
+nobody runs locally, and a page whose every control is one request and one re-render. For: the gap
+below is real, has produced two live bugs, and both were found by a human doing by hand what the
+test would do every commit.
+
+🚨 **The lesson generalises past this decision.** Two arguments in a row cited a constraint that the
+file defining it does not contain, and both stood because they *sounded* like this codebase's
+values. `docs/ledger.md` is full of this shape. Cite the mechanism and re-read it, or do not cite
+it.
 
 **What is already covered**, measured against the running page on 2026-09-01: **163** `pick()` paths,
 each walked against a response a real service produced; **14** `guarded(...)` write controls, each
@@ -468,9 +495,15 @@ declared-vs-in-force pair collapses. Both of those actually happened, and both w
 rendering the page. **The compensating discipline is the one already in use:** when rendering finds
 something, leave behind a guard a *source read* can make. That has worked twice (H).
 
-**Revisit if** the page grows a second interactive surface — a form with client-side validation, or
-state that has to survive a navigation. Today every control is one request and one re-render, which
-is the regime where a source-level guard can stand in for a rendered one.
+**The gap is unchanged, and it is the case FOR building one**: four of seven tabs
+(Callers, Providers, Control, Audit) have never been rendered by anybody, no write control has ever
+been clicked in a browser, the live feed has only ever been observed saying *waiting for traffic…*,
+and the read-only view has never been looked at — the plane's refusal is verified, what an operator
+sees is not.
+
+**Weigh it against** the fact that every control is one request and one re-render, which is the
+regime where a source-level guard can stand in for a rendered one. That regime ends if the page
+grows client-side validation or state that survives a navigation.
 
 **~~Nothing here is audited.~~ Closed 2026-09-01 by H**, in the overlay, which is where this
 predicted it would go.

@@ -122,12 +122,15 @@ def test_the_dependency_list_did_not_grow_a_frontend():
     an assertion rather than as an intention.
 
     🚨 It reads `project.dependencies`, i.e. the **runtime** list, and that
-    scope is deliberate but has been misread: this rule does NOT forbid a
+    scope is deliberate but has been misread twice. This rule does NOT forbid a
     test-time dependency, and `[project.optional-dependencies].dev` already
     carries three. The roadmap once argued against a browser-driven UI test on
-    the strength of this test, which does not say that. What actually rules one
-    out is the suite's promise in CLAUDE.md — install and run, no network — and
-    `docs/roadmap.md` under G now says so instead.
+    the strength of this test, which does not say that; the correction then
+    argued from the suite's no-network promise, which does not say it either,
+    because `pyproject.toml` already deselects `wire_fidelity` by a marker for
+    tests that cannot run in the default environment. Neither this test nor
+    that promise forbids a browser test. `docs/roadmap.md` under G carries the
+    corrected reasoning — the question is cost, not permission.
     """
     meta = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     names = {re.split(r"[<>=!\[ ]", d)[0].lower().replace("_", "-")
