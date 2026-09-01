@@ -515,13 +515,65 @@ not. It immediately found `#nk-agent` and `#rk-overlap` on a tab nobody had rend
 screenshot and the DOM said `disabled: true`; the computed styles were identical to the flag
 buttons. Checking the DOM rather than the pixels is what turned a false report into a real one.
 
-**Still not covered:** the live feed under real traffic. `EventSource` cannot carry a header, so it
-authenticates from the browser's credential cache — which the injection technique used here
-deliberately bypasses, and which is exactly why the door is HTTP Basic in the first place.
+**~~Still not covered: the live feed under real traffic.~~ CLOSED by hand on 2026-09-01.** The
+obstacle was reaching an authenticated `EventSource` at all: it cannot carry a header, so it
+authenticates from the browser's credential cache, which the fetch-injection technique used
+previously bypasses. Credentials in the URL are refused by the driver and a plain navigation raises a
+blocking Basic-auth modal. 🚨 **`XMLHttpRequest.open(method, url, false, user, password)` populates
+that cache and `fetch` has no equivalent** — one XHR against the UI path from an unauthenticated
+page on the same origin (`/health`), then navigate, and the page comes up with the stream
+authenticated and no modal. Worth writing down: it is the only way in, and it is not obvious.
+
+**Result: the feed works, and rendering it found nothing.** 2,566 calls through `roadstead.client`
+from two enrolled callers across three intents, zero errors. The feed showed `live`, held its 60-row
+cap, and every one of `feedRow`'s reads — `agent`, `endpoint`, `priority`, `duration_s`,
+`queue_wait_ms`, `status` — rendered from real `call.completed` frames. All seven tabs were then
+walked under sustained traffic: **no `[object HTMLSpanElement]`, no `undefined`, no `NaN`**, and every
+`—` traced to a genuinely null field (`daily_spend_usd` and `requests_per_minute` on callers with no
+threshold configured). Callers rendered live DRR balances, and `avoided_usd` populated with
+`spent_usd` at zero — §1.6's two-kinds-of-money rule, correct on the page.
+
+🚨 **The source guard was already telling the truth.** `feedRow` reads an SSE frame, not a REST
+response, so it needed its own coverage — and it has it:
+`test_admin_ui.py` pulls the `call.completed` payload out of the `sse.publish` call site by AST and
+walks the feed's paths against that. Rendering confirmed the guard rather than correcting it, which
+is the first time that has happened and is the outcome the discipline is supposed to produce.
 
 **Weigh it against** the fact that every control is one request and one re-render, which is the
 regime where a source-level guard can stand in for a rendered one. That regime ends if the page
 grows client-side validation or state that survives a navigation.
+
+### 🚨 DECIDED on cost, 2026-09-01: no permanent browser lane
+
+Third time of asking, and the first time on the right question — the two earlier answers were
+retracted because they argued permission, which was never in doubt.
+
+**What the argument was missing was a marginal rate, and this session supplies one.** The case *for*
+rests on two live bugs found by rendering. Both were found on the FIRST render of newly-written
+code, and both left behind a source-level guard. The number that matters is not "rendering has found
+bugs" but "rendering finds bugs the guards now miss" — and the page was rendered again on
+2026-09-01, under sustained real traffic, across all seven tabs, with the feed live: **zero
+DOM-level faults.** One render is a small sample, but it is the only evidence anyone has about the
+marginal rate, and it is 0.
+
+**Against, priced honestly.** A driver and a browser binary in their own extra — deselected by
+default, so `pip install -e '.[dev]' && pytest` is untouched, exactly as `wire_fidelity` proves. The
+real cost is not the download: it is a second lane nobody runs locally. `wire_fidelity` is the
+precedent and its own README records the answer — executed **once**, on 2026-08-31. An opt-in lane
+gets run when somebody remembers, and a guard that runs when somebody remembers is a guard whose
+value is set by memory rather than by CI.
+
+**So: no.** The discipline stays, and it gains the one piece it was missing — a written trigger,
+because "re-render when something changes" with no statement of *what* is how the two earlier
+retracted answers happened. 🚨 **Re-render by hand when: (a) a tab or view is added, (b) a render
+helper (`el`, `pick`, `tag`, `fmt`, `guarded`) changes, or (c) the page grows client-side state that
+survives a navigation** — (c) being the stated end of the regime where a source guard substitutes,
+so it is also the trigger to reopen this decision entirely.
+
+**The distinction that kept collapsing, stated once more because it is what makes this affordable:**
+validating the page needs no driver and no download. Rendering it by hand has now been done twice,
+cost zero bytes both times, and was productive both times — once finding two bugs, once establishing
+that the guards left behind by the first are holding.
 
 **~~Nothing here is audited.~~ Closed 2026-09-01 by H**, in the overlay, which is where this
 predicted it would go.
@@ -765,6 +817,34 @@ in ways the name does not suggest (`history.md`, "Things that will mislead you")
   /rs/v1/admin/keys` groups by `agent_id` so the structure is visible rather than inferable. A real
   team → key hierarchy would only start to earn its keep with per-team *aggregate* caps distinct from
   the per-caller ones, and nothing yet needs that.
+- 🚨 **Intent routing never explores, so a fleet converges on ONE endpoint.** Found on 2026-09-01
+  by running the thing: 2,566 calls from two callers across three intents (`fast-chat`, `chat`,
+  `reasoning`) went to `tier3` and *only* `tier3`. `tier1` and `tier2` ended with
+  `typical_ms: null` — never sampled, not once.
+
+  The mechanism is two individually-correct rules composing into a ratchet, and neither is a bug:
+
+  1. `_preference_key("latency")` is `(latency_key, -free_slots)`, and `latency_key` is `inf` for an
+     endpoint with no samples — deliberately, so we never prefer a backend *because* we know nothing
+     about it. **While every candidate is unmeasured the whole key collapses to `-free_slots`**, so
+     `latency` silently ranks as `capacity` and the largest endpoint wins. `balanced` reaches the
+     same answer by its own route.
+  2. The winner is the only endpoint that then accumulates samples. Once it has enough to publish a
+     `typical_ms`, its `latency_key` is finite and every rival is still `inf`, so it now wins
+     *outright* — and the rivals can never acquire the evidence that would unseat them.
+
+  The module docstring covers the cold-start tie ("everything ties, and the stable name tie-break
+  decides; that is deterministic and honest") and stops at the first request. This is the second
+  one. In a fleet with pinned traffic the smaller endpoints get sampled by other means and the
+  ratchet never closes; on a fleet driven purely by intent it closes immediately and permanently.
+
+  🚨 **Not obviously a defect, and deliberately not fixed here.** Every fix is a design decision:
+  exploration (a bandit, which makes a pure resolver stateful and non-deterministic — `resolve` is
+  pure, and `/rs/v1/plan` promises a plan and the call after it agree), or seeding `typical_ms` from
+  the timeout model's priors, or admitting that `latency` with no evidence *is* `capacity` and
+  saying so in the published profile table. The first is the one that changes the most. Write the
+  reason down before the code.
+
 - **Where cost truth lives.** Provider-reported spend vs. our own token accounting; they will
   disagree, and one of them has to be authoritative for threshold decisions.
 - **Streaming through a remote provider** under a computed deadline — the soft-deadline extension
