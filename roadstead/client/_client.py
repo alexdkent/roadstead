@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import weakref
 from typing import Any, AsyncIterator, Iterator
 
 import httpx
@@ -47,6 +48,12 @@ from ._wire import (
 #: have one; a caller with an opinion sends ``deadline_s`` and Roadstead honours
 #: it. This bounds the HTTP read, not the model — see ``chat``.
 _DEFAULT_HTTP_TIMEOUT_S = 900.0
+
+#: How long the blocking wrapper waits for an abandoned stream to unwind on the
+#: worker loop. Bounded rather than infinite because this runs from a finalizer:
+#: the caller is not asking for the result and may not even be on their own
+#: thread, so a wedged unwind must not become a hang in unrelated code.
+_STREAM_UNWIND_TIMEOUT_S = 5.0
 
 
 def enrichment_from(headers: Any) -> Enrichment:
@@ -433,6 +440,17 @@ class RoadsteadClient:
 
     def __init__(self, base_url: str, *, api_key: str | None = None,
                  timeout_s: float = _DEFAULT_HTTP_TIMEOUT_S) -> None:
+        # 🚨 Refuse BEFORE building the coroutine. `_make_async(...)` evaluates
+        # first if the guard lives only inside `_run`, so the refusal a caller
+        # inside a loop is supposed to get arrives trailing a
+        # `RuntimeWarning: coroutine '_make_async' was never awaited` — noise on
+        # the one path whose whole job is to say something clear.
+        self._refuse_inside_a_running_loop()
+        self._closed = False
+        # Async generators handed out by `stream`, so `close` can unwind them on
+        # the loop that owns them. Weak, because the ordinary end of a stream is
+        # the caller dropping it and this must not be what keeps it alive.
+        self._live_streams: "weakref.WeakSet" = weakref.WeakSet()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._loop.run_forever, name="roadstead-client",
@@ -440,16 +458,58 @@ class RoadsteadClient:
         self._thread.start()
         self._async = self._run(_make_async(base_url, api_key, timeout_s))
 
-    def _run(self, coro):
+    @staticmethod
+    def _refuse_inside_a_running_loop() -> None:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            pass
-        else:
+            return
+        raise RuntimeError(
+            "RoadsteadClient is the blocking client and was called from a "
+            "running event loop — use AsyncRoadsteadClient instead")
+
+    def _run(self, coro):
+        self._refuse_inside_a_running_loop()
+        # 🚨 A closed client must REFUSE, not block. `close` stops the worker
+        # loop and joins its thread; a coroutine submitted afterwards is
+        # accepted by `run_coroutine_threadsafe` and then never runs, so
+        # `.result()` waits on a future nothing will ever resolve — an
+        # unkillable hang, in the wrapper whose module docstring promises it
+        # "will tell you so rather than hanging". Use-after-close is a caller
+        # mistake and deserves a sentence, which is the same argument §1.5
+        # makes for refusing an unresolvable key instead of falling back.
+        if self._closed:
+            coro.close()
             raise RuntimeError(
-                "RoadsteadClient is the blocking client and was called from a "
-                "running event loop — use AsyncRoadsteadClient instead")
+                "RoadsteadClient is closed — build a new one; a closed client "
+                "has no event loop to run on")
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def _unwind_stream(self, agen) -> None:
+        """Close one async generator ON THE WORKER LOOP that owns it.
+
+        🚨 Breaking out of ``for frame in client.stream(...)`` is the ordinary
+        way to use a stream, not an edge case, and without this it leaks the
+        connection. The async generator is left for CPython to finalize from the
+        GC, on whatever thread collects it, with no running loop: anyio raises
+        ``NoEventLoopError`` inside ``Exception ignored in: <async_generator>``,
+        so the ``async with self._client.stream(...)`` body never unwinds and the
+        response is never closed. Nobody reads "Exception ignored", and the leak
+        surfaces later as a pool that has stopped handing out connections.
+
+        Errors are swallowed because this runs from a generator finalizer, where
+        raising produces exactly the unreadable "Exception ignored" this exists
+        to remove. It is cleanup on a request the caller has already walked away
+        from — there is no result to be wrong about.
+        """
+        self._live_streams.discard(agen)
+        if self._closed or not self._loop.is_running():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(agen.aclose(), self._loop).result(
+                timeout=_STREAM_UNWIND_TIMEOUT_S)
+        except BaseException:
+            pass
 
     def __enter__(self) -> "RoadsteadClient":
         return self
@@ -458,9 +518,16 @@ class RoadsteadClient:
         self.close()
 
     def close(self) -> None:
+        if self._closed:
+            return          # idempotent: `with` plus an explicit close is normal
         try:
+            # Streams the caller still holds go first, while the loop that owns
+            # them is alive. After the join there is nowhere left to unwind them.
+            for agen in list(self._live_streams):
+                self._unwind_stream(agen)
             self._run(self._async.aclose())
         finally:
+            self._closed = True
             self._loop.call_soon_threadsafe(self._loop.stop)
             self._thread.join(timeout=5.0)
 
@@ -479,25 +546,31 @@ class RoadsteadClient:
     def stream(self, **kwargs: Any) -> Iterator[dict]:
         """Blocking iteration over the enriched stream frames.
 
-        Pumped one frame at a time across the worker loop rather than collected
-        first: a streaming API that buffers the whole response before yielding
-        anything is a non-streaming API with extra steps, and the reason to
-        stream at all is to see the first token early.
+        Abandoning it partway — a ``break``, an exception, or simply dropping
+        it — is safe and releases the connection; see ``_unwind_stream``.
         """
-        agen = self._async.stream(**kwargs)
-        while True:
-            try:
-                yield self._run(agen.__anext__())
-            except StopAsyncIteration:
-                return
+        yield from self._pump(self._async.stream(**kwargs))
 
     def text_stream(self, **kwargs: Any) -> Iterator[str]:
-        agen = self._async.text_stream(**kwargs)
-        while True:
-            try:
-                yield self._run(agen.__anext__())
-            except StopAsyncIteration:
-                return
+        yield from self._pump(self._async.text_stream(**kwargs))
+
+    def _pump(self, agen):
+        """Drive an async generator one item at a time across the worker loop.
+
+        One item at a time rather than collected first: a streaming API that
+        buffers the whole response before yielding anything is a non-streaming
+        API with extra steps. The ``finally`` is what makes abandoning it safe —
+        see ``_unwind_stream``.
+        """
+        self._live_streams.add(agen)
+        try:
+            while True:
+                try:
+                    yield self._run(agen.__anext__())
+                except StopAsyncIteration:
+                    return
+        finally:
+            self._unwind_stream(agen)
 
 
 async def _make_async(base_url: str, api_key: str | None,
