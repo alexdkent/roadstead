@@ -41,21 +41,30 @@ Roadstead answers that question by measuring rather than assuming:
 A survey of ~25 open-source gateways (`docs/evaluation.md`) found none that does all of this
 outside Kubernetes, and none at all that does the last two.
 
+That survey was of a proxy for one private fleet. Roadstead generalises it: the same question, asked
+across local *and* remote capacity, for callers who declare what they need rather than which model
+to use. See `docs/roadmap.md`.
+
 ## Status
 
-| Phase | |
+Extraction is complete: the package is standalone, the suite runs against a shipped fake backend,
+and the contract is published and executable. Roadstead is now its own project rather than a
+standalone copy of the proxy it came from.
+
+**Where it is going** (`docs/roadmap.md`):
+
+| | |
 |---|---|
-| 0 · Sever host-application imports | ✅ done |
-| 1 · Standalone repo, namespace, packaging | ✅ done |
-| 2 · Standalone test harness | ✅ done |
-| 3 · Soak + hardening | 🔨 next |
-| 4 · Scrub, then publish | gated on the scrub |
+| **North face** | OpenAI-compatible, strictly — plus an enriched Roadstead API carrying live model information, computed deadlines, priority and attribution |
+| **Model abstraction** | Callers declare intent (`reasoning`, `fast-chat`, `vision`); Roadstead owns the choice. Concrete pins honoured, substitution opt-in and always disclosed |
+| **South face** | Modular providers: llama.cpp and vLLM local, OpenRouter and others remote |
+| **Capacity** | One admission decision, three outcomes — dispatch locally, **spill** to a remote provider, or defer |
+| **Identity** | API keys as the fair-share, quota and budget key |
+| **Cost** | Token and spend accounting, with thresholds that **degrade rather than reject** |
+| **Operations** | Eventually a management interface for running it standalone |
 
 Parity against the origin copy, and the cutover it existed to make safe, were **removed from the
-plan on 2026-08-31** when the project stopped being tied to its origin. A parity gate on a
-deliberate superset fails on every improvement.
-
-Plan and current state: **`docs/handoff.md`**.
+plan on 2026-08-31**: a parity gate on a deliberate superset fails on every improvement.
 
 ## Quick start
 
@@ -96,7 +105,9 @@ It is also the executable form of §4 of `docs/api.md` — what Roadstead requir
 |---|---|
 | `CLAUDE.md` | Orientation, the concurrency invariant, and the engine-behaviour findings that explain why the code is shaped the way it is. **Read before changing anything.** |
 | `docs/api.md` | The four API surfaces: north face, error contract, admin/control plane, and what Roadstead requires *of a backend*. |
-| `docs/handoff.md` | The extraction plan, current state, and what to do next. |
+| `docs/roadmap.md` | **What is being built and why.** Start here for direction. |
+| `docs/compatibility.md` | What is stable, what is not, and how to break something on purpose. |
+| `docs/history.md` | Closed record of the extraction — where the code came from and what that cost. |
 | `docs/evaluation.md` | Why this exists rather than adopting something else — the field survey and decision record. |
 | `docs/corpus_and_scrub_plan.md` | What must be scrubbed before this can go public, and why the working tree is not enough. |
 | `docs/ledger.md` | Defects that came back, with the guard that now prevents each. |

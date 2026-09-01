@@ -1,6 +1,6 @@
 """The timeout floor, from the SERVER side (`docs/api.md` §1.4).
 
-`docs/handoff.md` Phase 2 lists "the timeout-floor mirror" among the contracts
+`docs/history.md` (then `handoff.md`) listed "the timeout-floor mirror" among the contracts
 "currently only asserted from the host's side, which is the tautology trap".
 The host keeps its own copy of the floor table — `framework/timeout_advice`'s
 `floor_for()` — because it needs a floor *before* it can reach the proxy, and

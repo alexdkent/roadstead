@@ -1,6 +1,6 @@
 """The same wire contract, against a REAL engine. Off the default path.
 
-Purpose, from `docs/handoff.md` Phase 2: "catch the day an engine changes its
+Purpose, from the extraction plan (`docs/history.md`): "catch the day an engine changes its
 `/props` shape". Everything else in the suite runs against `roadstead.testing`,
 which encodes what engines did on the day it was written — a snapshot with no
 alarm on it. This is the alarm.

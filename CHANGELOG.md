@@ -12,8 +12,15 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 *None yet.* The project became free to break compatibility on 2026-08-31 and has not used it.
 
+**Planned:** the `/v1/submit` envelope will be superseded by the enriched Roadstead API
+(`docs/roadmap.md`). The OpenAI-compatible surface is unaffected and stays strictly compatible.
+
 ### Added
 
+- **`docs/roadmap.md`** — what Roadstead is being built into: modular providers (llama.cpp and vLLM
+  local, OpenRouter and others remote), remote capacity as spill under a single admission decision,
+  an enriched API beside the OpenAI one, caller-intent model abstraction, API-key identity, and
+  cost/token thresholds that degrade rather than reject.
 - **`roadstead.testing`** — the programmable fake backend is now shipped API, not test scaffolding.
   A real ASGI app on a real socket, both engine wire shapes, and ~20 south-face pathologies on
   demand including `capacity_desync`. Was `tests/fake_backend.py`.
@@ -41,6 +48,8 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ### Removed
 
+- **`docs/handoff.md`** — retired to `docs/history.md` as a closed record. The extraction handoff is
+  complete; the forward-looking half became `docs/roadmap.md`.
 - **Golden-oracle parity against the origin monorepo, and the cutover it existed to make safe.**
   Roadstead is an independent project heading for a superset, and a parity gate on a superset fails
   on every improvement. `docs/compatibility.md` replaces it.

@@ -9,7 +9,7 @@ signals, and the slowest scenario takes ~80 seconds. It is here so the
 measurement can be *re-run* rather than merely cited — the finding it produced
 is recorded in ``docs/ledger.md`` and summarised in ``CLAUDE.md``.
 
-The question it answers (``docs/handoff.md``, open question 1): the origin
+The question it answers (``docs/history.md``, open question 1): the origin
 project's knowledge layer contradicted itself on whether SIGTERM hangs behind
 slow in-flight requests, and it becomes load-bearing the day this is
 containerised, because ``docker stop`` sends SIGTERM and hard-kills after 10s.

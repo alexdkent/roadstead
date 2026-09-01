@@ -4,9 +4,17 @@
 > free up. That is not a metaphor for the admission queue — it *is* the queue, and specifically one
 > that exists because capacity is finite and currently occupied.
 
-**What this is:** a capacity-aware admission-controlling gateway for self-hosted LLM inference
-fleets — several llama.cpp servers and a vLLM tensor-parallel pair across heterogeneous hardware,
-without Kubernetes. OpenAI-compatible on the front, model-authoritative on the back.
+**What this is:** a capacity-aware admission-controlling gateway for LLM inference — several
+llama.cpp servers and a vLLM tensor-parallel pair across heterogeneous hardware, without Kubernetes.
+OpenAI-compatible on the front, model-authoritative on the back.
+
+**Where it is going — read `docs/roadmap.md` before planning anything.** Roadstead is an independent
+project with two goals: a high-quality local capability (primary) and an open-source project others
+can use (secondary). It is growing a provider abstraction (llama.cpp + vLLM local, OpenRouter and
+others remote, with remote capacity as *spill* under one admission decision), an enriched API
+alongside the OpenAI one, caller-intent model abstraction, API-key identity, and cost/token
+governance whose thresholds degrade rather than reject. Much of what follows describes the code as
+it is *today*, which is still shaped by one private fleet.
 
 **The thesis in one sentence:** the proxy empirically models its backends' capacity and latency
 behaviour, and uses that model for both admission control and deadline setting.

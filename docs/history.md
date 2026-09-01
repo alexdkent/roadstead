@@ -1,10 +1,18 @@
-# Handoff — where this stands and what to do next
+# History — the extraction, and what it left behind
 
-**Written 2026-08-31**, at the moment of extraction, for whoever picks this up next — most likely a
-fresh Claude Code instance with none of the origin project's context.
+**This is a closed record, not a plan.** It was `handoff.md`, written on 2026-08-31 at the moment of
+extraction for whoever picked the project up next. That handoff is complete: Roadstead is its own
+project with no dependencies or expectations outside it. The forward-looking half moved to
+**`roadmap.md`**; what remains here is the part still worth being able to look up.
 
-Read `CLAUDE.md` first. It carries the concurrency invariant and the engine-behaviour findings, and
-those are the two things that will bite you if you skip them.
+Kept because several things reference it and because the reasoning behind some odd-looking code is
+recorded nowhere else: where the code came from, what the extraction did and cost, which tests left
+and why, and the findings that came out of standalone-ing it. `ledger.md` and a few test docstrings
+cite this file.
+
+> ⚠️ Statements below describe the state of things in **August 2026**. Two governance rules quoted
+> in passing — that the origin monorepo was authoritative for behaviour, and that a cutover to it
+> was planned — were **both retired on 2026-08-31**. See `CLAUDE.md` and `compatibility.md`.
 
 ---
 
@@ -156,40 +164,15 @@ All three items. Suite 1064 at extraction → **1267 passed**, 1 skipped, 6 dese
 deployment data — with a test that fails if anyone tabulates them into a document headed for
 publication.
 
-### Phase 3 — soak and hardening 🔨 **next**
+### Phases 3+ — moved to `roadmap.md`
 
-Reshaped 2026-08-31. The phase was *"golden-oracle parity against the origin copy, then soak"*.
-**Parity is deleted, and so is the Phase 4 cutover it existed to make safe** — a parity gate on a
-deliberate superset fails on every improvement, so it would have measured the wrong thing and
-punished the right work. Whether the monorepo ever adopts this package is now its own integration
-question, not a phase of this project.
+Everything forward-looking left this file on 2026-08-31, when the project's scope widened well past
+"a standalone copy of llmproxy". Soak and the scrub both survive as workstreams there.
 
-Soak survives, and the case for it got *stronger*, not weaker. Nothing about it was ever about the
-origin: it is about whether this software is sound over time. What it has to catch:
-
-- 🚨 **The concurrency invariant** — single event loop, no locks, exactly one writer thread. It is
-  the most dangerous thing in the codebase and **nothing in the suite guards it** (`CLAUDE.md`).
-  Sustained concurrent load is the only thing that would surface a violation. Until now "differs
-  from the monorepo" was an implicit backstop for this whole class of bug; dropping parity removes
-  it, which is precisely why soak is now the replacement rather than a nice-to-have.
-- **Growth over time** — WAL and `queue.db` size under the retention sweeps, RSS, the DRR budget
-  table, `proxy_completions` under a realistic mix.
-- **State that survives restarts** — budget drift across repeated SIGTERM/start cycles, the drain
-  under load (measured once, at `tools/docker_stop_probe/`; not yet measured *repeatedly*).
-- **Model convergence** — cost-model EWMA calibration and timeout-model p99 estimates settling to
-  something sane rather than drifting, over hours rather than a test's seconds.
-- **Circuit-breaker flap** — an endpoint that is intermittently unhealthy must not oscillate.
-
-The material already exists: `roadstead.testing` can hold, stall, 503 and desync on demand, and
-`roadstead/simulation.py` + `test_harness.py` came across in the extraction. The work is a
-long-running driver and something that watches, not new fault machinery.
-
-### Phase 4 — the scrub, then publish
-
-Now the horizon, and the scrub is the real blocker rather than a footnote. `models.yaml` is still a
-real hardware inventory and `10.0.0.x` topology is still in the working tree **and in all 283
-commits**. Read `corpus_and_scrub_plan.md` before changing repository visibility; the history
-rewrite is a second `git filter-repo` pass and must be done last.
+For the record, the plan as it stood at extraction had five phases ending in a cutover to the origin
+monorepo. **Phases 0-2 completed; parity and cutover were deleted** rather than done — the project
+stopped being a 1:1 replacement, and a parity gate on a deliberate superset fails on every
+improvement.
 
 ---
 
@@ -208,7 +191,7 @@ rewrite is a second `git filter-repo` pass and must be done last.
 - **The suite passing does not prove a capability works.** Every schema and generation config needs
   one real call at the size you will actually send before you trust it.
 
-## Open questions inherited
+## Open questions inherited at extraction
 
 1. ~~**SIGTERM vs SIGKILL for shutdown**~~ ✅ **resolved by experiment, 2026-08-31.** SIGTERM is
    correct — the drain persists DRR budgets and completions even for a straggler it cancels, which
