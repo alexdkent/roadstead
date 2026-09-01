@@ -125,7 +125,7 @@ whether the caller is allowed to spend.
 
 **API keys.** A key is the caller's identity — and therefore the DRR fair-share key, the quota
 holder, and the budget holder. The IP-based ACL is demoted to an optional second factor, which also
-clears scrub item **S1** (no addresses shipped in code).
+clears scrub item **S1** (no addresses shipped in code). **Landed 2026-09-01** — see Workstream B.
 
 ### Token management, thresholds, costing
 
@@ -199,8 +199,26 @@ done together as planned rather than twice.
 
 ### B · Identity and API-key auth
 
-Keys → identity → fair-share key → quota/budget holder. Demote the IP ACL. **Clears scrub S1.**
-Blocks meaningful per-caller costing.
+**Landed 2026-09-01.** Keys → identity → fair-share key → quota/budget holder; the address ACL is
+demoted to a second factor. `identity.py` is the one place that knows the precedence, and everything
+downstream — the two OpenAI doors, `/v1/submit`, the admin gates, the deadline floor — reads the
+answer off a `Principal` rather than asking about an address.
+
+- **`/v1/submit` is gated.** It was not, on the same port as the ACL-gated OpenAI doors, so the DRR
+  fair-share key was self-asserted by anyone who used it. A key now overrides a body-declared
+  `agent_id`; an address only fills in one the body omitted.
+- **Three doctrine rules**, in `docs/api.md` §1.5 and enforced by `tests/test_identity_keys.py`: a
+  presented key that does not resolve is a 401 and never falls back to the address; with no keys
+  configured a presented key is ignored entirely (every OpenAI client sends one whether anybody
+  meant it to or not); an authenticated non-admin identity does not inherit its host's admin
+  privileges.
+- **Clears scrub S1**, as planned — and S3 with it, plus a fourth private inventory the plan had not
+  listed (`agents.yaml`, the same way S2 turned up `usage_rates.py`).
+
+**Still open in B:** keys are flat — there is no team → key nesting for quota and budget
+inheritance, which is the "multi-tenancy depth" question below. Nothing reads a key on the
+management side yet either: there is no enrolment surface, so a key is created by editing config and
+restarting. That belongs with **E**.
 
 ### C · The enriched API
 
@@ -230,8 +248,13 @@ cover the new surfaces, especially anything that touches remote providers over t
 the catalog redesign it shared its work with — and it turned up a second inventory nobody had listed,
 `usage_rates.py`, which is now anchored to model classes rather than to one fleet's models.
 
-**S1 (the ACL's `10.0.0.x` seeds) and S3 (the remaining topology references) are the open ones**, and
-they are the cheap half. The history rewrite is still the expensive one.
+**S1 and S3 are done** (2026-09-01), with Workstream B, which is what made S1 possible: removing the
+address seeds needed an identity mechanism to remove them *in favour of*. The working tree is clean
+of private topology. It also turned up a fourth inventory nobody had listed — `agents.yaml` shipped
+one fleet's agent roster with weekly volumes and infra paths — which is now a generic example on the
+caller archetypes named above, exactly as `models.yaml` is.
+
+**Only the history rewrite (S6) is left**, and it is the expensive one.
 
 ⚠️ The history rewrite stays last — it invalidates every SHA.
 

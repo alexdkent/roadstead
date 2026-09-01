@@ -10,7 +10,49 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ### Breaking
 
-All four landed together on 2026-08-31 with the catalog redesign, and none touches the wire contract
+Landed 2026-09-01 with Workstream B (identity and API keys), which also clears scrub items **S1** and
+**S3**. One of these touches the wire contract in `docs/api.md`; the rest are deployment surface.
+
+- **`/v1/submit` now requires an identity.** It had none: the OpenAI doors were ACL-gated and this
+  one was not, on the same port, so any caller could reach it unenrolled *and* claim any `agent_id`
+  it liked — including one with a better DRR weight. The fair-share key was self-asserted. It is now
+  gated exactly like the OpenAI doors. *Why:* a scheduler whose unit of fairness is caller identity
+  cannot let callers choose their own. Migration: present an API key, or enrol the source address in
+  `ROADSTEAD_ACL`. Loopback and docker-internal callers are unaffected.
+- **A presented API key overrides a body-declared `agent_id`.** An address still only fills in an
+  `agent_id` the body omitted. *Why:* a verified credential is a stronger statement about who is
+  calling than anything in the body; letting the body win would launder a claim past the credential.
+- **The ACL ships no registrations, and no addresses at all.** It carried a private fleet's LAN —
+  ten hosts by address, role and deadline floor (scrub item **S1**). A fresh install now allows
+  loopback and docker-internal and refuses everything else. *Why:* a default that happens to match
+  somebody's LAN hands an identity, a DRR share and a deadline floor to whatever answers at an
+  address we guessed. Migration: `ROADSTEAD_ACL=<ip-or-subnet>=<agent_id>[:priority][:min_timeout_s][:admin]`,
+  comma-separated. `LLM_PROXY_ACL` is still read — the one legacy env name kept, because a proxy
+  that silently stops recognising its callers on upgrade fails closed in the most confusing way
+  available.
+- **🔒 A new error code, `invalid_api_key` (401)** — `docs/api.md` §2.1, so this one is the wire
+  contract. It is deliberately NOT `access_denied`: 403 says *this source is not enrolled*, 401 says
+  *this credential is wrong*, and collapsing them sends an operator to the wrong file. A presented
+  key that does not resolve never falls back to the address, which is the reason a separate code was
+  needed at all.
+- **A caller that declares no `priority` now takes its identity's default**, rather than always
+  `P1_TURN_SUPPORT`. *Why:* the OpenAI doors already did this; `/v1/submit` ignoring the same
+  registration meant one caller landed in two different bands depending on which door it used.
+- **`agents.yaml` is a generic example**, on the caller archetypes in `docs/roadmap.md`
+  (`chat-assistant`, `coding-assistant`, `summarizer`, `extractor`, `hygiene`). It shipped one
+  fleet's agent roster with weekly request volumes and infra paths — a fourth private inventory,
+  found the way `usage_rates.py` was found during S2, by walking past it. The same arrangement as
+  `models.yaml`: the example IS the default, so it boots a fresh install and cannot rot. The DRR
+  sizing reasoning and the whole `degrade_ok` doctrine are kept; only the vocabulary changed. The
+  built-in simulation scenarios (`roadstead.simulation`) were renamed to match — their measured
+  shapes are untouched.
+- **`ANVIL_DISPATCHER_URL` → `ROADSTEAD_ON_DEMAND_DISPATCHER_URL`, and it has no default.** The
+  old default was one deployment's dispatcher address (scrub item **S3**). *Why:* the GPU-slot
+  dispatcher is a host-side service Roadstead does not own or ship, so a baked-in URL could only
+  ever be somebody else's. An `on_demand` endpoint with this unset fails `ensure_loaded` as
+  unreachable — the same clean deferrable error as a dispatcher that is genuinely down.
+
+All four below landed together on 2026-08-31 with the catalog redesign, and none touches the wire contract
 in `docs/api.md` — the OpenAI surface is unaffected.
 
 - **`models.yaml` is a new schema: `providers:` + `endpoints:`.** Connection and engine on one side,
@@ -38,6 +80,28 @@ in `docs/api.md` — the OpenAI surface is unaffected.
 (`docs/roadmap.md`). The OpenAI-compatible surface is unaffected and stays strictly compatible.
 
 ### Added
+
+- **`roadstead/identity.py` — API keys as the caller identity** (roadmap Workstream B). A key
+  resolves to a `Principal` carrying the `agent_id` (the DRR fair-share key, quota holder and budget
+  holder), a default priority, an optional `min_timeout_s` deadline floor and an optional `admin`
+  scope — so all four travel with the caller rather than with the machine it runs on.
+  - **Keys are held as SHA-256 digests**, which is both the storage form and the lookup key: the
+    plaintext never outlives the load. A config entry may give `key:` (hashed here) or `key_sha256:`
+    (the documented form — a key in a config file is a key in a git history). Configure via
+    `ROADSTEAD_API_KEYS` for the one-key container case or `ROADSTEAD_API_KEYS_FILE` for anything
+    real; `ROADSTEAD_REQUIRE_API_KEY=1` refuses a request that presents none.
+  - **One identity-spec grammar for both registries** — `agent_id[:priority][:min_timeout_s][:admin]`,
+    where segments are recognised by shape rather than position, so an operator configuring
+    `ROADSTEAD_ACL` and `ROADSTEAD_API_KEYS` in the same file learns one spelling of the same four
+    facts. Backwards-compatible with the two forms the ACL already accepted.
+  - **The address ACL is demoted to a second factor**, and `IdentityResolver` is the one place that
+    knows the precedence — the two OpenAI doors, `/v1/submit`, the five admin gates and the deadline
+    floor all read the answer off the principal, so a third factor lands in one file.
+  - **An interactive identity floored above its own ceiling is reported at load** through
+    `hooks.degradation`. That shape was live for a day in the origin fleet — a caller promoted from
+    the background band kept the background 1800s floor against a 600s interactive ceiling — and it
+    used to be pinned by a test that asserted about specific fleet hosts. It is now a guard that
+    fires for anybody's registration, in either registry.
 
 - **`roadstead/providers/` — the provider interface** (roadmap Workstream A, the foundation the rest
   of the roadmap depends on). The llama.cpp/vLLM branching that was inline in `backend.py` is now

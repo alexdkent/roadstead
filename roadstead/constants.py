@@ -23,12 +23,14 @@ _DEFAULT_TIMEOUT_S = 180.0
 _SMART_DEFAULT_CAP_S = 1800.0
 
 # The INTERACTIVE band's deadline ceiling. Single source of truth: `config`'s
-# `TimeoutConfig.timeout_ceiling_interactive_s` defaults to this, and `acl`
-# uses it as the min_timeout_s floor for interactive callers that supply no
-# deadline of their own. 🚨 Do NOT floor an interactive caller at
+# `TimeoutConfig.timeout_ceiling_interactive_s` defaults to this, and it is the
+# right `min_timeout_s` floor for an interactive caller that supplies no
+# deadline of its own. 🚨 Do NOT floor an interactive caller at
 # `_SMART_DEFAULT_CAP_S` (1800s) — that is the BACKGROUND cap and is three
-# times this, i.e. a floor above its own ceiling. That mistake was live on the
-# `beacon` registration from Phase 0 until the 2026-08-24 cutover.
+# times this, i.e. a floor above its own ceiling. That mistake was live on one
+# registration for a day in the origin fleet, when a caller was promoted from
+# the background band and its floor was left behind. `identity.py` now reports
+# that shape at load for ANY registration, in either registry.
 _INTERACTIVE_CEILING_S = 600.0
 
 # Phase 5C — time-to-first-token watchdog for streaming. Data (2026-05-31): the

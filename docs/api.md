@@ -137,17 +137,58 @@ call below the deadline the model already guarantees.
 
 ---
 
+### 1.5 Identity — who a caller is 🚨
+
+**A caller's identity is its `agent_id`, and that string is the DRR fair-share key, the quota holder
+and the budget holder.** It is established in one of three ways, in strict precedence:
+
+| | how | strength |
+|---|---|---|
+| 1 | **API key** — `Authorization: Bearer <key>` (what an OpenAI client already sends) or `X-API-Key: <key>` | authenticated |
+| 2 | **Source address** — an operator registration in `ROADSTEAD_ACL` | a weak second factor: it identifies a *host*, and several callers may share one |
+| 3 | **`agent_id` in the body** — `/v1/submit` only | a claim, honoured only where nothing stronger contradicts it |
+
+A key carries its own default `priority`, an optional `min_timeout_s` deadline floor, and an
+optional `admin` scope, so all four facts travel with the caller rather than with the machine it
+runs on.
+
+Three rules, each of which is a decision rather than an implementation detail:
+
+1. 🚨 **A presented key that does not resolve is a `401 invalid_api_key`. It never falls back to the
+   source address.** A wrong or revoked credential must not silently become a *different, weaker*
+   identity that still works — from the outside that is indistinguishable from the credential being
+   fine. Remove the header to be identified by address instead; the error message says so.
+2. 🚨 **When no keys are configured, a presented key is ignored entirely** and the address decides.
+   Every OpenAI client sends an `Authorization` header whether or not anybody meant it to, so
+   treating one as significant before an operator has configured any key would refuse the existing
+   world over a credential nobody chose.
+3. 🚨 **A key overrides a body-declared `agent_id`; an address only fills in one the body omitted.**
+   A verified credential is a stronger statement about who is calling than anything in the body.
+
+**Every door is gated**, `/v1/submit` included. Out of the box, loopback and docker-internal
+addresses resolve to the identity `internal` and everything else is refused — default-deny, and the
+local-first case needs no configuration at all. `ROADSTEAD_REQUIRE_API_KEY=1` additionally refuses
+any request that presents no key.
+
 
 ## 2. Error contract 🚨
 
 ### 2.1 Codes
 
-Every error envelope carries a machine-readable `code`. **Fourteen exist** (a common under-count is
+Every error envelope carries a machine-readable `code`. **Fifteen exist** (a common under-count is
 eight):
 
 `backpressure` · `circuit_open` · `draining` · `unknown_endpoint` · `invalid_grammar` ·
-`proxy_timeout` · `backend_error` · `context_overflow` · `access_denied` · `invalid_messages` ·
-`invalid_request_error` · `vision_not_supported` · `on_demand_unavailable` · `structured_invalid_json`
+`proxy_timeout` · `backend_error` · `context_overflow` · `access_denied` · `invalid_api_key` ·
+`invalid_messages` · `invalid_request_error` · `vision_not_supported` · `on_demand_unavailable` ·
+`structured_invalid_json`
+
+`access_denied` (403) and `invalid_api_key` (401) are **not interchangeable** and a client should not
+collapse them: the first says *this source is not enrolled*, the second says *this credential is
+wrong*, and they send an operator to different files. On the OpenAI door `invalid_api_key` rides
+OpenAI's own envelope for a rejected credential — `type: invalid_request_error`, `code:
+invalid_api_key` — while `access_denied` keeps `type: access_denied`, which is what that door has
+always emitted.
 
 ### 2.2 The marker substrings are the real contract
 
@@ -179,8 +220,15 @@ Deterministic 4xx are non-deferrable (the caller must change something). 429 and
 
 ## 3. Admin / control plane
 
-**ACL: loopback and docker-internal only** (plus an explicit allow-list). These are not exposed to
-the LAN inference door.
+**Admin is narrower than inference, deliberately.** An operator who enrols a subnet for inference has
+said nothing about who may pause a backend fleet-wide. Two ways in: an **API key with the `admin`
+scope** (from anywhere), or a **source address** in the admin nets — loopback and docker-internal by
+default, extended by `ROADSTEAD_ADMIN_NETS`.
+
+🚨 **An authenticated non-admin identity is refused even from a host in the admin nets.** Once a
+caller says who it is, its privileges are that identity's; inheriting the host's would mean a scoped
+key could only ever widen access and never narrow it, which makes it worthless on the machine it
+runs on.
 
 | Route | Purpose |
 |---|---|
@@ -412,9 +460,11 @@ Default is a WARNING log in a grep-able shape. Everything else in the package re
 ## 6. Verification status
 
 **Verified against source 2026-08-31:** the route table location, the non-standard request fields,
-the fourteen error codes, the deferrability mechanism and its marker substrings, the
-context-overflow marker verbatim, backend dispatch paths, the capacity-discovery asymmetry, and the
-metric-name prefixes.
+the error codes, the deferrability mechanism and its marker substrings, the context-overflow marker
+verbatim, backend dispatch paths, the capacity-discovery asymmetry, and the metric-name prefixes.
+
+**Updated 2026-09-01:** §1.5 (identity and API keys) is new, `invalid_api_key` joins §2.1, and §3
+restates the admin gate now that a key can carry the scope — Workstream B in `docs/roadmap.md`.
 
 **Previously INCOMPLETE — both closed 2026-08-31:**
 1. ~~Nested response schemas for `/v1/fleet/*` analytics.~~ Chased to column level in §3.1 and

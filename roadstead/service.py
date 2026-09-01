@@ -148,6 +148,7 @@ class ProxyService:
     _metrics = _StateField("metrics")
     _request_logger = _StateField("request_logger")
     _acl = _StateField("acl")
+    _identity = _StateField("identity")
     _sse = _StateField("sse")
     _dispatch_event = _StateField("dispatch_event")
     _draining = _StateField("draining")

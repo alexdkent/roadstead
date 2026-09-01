@@ -92,6 +92,52 @@ python3.11 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 The suite needs **no fleet, no network and no inference backend** — it runs against
 `roadstead.testing`, described below.
 
+## Who is calling — API keys
+
+A caller's identity is the **DRR fair-share key**: the string fairness, quotas and budgets are all
+accounted against. An API key establishes it, and carries that caller's policy with it — default
+priority, an optional deadline floor, an optional admin scope — so it travels with the caller rather
+than with the machine it happens to run on.
+
+```sh
+# one key, for the container case
+ROADSTEAD_API_KEYS='sk-local-abc=coding-assistant:P1_TURN_SUPPORT'
+
+# or a file, which can carry digests instead of secrets
+ROADSTEAD_API_KEYS_FILE=/etc/roadstead/keys.yaml
+```
+
+```yaml
+# keys.yaml — no example ships in the package, deliberately: a default key file
+# is a default credential.
+keys:
+  - id: coding-assistant-laptop     # a public label, safe to log. Never the key.
+    agent_id: coding-assistant      # the DRR fair-share key
+    key_sha256: "8f4e…"             # `printf %s "$KEY" | shasum -a 256`
+    priority: P1_TURN_SUPPORT       # the band when the caller declares none
+    min_timeout_s: 600              # deadline floor, for a caller that sets none
+  - id: ops
+    agent_id: ops
+    key: plaintext-is-allowed-too   # hashed at load; but a key in a file is a
+    admin: true                     # key in a git history — prefer key_sha256
+```
+
+An OpenAI client needs nothing but its `api_key` set — the key rides the `Authorization: Bearer`
+header it already sends.
+
+**Out of the box there is no key and no configuration**: loopback and docker-internal callers are
+admitted as `internal`, and everything else is refused. That is default-deny with the local-first
+case free. To admit a host without issuing it a key, enrol its address:
+
+```sh
+ROADSTEAD_ACL='192.0.2.0/24=lan:P3_INGESTION,192.0.2.9=ingest:P4_HYGIENE:1800'
+```
+
+An address is deliberately the *weaker* factor — it identifies a host, not a caller. Where the two
+disagree the key wins, and a presented key that does not resolve is a 401 rather than a quiet
+demotion to whatever the address would have given. `docs/api.md` §1.5 has the full precedence and
+the reasoning.
+
 ## A programmable backend, in the box
 
 `roadstead.testing` ships the fake backend the suite runs on, because for a gateway whose thesis is

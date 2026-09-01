@@ -89,7 +89,7 @@ async def _wait_until(predicate, timeout_s: float = 5.0, interval_s: float = 0.0
 async def journey(caplog) -> AsyncIterator[dict]:
     """A real ProxyService with tier3 (`tier3`) and tier2
     (`tier2`) backed by TWO INDEPENDENT fake backends, real agents.yaml
-    (`discord.degrade_ok=True`, `sidekick.degrade_ok=False`), and the `tier3`
+    (`chat-assistant.degrade_ok=True`, `extractor.degrade_ok=False`), and the `tier3`
     dwell shrunk to FAST_DWELL_S. Every other endpoint is left pointed at the
     tier2 fake — unused by this journey, but must resolve to
     something so config construction doesn't 404 on itself.
@@ -101,7 +101,7 @@ async def journey(caplog) -> AsyncIterator[dict]:
         with tempfile.TemporaryDirectory() as tmp:
             base = ProxyConfig(
                 queue_db_path=f"{tmp}/queue.db",
-                agents=load_agent_configs(),  # real agents.yaml — discord opted in, sidekick not
+                agents=load_agent_configs(),  # real agents.yaml — chat-assistant opted in, extractor not
             )
             endpoints: Dict[str, EndpointConfig] = {}
             for cls, ep in base.endpoints.items():
@@ -171,7 +171,7 @@ async def test_tier3_failover_full_journey(journey, caplog):
     fake_creative = journey["fake_creative"]
 
     # -- 0. baseline: tier3 healthy, served directly, no degraded marker ----
-    resp = await client.post("/v1/submit", json=_submit_body("discord"))
+    resp = await client.post("/v1/submit", json=_submit_body("chat-assistant"))
     assert resp.status_code == 200, resp.text
     env = resp.json()
     assert env["status"] == "ok"
@@ -189,7 +189,7 @@ async def test_tier3_failover_full_journey(journey, caplog):
 
     # -- 2. served by tier2; response labelled; resp.model correct --
     fake_creative.controller.reset()
-    resp = await client.post("/v1/submit", json=_submit_body("discord", content="degraded turn"))
+    resp = await client.post("/v1/submit", json=_submit_body("chat-assistant", content="degraded turn"))
     assert resp.status_code == 200, resp.text
     env = resp.json()
     assert env["status"] == "ok"
@@ -220,15 +220,15 @@ async def test_tier3_failover_full_journey(journey, caplog):
 
     # -- 4. an agent WITHOUT degrade_ok gets a clean 503 + Retry-After, ------
     #       in the SAME window (tier3 still down, still degraded) -----------
-    assert svc._state.config.agent_config("sidekick").degrade_ok is False
-    resp = await client.post("/v1/submit", json=_submit_body("sidekick", content="not opted in"))
+    assert svc._state.config.agent_config("extractor").degrade_ok is False
+    resp = await client.post("/v1/submit", json=_submit_body("extractor", content="not opted in"))
     assert resp.status_code == 503, resp.text
     body = resp.json()
     assert body["code"] == "draining"  # this outage is an operator drain
     assert body["degraded_refusal"] == "degraded_not_opted_in"
     assert "Retry-After" in resp.headers
     assert int(resp.headers["Retry-After"]) > 0
-    # refused, never silently degraded — sidekick's request must not have reached
+    # refused, never silently degraded — the request must not have reached
     # EITHER backend.
     assert not any("not opted in" in str(r.body) for r in fake_thinker.controller.requests)
     assert not any("not opted in" in str(r.body) for r in fake_creative.controller.requests)
@@ -239,7 +239,7 @@ async def test_tier3_failover_full_journey(journey, caplog):
     # observable cohort to drain rather than an instantaneous empty one.
     fake_creative.controller.set_fault(FAULT_CAPACITY_DESYNC, 0.5)
     inflight_task = asyncio.create_task(
-        client.post("/v1/submit", json=_submit_body("discord", content="in-flight during recovery")))
+        client.post("/v1/submit", json=_submit_body("chat-assistant", content="in-flight during recovery")))
     assert await _wait_until(
         lambda: svc._scheduler.degraded_inflight(SRC) >= 1, timeout_s=2.0
     ), "the held request never registered as degraded in-flight"
@@ -273,7 +273,7 @@ async def test_tier3_failover_full_journey(journey, caplog):
     # Next request goes back to tier3, unlabelled.
     fake_thinker.controller.reset()
     fake_creative.controller.reset()
-    resp = await client.post("/v1/submit", json=_submit_body("discord", content="recovered turn"))
+    resp = await client.post("/v1/submit", json=_submit_body("chat-assistant", content="recovered turn"))
     assert resp.status_code == 200, resp.text
     env = resp.json()
     assert "degraded" not in env

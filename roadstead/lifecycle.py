@@ -306,6 +306,49 @@ class Lifecycle:
                 {"status": "error", "error": err, "code": "draining"},
                 status_code=503)
 
+        # Identity, BEFORE anything reads the body. Until 2026-09-01 this door
+        # had no access control at all — the OpenAI doors were ACL-gated and
+        # `/v1/submit` was not, on the same port — so a caller could both reach
+        # it unenrolled and claim any `agent_id` it liked, including one with a
+        # better DRR weight. The fair-share key was self-asserted.
+        #
+        # The OpenAI doors resolve first and pass the answer down in the
+        # envelope; resolving again here costs a dict lookup and makes this door
+        # safe on its own rather than safe by virtue of who calls it. Gating
+        # before endpoint resolution also stops an unenrolled caller enumerating
+        # endpoint names off the 404/tally path.
+        resolved = self.state.identity.resolve(request)
+        if not resolved.ok:
+            denial = resolved.denial
+            if openai:
+                return _openai_error(denial.message, denial.openai_type,
+                                     denial.status, code=denial.code)
+            return JSONResponse(
+                {"status": "error", "error": denial.message,
+                 "code": denial.code},
+                status_code=denial.status)
+        principal = resolved.principal
+
+        # 🚨 A KEY overrides a body-declared identity; an ADDRESS only fills in
+        # one that was omitted. A verified credential is a stronger statement
+        # about who is calling than anything in the body, so letting the body
+        # win would launder a claim past the credential and put the traffic on
+        # somebody else's DRR budget. A source address is a much weaker signal —
+        # it identifies a host, not a caller, and several callers legitimately
+        # share one — so there it is the body that knows better, and the
+        # registration only supplies what the body left out.
+        if principal.authenticated:
+            agent_id = principal.agent_id
+        else:
+            agent_id = str(body.get("agent_id") or principal.agent_id)
+        # Same rule for the band: a declared priority wins, the identity's
+        # default fills in. Compared against None rather than truthiness —
+        # P0_REALTIME is 0, and `or` would silently promote realtime traffic to
+        # the identity default.
+        declared_priority = body.get("priority")
+        if declared_priority is None:
+            declared_priority = principal.priority
+
         now = time.monotonic()
 
         # Unknown-endpoint gate. Without it a typo'd role enqueues into a
@@ -420,7 +463,7 @@ class Lifecycle:
         # floor. Independent of the smart_default_timeout flag — the flat 180s
         # default is if anything a tighter wall than the smart one.
         if deadline_is_default:
-            min_s = self._identity_min_timeout_s(request)
+            min_s = principal.min_timeout_s
             if min_s is not None and timeout_s < min_s:
                 timeout_s = min_s
 
@@ -435,9 +478,9 @@ class Lifecycle:
                 timeout_s = floor_s
 
         req = QueuedRequest.create(
-            agent_id=body.get("agent_id", "unknown"),
+            agent_id=agent_id,
             endpoint=endpoint,
-            priority=body.get("priority"),
+            priority=declared_priority,
             call_site=body.get("call_site", "unknown"),
             payload_type=body.get("payload_type", "chat_completion"),
             payload=body.get("payload", {}),
@@ -2009,22 +2052,6 @@ class Lifecycle:
 
         # Trigger scheduler (a slot freed up)
         self.state.dispatch_event.set()
-    def _identity_min_timeout_s(self, request) -> float | None:
-        """The requesting IP's registered minimum-deadline floor, or None.
-
-        Keyed on the SOURCE IP (the ACL's own key), not on ``body.agent_id`` —
-        agent_id is caller-asserted on a bare /v1/submit, and the floor is a
-        capacity concession granted to a host we recognise. Fully guarded: a
-        request object without a client (or an ACL fault) means no floor, never
-        a 500 — the deadline is already resolved and valid by this point."""
-        try:
-            client = getattr(request, "client", None)
-            remote_ip = getattr(client, "host", None)
-            if not remote_ip:
-                return None
-            return self.state.acl.min_timeout_s(str(remote_ip))
-        except Exception:  # noqa: BLE001 — a floor lookup must never 500 a request
-            return None
 
     def resolve_default_timeout(self, endpoint: str, body: dict) -> float:
         """Deadline for a caller that supplied no ``timeout_s`` (the OpenAI door

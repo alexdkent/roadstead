@@ -175,6 +175,7 @@ roadstead/          the package (32 modules + providers/)
   lifecycle.py      admission → dispatch → streaming → timeout recording
   health.py         capacity discovery, circuit breaker, drain
   queue.py          durable event log + THE single writer thread
+  identity.py       who is calling: API keys first, acl.py as second factor
   backend.py        south face TRANSPORT: pools, deadlines, error taxonomy, SSE relay
   providers/        south face ENGINES: llama.cpp | vllm | openrouter (see below)
   model_catalog.py  reads models.yaml — providers + endpoints (see below)
@@ -237,6 +238,25 @@ Providers are **stateless singletons** shared across every endpoint on the singl
 state on one is a data race no test here would catch. An unknown engine string resolves to
 llama.cpp, deliberately: that is what `!= "vllm"` always did.
 
+🚨 **Identity is a credential first and an address second, and the precedence is doctrine.**
+`identity.py` resolves every request to a `Principal` — `agent_id` (the DRR fair-share key, quota
+holder, budget holder), a default priority, an optional deadline floor, an optional admin scope —
+and it is the ONLY place that knows the order. Three rules, each of which looks arbitrary until it
+bites, all in `docs/api.md` §1.5:
+
+- **A presented key that does not resolve is a 401 and never falls back to the address.** Falling
+  back means a wrong or revoked credential silently becomes a *different, weaker* identity that
+  still works — the same shape as the `finish_reason` repair that became a silencer.
+- **With no keys configured the registry is not in play**, so a presented key is ignored and the
+  address decides. Every OpenAI client sends an `Authorization` header whether anybody meant it to
+  or not; treating one as significant before an operator configured any key would 401 the world.
+- **A key overrides a body-declared `agent_id`; an address only fills in one the body omitted.** And
+  an authenticated non-admin identity does NOT inherit its host's admin privileges — a scoped key
+  that can only widen access and never narrow it is worthless on the machine it runs on.
+
+`/v1/submit` is gated like the OpenAI doors as of 2026-09-01. It was not, on the same port, which
+meant the fair-share key was self-asserted by anyone who used that door.
+
 **`hooks.py` is the integration seam.** A host application can register a degradation sink; the
 default is a WARNING log. Everything else in the package reports through it. Keep this module
 dependency-free — an import of anything outside the stdlib re-creates the coupling it exists to
@@ -273,9 +293,14 @@ It is **private** and must stay private until the scrub in `docs/corpus_and_scru
 schema redesign that had to happen anyway went in with it. `usage_rates.py` lost its fleet model
 anchors in the same pass.
 
-**S1 and S3 are not.** `acl.py` still ships `10.0.0.x` seed registrations (19 lines), and
-`config.py`, `on_demand.py`, `test_harness.py` and four test files still carry addresses or host
-names. Run `git grep -n '10\.0\.0\.'` for the live list.
+**S1, S1b and S3 are done** (2026-09-01), with Workstream B — and that ordering was necessary, not
+convenient: the ACL seeds could only be removed *in favour of* something, and the something is an
+API key. The working tree carries no private address. It also turned up `agents.yaml` as a fourth
+inventory nobody had listed (one fleet's agent roster, weekly volumes, infra paths — and the package
+DEFAULT), now a generic example on the roadmap's caller archetypes.
+
+🚨 **What remains under fleet names is COMMENTS RECORDING MEASUREMENTS, and they stay.** Same rule as
+`models.yaml`: those are records of what was measured, not references to anything that exists here.
 
 🚨 **And scrubbing the working tree is not enough — it is in the history**, across 282 commits, which
 means another `git filter-repo` pass (S6, last, because it invalidates every SHA). Read that plan

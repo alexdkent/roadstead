@@ -29,6 +29,7 @@ from .coalesce import DeterministicCache
 from .config import ProxyConfig, normalize_endpoint
 from .cost_model import CostModel
 from .flags import RuntimeFlags
+from .identity import IdentityResolver, KeyRegistry
 from .observability import RequestLogger, RollingMetrics
 from .on_demand import OnDemandManager
 from .queue import PersistentQueue
@@ -128,6 +129,11 @@ class ProxyState:
         self.metrics = RollingMetrics(window_s=300.0)
         self.request_logger = RequestLogger(config.request_log_path or None)
         self.acl = IPIdentityMap.from_env()
+        # Caller identity: an API key first, ``self.acl`` as the second factor.
+        # The resolver is what the request path asks — the ACL is kept as its
+        # own field because it is the thing an operator configures and a test
+        # registers into, not because anything reads it directly any more.
+        self.identity = IdentityResolver(self.acl, KeyRegistry.from_env())
         # Real-time fan-out (Phase 1: proxy = fleet call-metrics authority).
         # Every completion emits a `call.completed` event; the poller pushes a
         # periodic `metrics` frame. Drives the unified Inference page's usage

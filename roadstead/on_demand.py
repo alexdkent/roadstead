@@ -1,12 +1,14 @@
 """On-demand backend lifecycle — for endpoints whose model is loaded lazily
-under the anvil GPU-slot dispatcher lease, then idle-unloaded.
+under a GPU-slot dispatcher lease, then idle-unloaded.
 
 An endpoint opts in via ``EndpointConfig.on_demand=True`` +
 ``.dispatcher_capability``. Before a request to such an endpoint dispatches,
-``ensure_loaded`` acquires (or confirms) the **anvil dispatcher** lease — a
-single GPU slot shared FIFO with the other on-demand services (imagegen,
-diarize, lyrics, …). Acquiring loads the model (and blocks behind any current
-slot holder). A background loop heartbeats each held lease and releases it once
+``ensure_loaded`` acquires (or confirms) a **dispatcher lease** — a single GPU
+slot shared FIFO with whatever other services contend for it (image generation,
+diarization, and so on in the deployment this was measured against). The
+dispatcher itself is a host-side service Roadstead talks to over HTTP at
+``ROADSTEAD_ON_DEMAND_DISPATCHER_URL``; it is not part of this package.
+Acquiring loads the model (and blocks behind any current slot holder). A background loop heartbeats each held lease and releases it once
 no request has been in-flight for ``hold_idle_s``; the dispatcher then keeps the
 model warm for its own ``keep_warm_sec`` and idle-unloads it (or evicts it the
 moment another service claims the slot), returning the GPU memory to the pool.
@@ -45,8 +47,14 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# The GPU-slot dispatcher this manager leases from. No default address — the
+# dispatcher is a HOST-side service that Roadstead does not own or ship, so a
+# baked-in URL could only ever be one deployment's (it was, until 2026-09-01:
+# scrub item S3). An endpoint marked ``on_demand`` with this unset fails its
+# ``ensure_loaded`` as unreachable, which is the same clean deferrable error as
+# a dispatcher that is genuinely down.
 _DEFAULT_DISPATCHER_URL = os.environ.get(
-    "ANVIL_DISPATCHER_URL", "http://10.0.0.3:9201"
+    "ROADSTEAD_ON_DEMAND_DISPATCHER_URL", ""
 )
 
 # Lease protocol params — mirror the imagegen lease client.

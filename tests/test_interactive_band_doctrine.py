@@ -1,83 +1,68 @@
 """The interactive band's invariants.
 
-Two defects this pins, both live on the `beacon` registration between Phase 0
-(2026-08-23) and the cutover (2026-08-24):
+Two defects this pins, both of which were live on one registration in the origin
+fleet between 2026-08-23 and 2026-08-24:
 
-1. **A user-facing chat caller was in the BACKGROUND band.** Beacon was
-   registered `P3_INGESTION` while it was still framed as a third evaluation
-   surface. After it became the chat brain behind the SPA and SidekickApp, that put
-   every turn a human waits on behind ingestion/hygiene batch work and excluded
-   it from `fast_path_reserve_slots`. Measured at the time: `tier3` p95
-   background wait 583,017 ms, one trivial call 254.9 s.
+1. **A user-facing chat caller was in the BACKGROUND band.** It was registered
+   `P3_INGESTION` while it was still framed as an evaluation surface. After it
+   became the chat brain behind a phone app and a web UI, that put every turn a
+   human waits on behind ingestion/hygiene batch work and excluded it from
+   `fast_path_reserve_slots`. Measured at the time: `tier3` p95 background wait
+   583,017 ms, one trivial call 254.9 s.
 
 2. **A deadline floor ABOVE its own ceiling.** The floor was
    `_SMART_DEFAULT_CAP_S` (1800 s) — the BACKGROUND cap — which is 3x the
    interactive ceiling (600 s). Correct while the caller was background;
-   incoherent the moment it moved. The generic guard below catches this shape
-   for ANY interactive registration, not just Beacon.
+   incoherent the moment it moved, and nothing failed on it.
+
+🚨 The subject changed on 2026-09-01, the doctrine did not. These used to assert
+about specific fleet hosts by address, which is both scrub item S1 and a test
+that could only ever protect one deployment. Defect (2) is now a **load-time
+guard in `identity.py`** that fires for anybody's registration, in either
+registry, and this file drives that guard — including the direction that must
+NOT fire, since a check that reports everything protects nothing.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from roadstead.acl import IPIdentityMap
-from roadstead.config import LLMPriority, ProxyConfig
-from roadstead.constants import (
-    _INTERACTIVE_CEILING_S,
-    _SMART_DEFAULT_CAP_S,
-)
+from roadstead import hooks
+from roadstead.backend import BackendResponse
+from roadstead.config import LLMPriority, PriorityBand, ProxyConfig, priority_to_band
+from roadstead.constants import _INTERACTIVE_CEILING_S, _SMART_DEFAULT_CAP_S
+from roadstead.identity import KeyRegistry
+from roadstead.service import ProxyService
 
 _INTERACTIVE = (LLMPriority.P0_REALTIME, LLMPriority.P1_TURN_SUPPORT)
 
-# Source IPs whose traffic a human is directly waiting on. Beacon is the chat
-# brain as of the 2026-08-24 cutover (GATEWAY_ORCHESTRATOR_URL -> beacon_bridge
-# -> Beacon). If Beacon is ever retired, delete the row rather than demoting it.
-_USER_FACING_CALLERS = {"10.0.0.23": "beacon"}
+
+@pytest.fixture
+def degradations():
+    """Capture what the package reports out through its integration seam."""
+    seen: list[dict] = []
+
+    def sink(*, component, reason, impact, **fields):
+        seen.append({"component": component, "reason": reason,
+                     "impact": impact, **fields})
+
+    hooks.set_degradation_sink(sink)
+    try:
+        yield seen
+    finally:
+        hooks.set_degradation_sink(None)
 
 
-def _acl() -> IPIdentityMap:
-    return IPIdentityMap.from_env()
+# --------------------------------------------------------------------------
+# The band mapping itself.
+# --------------------------------------------------------------------------
 
-
-@pytest.mark.parametrize("ip,expected_id", sorted(_USER_FACING_CALLERS.items()))
-def test_user_facing_callers_are_in_the_interactive_band(ip, expected_id):
-    agent_id, priority = _acl().identify(ip)
-    assert agent_id == expected_id, (
-        f"{ip} resolves to {agent_id!r}, not {expected_id!r} — the ACL row moved "
-        "or the address was reused. A stale source-IP identity is the .12/.18/.19/.86 "
-        "mis-claim class; fix the registration, don't relax this test."
-    )
-    assert priority in _INTERACTIVE, (
-        f"{expected_id} ({ip}) is registered {priority.name}, which is NOT the "
-        "INTERACTIVE band. A human waits on every one of this caller's requests, "
-        "so scheduling it with batch work is a latency regression in the thing "
-        "the user actually feels."
-    )
-
-
-def test_no_interactive_caller_has_a_floor_above_the_interactive_ceiling():
-    """A `min_timeout_s` floor above the band's ceiling is incoherent.
-
-    Generic on purpose: this is the shape that bit `beacon`, and it will bite
-    the next caller promoted from BACKGROUND to INTERACTIVE whose floor is left
-    at `_SMART_DEFAULT_CAP_S`.
-    """
-    ceiling = ProxyConfig().timeout_ceiling_interactive_s
-    acl = _acl()
-    offenders = []
-    for ip in _USER_FACING_CALLERS:
-        _, priority = acl.identify(ip)
-        if priority not in _INTERACTIVE:
-            continue
-        floor = acl.min_timeout_s(ip)
-        if floor is not None and floor > ceiling:
-            offenders.append(f"{ip} floor={floor}s > interactive ceiling={ceiling}s")
-    assert not offenders, (
-        "interactive caller(s) floored above their own ceiling: "
-        + "; ".join(offenders)
-        + f". _SMART_DEFAULT_CAP_S ({_SMART_DEFAULT_CAP_S}s) is the BACKGROUND cap "
-        f"— interactive callers floor at _INTERACTIVE_CEILING_S ({_INTERACTIVE_CEILING_S}s)."
-    )
+def test_the_interactive_band_is_p0_and_p1_only():
+    """The premise both defects rest on. If this mapping ever widens, "put the
+    chat brain in the interactive band" stops meaning what it meant."""
+    assert {p for p in LLMPriority
+            if priority_to_band(p) is PriorityBand.INTERACTIVE} == set(_INTERACTIVE)
 
 
 def test_the_interactive_ceiling_has_one_source_of_truth():
@@ -89,19 +74,117 @@ def test_the_interactive_ceiling_has_one_source_of_truth():
     assert ProxyConfig().timeout_ceiling_interactive_s == _INTERACTIVE_CEILING_S
 
 
-def test_batch_harnesses_stay_in_the_background_band():
-    """The counterweight: promoting Beacon must not drag the batch fleet with it.
+# --------------------------------------------------------------------------
+# Defect 2, generically: a floor above its own ceiling is reported at LOAD.
+# --------------------------------------------------------------------------
 
-    goose/dsh are agentic harnesses doing long unattended work. They belong
-    behind interactive traffic, and `fast_path_reserve_slots` only means anything
-    while something is actually reserved *from*.
-    """
-    acl = _acl()
-    for ip, expected in (("10.0.0.14", "recipe-runner"), ("10.0.0.25", "cli-read"),
-                         ("10.0.0.41", "cli-write")):
-        agent_id, priority = acl.identify(ip)
-        assert agent_id == expected
-        assert priority not in _INTERACTIVE, (
-            f"{expected} ({ip}) is in the INTERACTIVE band; it is unattended batch "
-            "work and would compete with user-facing chat."
-        )
+def test_an_interactive_key_floored_above_its_ceiling_is_reported(degradations):
+    keys = KeyRegistry()
+    keys.register(secret="k", agent_id="chat-brain",
+                  priority=LLMPriority.P1_TURN_SUPPORT,
+                  min_timeout_s=_SMART_DEFAULT_CAP_S, key_id="chat-brain-key")
+    assert len(degradations) == 1, (
+        "an interactive identity floored at the BACKGROUND cap was accepted in "
+        "silence — this is the exact shape that was live for a day")
+    reported = degradations[0]
+    assert reported["component"] == "identity"
+    assert reported["agent_id"] == "chat-brain"
+    assert reported["min_timeout_s"] == _SMART_DEFAULT_CAP_S
+    assert reported["interactive_ceiling_s"] == _INTERACTIVE_CEILING_S
+    # 🚨 It REPORTS, it does not refuse and it does not clamp. Refusing to start
+    # over a policy typo is worse than serving with a loud line, and clamping
+    # would hide the mistake being made.
+    assert keys.resolve("k").min_timeout_s == _SMART_DEFAULT_CAP_S
+
+
+@pytest.mark.parametrize(
+    "priority,floor",
+    [
+        # Background caller, background floor — the case the floor was BUILT for.
+        (LLMPriority.P3_INGESTION, _SMART_DEFAULT_CAP_S),
+        # Interactive caller, a floor at its ceiling — coherent, on the boundary.
+        (LLMPriority.P1_TURN_SUPPORT, _INTERACTIVE_CEILING_S),
+        # Interactive caller, no floor at all — the common case.
+        (LLMPriority.P1_TURN_SUPPORT, None),
+    ],
+)
+def test_coherent_registrations_are_not_reported(degradations, priority, floor):
+    """The counterweight. A guard that fires on the background floor — which is
+    the floor's whole purpose — would be noise an operator learns to ignore, and
+    then it protects nothing."""
+    KeyRegistry().register(secret="k", agent_id="a", priority=priority,
+                           min_timeout_s=floor)
+    assert degradations == []
+
+
+def test_the_two_caps_are_still_three_ceilings_apart():
+    """Why the mistake was available at all: the background cap is 3x the
+    interactive ceiling, so leaving a promoted caller's floor alone yields a
+    floor that can never bind."""
+    assert _SMART_DEFAULT_CAP_S > _INTERACTIVE_CEILING_S
+    assert _SMART_DEFAULT_CAP_S == 1800.0 and _INTERACTIVE_CEILING_S == 600.0
+
+
+# --------------------------------------------------------------------------
+# Defect 1, generically: a registration's band reaches the scheduler.
+# --------------------------------------------------------------------------
+
+class _Req:
+    def __init__(self, host="203.0.113.10", headers=None):
+        class _C:
+            pass
+
+        _C.host = host
+        self.client = _C()
+        self.headers = headers or {}
+        self.method = "POST"
+        self.query_params: dict = {}
+
+
+def _body():
+    # NO `priority` — the whole point is that the registration supplies it.
+    return {"endpoint": "chat", "call_site": "t", "payload_type": "chat_completion",
+            "payload": {"messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 8}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spec,expected_band",
+    [("chat-brain:P1_TURN_SUPPORT", PriorityBand.INTERACTIVE),
+     ("batch-harness:P3_INGESTION", PriorityBand.BACKGROUND)],
+)
+async def test_a_registrations_band_reaches_the_queued_request(
+    monkeypatch, spec, expected_band,
+):
+    """A registered default priority that never reaches the scheduler is a
+    policy nobody can see is wrong — which is how defect 1 survived. Assert the
+    band on the QUEUED REQUEST, not on the registry that declared it."""
+    monkeypatch.setenv("ROADSTEAD_API_KEYS", f"kk={spec}")
+    monkeypatch.delenv("ROADSTEAD_ACL", raising=False)
+    svc = ProxyService(ProxyConfig())
+
+    async def ok_call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
+        return BackendResponse(
+            status_code=200,
+            body={"choices": [{"message": {"content": "y"}, "finish_reason": "stop"}],
+                  "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+            duration_s=0.01, input_tokens=1, output_tokens=1, finish_reason="stop")
+
+    svc._backend.call = ok_call
+    from roadstead import scheduler as _sched
+    created: list = []
+    orig = _sched.QueuedRequest.create.__func__
+    _sched.QueuedRequest.create = classmethod(
+        lambda cls, **kw: created.append(orig(cls, **kw)) or created[-1])
+    await svc.startup()
+    try:
+        r = await asyncio.wait_for(
+            svc.handle_submit(_body(), _Req(headers={"X-API-Key": "kk"})),
+            timeout=10.0)
+        assert r.status_code == 200
+        assert created[-1].band is expected_band
+        assert created[-1].agent_id == spec.split(":")[0]
+    finally:
+        _sched.QueuedRequest.create = classmethod(orig)
+        await svc.shutdown()

@@ -1,115 +1,114 @@
-# Per-agent DRR quota overrides for the centralized LLM proxy.
+# Per-agent DRR quota overrides.
 #
-# Each top-level key is an agent_id (matching what the proxy infers
-# from /proc/self/cmdline — i.e. the leaf module under
-# originfleet.agents.* or originfleet.tools.*). Missing keys fall
-# back to AgentQuotaConfig dataclass defaults:
+# 🚨 THIS IS AN EXAMPLE, and it is also the default — the same arrangement as
+# `models.yaml`. A shipped example that nothing loads rots; this one boots a
+# fresh install and is what the suite runs against, so it cannot. Point
+# `LLM_PROXY_AGENTS_CONFIG` at your own file for a real deployment.
+#
+# Each top-level key is an `agent_id` — the caller identity, which is the DRR
+# fair-share key. Since 2026-09-01 that identity comes from an API key where one
+# is presented (`identity.py`), otherwise from an address registration
+# (`ROADSTEAD_ACL`) or, on `/v1/submit`, from the body. However it is
+# established, the name here must match it: a rename on either side silently
+# opts the caller back out of everything below, with nothing to see.
+#
+# Missing keys fall back to the AgentQuotaConfig dataclass defaults:
 #   weight: 1.0
 #   max_balance_ss: 60.0
 #   default_priority: P1_TURN_SUPPORT
 #
-# Override path: set LLM_PROXY_AGENTS_CONFIG=<path> to point the proxy
-# at a different file (e.g. for tests). Missing file is non-fatal —
-# proxy falls back to lazy-creating defaults.
+# ⚠️ A key not in `config.load_agent_configs`'s parser is SILENTLY IGNORED —
+# adding a knob to AgentQuotaConfig is not enough to make it operator-reachable.
+# Guarded by test_failover.py::test_degrade_ok_reaches_agent_config.
+#
+# --- what the numbers mean ---------------------------------------------------
+#
+# `weight` only matters UNDER CONTENTION, and the head-of-queue-wait starvation
+# rescue already prevents pathology on its own — so these are deliberate nudges,
+# not load-bearing knobs. `max_balance_ss` is how much burst a caller may bank
+# in slot-seconds before DRR fairness starts to bind: size it from what the
+# caller's steady state actually costs (concurrency × typical call duration),
+# not from how important it feels.
 
-forum-agent:
-  # Voice-neutral periodics (digests, author_memory, themes, song_manifest)
-  # default to P3 ingestion band so they yield to sidekick's user turns.
-  # Heavy ticks now run with semaphore(2) in-process, so the steady
-  # state is up to 2 concurrent LLM calls × ~30s each = ~60 slot-
-  # seconds of in-flight cost. 180s of max_balance_ss lets that burst
-  # (~3 full-cost calls) before DRR fairness kicks in. Was 120 — bumped
-  # 2026-05-27 with the lane Lock→Semaphore(2) upgrade. Weight matches
-  # default — forum-agent isn't privileged relative to other agents.
+chat-assistant:
+  # A user-facing conversational surface: a human is waiting on every turn.
+  # Weight 2 so a user turn wins a contended slot against same-band periodic
+  # traffic. The balance covers a normal turn's tool ladder and no more.
+  # `degrade_ok` is the failover opt-in — see the section at the foot of this
+  # file for why this caller is in the set and what it takes to join it.
+  weight: 2.0
+  max_balance_ss: 120.0
+  degrade_ok: true
+
+coding-assistant:
+  # Bursty and unattended-ish: several calls per interaction, each long. The
+  # deeper balance lets one interaction's burst through before fairness binds;
+  # the default weight keeps it from outranking a waiting human.
+  weight: 1.0
+  max_balance_ss: 180.0
+  default_priority: P1_TURN_SUPPORT
+
+summarizer:
+  # Periodic background work. P3 so it yields to interactive turns; a balance
+  # sized for ~2 concurrent calls of ~30s each (≈60 slot-seconds in flight)
+  # with room for a ~3-call burst.
   weight: 1.0
   max_balance_ss: 180.0
   default_priority: P3_INGESTION
 
-# 2026-06-10 data-driven pass (7d /v1/usage?by=agent — the proxy hardening
-# uplift). Weights only matter UNDER CONTENTION; the head-of-queue-wait
-# starvation rescue already prevents pathology, so these are deliberate
-# nudges, not load-bearing knobs.
-
-sidekick:
-  # The user-facing companion: 14.7K req/wk, interactive turns. Weight 2 so a
-  # user turn wins a contended slot against same-band periodic traffic.
-  weight: 2.0
-  max_balance_ss: 120.0
-
-notifier:
-  # Renamed from `orchestrator` 2026-08-30 (F1). The inner tool-calling loop
-  # this block was sized for died with the 2026-08-29 gut — the agent is now a
-  # notification + action bus and makes essentially no LLM calls. The weights
-  # are left at their old values deliberately: re-sizing a DRR share is a
-  # behaviour change, not a rename, and an idle caller costs nothing.
-  weight: 2.0
-  max_balance_ss: 120.0
-
-knowledge:
-  # The fleet's biggest caller (48.5K req/wk, 35M tokens in) — almost all P3
-  # background ingestion that fans out in chunked storms. Default weight (it
-  # should NOT be privileged), but a deeper balance so a legitimate
-  # extraction burst isn't throttled against its own long-run average; the
-  # background band cap still protects interactive headroom.
+extractor:
+  # Typically the heaviest caller by volume — chunked ingestion that fans out in
+  # storms. DEFAULT weight, deliberately: heaviest is not most privileged. The
+  # deeper balance stops a legitimate extraction burst being throttled against
+  # its own long-run average, and the background band cap still protects
+  # interactive headroom.
   weight: 1.0
   max_balance_ss: 240.0
   default_priority: P3_INGESTION
 
+hygiene:
+  # Lowest-urgency maintenance work — reindexing, backfills, cleanup. It should
+  # run only when nothing else wants the slot.
+  weight: 1.0
+  max_balance_ss: 240.0
+  default_priority: P4_HYGIENE
+
 
 # --- degrade_ok: the tier3 failover opt-IN (§ 9.5) ---------------------------
-# When tier3 (`thinker`) is unhealthy, ONLY agents with `degrade_ok: true` are
-# rerouted to tier2-analyst; every other caller gets the same clean 503 it gets
-# today, now labelled and carrying Retry-After. Absent = false.
+# When an endpoint with a declared `failover_to` is unhealthy, ONLY agents with
+# `degrade_ok: true` are rerouted to the smaller model; every other caller gets
+# the same clean 503, now labelled and carrying Retry-After. Absent = false.
 #
-# 🚨 This set GROWS ONE AUDITED AGENT AT A TIME, through the normal audit cycle
-# (audit_dimensions.md § E9). It is not a migration and has no completion date.
-# The question each audit answers is "may this agent's tier3 calls be served by
-# a smaller model?", and recording a NO is as much of an answer as a yes.
+# 🚨 This set GROWS ONE AUDITED CALLER AT A TIME. It is not a migration and has
+# no completion date. The question each audit answers is "may this caller's work
+# be served by a smaller model?", and recording a NO is as much of an answer as
+# a yes — a degraded answer is a WORSE answer, and who can absorb one is a
+# judgement, never a default.
 #
-# Granularity is per-AGENT by operator decision (2026-08-19), with a known cost:
-# an agent doing both conversational and authoring/extraction work is in or out
-# as a whole. Where that bites, the EXTRACTION path governs and the agent stays
-# OUT — so sidekick, whose chat turns would degrade fine, is not here, because her
-# one-shot authoring deliberately wants tier3.
+# The test that has held up across every audit: **is the output RETRACTABLE by
+# the person reading it?** A conversational turn is — the person who asked is
+# the person reading, in the same turn, and can undo it by replying. A public
+# broadcast is not, however conversational it looks, because the audience cannot
+# reply it away. That distinction is the one most often got wrong.
+#
+# Granularity is per-CALLER, with a known cost: a caller doing both
+# conversational and authoring/extraction work is in or out as a whole. Where
+# that bites, the EXTRACTION path governs and the caller stays OUT.
 
-discord:
-  # DAY-1 SEED, and deliberately the only one. Chosen so the path runs in
-  # PRODUCTION rather than only in the journey — a failover that never fires is
-  # the guard-that-reads-green failure class.
-  #  * Conversational: its output is retractable by the person replying, which
-  #    is the house rule's own test for what may be softened without a code gate.
-  #  * ~200 requests/24h — the smallest real blast radius available.
-  # Two near-misses, recorded so they are not re-proposed:
-  #  * `dj` looks obvious and is NOT: its output is a public broadcast and a
-  #    listener cannot undo it by replying.
-  #  * `knowledge_store` is the canonical NEVER — 12,570 req and 64.7M input
-  #    tokens/24h, all of it extraction into durable state.
-  degrade_ok: true
-
-beacon:
-  # ADDED 2026-08-29 on operator decision, the second member of this set.
-  # Beacon (Kestrel CTnnn) is the operator's own agentic chat surface, and the
-  # ask came from the failure it caused: during a tier3 outage that morning
-  # every Beacon turn was refused outright, when a smaller model would have
-  # answered. A degraded answer he can read and reply to beats no answer.
-  #  * Conversational and RETRACTABLE — the house test for what may be
-  #    softened without a code gate. The person reading the reply is the same
-  #    person who asked, in the same turn, and can undo it by replying.
-  #  * Its outward-facing ACTIONS are not gated by which model served the
-  #    turn: `agent.disabled_toolsets` (the fleet floor in
-  #    infra/beacon/config/templates/config.yaml) and `approvals.mode: smart`
-  #    both sit downstream of routing and are unchanged by a degrade. This
-  #    matters because Beacon has a terminal and a browser — the answer to
-  #    "may a smaller model drive those?" is yes ONLY because the same
-  #    approval gate stands in front of them either way.
-  #  * NOT an extraction path. Beacon writes nothing into fleet durable state;
-  #    its memory writes go through the pending-approval sidecar, which is a
-  #    human gate, not a silent one. That is what keeps it out of the
-  #    `knowledge_store` class, where the extraction rule says stay OUT.
-  # Context: tier2-analyst (`creative`) is 262,144/slot against tier3's 1M, and
-  # Beacon carries a ~49KB skills prompt — comfortably inside, but a very long
-  # session can still trip Gate 2 and be refused with `degraded_context_overflow`
-  # rather than truncated. That refusal is correct; do not "fix" it by trimming.
-  degrade_ok: true
-
-# (Other agents not listed here use AgentQuotaConfig defaults.)
+# `chat-assistant` above carries the seed `degrade_ok: true`, and deliberately
+# as the only one to start with — so the failover path runs in PRODUCTION rather
+# than only in a test. A path that never fires is the guard-that-reads-green
+# failure class. It qualifies because:
+#  * it is conversational and retractable, per the test above;
+#  * its outward-facing ACTIONS are not gated by which model served the turn.
+#    Where a caller has a terminal or a browser, the answer to "may a smaller
+#    model drive those?" is yes ONLY because the same approval gate stands in
+#    front of them either way;
+#  * it is not an extraction path — it writes nothing into durable state that a
+#    human does not see first.
+#
+# `extractor` is the canonical NEVER, and is left at the default rather than
+# written out as `degrade_ok: false`: everything it produces goes into durable
+# state that nobody re-reads, so a quietly worse answer is a permanent one.
+#
+# (Any caller not listed here uses the AgentQuotaConfig defaults.)

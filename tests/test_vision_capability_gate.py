@@ -164,6 +164,17 @@ def _image_body(endpoint: str) -> dict:
     }
 
 
+class _LoopbackReq:
+    """The minimum a request double needs to be identified: a source address."""
+
+    class _Client:
+        host = "127.0.0.1"
+
+    client = _Client()
+    headers: dict = {}
+    method = "POST"
+
+
 @pytest.mark.asyncio
 async def test_image_to_a_blind_endpoint_is_counted_and_refused_when_armed():
     from roadstead.service import ProxyService
@@ -178,7 +189,12 @@ async def test_image_to_a_blind_endpoint_is_counted_and_refused_when_armed():
     # (§11 lesson 6). Resolve it the same way the gate does.
     resolved = svc._lifecycle.resolve_endpoint(body)
 
-    resp = await svc._lifecycle.handle_submit(body, None, openai=False)
+    # A loopback request double rather than ``None``: since Workstream B
+    # (2026-09-01) ``handle_submit`` identifies the caller BEFORE it reads the
+    # body, and a request with no source address is refused 403 — fail-closed is
+    # the point. This test is about the vision gate, so give it a caller the
+    # default ACL admits.
+    resp = await svc._lifecycle.handle_submit(body, _LoopbackReq(), openai=False)
 
     assert resp.status_code == 400
     tally = svc._state.vision_capability_violations.get(resolved)

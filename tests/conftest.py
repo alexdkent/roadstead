@@ -4,9 +4,9 @@ The capacity poller probes backends (/health for skip_discovery shims,
 /props + /v1/models otherwise) starting with its FIRST iteration after
 ``ProxyService.startup()`` — which most tests call. This autouse fixture
 stubs every probe at the BackendClientPool *class* level so a test that
-forgets to stub them can never issue a real HTTP call to the inference
-hosts (10.0.0.3/.6 are reachable from the dev Mac AND the container, so a
-leak would silently "work" locally and flake elsewhere).
+forgets to stub them can never issue a real HTTP call to an inference host.
+A leak is worst when it SUCCEEDS: on the machine where the backends are
+reachable it silently "works", and flakes everywhere else.
 
 Tests that exercise probe behaviour set ``svc._backend.probe_* = ...``
 INSTANCE attributes, which shadow these class stubs — the existing pattern
@@ -150,9 +150,9 @@ _redirect_scratch_to_tmpfs()
 #: stubs by name, so a probe added later was simply absent and therefore NOT
 #: stubbed — it made REAL calls to real fleet hosts from a unit test. Caught
 #: 2026-08-24 when `probe_model_fingerprint` and `probe_thinking_switch`
-#: landed: the e2e suite went 1.3s -> 61-181s because the poller was dialling
-#: 10.0.0.3, and `probe_thinking_switch` would have run a real GENERATION
-#: against live tier3 from `pytest`. The tests still PASSED — only teardown
+#: landed: the e2e suite went 1.3s -> 61-181s because the poller was dialling a
+#: real backend, and `probe_thinking_switch` would have run a real GENERATION
+#: against a live tier3 from `pytest`. The tests still PASSED — only teardown
 #: timed out — which is exactly how a gap like this survives unnoticed.
 #:
 #: The list stays (blocking the transport wholesale breaks the ~84 tests that

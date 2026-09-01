@@ -115,7 +115,7 @@ def _make_ep_cfg(**kwargs) -> EndpointConfig:
     defaults = dict(
         endpoint_class="tier3", role="tier3",
         max_slots=4, dispatch_concurrency_cap=3,
-        slot_affinity=True, host="10.0.0.6", port=8081,
+        slot_affinity=True, host="192.0.2.10", port=8081,
     )
     defaults.update(kwargs)
     return EndpointConfig(**defaults)

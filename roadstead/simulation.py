@@ -479,20 +479,25 @@ class SimRunner:
 # Built-in scenarios
 # ---------------------------------------------------------------------------
 
+#: The default scenario roster. The NAMES are the caller archetypes
+#: ``docs/roadmap.md`` describes — they were one deployment's agent roster until
+#: 2026-09-01, which made a shipped simulation a readout of somebody's private
+#: system. The measured SHAPES (arrival rate, token sizes, priority mix, weight)
+#: are unchanged: those came from real traffic and are the part worth having.
 REALISTIC_AGENTS = [
-    AgentProfile("orchestrator", rate_rps=0.5, priority_mix={"P0_REALTIME": 0.3, "P1_TURN_SUPPORT": 0.7},
+    AgentProfile("chat-assistant", rate_rps=0.5, priority_mix={"P0_REALTIME": 0.3, "P1_TURN_SUPPORT": 0.7},
                  endpoints=["tier3", "tier1", "tier1"], avg_input_tokens=4000,
                  avg_output_tokens=500, weight=2.0),
-    AgentProfile("knowledge", rate_rps=2.0, priority_mix={"P1_TURN_SUPPORT": 0.4, "P3_INGESTION": 0.6},
+    AgentProfile("extractor", rate_rps=2.0, priority_mix={"P1_TURN_SUPPORT": 0.4, "P3_INGESTION": 0.6},
                  endpoints=["tier2", "embed", "rerank"], avg_input_tokens=3000,
                  avg_output_tokens=200, weight=1.5),
-    AgentProfile("forum-agent", rate_rps=0.8, priority_mix={"P3_INGESTION": 1.0},
+    AgentProfile("summarizer", rate_rps=0.8, priority_mix={"P3_INGESTION": 1.0},
                  endpoints=["tier3"], avg_input_tokens=5000, avg_output_tokens=400),
-    AgentProfile("mail-agent", rate_rps=0.3, priority_mix={"P3_INGESTION": 1.0},
+    AgentProfile("ingest", rate_rps=0.3, priority_mix={"P3_INGESTION": 1.0},
                  endpoints=["tier2", "tier1"], avg_input_tokens=2000, avg_output_tokens=150),
-    AgentProfile("sidekick", rate_rps=0.2, priority_mix={"P1_TURN_SUPPORT": 0.5, "P3_INGESTION": 0.5},
+    AgentProfile("coding-assistant", rate_rps=0.2, priority_mix={"P1_TURN_SUPPORT": 0.5, "P3_INGESTION": 0.5},
                  endpoints=["tier2", "tier3"], avg_input_tokens=1500, avg_output_tokens=100),
-    AgentProfile("homeassistant", rate_rps=0.1, priority_mix={"P1_TURN_SUPPORT": 0.8, "P3_INGESTION": 0.2},
+    AgentProfile("voice-frontend", rate_rps=0.1, priority_mix={"P1_TURN_SUPPORT": 0.8, "P3_INGESTION": 0.2},
                  endpoints=["tier1", "tier3"], avg_input_tokens=1000, avg_output_tokens=100),
 ]
 
@@ -510,7 +515,7 @@ def _scenario_all_agents_burst() -> Scenario:
 def _scenario_one_agent_flood() -> Scenario:
     agents = list(REALISTIC_AGENTS)
     agents[0] = AgentProfile(
-        "orchestrator", rate_rps=10.0, priority_mix={"P1_TURN_SUPPORT": 1.0},
+        "chat-assistant", rate_rps=10.0, priority_mix={"P1_TURN_SUPPORT": 1.0},
         endpoints=["tier3"], avg_input_tokens=4000, avg_output_tokens=500, weight=2.0,
     )
     return Scenario("one_agent_flood", duration_s=60, agents=agents)
@@ -551,12 +556,12 @@ def _scenario_new_agent() -> Scenario:
 
 def _scenario_turn_storm() -> Scenario:
     agents = [
-        AgentProfile("orchestrator", rate_rps=3.0, priority_mix={"P0_REALTIME": 0.5, "P1_TURN_SUPPORT": 0.5},
+        AgentProfile("chat-assistant", rate_rps=3.0, priority_mix={"P0_REALTIME": 0.5, "P1_TURN_SUPPORT": 0.5},
                      endpoints=["tier3", "tier1"], avg_input_tokens=4000,
                      avg_output_tokens=500, weight=2.0),
-        AgentProfile("knowledge", rate_rps=4.0, priority_mix={"P3_INGESTION": 1.0},
+        AgentProfile("extractor", rate_rps=4.0, priority_mix={"P3_INGESTION": 1.0},
                      endpoints=["tier2", "embed"], avg_input_tokens=3000, avg_output_tokens=200),
-        AgentProfile("forum-agent", rate_rps=2.0, priority_mix={"P3_INGESTION": 1.0},
+        AgentProfile("summarizer", rate_rps=2.0, priority_mix={"P3_INGESTION": 1.0},
                      endpoints=["tier3"], avg_input_tokens=5000, avg_output_tokens=400),
     ]
     return Scenario("turn_storm", duration_s=60, agents=agents)

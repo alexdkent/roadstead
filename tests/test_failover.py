@@ -71,7 +71,7 @@ def _well(svc, ep=SRC):
         "healthy": True, "consecutive_failures": 0, "unhealthy_since": None}
 
 
-def _req(agent="discord", endpoint=SRC, tokens=50, max_tokens=256,
+def _req(agent="chat-assistant", endpoint=SRC, tokens=50, max_tokens=256,
          priority=LLMPriority.P1_TURN_SUPPORT):
     """A chat request whose estimated input size is controllable.
 
@@ -104,20 +104,20 @@ def test_degrade_ok_reaches_agent_config():
     not opted in.
     """
     cfgs = load_agent_configs()
-    assert cfgs["discord"].degrade_ok is True, (
-        "the day-1 opt-in seed did not survive the agents.yaml parser")
-    # beacon joined the set on 2026-08-29 (operator decision, after a tier3
-    # outage refused every one of its turns). Pinned by NAME because the agent
-    # id is what Gate 1 reads: llmproxy/acl.py registers 10.0.0.23 as "beacon",
-    # and a rename there would silently opt it back out.
-    assert cfgs["beacon"].degrade_ok is True, (
-        "beacon lost its tier3 failover opt-in — during a tier3 outage every "
-        "Beacon turn goes back to a hard 503 instead of degrading to "
-        "tier2")
-    # Default-deny is the property that matters most, so assert it on a real
-    # agent that IS in the file (i.e. the parser ran for it) rather than on an
-    # absent key, which would pass even if the parser were dead.
-    assert cfgs["sidekick"].degrade_ok is False
+    # Pinned by NAME because the agent id is what Gate 1 reads — whatever
+    # establishes the identity (an API key, or an address registration) has to
+    # agree with the name in agents.yaml, and a rename on either side silently
+    # opts the caller back out with nothing to see.
+    assert cfgs["chat-assistant"].degrade_ok is True, (
+        "the opt-in seed did not survive the agents.yaml parser — during a "
+        "tier3 outage every one of this caller's turns goes back to a hard 503 "
+        "instead of degrading to tier2")
+    # Default-deny is the property that matters most, so assert it on a caller
+    # that IS in the file (i.e. the parser ran for it) rather than on an absent
+    # key, which would pass even if the parser were dead. `extractor` is also
+    # the canonical NEVER: its output goes into durable state nobody re-reads,
+    # so a quietly worse answer is a permanent one.
+    assert cfgs["extractor"].degrade_ok is False
 
 
 def test_dwell_reaches_endpoint_config():
@@ -260,7 +260,7 @@ def test_opted_in_agent_is_rerouted(svc):
     _sick(svc)
     fo = svc._state.failover
     fo.refresh()
-    plan = fo.plan(_req(agent="discord"))
+    plan = fo.plan(_req(agent="chat-assistant"))
     assert plan.rerouted and plan.target == TGT
 
 
@@ -310,10 +310,10 @@ def test_oversized_request_is_refused_not_truncated(svc):
     ctx = svc._state.config.endpoints[TGT].context_per_slot
     assert ctx > 0
 
-    fits = _req(agent="discord", tokens=ctx // 4, max_tokens=256)
+    fits = _req(agent="chat-assistant", tokens=ctx // 4, max_tokens=256)
     assert fo.plan(fits).rerouted, "a request that fits was refused"
 
-    too_big = _req(agent="discord", tokens=ctx + 5_000, max_tokens=256)
+    too_big = _req(agent="chat-assistant", tokens=ctx + 5_000, max_tokens=256)
     plan = fo.plan(too_big)
     assert not plan.rerouted
     assert plan.refusal_code == failover_mod.CODE_CONTEXT_OVERFLOW
@@ -330,10 +330,10 @@ def test_max_tokens_counts_toward_the_fit(svc):
     fo = svc._state.failover
     fo.refresh()
     ctx = svc._state.config.endpoints[TGT].context_per_slot
-    near = _req(agent="discord", tokens=(ctx - 1000) // 4, max_tokens=64)
+    near = _req(agent="chat-assistant", tokens=(ctx - 1000) // 4, max_tokens=64)
     assert fo.plan(near).rerouted
     same_input_huge_output = _req(
-        agent="discord", tokens=(ctx - 1000) // 4, max_tokens=ctx)
+        agent="chat-assistant", tokens=(ctx - 1000) // 4, max_tokens=ctx)
     assert not fo.plan(same_input_huge_output).rerouted
 
 
@@ -341,7 +341,7 @@ def test_no_reroute_when_not_degraded(svc):
     """A healthy fleet must never execute a reroute, whatever the opt-in says."""
     fo = svc._state.failover
     fo.refresh()
-    assert not fo.plan(_req(agent="discord")).rerouted
+    assert not fo.plan(_req(agent="chat-assistant")).rerouted
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +352,7 @@ def test_apply_repoints_routing_and_records_the_origin(svc):
     _sick(svc)
     fo = svc._state.failover
     fo.refresh()
-    req = _req(agent="discord")
+    req = _req(agent="chat-assistant")
     deadline_before = req.timeout_deadline
     fo.apply(req, TGT)
 
@@ -376,7 +376,7 @@ def test_rerouted_request_queues_and_is_costed_on_the_target(svc):
     _sick(svc)
     fo = svc._state.failover
     fo.refresh()
-    req = _req(agent="discord")
+    req = _req(agent="chat-assistant")
     fo.apply(req, TGT)
     svc._state.scheduler.enqueue(req)
     assert svc._state.scheduler.queue_depth(TGT) == 1
@@ -394,7 +394,7 @@ def test_fast_fail_interactive_reroutes_an_opted_in_request(svc):
     without this they are the one group that fails during the very outage the
     failover exists to absorb."""
     st = svc._state
-    req = _req(agent="discord", priority=LLMPriority.P0_REALTIME)
+    req = _req(agent="chat-assistant", priority=LLMPriority.P0_REALTIME)
     assert req.band == PriorityBand.INTERACTIVE
     st.scheduler.enqueue(req)
     released: list = []
@@ -442,7 +442,7 @@ def test_status_exposes_a_set_not_a_per_endpoint_bool(svc):
     fo.refresh()
     refused = _req(agent="knowledge_store")         # a refusal
     fo.record_refusal(refused, fo.plan(refused))
-    req = _req(agent="discord")
+    req = _req(agent="chat-assistant")
     fo.apply(req, TGT)                            # a reroute
 
     s = fo.status()
@@ -487,7 +487,7 @@ def test_failover_target_is_never_on_demand(svc):
         _sick(svc)
         st.failover.refresh()
         assert SRC not in st.degraded_endpoints
-        assert not st.failover.plan(_req(agent="discord")).rerouted
+        assert not st.failover.plan(_req(agent="chat-assistant")).rerouted
     finally:
         st.on_demand.manages = real_manages
 

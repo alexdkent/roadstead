@@ -1,7 +1,27 @@
-"""IP-based access control for LAN consumers.
+"""Address-based access control — the SECOND factor, behind API keys.
 
-Maps source IPs to agent identities for external services that use
-the proxy's OpenAI-compatible endpoints.
+Maps a source IP to a caller identity. This was the proxy's only identity
+mechanism until 2026-09-01, when ``identity.py`` made an API key the primary
+one; an address now fills in an identity that no credential established.
+
+🚨 **It ships no addresses.** Until 2026-09-01 this file carried a private
+fleet's LAN registrations — ten hosts by address, role and purpose, compiled
+into the package (scrub item S1, ``docs/corpus_and_scrub_plan.md``). They are
+gone, and the environment is now the ONLY way to register one. Two spellings for
+one registration is how they come to disagree, and a shipped default that
+happens to match somebody's LAN is worse than no default at all: it hands an
+identity — and a DRR share — to whatever answers at an address we guessed.
+
+What that means for a fresh install: **loopback and docker-internal are allowed;
+everything else is refused until enrolled.** Default-deny is the right posture
+for a door that hands out capacity, and the local-first case (a proxy on the
+machine that calls it) works with no configuration at all.
+
+The registrations that were here are not lost — the *reasoning* in them was
+about shapes, not addresses, and the two that generalise now live where they can
+apply to anybody's config: the deadline floor for a caller that supplies no
+deadline of its own (``Lifecycle.handle_submit``), and the refusal to floor an
+interactive caller above its own ceiling (``identity._warn_if_floor_exceeds_ceiling``).
 """
 
 from __future__ import annotations
@@ -14,7 +34,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 from .config import LLMPriority
-from .constants import _INTERACTIVE_CEILING_S, _SMART_DEFAULT_CAP_S
+from .identity import parse_identity_spec
 
 
 @dataclass(frozen=True)
@@ -36,7 +56,8 @@ class IPIdentityMap:
     deliberately still returns the 2-tuple ``(agent_id, priority)``: widening
     it would churn every call site and every existing assertion for a field
     only ONE code path cares about. The floor is read through its own
-    ``min_timeout_s()`` lookup instead.
+    ``min_timeout_s()`` lookup instead, and the whole record through
+    ``identity.IdentityResolver``, which is what the request path now uses.
     """
 
     def __init__(self) -> None:
@@ -50,18 +71,19 @@ class IPIdentityMap:
             ipaddress.ip_network("::1/128"),
         ]
         # Admin surfaces (drain/pause, maintenance, flags, calls-log ingest) accept
-        # the internal nets PLUS an explicit allow-list — deliberately SEPARATE from
-        # _internal_nets so granting admin never changes a host's inference
-        # PRIORITY (identify() matches _internal_nets first, before subnet
-        # entries — see is_admin). anvil (10.0.0.3) is granted admin: originally
-        # (2026-07-09) for the classify-evict pause/resume, but anvil also depends
-        # on it for its HEALTH TELEMETRY path — a brief 2026-07-11 removal (after
-        # classify re-homed off anvil) broke anvil health telemetry on the
-        # Systems page, so it is KEPT. DO NOT remove even though classify eviction is
-        # now inert: anvil has other admin-gated proxy dependencies.
-        self._admin_nets = list(self._internal_nets) + [
-            ipaddress.ip_network("10.0.0.3/32"),
-        ]
+        # the internal nets PLUS whatever ``ROADSTEAD_ADMIN_NETS`` adds —
+        # deliberately SEPARATE from _internal_nets so granting admin never
+        # changes a host's inference PRIORITY (identify() matches _internal_nets
+        # first, before subnet entries — see is_admin).
+        #
+        # The list ships with the internal nets only. It previously carried one
+        # fleet host by address, granted for a control-plane call and then kept
+        # because a health-telemetry path turned out to depend on it too — a good
+        # illustration of why an admin grant is an operator decision and not a
+        # package default: nobody could tell, from here, what would break by
+        # removing it. An API key with the ``admin`` scope is now the better
+        # answer; this stays for the pre-key deployment shape.
+        self._admin_nets = list(self._internal_nets)
 
     def register(
         self,
@@ -79,6 +101,15 @@ class IPIdentityMap:
                 self._subnets.append((net, reg))
         except ValueError:
             logger.warning("invalid IP/subnet in ACL: %s", ip_or_subnet)
+
+    def register_admin_net(self, ip_or_subnet: str) -> None:
+        """Extend the admin allow-list. Identity and PRIORITY are untouched —
+        granting admin to a host must never quietly promote its inference
+        traffic into a better band."""
+        try:
+            self._admin_nets.append(ipaddress.ip_network(ip_or_subnet, strict=False))
+        except ValueError:
+            logger.warning("invalid IP/subnet in admin nets: %s", ip_or_subnet)
 
     def _lookup(self, remote_ip: str) -> _Registration | None:
         """Resolve an IP to its registration, or None if unregistered.
@@ -128,18 +159,21 @@ class IPIdentityMap:
 
     def is_admin(self, remote_ip: str) -> bool:
         """Admin surfaces (drain/pause, maintenance windows, runtime flags,
-        calls-log ingest) accept ONLY loopback + docker-internal sources.
+        calls-log ingest) accept loopback + docker-internal sources, plus
+        anything ``ROADSTEAD_ADMIN_NETS`` adds.
 
-        The generic ``identify`` ACL passes the whole LAN (the
-        ``10.0.0.0/24 → lan-generic`` entry), which is fine for INFERENCE but
-        let any LAN device pause a backend fleet-wide. :42161 is container-
-        internal (port not published) and every legitimate admin caller goes
-        through ``docker exec curl localhost`` (restart_llm.sh) or the gateway
-        on loopback — verified by the admin-audit IP log before tightening
-        (2026-06-10: 127.0.0.1 only). 2026-07-09: anvil (10.0.0.3) added to
-        _admin_nets — needed for classify-evict AND the anvil health-telemetry
-        path (removing it broke anvil telemetry on the Systems page); KEEP it
-        (see __init__)."""
+        Deliberately NARROWER than ``identify``: an operator who enrols a whole
+        LAN subnet for inference has said nothing about who may pause a backend
+        fleet-wide, and the two decisions must not be the same decision. In the
+        origin deployment the admin port was container-internal and every
+        legitimate caller arrived on loopback; an audit of real admin source IPs
+        before the surface was tightened found exactly that.
+
+        🚨 This is the address answer to a question API keys answer better. When
+        a key is presented, ``identity.IdentityResolver.is_admin`` reads the
+        key's ``admin`` scope and does NOT consult this at all — see its
+        docstring for why an authenticated non-admin must not inherit its host's
+        privileges."""
         try:
             addr = ipaddress.ip_address(remote_ip)
         except ValueError:
@@ -148,142 +182,55 @@ class IPIdentityMap:
 
     @classmethod
     def from_env(cls) -> "IPIdentityMap":
-        """Build from environment variables.
+        """Build from the environment. Ships no registrations of its own.
 
-        LLM_PROXY_ACL entries are comma-separated: ``ip=agent_id[:priority]``
-        e.g. ``10.0.0.9=tideway:P3_INGESTION,10.0.0.0/24=lan:P3_INGESTION``
+        ``ROADSTEAD_ACL`` entries are comma-separated
+        ``ip_or_subnet=agent_id[:priority][:min_timeout_s][:admin]``, e.g.::
+
+            ROADSTEAD_ACL=192.0.2.9=tideway:P3_INGESTION,192.0.2.0/24=lan:P3_INGESTION:1800
+
+        The right-hand side is the same grammar API keys use
+        (``identity.parse_identity_spec``) — segments are recognised by shape,
+        so their order does not matter and any of them may be omitted. ``admin``
+        on an entry ALSO adds that address to the admin nets, which is the one
+        place the two decisions are made together, because an operator writing
+        ``=ops:admin`` plainly means both.
+
+        ``ROADSTEAD_ADMIN_NETS`` is a comma-separated CIDR list for hosts that
+        need the control plane but no inference identity.
+
+        ``LLM_PROXY_ACL`` is still read, for the pre-rename deployments. It is
+        the ONE legacy spelling kept here, and only because it configures access
+        — a proxy that silently stops recognising its callers on upgrade fails
+        closed in the most confusing possible way. Both are read when both are
+        set; ``ROADSTEAD_ACL`` is applied second and therefore wins a collision.
         """
         acl = cls()
-        raw = os.environ.get("LLM_PROXY_ACL", "")
-        for entry in raw.split(","):
-            entry = entry.strip()
-            if not entry or "=" not in entry:
-                continue
-            ip_part, id_part = entry.split("=", 1)
-            if ":" in id_part:
-                agent_id, pri_str = id_part.rsplit(":", 1)
-                try:
-                    priority = LLMPriority.coerce(pri_str)
-                except ValueError:
-                    priority = LLMPriority.P3_INGESTION
-            else:
-                agent_id = id_part
-                priority = LLMPriority.P3_INGESTION
-            acl.register(ip_part.strip(), agent_id.strip(), priority)
+        for var in ("LLM_PROXY_ACL", "ROADSTEAD_ACL"):
+            raw = os.environ.get(var, "")
+            if raw and var == "LLM_PROXY_ACL":
+                logger.warning(
+                    "LLM_PROXY_ACL is the pre-rename spelling; it is still "
+                    "honoured, but rename it to ROADSTEAD_ACL.")
+            for entry in raw.split(","):
+                entry = entry.strip()
+                if not entry or "=" not in entry:
+                    if entry:
+                        logger.warning(
+                            "%s: skipping malformed entry %r (expected "
+                            "<ip-or-subnet>=<agent_id>[:priority][:min_timeout_s][:admin])",
+                            var, entry)
+                    continue
+                ip_part, spec = entry.split("=", 1)
+                agent_id, priority, floor, admin = parse_identity_spec(spec.strip())
+                ip_part = ip_part.strip()
+                acl.register(ip_part, agent_id, priority, min_timeout_s=floor)
+                if admin:
+                    acl.register_admin_net(ip_part)
 
-        # Always register known infrastructure
-        acl.register("10.0.0.9", "tideway", LLMPriority.P3_INGESTION)
-        acl.register("10.0.0.6", "nexus-local", LLMPriority.P3_INGESTION)
-        acl.register("10.0.0.3", "anvil-local", LLMPriority.P3_INGESTION)
-        # recipe-runner (Kestrel CTnnn, static 10.0.0.14). The Goose CLI's own LLM
-        # provider hits the OpenAI-compat door (NEXUS_URL=…:42161/v1,
-        # GOOSE_MODEL=llama-thinker) as a plain OpenAI client — no identity
-        # header — so without this it fell through to `lan-generic`, hiding the
-        # fleet's single highest-volume OpenAI-door caller (~9k calls, mostly
-        # thinker) behind the catch-all. Identity-only fix: same P3 tier it
-        # already got via the subnet default, so QoS is unchanged. (2026-07-12)
-        acl.register("10.0.0.14", "recipe-runner", LLMPriority.P3_INGESTION)
-        # cli-read (jetty CTnnn, static 10.0.0.25) and cli-write (jetty CTnnn,
-        # static 10.0.0.41), created 2026-08-22 — see
-        # docs/dsh_builder_containers_plan_2026-08.md. Same situation as goose
-        # above: dsh reaches the proxy through a plain
-        # OpenAI-compatible route with no identity header, so without these two
-        # lines both land in `lan-generic` and are invisible in
-        # `proxy_completions`. Registered in CODE, not via LLM_PROXY_ACL,
-        # because container env is baked at `docker run` and an env change would
-        # force a permission-gated full-fleet re-run for a one-line identity fix.
-        #
-        # Registered SEPARATELY rather than as two aliases of one `dsh`
-        # identity because they are the READ and WRITE halves of a deliberate
-        # blast-radius split, and the day tier3 needs to shed load from the
-        # write lane but not the read lane, QoS attribution has to be able to
-        # tell them apart. Same P3 tier the subnet default already gave them, so
-        # this changes attribution, not priority.
-        #
-        # min_timeout_s: identical reasoning to recipe-runner above — dsh
-        # supplies NO deadline of its own, so it gets the smart default, whose
-        # size_stretch clamp binds long before any per-role ceiling. The floor
-        # raises it to the cap the smart default may already reach rather than
-        # inventing a new bound; an explicit caller deadline still wins.
-        #
-        # 🚨 BOTH ADDRESSES SIT INSIDE THE DHCP DYNAMIC POOL
-        # (dhcp-range=10.0.0.20,10.0.0.254) and are protected only by their
-        # dnsmasq reservations (added the same day via opnsense_netctl). If
-        # either CT is ever destroyed, DELETE ITS REGISTRATION HERE TOO —
-        # leaving a stale source-IP identity would silently misattribute
-        # whatever takes the address next — which is exactly why the two pool CT
-        # registrations that used to sit here were deleted WITH their CTs on
-        # 2026-08-26, rather than left behind pointing at .17/.20.
-        acl.register("10.0.0.25", "cli-read", LLMPriority.P3_INGESTION,
-                     min_timeout_s=_SMART_DEFAULT_CAP_S)
-        acl.register("10.0.0.41", "cli-write", LLMPriority.P3_INGESTION,
-                     min_timeout_s=_SMART_DEFAULT_CAP_S)
-        # pool-analyst (Kestrel CTnnn, 10.0.0.23) was registered here from
-        # 2026-08-14 until the CT was DESTROYED 2026-08-20, and the registration
-        # was removed with it — exactly the doctrine this file follows every
-        # time an address is reused (.12/.18/.19/.86 mis-claim class): don't
-        # leave a stale source-IP identity for whatever takes the address next.
-        #
-        # beacon (Kestrel CTnnn, 10.0.0.23) — a DIFFERENT CT reusing the freed
-        # .23, deliberately, per docs/beacon_container_and_orchestrator_replacement_plan_2026-08.md
-        # §1/§2, Phase 0 (2026-08-23). Same situation as goose/dsh above:
-        # the Beacon CLI's bundled "custom" provider is a plain OpenAI-compat
-        # client with no identity header, so without this line its traffic
-        # lands in `lan-generic` and is invisible in `proxy_completions`.
-        # 🚨 INTERACTIVE, not P3 — and unlike every other LAN registration here.
-        # goose/dsh are batch agentic harnesses and belong in the BACKGROUND
-        # band. Beacon is NOT one of those any more: as of the 2026-08-24 cutover
-        # it IS the chat brain behind the SPA and SidekickApp, so a human is sitting
-        # and waiting on every one of its calls.
-        #
-        # It was registered P3_INGESTION at Phase 0, when the plan still framed it
-        # as a third evaluation surface. Leaving it there after the cutover put
-        # every user-facing chat turn in the BACKGROUND band
-        # (config.PriorityBand: INTERACTIVE = P0/P1, BACKGROUND = P3/P4) — behind
-        # ingestion and hygiene batch work, and excluded from
-        # fast_path_reserve_slots. Measured during the cutover investigation:
-        # `thinker` p95 background wait reached 583,017 ms and one trivial call
-        # took 254.9 s. The orchestrator it replaced runs its chat turns at
-        # P0_REALTIME/P1_TURN_SUPPORT, so P3 was a straight regression in the
-        # thing the user actually feels.
-        #
-        # P1_TURN_SUPPORT rather than P0_REALTIME deliberately: Beacon sends no
-        # priority header, so EVERY call it makes takes this default, and its
-        # tool ladder issues ~4 per turn. P0 is left for the genuinely
-        # latency-critical realtime lane (voice) rather than being claimed four
-        # times per chat turn. P1 is still INTERACTIVE, which is what buys the
-        # reserved fast-path slots.
-        #
-        # min_timeout_s: same reasoning as goose/dsh — Beacon supplies no
-        # deadline of its own (config-side request_timeout_seconds is a client
-        # socket timeout, not an X-Timeout-S header), so the floor hands it the
-        # full band window. 🚨 But the number MUST track the band: the background
-        # cap `_SMART_DEFAULT_CAP_S` (1800s) is ABOVE the interactive ceiling
-        # (`timeout_ceiling_interactive_s`, 600s), so keeping it here would set a
-        # floor higher than its own ceiling. Longest turn measured end-to-end was
-        # ~54 s, so 600 s is ~11x headroom.
-        # 🚨 .23 SITS INSIDE THE DHCP DYNAMIC POOL, protected only by the
-        # dnsmasq reservation added the same day via opnsense_netctl (see
-        # infra/firewall/host_inventory.yaml's `beacon` row). The reservation,
-        # this ACL line, and the CT are ONE UNIT — if CTnnn/beacon is ever
-        # destroyed, delete this registration with it, same as the pool CTs
-        # above and cli-read/cli-write's own warning.
-        acl.register("10.0.0.23", "beacon", LLMPriority.P1_TURN_SUPPORT,
-                     min_timeout_s=_INTERACTIVE_CEILING_S)
-        # lan-generic carries the SAME floor, and that is a deliberate blunt
-        # instrument, not an oversight: an un-registered LAN client that supplies
-        # no deadline of its own would otherwise be strangled at 540s, and the
-        # registered identities above cannot cover a host nobody has enrolled.
-        # (Written when the mac dev host ran the `pool` CLI, which is gone as of
-        # 2026-08-26; the floor survives it because the SHAPE is not pool's —
-        # any agentic client omitting timeout_s lands here.) This is the
-        # fast unblock pending the real fix in the adaptive timeout model (the
-        # size_stretch clamp). Whoever narrows this later: the correct end state
-        # is that the model stops emitting a deadline shorter than the work
-        # takes, at which point this subnet-wide floor should go away entirely —
-        # it currently hands every un-registered LAN client a 30-minute deadline
-        # when it omits timeout_s. (2026-08-03)
-        acl.register("10.0.0.0/24", "lan-generic", LLMPriority.P3_INGESTION,
-                     min_timeout_s=_SMART_DEFAULT_CAP_S)
+        for net in os.environ.get("ROADSTEAD_ADMIN_NETS", "").split(","):
+            net = net.strip()
+            if net:
+                acl.register_admin_net(net)
 
         return acl

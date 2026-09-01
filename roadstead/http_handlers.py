@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from . import cache_stats
 from .config import LLMPriority, normalize_endpoint
 from .constants import _PAYLOAD_KIND
+from .identity import remote_ip as _remote_ip
 from .lifecycle import _openai_error
 from .observability import structured_empty_rates
 from .sse_hub import DROP_SENTINEL
@@ -152,15 +153,16 @@ class ProxyHttpHandlers:
         self.health = health
 
     async def handle_openai_chat(self, body: dict, request: Request) -> Response:
-        remote_ip = request.client.host if request.client else "unknown"
-        identity = self.state.acl.identify(remote_ip)
-        if not identity:
-            # Phase 5D: OpenAI-shaped 403 (was a bare {"error": "<str>"} that a
-            # strict OpenAI client crashes on doing resp.error.message).
-            return _openai_error(
-                f"access denied for {remote_ip}", "access_denied", 403,
-                code="access_denied")
-        agent_id, default_priority = identity
+        # Identity: an API key if one is presented, else the source address.
+        # Phase 5D: the refusal is OpenAI-shaped (it was a bare {"error": "<str>"}
+        # that a strict OpenAI client crashes on doing resp.error.message).
+        resolved = self.state.identity.resolve(request)
+        if not resolved.ok:
+            denial = resolved.denial
+            return _openai_error(denial.message, denial.openai_type,
+                                 denial.status, code=denial.code)
+        agent_id = resolved.principal.agent_id
+        default_priority = resolved.principal.priority
         model = body.get("model", "qwen-analyst")
         # Phase 5D: validate the model maps to a known endpoint BEFORE enqueue.
         # Otherwise an unknown model burns a scheduler slot + DRR charge and
@@ -208,13 +210,13 @@ class ProxyHttpHandlers:
         ``/v1/submit``, which already speaks ``texts`` — so this path only ever served
         external OpenAI clients, and nothing in-repo exercised it.
         """
-        remote_ip = request.client.host if request.client else "unknown"
-        identity = self.state.acl.identify(remote_ip)
-        if not identity:
-            return _openai_error(
-                f"access denied for {remote_ip}", "access_denied", 403,
-                code="access_denied")
-        agent_id, default_priority = identity
+        resolved = self.state.identity.resolve(request)
+        if not resolved.ok:
+            denial = resolved.denial
+            return _openai_error(denial.message, denial.openai_type,
+                                 denial.status, code=denial.code)
+        agent_id = resolved.principal.agent_id
+        default_priority = resolved.principal.priority
 
         texts, err = _embedding_texts(body.get("input"))
         if err:
@@ -744,11 +746,11 @@ class ProxyHttpHandlers:
         flag→bool), persisted across restarts. Internal-only (ACL). This is the
         flip surface for the shadow→enforce switches and kill-switches — flags
         change behaviour immediately, no process restart."""
-        remote_ip = request.client.host if request.client else "unknown"
+        remote_ip = _remote_ip(request)
         self.audit_admin_ip("/v1/admin/flags", remote_ip)
-        if not self.state.acl.is_admin(remote_ip):
-            return JSONResponse(
-                {"error": f"access denied for {remote_ip}"}, status_code=403)
+        denied = self._deny_non_admin(request, remote_ip)
+        if denied is not None:
+            return denied
         if request.method == "GET":
             return JSONResponse({"flags": self.state.flags.as_dict()})
         try:
@@ -776,11 +778,11 @@ class ProxyHttpHandlers:
         ~30s auto-circuit-trip lag. RESUME hands it back to the poller, which
         re-probes, recovers on /health, re-discovers capacity (the new
         max_model_len), and the deferred queue drains."""
-        remote_ip = request.client.host if request.client else "unknown"
+        remote_ip = _remote_ip(request)
         self.audit_admin_ip("/v1/admin/endpoints", remote_ip)
-        if not self.state.acl.is_admin(remote_ip):
-            return JSONResponse(
-                {"error": f"access denied for {remote_ip}"}, status_code=403)
+        denied = self._deny_non_admin(request, remote_ip)
+        if denied is not None:
+            return denied
         ep = normalize_endpoint(endpoint)
         if ep not in self.state.config.endpoints:
             return JSONResponse(
@@ -837,11 +839,11 @@ class ProxyHttpHandlers:
           started_at / ended_at: epoch s   explicit bounds (override duration_s)
         With none of duration_s/started_at/ended_at, opens an OPEN window now
         (close it later via the drain resume, or re-POST with ended_at)."""
-        remote_ip = request.client.host if request.client else "unknown"
+        remote_ip = _remote_ip(request)
         self.audit_admin_ip("/v1/admin/maintenance", remote_ip)
-        if not self.state.acl.is_admin(remote_ip):
-            return JSONResponse(
-                {"error": f"access denied for {remote_ip}"}, status_code=403)
+        denied = self._deny_non_admin(request, remote_ip)
+        if denied is not None:
+            return denied
         if self.state.queue_db is None:
             return JSONResponse({"error": "no persistence backend"}, status_code=503)
         try:
@@ -903,11 +905,11 @@ class ProxyHttpHandlers:
     async def handle_maintenance_list(self, request: Request) -> Response:
         """List maintenance windows overlapping the last ``hours`` (default 24).
         Admin surface (was unauthenticated — tightened with the rest)."""
-        remote_ip = request.client.host if request.client else "unknown"
+        remote_ip = _remote_ip(request)
         self.audit_admin_ip("/v1/admin/maintenance", remote_ip)
-        if not self.state.acl.is_admin(remote_ip):
-            return JSONResponse(
-                {"error": f"access denied for {remote_ip}"}, status_code=403)
+        denied = self._deny_non_admin(request, remote_ip)
+        if denied is not None:
+            return denied
         if self.state.queue_db is None:
             return JSONResponse({"hours": 0, "windows": []})
         hours = _to_float(request.query_params.get("hours"), 24)
@@ -1030,10 +1032,11 @@ class ProxyHttpHandlers:
         never traversed the scheduler, so the proxy is the single fleet
         call-metrics store. Internal/LAN — gated by the same ACL as admin.
         Best-effort: validates the minimum, records, fans out, returns ok."""
-        remote_ip = request.client.host if request.client else "unknown"
+        remote_ip = _remote_ip(request)
         self.audit_admin_ip("/v1/calls/log", remote_ip)
-        if not self.state.acl.is_admin(remote_ip):
-            return JSONResponse({"error": f"access denied for {remote_ip}"}, status_code=403)
+        denied = self._deny_non_admin(request, remote_ip)
+        if denied is not None:
+            return denied
         try:
             body = await request.json()
         except Exception:  # noqa: BLE001
@@ -1316,6 +1319,30 @@ class ProxyHttpHandlers:
             },
             status_code=200 if ready else 503,
         )
+
+    def _deny_non_admin(self, request: Request, remote_ip: str) -> Response | None:
+        """The admin gate: ``None`` to proceed, otherwise the refusal to return.
+
+        TWO refusals, and they mean different things. A presented credential
+        that does not resolve is a 401 from the identity layer and says so —
+        conflating it with the 403 below would tell an operator whose key was
+        revoked that their *host* was not allowed, sending them to fix the wrong
+        file. A resolved identity without the admin scope is the 403, whose body
+        is byte-identical to what this surface has always returned.
+
+        🚨 An authenticated non-admin identity is refused even from a host in the
+        admin nets — ``IdentityResolver.is_admin`` explains why a scoped key must
+        be able to narrow access and not only widen it.
+        """
+        resolved = self.state.identity.resolve(request)
+        if not resolved.ok:
+            return JSONResponse(
+                {"error": resolved.denial.message, "code": resolved.denial.code},
+                status_code=resolved.denial.status)
+        if not resolved.principal.admin:
+            return JSONResponse(
+                {"error": f"access denied for {remote_ip}"}, status_code=403)
+        return None
 
     def audit_admin_ip(self, route: str, remote_ip: str) -> None:
         """Track source IPs per admin-ish route (exposed on /v1/status) and log

@@ -7,8 +7,8 @@ Three modes:
 
 Usage:
     python -m roadstead test sim all_agents_burst
-    python -m roadstead test replay --hours 4 --compress 8 --endpoint thinker
-    python -m roadstead test ab --hours 4 --endpoint thinker --shadow-host 10.0.0.3 --shadow-port 9084
+    python -m roadstead test replay --hours 4 --compress 8 --endpoint tier3
+    python -m roadstead test ab --hours 4 --endpoint tier3 --shadow-host 192.0.2.10 --shadow-port 9084
 """
 
 from __future__ import annotations
