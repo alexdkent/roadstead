@@ -160,7 +160,7 @@ def test_endpoint_normalization_has_no_hardcoded_fleet_NAMES():
     assert normalize_endpoint("reasoner") == ROLE_TO_CLASS["reasoner"]
 
 
-@pytest.mark.parametrize("literal", ["10.9.9.9", "10.0.0.2", "10.0.1.1",
+@pytest.mark.parametrize("literal", ["10.9.9.9", "192.168.7.7", "10.0.1.1",
                                      "169.254.1.1"])
 def test_the_guard_would_actually_catch_something(literal):
     """Exercised — a sweep that matches nothing passes forever.
@@ -169,7 +169,10 @@ def test_the_guard_would_actually_catch_something(literal):
     longer needs to name a real private address to prove it works.
 
     `10.0.1.1` is the edge case — private, and one octet outside the
-    `10.0.0.0/24` the allowlist permits. Written first as `172.15.0.4` on the
+    `10.0.0.0/24` the allowlist permits. 🚨 A fixture here must be an address
+    no history-rewrite rule would ever remap: one of these was `198.51.100.10`,
+    a rule remapped it into ALLOWED space, and the test went red because its
+    own example had stopped being a straggler. Written first as `172.15.0.4` on the
     theory that it sat just outside the docker range; it does not, it is
     PUBLIC, because RFC 1918's block starts at `172.16`. The test caught that,
     which is the argument for having it.
