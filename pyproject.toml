@@ -51,7 +51,12 @@ Repository = "https://github.com/alexdkent/roadstead"
 include = ["roadstead*"]
 
 [tool.setuptools.package-data]
-roadstead = ["*.yaml"]
+# 🚨 `ui/index.html` ships, so it is PUBLIC SURFACE — same argument as
+# `roadstead.testing`. It is one static file with no external references (the
+# CSP the server sends forbids them, and a test sweeps for them), and nothing in
+# the library imports it, so a deployment that never sets ROADSTEAD_ADMIN_UI
+# pays only the ~40KB on disk.
+roadstead = ["*.yaml", "ui/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

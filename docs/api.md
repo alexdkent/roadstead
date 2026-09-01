@@ -147,7 +147,7 @@ and the budget holder.** It is established in one of three ways, in strict prece
 
 | | how | strength |
 |---|---|---|
-| 1 | **API key** — `Authorization: Bearer <key>` (what an OpenAI client already sends) or `X-API-Key: <key>` | authenticated |
+| 1 | **API key** — `Authorization: Bearer <key>` (what an OpenAI client already sends), `Authorization: Basic <base64(anything:key)>` (what a *browser* can send — the key is the **password** half and the username is ignored), or `X-API-Key: <key>` | authenticated |
 | 2 | **Source address** — an operator registration in `ROADSTEAD_ACL` | a weak second factor: it identifies a *host*, and several callers may share one |
 | 3 | ~~**`agent_id` in the body**~~ | **Gone.** It was reachable only on `/v1/submit`, which was removed in Workstream C (§1.9). No door reads an identity from a request body; a caller cannot name its own fair-share key at all. |
 
@@ -201,6 +201,26 @@ caller's address should be, and a **chain longer than 32 hops**. Both resolve to
 not an address, matches no registration, and is therefore refused.
 
 `GET /rs/v1/admin/config` reports what is trusted and what that changed (§3.5).
+
+#### Basic carries a key, not a password 🚨
+
+A browser cannot attach a bearer token to a navigation, and `EventSource` cannot set a request
+header at all — so the management UI (§3.7) needs a scheme the browser itself carries. That scheme
+is Basic, and **the credential inside it is an ordinary API key**. Minting a password to go with it
+would be a second kind of credential with its own store, its own rotation and its own revocation,
+running in parallel with a registry that already does all three; `identity.py` exists to prevent
+exactly that. The username is ignored rather than checked against `key_id`, because the label is
+public and requiring it buys nothing an attacker holding the key does not already have.
+
+Rules 1 and 2 hold through the wrapper: a Basic password that does not resolve is a **401** and never
+falls back to the address, and with no keys configured a Basic header is ignored entirely. A header
+that cannot be base64-decoded is **no credential at all** rather than a failed one — the address
+decides, exactly as with no header — because a header we cannot parse was probably never meant as
+ours.
+
+⚠️ **Changed 2026-09-01.** `Authorization: Basic` was previously ignored as "somebody else's auth".
+A deployment that has keys configured *and* callers presenting an unrelated Basic header will now see
+those callers refused with a 401 rather than identified by address. Recorded in `CHANGELOG.md`.
 
 **Every door is gated**, the three `/rs/v1` routes included. Out of the box, loopback and docker-internal
 addresses resolve to the identity `internal` and everything else is refused — default-deny, and the
@@ -562,6 +582,8 @@ is not an error: see §3.2.
 | `POST /rs/v1/admin/endpoints/{ep}/resume` · `POST /v1/admin/endpoints/{ep}/resume` | Re-probe, **re-discover capacity**, drain the deferred queue, close the window. |
 | `GET`/`POST /rs/v1/admin/flags` · `GET`/`POST /v1/admin/flags` | Read/flip runtime flags; persisted to JSON, survives restart. |
 | `GET`/`POST /rs/v1/admin/maintenance` · `GET`/`POST /v1/admin/maintenance` | List, or backdate a closed window for a restart done without draining. |
+| `GET /rs/v1/admin/ui` | The operator UI (§3.7). **Only when `ROADSTEAD_ADMIN_UI` is set** — otherwise the route does not exist. Refuses with 401 + `WWW-Authenticate: Basic`. |
+| `GET /rs/v1/admin/stream` · `GET /v1/stream` | Live `call.completed` + `metrics` SSE. Admin-gated since 2026-09-01. The alias exists because `EventSource` cannot set a header (§3.7). |
 
 Open surfaces: `GET /v1/status` (per-endpoint health, capacity, reliability counters),
 `GET /v1/timeouts`, `GET /metrics` (Prometheus), `GET /health`, `GET /readyz` (fails closed on
@@ -672,6 +694,35 @@ left), plus whether the engine publishes it at all — so "discovery agreed" and
 are distinguishable, which they are not on `/v1/status`. `GET /rs/v1/admin/callers` reports quota as
 three blocks — `in_force`, `declared` (what the file set) and `runtime` (what this API changed) — so
 an override reads as a difference rather than a label.
+
+### 3.7 The management UI 🚨
+
+`GET /rs/v1/admin/ui` — one static HTML page, vanilla JS, **no bundler and no external references at
+all**. It ships in the wheel, so it is public surface: the `Content-Security-Policy` it is served
+with is `default-src 'none'` with `connect-src 'self'` and no host permitted anywhere, and a test
+sweeps the file for a `<script src>`, a webfont or an `@import`.
+
+**The route does not exist unless `ROADSTEAD_ADMIN_UI` is set.** Off means absent, not refusing —
+the same posture as `ROADSTEAD_TRUSTED_PROXIES` and `ROADSTEAD_REQUIRE_API_KEY`, because a
+capability that widens what is reachable is an operator's decision and an HTML door is reachable by
+things that would never send an API request on purpose.
+
+**It refuses with a 401 and `WWW-Authenticate: Basic`, where the plane behind it answers 403.** That
+deviation is deliberate and applies to the door only. The 401/403 split is right for an API client,
+which reads the two differently; it is a dead end for a browser, where a 403 produces no password box
+and an operator arriving with no credential — which is everyone, the first time — has no way to
+answer the refusal. The challenge is identical whether or not any key is configured, so it discloses
+nothing about which identity regime (§1.5) is in play.
+
+**No cookie is minted, so CSRF is never reachable on these mutating routes.** The browser attaches
+the credential; the page neither reads, stores nor forwards it. That is also why `GET /v1/stream` is
+aliased at **`/rs/v1/admin/stream`**: `EventSource` cannot set a header, so a page can reach an
+authenticated stream only through credentials the browser attaches by directory, and that is the
+directory the page was challenged in. Same handler, same gate.
+
+⚠️ **`GET /v1/stream` is admin-gated as of 2026-09-01** and was not before. A frame there names the
+caller, endpoint, tokens and timing of every call the fleet serves — the live form of
+`/rs/v1/admin/callers`, which has been gated since it existed. Recorded in `CHANGELOG.md`.
 
 ### 3.6 `/v1/fleet/*` analytics — response schemas
 

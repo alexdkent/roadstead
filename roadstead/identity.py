@@ -62,6 +62,8 @@ in a git history, which is why ``key_sha256:`` is the documented form and
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import ipaddress
 import logging
@@ -86,6 +88,23 @@ logger = logging.getLogger(__name__)
 #: needs its ``api_key`` set and nothing else. ``X-API-Key`` exists for callers
 #: that are not speaking the OpenAI dialect at all (the enriched ``/rs/v1``).
 _BEARER_PREFIX = "bearer "
+
+#: 🚨 ``Authorization: Basic <base64(user:key)>`` — the KEY goes in the password
+#: half and the username is ignored entirely.
+#:
+#: Added 2026-09-01 for the management UI (Workstream G), and the important part
+#: is what it deliberately is NOT: a password. A browser cannot attach a bearer
+#: token to a navigation, and ``EventSource`` cannot set a header at all, so a
+#: browser-facing surface needs a scheme the browser itself carries. Basic is
+#: that scheme — but minting a password to go with it would be a SECOND kind of
+#: credential, with its own store, its own rotation and its own revocation,
+#: parallel to a key registry that already does all three. So the credential
+#: stays the API key and only its wrapper changes.
+#:
+#: The username is ignored rather than checked against ``key_id``: the label is
+#: public, so requiring it adds a second string for an operator to remember and
+#: buys nothing an attacker who has the key does not already have.
+_BASIC_PREFIX = "basic "
 
 
 # ---------------------------------------------------------------------------
@@ -546,16 +565,41 @@ def _header(request: Any, name: str) -> str:
     return ""
 
 
+def _basic_password(blob: str) -> str:
+    """The password half of a base64 ``user:password``, or ``""``.
+
+    An undecodable blob yields ``""`` — i.e. NO credential was presented, so the
+    address decides. That is the right reading: a header we cannot parse is not
+    a credential that failed, and 401-ing it would refuse a caller over bytes
+    nobody meant as ours. A *decodable* one with a password is a presented
+    credential and takes rule 1 in full.
+    """
+    try:
+        decoded = base64.b64decode(blob, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return ""
+    _user, sep, password = decoded.partition(":")
+    return password.strip() if sep else ""
+
+
 def presented_key(request: Any) -> str:
     """The API key on this request, or ``""``.
 
-    ``Authorization: Bearer <key>`` first (what an OpenAI client sends), then
-    ``X-API-Key``. A non-Bearer ``Authorization`` scheme is ignored rather than
-    treated as a key: it is somebody else's auth, not a malformed one of ours.
+    Three places, in order: ``Authorization: Bearer <key>`` (what an OpenAI
+    client sends), ``Authorization: Basic <base64(anything:key)>`` (what a
+    BROWSER can send — see ``_BASIC_PREFIX``), then ``X-API-Key`` for callers
+    speaking neither dialect.
+
+    🚨 A scheme this does not recognise is still ignored rather than treated as
+    a malformed key of ours — it is somebody else's auth. What changed on
+    2026-09-01 is only that ``Basic`` moved from that category into ours, which
+    is a wire-contract change and is recorded as one.
     """
     auth = _header(request, "Authorization").strip()
     if auth.lower().startswith(_BEARER_PREFIX):
         return auth[len(_BEARER_PREFIX):].strip()
+    if auth.lower().startswith(_BASIC_PREFIX):
+        return _basic_password(auth[len(_BASIC_PREFIX):].strip())
     return _header(request, "X-API-Key").strip()
 
 

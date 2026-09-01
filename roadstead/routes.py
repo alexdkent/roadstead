@@ -29,6 +29,8 @@ Provides:
   - GET  /rs/v1/admin/callers   — per-caller identity, quota, DRR, spend
   - PATCH /rs/v1/admin/callers/{agent_id} — edit one caller's quota
   - GET  /rs/v1/admin/providers — providers + endpoints: declared vs in force
+  - GET  /rs/v1/admin/ui        — the operator UI (only when ROADSTEAD_ADMIN_UI)
+  - GET  /rs/v1/admin/stream    — the SSE stream, aliased for the UI's EventSource
   - GET  /health           — health check
 """
 
@@ -46,6 +48,7 @@ from starlette.routing import Route
 
 from .enriched import PREFIX
 from .management import PREFIX as ADMIN_PREFIX
+from .management import admin_ui_enabled
 
 if TYPE_CHECKING:
     from .service import ProxyService
@@ -179,7 +182,28 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_admin_providers(request: Request) -> Response:
         return await svc.handle_admin_providers(request)
 
-    return [
+    async def handle_admin_ui(request: Request) -> Response:
+        return await svc.handle_admin_ui(request)
+
+    ui_routes: list[Route] = []
+    if admin_ui_enabled():
+        # 🚨 Registered only when ROADSTEAD_ADMIN_UI is set, so OFF means the
+        # route does not EXIST rather than that it refuses. A capability that
+        # widens what is reachable is the operator's decision — same posture as
+        # ROADSTEAD_TRUSTED_PROXIES and ROADSTEAD_REQUIRE_API_KEY.
+        ui_routes = [
+            Route(f"{ADMIN_PREFIX}/ui", handle_admin_ui, methods=["GET"]),
+            # 🚨 The stream, aliased under the admin prefix — and this alias is
+            # load-bearing rather than tidy. `EventSource` cannot set a request
+            # header AT ALL, so a browser page can only reach an authenticated
+            # stream via credentials the browser itself attaches; a browser
+            # attaches cached Basic credentials by directory, and this is the
+            # one directory the UI page was challenged in. Same handler, same
+            # gate — the pattern the four control routes already established.
+            Route(f"{ADMIN_PREFIX}/stream", handle_stream, methods=["GET"]),
+        ]
+
+    return ui_routes + [
         # --- the enriched north face (roadmap Workstream C) -----------------
         # 🚨 This REPLACES the `/v1/submit` envelope, which was removed rather
         # than deprecated: it had no intent vocabulary, no attribution and no

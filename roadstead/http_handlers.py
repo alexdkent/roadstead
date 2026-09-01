@@ -1136,7 +1136,22 @@ class ProxyHttpHandlers:
     async def handle_stream(self, request: Request) -> Response:
         """Server-Sent Events: real-time `call.completed` + periodic `metrics`
         frames. Slow clients are dropped (the browser reconnects + re-syncs via
-        the REST endpoints). Mirrors the host-telemetry /stream/v2 shape."""
+        the REST endpoints). Mirrors the host-telemetry /stream/v2 shape.
+
+        🚨 **Admin-gated as of 2026-09-01**, and it was not before. A frame here
+        names the caller, the endpoint, the tokens and the timing of every call
+        the fleet serves — the live version of what `/rs/v1/admin/callers`
+        reports, which has been gated since it existed. `handle_maintenance_list`
+        carries the same note from the previous round of this ("was
+        unauthenticated — tightened with the rest"); this one was missed because
+        a stream reads as plumbing rather than as a view. Recorded in
+        `CHANGELOG.md` as the breaking change it is.
+        """
+        remote_ip = self.state.identity.client_ip(request)
+        self.audit_admin_ip("/v1/stream", remote_ip)
+        denied = self.deny_non_admin(request, remote_ip)
+        if denied is not None:
+            return denied
         q = self.state.sse.subscribe()
 
         async def event_gen():

@@ -208,6 +208,23 @@ curl -sX PATCH localhost:42100/rs/v1/admin/callers/coding-assistant \
 curl -sX DELETE localhost:42100/rs/v1/admin/keys/coding-assistant-laptop
 ```
 
+### The UI
+
+```sh
+ROADSTEAD_ADMIN_UI=1        # off by default: unset, the route does not exist
+```
+
+Then open `http://<host>/rs/v1/admin/ui`. It is **one static HTML file** with no bundler, no
+framework and no external references of any kind — the same judgement that keeps `roadstead.client`
+on httpx-and-stdlib — and it shows the thing the HTTP plane exists to show: wherever a value you
+declared and the value actually in force can disagree, both appear side by side and a difference is
+made loud.
+
+Sign in with an **admin API key as the password** (the username is ignored). The browser is
+challenged with HTTP Basic, so there is no login form, no session and no cookie — which means CSRF
+never becomes reachable on the mutating routes. Put it behind TLS, and see the trusted-proxy note
+above, because a UI is the usual reason a reverse proxy appears in front of this.
+
 **A runtime change never rewrites your config file.** It goes to a JSON overlay layered over
 `models.yaml`, `agents.yaml` and your keys file at startup — so your comments survive, and what you
 wrote stays separable from what the API changed.

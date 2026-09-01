@@ -309,7 +309,8 @@ remote providers will eventually want to choose between them.
 ### E · Management interface
 
 **Landed 2026-09-01.** `/rs/v1/admin/*` — read first, control second, and it went last because there
-was nothing worth managing until keys, quotas, budgets and providers all existed.
+was nothing worth managing until keys, quotas, budgets and providers all existed. The UI on top of it
+is **G**, below.
 
 **The thesis.** An operator's questions are not the caller's questions one level up. A caller asks
 *what can serve me, how long, what does it cost*; an operator asks something the package could not
@@ -347,10 +348,43 @@ force, and a surface that merely echoed `models.yaml` back would be a worse `cat
   real: the doc pin was satisfied by a route named in *prose* rather than in the table, and one
   mutation was a no-op that had to be rewritten before it proved anything.
 
-**Still open in E.** It is read-and-control over HTTP, not a product: there is no UI, and the
-roadmap's "manage and monitor as a standalone product" line still wants one — with the two
-constraints it has always had (heavy reads off-loop, no frontend toolchain in a package whose
-dependency list is deliberately short). Providers and endpoints are **read-only**: adding a backend
+### G · The management UI
+
+**Landed 2026-09-01.** `GET /rs/v1/admin/ui` — the face on E's plane, and the roadmap's "manage and
+monitor as a standalone product" line. Both binding constraints held: **one static HTML file** with
+vanilla JS, no bundler and no external reference of any kind (the dependency list is still six, and a
+test asserts it), and the only server-side work is an asset read that goes **off-loop**.
+
+- **Off by default.** Unset `ROADSTEAD_ADMIN_UI` and the route does not EXIST — absence rather than
+  refusal, the same posture as `ROADSTEAD_TRUSTED_PROXIES` and `ROADSTEAD_REQUIRE_API_KEY`.
+- **🚨 The CSRF question is answered by not creating it.** Of the three options the workstream had —
+  a session cookie minted from a key, HTTP Basic, or a separate UI credential — the third is what
+  `identity.py` exists to prevent, and the first makes a cookie authenticate mutating routes, which
+  would be the first real CSRF surface in this codebase. Basic was chosen, **carrying an API key in
+  the password half**: a browser can attach it to a navigation (a bearer token cannot be) and
+  `EventSource` can attach it to a stream (a header cannot be set at all), while minting a *password*
+  would have been a second credential kind with its own store, rotation and revocation beside a
+  registry that already does all three. No cookie is minted, so no CSRF defence is needed.
+- **The door refuses 401 + `WWW-Authenticate` where the plane answers 403.** The split is right for
+  an API client and a dead end for a browser, which shows no password box for a 403.
+- **🚨 Every field the page reads is pinned against a real response.** A UI has no compiler, no schema
+  and no types: rename a field and one cell renders "—" forever while the page looks healthy. Reads
+  go through `pick(obj, "a.b.c")` so the paths are extractable and each is walked against a response
+  a real service produced. It found a live bug on the first run — and *rendering the page in a
+  browser* found two more that no test could have: a one-level `flat()` stringifying nested nodes,
+  and boolean attributes rendered empty so no declared-vs-in-force pair ever collapsed.
+- **`GET /v1/stream` is admin-gated**, which it was not. A frame there names the caller, endpoint,
+  tokens and timing of every call served — the live form of `/rs/v1/admin/callers`. Aliased at
+  `/rs/v1/admin/stream` for the reason above.
+- Sixteen mutations, every guard observed going red.
+
+**Still open in G.** `admin` is one scope, so browsing the fleet and revoking a key are the same
+privilege — a read-only scope is the obvious next split, and it changes what a key *means*, which is
+why it did not land with the UI. There is also no audit trail: the plane shows what changed, not who
+changed it or when (open in E too), and the UI makes that gap easier to reach. Nothing here is
+covered by a browser-driven test; the guards are contract pins plus a rendered walkthrough by hand.
+
+**Still open in E.** Providers and endpoints are **read-only**: adding a backend
 is still a `models.yaml` edit and a restart, deliberately, because an endpoint is a routing-table
 entry that discovery, health and the DRR denominator all key on, and hot-adding one is a much larger
 question than hot-adding a key. Nothing here is audited: an operator can see what changed but not

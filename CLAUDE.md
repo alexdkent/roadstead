@@ -194,6 +194,7 @@ roadstead/          the package (37 modules + providers/ + client/)
   lifecycle.py      admission → dispatch → streaming → timeout recording
   enriched.py       north face TWO: /rs/v1 (see below)
   management.py     north face THREE: /rs/v1/admin — the operator's plane
+  ui/index.html     the operator's FACE — one static file, no toolchain (see below)
   http_handlers.py  north face ONE: the OpenAI doors, admin, analytics
   health.py         capacity discovery, circuit breaker, drain
   queue.py          durable event log + THE single writer thread
@@ -325,6 +326,20 @@ which reads as "the edit did nothing" for exactly the busy caller it was aimed a
 **rate, not the balance**. And keys are flat because the budget holder is the `agent_id`, not the
 key: many keys → one `agent_id` is already team-level quota inheritance, which is what the roadmap's
 "multi-tenancy depth" question was asking for.
+
+🚨 **The management UI is ONE static file, and the credential is still a key.** `roadstead/ui/index.html`
+(`GET /rs/v1/admin/ui`, registered only when `ROADSTEAD_ADMIN_UI` is set — off means the route does
+not exist) is vanilla JS with no bundler and no external reference of any kind; it ships in the wheel,
+so it is public surface on the same argument as `roadstead.testing`, and the CSP forbids an external
+reference rather than trusting a reviewer to spot one. Auth is **HTTP Basic carrying an API key in
+the PASSWORD half** — a browser cannot attach a bearer token to a navigation and `EventSource` cannot
+set a header at all, and minting a password would be a second credential kind with its own store,
+rotation and revocation beside a registry that already does all three. No cookie is minted, so CSRF
+never becomes reachable. The door refuses **401 + `WWW-Authenticate`** where the plane answers 403,
+because a 403 gives a browser no way to answer it. 🚨 **Every field the page reads goes through
+`pick(obj, "a.b.c")`** so the paths are extractable, and `tests/test_admin_ui.py` walks each one
+against a real response — a UI has no compiler and no schema, so a renamed field renders "—" forever
+in one cell while the page looks healthy.
 
 🚨 **`roadstead.client` imports nothing from the server, and that is a rule with a test.** Two
 reasons, and the second is the one that would be lost silently: a consumer sending an HTTP request

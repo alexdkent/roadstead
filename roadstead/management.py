@@ -124,7 +124,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from . import hooks, model_catalog
 from .config import AgentQuotaConfig, LLMPriority
@@ -144,6 +144,57 @@ logger = logging.getLogger(__name__)
 #: versioned by us; see the module docstring for why admin does not stay on the
 #: OpenAI-versioned one.
 PREFIX = "/rs/v1/admin"
+
+# ---------------------------------------------------------------------------
+# The operator UI (roadmap Workstream G)
+# ---------------------------------------------------------------------------
+#
+# 🚨 ONE static HTML file, vanilla JS, no bundler and no third-party anything.
+# The dependency list is six packages on purpose (CLAUDE.md); a build step, a
+# node_modules or a React dependency is out, and the same judgement that keeps
+# ``roadstead.client`` on httpx-and-stdlib keeps this on the platform.
+#
+# It ships in the wheel, so it is PUBLIC SURFACE — the same argument as
+# ``roadstead.testing``. A new external reference in it is a new one for
+# everybody who installs Roadstead, which is why the CSP below forbids one
+# outright rather than trusting a reviewer to notice.
+
+_UI_ENV = "ROADSTEAD_ADMIN_UI"
+_UI_FILE = Path(__file__).resolve().parent / "ui" / "index.html"
+
+#: 🚨 ``default-src 'none'`` with NO host allowed anywhere. The page may talk to
+#: its own origin and load nothing at all from outside it, which is what makes
+#: "the key is readable by script on the page" an acceptable trade: the only
+#: script on the page is the one in the file. ``'unsafe-inline'`` is the price of
+#: having no bundler — there is no build step to emit a hash or a nonce, and the
+#: alternative is a toolchain. ``frame-ancestors 'none'`` closes clickjacking on
+#: a page whose buttons pause backends.
+_UI_CSP = (
+    "default-src 'none'; "
+    "script-src 'unsafe-inline'; "
+    "style-src 'unsafe-inline'; "
+    "connect-src 'self'; "
+    "img-src data:; "
+    "form-action 'none'; "
+    "base-uri 'none'; "
+    "frame-ancestors 'none'"
+)
+
+#: The realm a browser shows in its password box, and the key a browser caches
+#: the credential under. Stable: changing it logs every operator out.
+_UI_REALM = "Roadstead"
+
+
+def admin_ui_enabled() -> bool:
+    """Whether ``GET /rs/v1/admin/ui`` is registered at all.
+
+    🚨 Default OFF, and OFF means the route does not exist rather than that it
+    refuses — the same posture as ``ROADSTEAD_TRUSTED_PROXIES`` and
+    ``ROADSTEAD_REQUIRE_API_KEY``, for the same reason: a capability that widens
+    what is reachable is an operator's decision, and an HTML door on a proxy is
+    reachable by things that would never send an API request on purpose.
+    """
+    return os.environ.get(_UI_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 #: Prefix on a generated secret, so a leaked string is identifiable as a
 #: Roadstead credential in a log or a paste and can be revoked by shape.
@@ -498,6 +549,8 @@ class ManagementApi:
         # and holds across the `to_thread` that does the I/O. It guards no
         # in-memory scheduler state, which is what CLAUDE.md forbids locking.
         self._store_lock = asyncio.Lock()
+        #: The UI asset, read once off-loop and then held. None until first served.
+        self._ui_html: str | None = None
 
     # ---- gate -----------------------------------------------------------
 
@@ -897,6 +950,75 @@ class ManagementApi:
                 "live": self.state.scheduler.agent_snapshot(agent_id),
             })
         return out
+
+    # ---- the operator UI (roadmap Workstream G) --------------------------
+
+    def _gate_ui(self, request: Request) -> Response | None:
+        """The admin gate, refusing in a shape a BROWSER can act on.
+
+        🚨 Deliberately different from ``_gate`` in exactly one way: every
+        refusal is a **401 carrying ``WWW-Authenticate: Basic``**, where the JSON
+        plane distinguishes 401 (a credential that did not resolve) from 403 (a
+        resolved identity without the scope).
+
+        That split is right for an API client, which reads the two differently
+        and can act on both. It is a dead end for a browser: a 403 produces no
+        password box, so an operator arriving at this URL with no credential —
+        which is *every* operator, the first time — would see a refusal with no
+        way to answer it. A 401 is the one status that makes the browser ask.
+
+        The refusal is otherwise unchanged: it still refuses, and the challenge
+        is identical whether or not any key is configured, so it discloses
+        nothing about the deployment. The routes the page then calls keep the
+        ordinary 401/403 split — this applies to the door, not to the plane
+        behind it.
+        """
+        denied = self._gate(f"{PREFIX}/ui", request)
+        if denied is None:
+            return None
+        return Response(
+            "Roadstead management — an admin API key is required. Present it as "
+            "the PASSWORD; the username is ignored.\n",
+            status_code=401,
+            media_type="text/plain; charset=utf-8",
+            headers={"WWW-Authenticate": f'Basic realm="{_UI_REALM}"',
+                     "Cache-Control": "no-store"},
+        )
+
+    async def handle_admin_ui(self, request: Request) -> Response:
+        """GET — the operator UI: one static page, served from the wheel.
+
+        The file read runs **off the loop**. It is small and it is cached after
+        the first request, so this is not about throughput — it is the invariant:
+        a blocking read on the loop thread is a blocking read on the loop thread,
+        and the exception a dashboard makes for itself is the one that is still
+        there when somebody serves a bigger asset from the same handler.
+        """
+        denied = self._gate_ui(request)
+        if denied is not None:
+            return denied
+        if self._ui_html is None:
+            try:
+                html = await asyncio.to_thread(_UI_FILE.read_text, "utf-8")
+            except OSError as exc:
+                # Shipped in the wheel, so this means a broken install rather
+                # than a misconfiguration — say which, since the operator's next
+                # move differs completely.
+                logger.error("admin UI asset missing at %s: %s", _UI_FILE, exc)
+                return _error("invalid_request_error",
+                              f"the UI asset is missing from this install ({_UI_FILE})",
+                              500)
+            # Assigned ON the loop; only the read went off it. Same shape as the
+            # overlay's "mutate on the loop, persist off it", and idempotent, so
+            # two concurrent first-requests cannot disagree about the result.
+            self._ui_html = html
+        return HTMLResponse(self._ui_html, headers={
+            "Content-Security-Policy": _UI_CSP,
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "X-Frame-Options": "DENY",
+            "Cache-Control": "no-store",
+        })
 
     # ---- providers ------------------------------------------------------
 

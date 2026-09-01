@@ -1,0 +1,917 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Roadstead — management</title>
+<!--
+  🚨 ONE FILE. No bundler, no node_modules, no framework, no external anything.
+
+  Roadstead's dependency list is six packages on purpose (CLAUDE.md), and the
+  same judgement that keeps `roadstead.client` on httpx-and-stdlib keeps this on
+  the platform. It ships in the wheel, so every byte here is public surface: a
+  <script src>, a webfont or a CDN stylesheet would be a new external reference
+  for everyone who installs Roadstead. The Content-Security-Policy the server
+  sends forbids all of them outright rather than trusting a reviewer to notice.
+
+  WHAT THIS PAGE IS FOR — read management.py's module docstring first. An
+  operator's question is not the caller's question one level up. It is:
+
+      "what did I write that is not in force?"
+
+  So this shows the GAP. Wherever a declared value and an in-force value can
+  disagree, both are rendered side by side and a difference is made loud. A page
+  that echoed models.yaml back would be a worse `cat`, and every expensive
+  failure in docs/ledger.md lives in a gap between two sources that agree most
+  of the time.
+
+  AUTH. There is no login form and no session. The page is served behind HTTP
+  Basic; the PASSWORD is an admin API key (identity.py, §1.5) and the username is
+  ignored. Nothing here reads, stores or forwards the credential — the browser
+  attaches it, which is also why the live stream is reached at
+  /rs/v1/admin/stream: EventSource cannot set a header at all. No cookie is ever
+  minted, so CSRF never becomes reachable on these mutating routes.
+-->
+<style>
+:root {
+  color-scheme: dark light;
+  --bg:        #0e1116;
+  --bg-raise:  #161b22;
+  --bg-sink:   #0a0d12;
+  --line:      #262d38;
+  --line-soft: #1c222b;
+  --ink:       #d8dee7;
+  --ink-dim:   #8b96a6;
+  --ink-faint: #5b6675;
+  --accent:    #58a6ff;
+  --ok:        #3fb950;
+  --warn:      #d29922;
+  --bad:       #f85149;
+  --gap:       #d29922;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f8fa; --bg-raise: #fff; --bg-sink: #eef1f5;
+    --line: #d6dce4; --line-soft: #e7ebf0;
+    --ink: #1c2431; --ink-dim: #5b6675; --ink-faint: #8b96a6;
+    --accent: #0b62d0; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --gap: #9a6700;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg); color: var(--ink);
+  font: 13px/1.5 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); }
+code, .mono, td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* ---- chrome ---------------------------------------------------------- */
+header {
+  display: flex; align-items: center; gap: 16px;
+  padding: 10px 18px; background: var(--bg-sink);
+  border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5;
+}
+.brand { font-weight: 650; letter-spacing: .04em; }
+.brand span { color: var(--ink-faint); font-weight: 400; margin-left: 8px; }
+.spacer { flex: 1; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 9px; border-radius: 999px; font-size: 11.5px;
+  border: 1px solid var(--line); color: var(--ink-dim); background: var(--bg-raise);
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-faint); }
+.pill[data-state="live"]  .dot { background: var(--ok); }
+.pill[data-state="lost"]  .dot { background: var(--bad); }
+.pill[data-state="idle"]  .dot { background: var(--warn); }
+
+nav { display: flex; gap: 2px; padding: 0 12px; background: var(--bg-sink);
+      border-bottom: 1px solid var(--line); overflow-x: auto; }
+nav button {
+  background: none; border: 0; border-bottom: 2px solid transparent;
+  color: var(--ink-dim); font: inherit; padding: 9px 13px; cursor: pointer;
+  white-space: nowrap;
+}
+nav button:hover { color: var(--ink); }
+nav button[aria-current="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+nav .badge {
+  margin-left: 6px; font-size: 10.5px; padding: 0 5px; border-radius: 999px;
+  background: var(--gap); color: #12151a; font-weight: 700;
+}
+main { padding: 18px; max-width: 1500px; }
+
+/* ---- structure ------------------------------------------------------- */
+section { margin-bottom: 26px; }
+h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase;
+     color: var(--ink-dim); margin: 0 0 4px; font-weight: 600; }
+.lede { color: var(--ink-faint); margin: 0 0 12px; max-width: 68ch; }
+.cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+.card { background: var(--bg-raise); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+.card .k { color: var(--ink-faint); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.card .v { font-family: var(--mono); font-size: 21px; margin-top: 3px; }
+
+table { width: 100%; border-collapse: collapse; background: var(--bg-raise);
+        border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+th, td { text-align: left; padding: 7px 11px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+th { color: var(--ink-faint); font-weight: 600; font-size: 11px;
+     text-transform: uppercase; letter-spacing: .05em; background: var(--bg-sink); }
+tr:last-child td { border-bottom: 0; }
+td.num { text-align: right; }
+.wrap { overflow-x: auto; }
+
+/* ---- the gap: the whole point of this page --------------------------- */
+.pair { display: inline-flex; align-items: baseline; gap: 5px; font-family: var(--mono); }
+.pair .arrow { color: var(--ink-faint); }
+.pair .d { color: var(--ink-faint); }
+.pair .f { color: var(--ink); }
+.pair[data-differs="true"] { background: color-mix(in srgb, var(--gap) 16%, transparent);
+  border-radius: 4px; padding: 0 5px; }
+.pair[data-differs="true"] .f { color: var(--gap); font-weight: 650; }
+.pair[data-same="true"] .arrow, .pair[data-same="true"] .d { display: none; }
+
+.tag { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 11px;
+       border: 1px solid var(--line); color: var(--ink-dim); font-family: var(--mono); }
+.tag.ok   { color: var(--ok);   border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+.tag.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+.tag.bad  { color: var(--bad);  border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+
+.notice { border-left: 3px solid var(--gap); background: var(--bg-raise);
+          border-radius: 0 6px 6px 0; padding: 9px 13px; margin-bottom: 8px; }
+.notice .h { font-family: var(--mono); font-size: 12px; }
+.notice .d { color: var(--ink-dim); margin-top: 2px; }
+.empty { color: var(--ink-faint); padding: 14px; border: 1px dashed var(--line);
+         border-radius: 8px; text-align: center; }
+
+/* ---- controls -------------------------------------------------------- */
+button.act, input, select {
+  font: inherit; color: var(--ink); background: var(--bg-sink);
+  border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px;
+}
+input[type="checkbox"] { padding: 0; width: 15px; height: 15px; accent-color: var(--accent); }
+button.act { cursor: pointer; }
+button.act:hover { border-color: var(--accent); color: var(--accent); }
+button.act.danger:hover { border-color: var(--bad); color: var(--bad); }
+button.act:disabled { opacity: .45; cursor: not-allowed; }
+input, select { min-width: 0; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+label.f { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--ink-faint); }
+
+.banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 14px;
+          border: 1px solid var(--line); background: var(--bg-raise); }
+.banner.bad  { border-color: color-mix(in srgb, var(--bad) 50%, transparent); }
+.banner.ok   { border-color: color-mix(in srgb, var(--ok) 50%, transparent); }
+.secret { font-family: var(--mono); word-break: break-all; user-select: all;
+          background: var(--bg-sink); padding: 7px 9px; border-radius: 6px; display: block; margin-top: 6px; }
+.feed { max-height: 300px; overflow-y: auto; font-family: var(--mono); font-size: 11.5px; }
+.feed div { padding: 2px 0; border-bottom: 1px solid var(--line-soft); color: var(--ink-dim); }
+.feed b { color: var(--ink); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">ROADSTEAD<span>management</span></div>
+  <div class="spacer"></div>
+  <span class="pill" id="uptime">—</span>
+  <span class="pill" id="live" data-state="idle"><span class="dot"></span><span id="livetext">connecting</span></span>
+  <button class="act" id="refresh">Refresh</button>
+</header>
+
+<nav id="tabs"></nav>
+<main>
+  <div id="banner"></div>
+  <div id="view"><div class="empty">loading…</div></div>
+</main>
+
+<script>
+"use strict";
+
+/* ---------------------------------------------------------------------------
+ * The routes this page depends on, in ONE table.
+ *
+ * 🚨 Not scattered through the handlers: tests/test_admin_ui.py reads these
+ * literals back and fails if one names a route the server does not serve. A UI
+ * is a client of a contract like any other, and a client whose URLs drift is a
+ * page that 404s in the one view nobody opened this week — the same failure the
+ * SDK's transcribed literals are pinned against.
+ * ------------------------------------------------------------------------- */
+const API = {
+  status:      "/v1/status",
+  config:      "/rs/v1/admin/config",
+  keys:        "/rs/v1/admin/keys",
+  key:         (id) => "/rs/v1/admin/keys/" + encodeURIComponent(id),
+  callers:     "/rs/v1/admin/callers",
+  caller:      (id) => "/rs/v1/admin/callers/" + encodeURIComponent(id),
+  providers:   "/rs/v1/admin/providers",
+  flags:       "/rs/v1/admin/flags",
+  maintenance: "/rs/v1/admin/maintenance",
+  pause:       (ep) => "/rs/v1/admin/endpoints/" + encodeURIComponent(ep) + "/pause",
+  resume:      (ep) => "/rs/v1/admin/endpoints/" + encodeURIComponent(ep) + "/resume",
+  stream:      "/rs/v1/admin/stream",
+};
+
+/* ---- plumbing -------------------------------------------------------- */
+
+const $ = (sel) => document.querySelector(sel);
+const el = (tag, attrs, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "text") n.textContent = String(v);
+    else if (k === "html") n.innerHTML = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v === true ? "" : String(v));
+  }
+  // flat(Infinity), not flat(): a view that maps rows to [node, " "] pairs hands
+  // this an array of arrays, and one level of flattening leaves the inner arrays
+  // to be stringified as "[object HTMLSpanElement]" — which renders, does not
+  // throw, and looks like data until somebody reads it.
+  for (const kid of kids.flat(Infinity)) {
+    if (kid === null || kid === undefined || kid === false) continue;
+    n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return n;
+};
+
+/* ---------------------------------------------------------------------------
+ * EVERY field read off an API response goes through pick(), and that is a rule
+ * with a test rather than a style.
+ *
+ * 🚨 A UI is a client of a contract, and this one has no compiler, no schema and
+ * no types. Rename `capacity.slots.in_force` on the server and the page renders
+ * "—" in one cell of one view, forever, looking entirely healthy — which is the
+ * failure mode a dashboard is worst at and the exact shape of the vision
+ * capability nothing read. Routing the reads through one function makes the
+ * paths EXTRACTABLE, so tests/test_admin_ui.py can walk every one of them
+ * against a real response from a real service and fail when one stops resolving.
+ * ------------------------------------------------------------------------- */
+function pick(obj, path, dflt) {
+  let cur = obj;
+  for (const seg of path.split(".")) {
+    if (cur === null || cur === undefined) return dflt;
+    cur = cur[seg];
+  }
+  return cur === undefined ? dflt : cur;
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, Object.assign({ headers: { "Accept": "application/json" } }, opts || {}));
+  let body = null;
+  try { body = await res.json(); } catch (_) { /* an empty or non-JSON body is not a crash */ }
+  if (!res.ok) {
+    const err = new Error((body && (body.error || (body.error_detail && body.error_detail.message))) || ("HTTP " + res.status));
+    err.status = res.status;
+    err.body = body;
+    throw err;
+  }
+  return body;
+}
+
+/* 🚨 A 401/403 on a fetch does NOT re-prompt the browser — only a navigation
+ * does. So say what to do instead of leaving the page silently stale, which is
+ * the failure mode a dashboard is worst at: it keeps rendering the last good
+ * answer and looks entirely healthy. */
+function banner(kind, ...kids) {
+  $("#banner").replaceChildren(kids.length ? el("div", { class: "banner " + kind }, ...kids) : "");
+}
+function reportError(err) {
+  if (err.status === 401 || err.status === 403) {
+    banner("bad",
+      el("b", { text: "Not authorised" }), " — ",
+      "this session's credential does not carry the admin scope, or the browser did not attach it. ",
+      el("a", { href: location.pathname, text: "Reload the page" }),
+      " to be challenged again. The password is an admin API key; the username is ignored.");
+  } else {
+    banner("bad", el("b", { text: "Request failed" }), " — ", String(err.message || err));
+  }
+}
+
+const fmt = {
+  n: (v, d) => (v === null || v === undefined || Number.isNaN(v)) ? "—" : Number(v).toFixed(d === undefined ? 0 : d),
+  usd: (v) => (v === null || v === undefined) ? "—" : "$" + Number(v).toFixed(4),
+  ms: (v) => (v === null || v === undefined) ? "—" : Math.round(v) + " ms",
+  dur: (s) => {
+    if (s === null || s === undefined) return "—";
+    s = Math.floor(s);
+    if (s < 90) return s + "s";
+    if (s < 5400) return Math.floor(s / 60) + "m";
+    if (s < 172800) return Math.floor(s / 3600) + "h";
+    return Math.floor(s / 86400) + "d";
+  },
+  when: (ts) => ts ? new Date(ts * 1000).toLocaleString() : "—",
+  bool: (v) => v === true ? "yes" : v === false ? "no" : "—",
+};
+
+/* 🚨 THE component. Everything this page exists to show goes through here:
+ * a value an operator DECLARED beside the value actually IN FORCE. When they
+ * agree it collapses to one number and gets out of the way; when they differ it
+ * is loud, because that difference is the thing worth a person's attention. */
+function pair(declared, inForce, opts) {
+  const o = opts || {};
+  const d = declared === null || declared === undefined || declared === "" ? "—" : String(declared);
+  const f = inForce === null || inForce === undefined || inForce === "" ? "—" : String(inForce);
+  const same = d === f;
+  // 🚨 The attribute values are the STRING "true", not a boolean. `el` renders a
+  // boolean `true` as an empty attribute, and `[data-same="true"]` does not match
+  // an empty one — so the collapse-when-equal and highlight-when-different rules
+  // both silently never fired, and every pair rendered as an unexplained arrow.
+  const node = el("span", {
+    class: "pair",
+    "data-differs": (!same && !o.quiet) ? "true" : null,
+    "data-same": same ? "true" : null,
+  });
+  node.append(el("span", { class: "d", text: d }), el("span", { class: "arrow", text: "→" }),
+              el("span", { class: "f", text: f }));
+  if (!same && o.why) node.title = o.why;
+  return node;
+}
+
+function tag(text, kind) { return el("span", { class: "tag " + (kind || ""), text: text }); }
+function empty(msg) { return el("div", { class: "empty", text: msg }); }
+function table(headers, rows) {
+  const head = headers.map((h) => el("th", { text: h }));
+  // A numeric header that stays left-aligned over right-aligned figures reads as
+  // a different column. Copy the alignment off the first row rather than making
+  // every call site declare it twice — the cells already know.
+  const first = rows[0];
+  if (first) {
+    Array.from(first.children).forEach((cell, i) => {
+      if (cell.classList.contains("num") && head[i]) head[i].className = "num";
+    });
+  }
+  return el("div", { class: "wrap" },
+    el("table", {}, el("thead", {}, el("tr", {}, head)), el("tbody", {}, rows)));
+}
+
+/* ---- views ------------------------------------------------------------ */
+
+const state = { status: null, config: null, keys: null, callers: null, providers: null, feed: [] };
+
+/* --- Fleet ------------------------------------------------------------- */
+async function viewFleet(root) {
+  const s = state.status = await api(API.status);
+  const eps = pick(s, "endpoints", {});
+  const inFlight = Object.values(eps).reduce((a, e) => a + (pick(e, "in_flight", 0) || 0), 0);
+  const queued = Object.values(eps).reduce((a, e) => a + (pick(e, "queued", 0) || 0), 0);
+
+  root.append(el("section", {},
+    el("h2", { text: "Fleet" }),
+    el("div", { class: "cards" },
+      card("endpoints", Object.keys(eps).length),
+      card("in flight", inFlight),
+      card("queued", queued),
+      card("dispatched", pick(s, "scheduler.total_dispatched")),
+      card("timeouts", pick(s, "scheduler.total_timeouts")),
+      card("spilled", pick(s, "scheduler.total_spilled")),
+      card("alerts", pick(s, "alerts", []).length))));
+
+  const alerts = pick(s, "alerts", []);
+  if (alerts.length) {
+    root.append(el("section", {},
+      el("h2", { text: "Alerts" }),
+      alerts.map((a) => el("div", { class: "notice" },
+        el("div", { class: "h" }, tag(pick(a, "severity", "?"),
+          pick(a, "severity") === "CRITICAL" ? "bad" : "warn"), " ", pick(a, "name", "?")),
+        el("div", { class: "d", text: pick(a, "detail", "") })))));
+  }
+
+  const rows = Object.entries(eps).sort().map(([name, e]) => {
+    const paused = pick(e, "admin_paused", false);
+    const health = paused ? tag("paused", "warn")
+                 : pick(e, "healthy") ? tag("healthy", "ok") : tag("down", "bad");
+    const util = pick(e, "utilization_pct");
+    return el("tr", {},
+      el("td", {}, el("code", { text: name })),
+      el("td", {}, health, pick(e, "cooling") ? [" ", tag("cooling", "warn")] : null),
+      el("td", { class: "num", text: fmt.n(pick(e, "in_flight")) + " / " + fmt.n(pick(e, "max_slots")) }),
+      el("td", { class: "num", text: fmt.n(pick(e, "queued")) }),
+      el("td", { class: "num", text: fmt.ms(pick(e, "p50_wait_ms")) }),
+      el("td", { class: "num", text: fmt.ms(pick(e, "p95_wait_ms")) }),
+      el("td", { class: "num", text: util === undefined || util === null ? "—" : util + "%" }),
+      el("td", { class: "num", text: fmt.n(pick(e, "recent_timeouts")) }),
+      el("td", {},
+        el("button", {
+          class: "act" + (paused ? "" : " danger"),
+          onclick: () => control(paused ? API.resume(name) : API.pause(name),
+                                 paused ? {} : { reason: "paused from the management UI" }),
+          text: paused ? "Resume" : "Pause",
+        })));
+  });
+  root.append(el("section", {},
+    el("h2", { text: "Endpoints" }),
+    el("p", { class: "lede", text: "Slots are the unit of fairness. Pausing drains an endpoint: background work defers, interactive work fast-fails, and the restart is tagged as planned so its timeout burst does not read as an incident." }),
+    rows.length ? table(["endpoint", "state", "slots", "queued", "p50 wait", "p95 wait", "util", "timeouts 5m", ""], rows)
+                : empty("no endpoints configured")));
+
+  root.append(el("section", {},
+    el("h2", { text: "Live" }),
+    el("p", { class: "lede", text: "Completed calls, streamed from the scheduler. Reconnects on its own; a slow reader is dropped rather than allowed to stall the hot path." }),
+    el("div", { class: "feed", id: "feed" }, state.feed.length ? state.feed.map(feedRow) : el("div", { text: "waiting for traffic…" }))));
+}
+function card(k, v) {
+  return el("div", { class: "card" }, el("div", { class: "k", text: k }),
+            el("div", { class: "v", text: v === null || v === undefined ? "—" : String(v) }));
+}
+function feedRow(f) {
+  return el("div", {}, el("b", { text: pick(f, "agent", "?") }), " → ",
+            pick(f, "endpoint", "?"), " ", tag(pick(f, "priority", "?")),
+            "  " + fmt.n(pick(f, "duration_s"), 2) + "s  " +
+            fmt.n(pick(f, "queue_wait_ms")) + "ms wait  " + pick(f, "status", ""));
+}
+
+/* --- The gap ----------------------------------------------------------- */
+async function viewGap(root) {
+  const c = state.config = await api(API.config);
+  const notices = pick(c, "notices", []);
+
+  root.append(el("section", {},
+    el("h2", { text: "What you wrote that is not in force" }),
+    el("p", { class: "lede", text: "Three loaders accept a fixed set of keys and drop the rest. The keys stay dropped — a typo must not stop a fleet booting — but each one is retained here, because the person who reads a boot log and the person who asks why a knob does nothing are usually not the same person, a week apart." }),
+    notices.length
+      ? notices.map((n) => el("div", { class: "notice" },
+          el("div", { class: "h" }, tag(pick(n, "problem", "?"), "warn"), " ",
+            pick(n, "source", "?"), " · ", pick(n, "subject", "?")),
+          el("div", { class: "d", text: pick(n, "detail", "") })))
+      : el("div", { class: "banner ok" }, el("b", { text: "Nothing dropped." }),
+          " Every knob in the files below is read by something. This is not the same as \"no config was loaded\" — the sources are listed underneath.")));
+
+  const srcRows = [
+    ["catalog",       pick(c, "sources.catalog.path"),   pick(c, "sources.catalog.env_var")],
+    ["agents",        pick(c, "sources.agents.path"),    pick(c, "sources.agents.env_var")],
+    ["api keys",      pick(c, "sources.api_keys.file") ||
+                        (pick(c, "sources.api_keys.declared_in_env") ? "(declared in the environment)" : ""),
+                      pick(c, "sources.api_keys.env_var")],
+    ["acl",           "", pick(c, "sources.acl.env_var")],
+    ["runtime flags", pick(c, "sources.runtime_flags.path"), ""],
+  ].map(([what, path, env]) => el("tr", {},
+    el("td", { text: what }), el("td", {}, el("code", { text: path || "—" })),
+    el("td", {}, el("code", { text: env || "—" }))));
+  root.append(el("section", {}, el("h2", { text: "Sources" }), table(["what", "path", "environment"], srcRows)));
+
+  root.append(el("section", {},
+    el("h2", { text: "Runtime overlay" }),
+    el("p", { class: "lede", text: "A runtime edit never rewrites your config file. Enrolments and quota overrides are layered on top of the files at startup, revocations last. When the overlay cannot be written the change still takes effect — it just does not survive a restart, and says so." }),
+    el("div", { class: "cards" },
+      card("runtime keys", pick(c, "sources.admin_store.runtime_keys")),
+      card("revocations", pick(c, "sources.admin_store.revocations")),
+      card("caller overrides", pick(c, "sources.admin_store.caller_overrides"))),
+    el("p", { class: "lede" },
+      el("code", { text: pick(c, "sources.admin_store.path", "—") }), " ",
+      pick(c, "sources.admin_store.writable")
+        ? tag("writable", "ok")
+        : tag("read-only: " + pick(c, "sources.admin_store.reason", "unknown"), "bad"))));
+
+  const proxies = pick(c, "sources.trusted_proxies.networks", []);
+  const honoured = pick(c, "sources.trusted_proxies.forwarded_headers_honoured", false);
+  const builtinNets = pick(c, "sources.admin_nets.builtin", []);
+  const operatorNets = pick(c, "sources.admin_nets.operator", []);
+  root.append(el("section", {},
+    el("h2", { text: "Who can reach this" }),
+    el("p", { class: "lede", text: "X-Forwarded-For is a caller-supplied string and is read only from an address you trusted. Configuring one also withdraws the BUILT-IN loopback/docker admin grant from forwarded requests — \"it arrived on loopback\" stops meaning \"somebody is already on the machine\" the moment a front door exists." }),
+    table(["setting", "value"], [
+      el("tr", {}, el("td", { text: "trusted proxies" }),
+        el("td", {}, proxies.length
+          ? proxies.map((n) => [el("code", { text: n }), " "])
+          : tag("none — X-Forwarded-For is never read", "warn"))),
+      el("tr", {}, el("td", { text: "admin nets (built in)" }),
+        el("td", {}, builtinNets.map((n) => [el("code", { text: n }), " "]),
+          honoured ? [" ", tag("not applied to forwarded requests", "warn")] : null)),
+      el("tr", {}, el("td", { text: "admin nets (yours)" }),
+        el("td", {}, operatorNets.length
+          ? operatorNets.map((n) => [el("code", { text: n }), " "])
+          : tag("none — admin by key only, for a forwarded caller", "warn"))),
+    ])));
+}
+
+/* --- Keys -------------------------------------------------------------- */
+async function viewKeys(root) {
+  const k = state.keys = await api(API.keys);
+
+  root.append(el("section", {},
+    el("h2", { text: "Keys" }),
+    el("p", { class: "lede", text: "A key is the caller's identity, and therefore the fair-share key, the quota holder and the budget holder. Keys are flat on purpose: many keys naming one agent_id give a team one budget with per-key revocation, which is what nesting would have been for." }),
+    el("div", { class: "row" },
+      pick(k, "configured") ? tag("registry in play", "ok")
+                            : tag("no keys — a presented key is IGNORED and the address decides", "warn"),
+      pick(k, "require_key") ? tag("a key is required", "ok") : tag("a key is optional", ""),
+      pick(k, "store.writable", true) ? null
+        : tag("overlay read-only: " + pick(k, "store.reason", ""), "bad"))));
+
+  const rows = pick(k, "keys", []).map((row) => {
+    const floor = pick(row, "min_timeout_s");
+    return el("tr", {},
+      el("td", {}, el("code", { text: pick(row, "key_id", "?") })),
+      el("td", {}, el("code", { text: pick(row, "agent_id", "?") })),
+      el("td", {}, tag(pick(row, "priority", "—"))),
+      el("td", { class: "num", text: floor === null || floor === undefined ? "—" : floor + "s" }),
+      el("td", {}, pick(row, "admin") ? tag("admin", "warn") : ""),
+      // 🚨 Where the key was DECLARED, not where it is stored. An env-declared
+      // key can be revoked now and comes back on restart; the response says so
+      // and this column is why an operator is not surprised by it.
+      el("td", {}, tag(pick(row, "source", "file"))),
+      el("td", { text: fmt.when(pick(row, "created_at")) }),
+      el("td", {}, el("button", {
+        class: "act danger", text: "Revoke",
+        onclick: () => revoke(pick(row, "key_id"), pick(row, "agent_id")),
+      })));
+  });
+  root.append(el("section", {},
+    rows.length ? table(["key id", "agent_id", "priority", "floor", "scope", "declared in", "created", ""], rows)
+                : empty("no keys registered — every caller is identified by address")));
+
+  root.append(el("section", {},
+    el("h2", { text: "Enrol" }),
+    el("p", { class: "lede", text: "The secret is generated here, returned once, and never stored — only its digest is. A plaintext secret is never accepted in a request body, because a secret in a body is a secret in an access log." }),
+    el("div", { class: "row" },
+      field("agent_id", el("input", { id: "nk-agent", placeholder: "coding-assistant" })),
+      field("priority", select("nk-prio", ["P0_REALTIME", "P1_TURN_SUPPORT", "P2_POST_TURN", "P3_INGESTION", "P4_HYGIENE"], "P3_INGESTION")),
+      field("min_timeout_s", el("input", { id: "nk-floor", type: "number", step: "1", placeholder: "none", style: "width:110px" })),
+      field("key id", el("input", { id: "nk-id", placeholder: "auto" })),
+      field("admin", el("input", { id: "nk-admin", type: "checkbox" })),
+      el("button", { class: "act", text: "Enrol", onclick: enrol }))));
+}
+function field(label, control) { return el("label", { class: "f" }, label, control); }
+function select(id, options, value) {
+  return el("select", { id: id }, options.map((o) => el("option", { value: o, text: o, selected: o === value })));
+}
+
+async function enrol() {
+  const body = { agent_id: $("#nk-agent").value.trim(), priority: $("#nk-prio").value };
+  const floor = $("#nk-floor").value.trim();
+  if (floor) body.min_timeout_s = Number(floor);
+  const id = $("#nk-id").value.trim();
+  if (id) body.id = id;
+  if ($("#nk-admin").checked) body.admin = true;
+  if (!body.agent_id) { banner("bad", "agent_id is required."); return; }
+  try {
+    const res = await api(API.keys, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    banner("ok",
+      el("b", { text: "Enrolled " + pick(res, "key_id", "") }),
+      " — copy this now. It is not stored and cannot be shown again.",
+      el("code", { class: "secret", text: pick(res, "key", "(no secret returned)") }),
+      warnings(res), persisted(res));
+    render();
+  } catch (e) { reportError(e); }
+}
+async function revoke(keyId, agentId) {
+  if (!confirmish("Revoke " + keyId + " (" + agentId + ")? It stops working immediately.")) return;
+  try {
+    const res = await api(API.key(keyId), { method: "DELETE" });
+    banner("ok", el("b", { text: "Revoked " + keyId }), " ", warnings(res), persisted(res));
+    render();
+  } catch (e) { reportError(e); }
+}
+/* A plain confirm() blocks the event loop of the page, which is fine, but it is
+ * also the one browser dialog that cannot be styled or tested. Kept because the
+ * alternative — a bespoke modal — is more code than the action it guards. */
+function confirmish(msg) { return window.confirm(msg); }
+
+/* 🚨 An array, never a field. Two disclosures can be true of one action — the
+ * canonical pair being "this key is also declared in the environment, so it
+ * returns on restart" and "that was the last key, so the deployment is back on
+ * address identity". A single field means the second silently overwrites the
+ * first. */
+function warnings(res) {
+  const ws = pick(res, "warnings", []);
+  return ws.length ? el("div", {}, ws.map((w) => el("div", { class: "notice" },
+    el("div", { class: "d", text: typeof w === "string" ? w : (w.detail || JSON.stringify(w)) }))) ) : null;
+}
+function persisted(res) {
+  if (pick(res, "persisted", true) !== false) return null;
+  return el("div", { class: "notice" }, el("div", { class: "d" },
+    el("b", { text: "In force, but not persisted" }),
+    " — " + pick(res, "reason", "the runtime overlay is not writable") +
+    ". The change applies now and will not survive a restart."));
+}
+
+/* --- Callers ----------------------------------------------------------- */
+async function viewCallers(root) {
+  const c = state.callers = await api(API.callers);
+  const rows = pick(c, "callers", []).map(callerRow);
+  root.append(el("section", {},
+    el("h2", { text: "Callers" }),
+    el("p", { class: "lede", text: "Quota is shown three ways: what is in force, what the file declared, and what this API changed. An override reads as a difference rather than as a label. Spend and savings are never summed — one is an invoice, the other is capacity that was free." }),
+    rows.length ? table(["agent_id", "identities", "weight", "band", "degrade", "spill",
+                         "daily cap", "spent today", "avoided", "drr balance", ""], rows)
+                : empty("no callers yet")));
+}
+/* 🚨 A quota cell shows a PAIR only when something actually overrode the file.
+ *
+ * `declared` carries only the fields the file set, so pairing it against
+ * `in_force` unconditionally would light up every caller that took a default —
+ * which is to say all of them, on a fresh install. A highlight that fires on
+ * everything means nothing; same lesson as `substituted: true` firing on every
+ * intent-routed call. So the difference shown is the one an operator caused. */
+function quotaCell(row, name) {
+  // The three blocks are picked whole and indexed by field, rather than built as
+  // "quota.in_force." + name — a path assembled from a variable is a path the
+  // drift guard cannot read, and a guard that cannot read its subject is not a
+  // guard. The field NAMES are already pinned three ways on the server
+  // (EDITABLE_QUOTA_FIELDS, the file parser, and the dataclass).
+  const inForce = pick(row, "quota.in_force", {})[name];
+  const runtime = pick(row, "quota.runtime", {})[name];
+  const declared = pick(row, "quota.declared", {})[name];
+  if (runtime === undefined) return el("span", { class: "mono", text: String(inForce) });
+  return pair(declared === undefined ? "(default)" : declared, inForce,
+              { why: "changed at runtime through /rs/v1/admin/callers" });
+}
+
+function callerRow(row) {
+  const keys = pick(row, "identities.keys", []);
+  const addresses = pick(row, "identities.addresses", []);
+  const cap = pick(row, "spend.cap_usd");
+  const drr = pick(row, "drr.balance_ss");
+  return el("tr", {},
+    el("td", {}, el("code", { text: pick(row, "agent_id", "?") }),
+      pick(row, "spend.over") === true
+        ? el("div", {}, tag("over cap — one band down, no paid spill", "warn")) : null),
+    el("td", {}, keys.map((k) => [tag(k), " "]), addresses.map((a) => [tag(a), " "]),
+      (!keys.length && !addresses.length) ? el("span", { class: "tag", text: "unregistered" }) : null),
+    el("td", { class: "num" }, quotaCell(row, "weight")),
+    // 🚨 Declared band beside effective band. This pair is the ONE place a
+    // spend threshold is visible at all: crossing a cap costs exactly one band
+    // and paid spill, mints no error code, and is otherwise invisible.
+    el("td", {}, pair(pick(row, "spend.declared_priority"), pick(row, "spend.effective_priority"),
+                      { why: "a threshold degrades a band; it never rejects" })),
+    el("td", {}, quotaCell(row, "degrade_ok")),
+    el("td", {}, quotaCell(row, "spill_ok")),
+    el("td", { class: "num", text: cap === null || cap === undefined ? "—" : fmt.usd(cap) }),
+    // Two kinds of money, side by side and never added: the first is an
+    // invoice, the second is capacity that was free. A total would be neither.
+    el("td", { class: "num", text: fmt.usd(pick(row, "spend.spent_today_usd")) }),
+    el("td", { class: "num", text: fmt.usd(pick(row, "spend.avoided_usd")) }),
+    el("td", { class: "num", text: drr === undefined || drr === null ? "—" : fmt.n(drr, 1) }),
+    el("td", {}, el("button", { class: "act", text: "Edit", onclick: () => editCaller(row) })));
+}
+function editCaller(row) {
+  const q = pick(row, "quota.in_force", {});
+  const box = el("div", { class: "banner" },
+    el("b", { text: "Edit " + row.agent_id }),
+    el("p", { class: "lede", text: "A weight change reaches the live DRR budget and moves the replenish RATE, not the balance already run — clearing a deficit on an edit would hand a fresh allowance to exactly the caller being reweighted for consuming too much." }),
+    el("div", { class: "row" },
+      field("weight", el("input", { id: "eq-weight", type: "number", step: "0.1", value: q.weight ?? "", style: "width:100px" })),
+      field("max_balance_ss", el("input", { id: "eq-bal", type: "number", step: "1", value: q.max_balance_ss ?? "", style: "width:130px" })),
+      field("default_priority", select("eq-prio", ["P0_REALTIME", "P1_TURN_SUPPORT", "P2_POST_TURN", "P3_INGESTION", "P4_HYGIENE"], q.default_priority)),
+      field("daily_spend_usd", el("input", { id: "eq-cap", type: "number", step: "0.01", value: q.daily_spend_usd ?? "", style: "width:120px" })),
+      field("degrade_ok", el("input", { id: "eq-degrade", type: "checkbox", checked: !!q.degrade_ok })),
+      field("spill_ok", el("input", { id: "eq-spill", type: "checkbox", checked: !!q.spill_ok })),
+      el("button", { class: "act", text: "Apply", onclick: () => patchCaller(row.agent_id) }),
+      el("button", { class: "act", text: "Cancel", onclick: () => banner("") })));
+  $("#banner").replaceChildren(box);
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+async function patchCaller(agentId) {
+  const body = {};
+  const num = (id) => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
+  if (num("#eq-weight") !== null) body.weight = num("#eq-weight");
+  if (num("#eq-bal") !== null) body.max_balance_ss = num("#eq-bal");
+  if (num("#eq-cap") !== null) body.daily_spend_usd = num("#eq-cap");
+  body.default_priority = $("#eq-prio").value;
+  body.degrade_ok = $("#eq-degrade").checked;
+  body.spill_ok = $("#eq-spill").checked;
+  try {
+    const res = await api(API.caller(agentId), {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    banner("ok", el("b", { text: "Updated " + agentId }),
+      " — changed: " + Object.keys(pick(res, "changed", {})).join(", "), persisted(res));
+    render();
+  } catch (e) { reportError(e); }
+}
+
+/* --- Providers --------------------------------------------------------- */
+async function viewProviders(root) {
+  const prov = state.providers = await api(API.providers);
+
+  root.append(el("section", {},
+    el("h2", { text: "Providers" }),
+    el("p", { class: "lede", text: "Providers and endpoints are read-only: an endpoint is a routing-table entry that discovery, health and the fairness denominator all key on, so adding one is a models.yaml edit and a restart. A credential is shown by the NAME of the variable it comes from and whether that resolved — never by its value." }),
+    table(["provider", "engine", "address", "credential", "publishes", "endpoints"],
+      pick(prov, "providers", []).map((pr) => {
+        // 🚨 What this KIND of backend can tell us about itself, read off the
+        // descriptor and never off the engine name. Discovery is asymmetric by
+        // necessity — llama.cpp publishes real slot counts, vLLM publishes
+        // neither — and an operator reading "config-seeded" should see that it
+        // is a property of the engine rather than a probe that failed.
+        const pubs = [];
+        if (pick(pr, "descriptor.publishes_slot_count")) pubs.push("slots");
+        if (pick(pr, "descriptor.publishes_slot_context")) pubs.push("per-slot context");
+        if (pick(pr, "descriptor.publishes_context_ceiling")) pubs.push("context ceiling");
+        if (pick(pr, "descriptor.publishes_token_costs")) pubs.push("prices");
+        const envVar = pick(pr, "credential.env_var");
+        const base = pick(pr, "address.base_url");
+        return el("tr", {},
+          el("td", {}, el("code", { text: pick(pr, "provider", "?") })),
+          el("td", {}, tag(pick(pr, "engine", "?"))),
+          el("td", {}, el("code", { text: base ||
+            (pick(pr, "address.host", "?") + ":" + pick(pr, "address.port", "?")) })),
+          // The variable's NAME and whether it resolved. Never its value: a
+          // management surface that prints a credential is a key store.
+          el("td", {}, envVar
+            ? [el("code", { text: envVar }), " ",
+               pick(pr, "credential.present") ? tag("resolved", "ok") : tag("NOT SET", "bad")]
+            : el("span", { class: "tag", text: "none needed" })),
+          el("td", {}, pubs.length ? pubs.map((x) => [tag(x), " "]) : tag("nothing — config-seeded", "warn")),
+          el("td", {}, pick(pr, "endpoints", []).map((e) => [el("code", { text: e }), " "])));
+      }))));
+
+  root.append(el("section", {},
+    el("h2", { text: "Endpoints — declared vs in force" }),
+    el("p", { class: "lede", text: "Capacity discovery is asymmetric by engine, not by oversight: llama.cpp publishes real slot counts and per-slot context, vLLM publishes neither. \"Discovery agreed\" and \"discovery never ran\" look identical on a status page, so the engine's own capability is reported beside the numbers." }),
+    table(["endpoint", "provider", "state", "slots", "context", "price in/out", "failover", "spill"],
+      pick(prov, "endpoints", []).map(endpointRow))));
+}
+function endpointRow(e) {
+  const discoverable = pick(e, "capacity.slots.discoverable");
+  const inPrice = pick(e, "price.input_usd_per_mtok");
+  const failover = pick(e, "routing.failover_to");
+  const spill = pick(e, "routing.spill_to");
+  return el("tr", {},
+    el("td", {}, el("code", { text: pick(e, "endpoint", "?") })),
+    el("td", {}, el("code", { text: pick(e, "provider", "?") })),
+    el("td", {}, pick(e, "health.admin_paused") ? tag("paused", "warn")
+               : pick(e, "health.healthy") === false ? tag("down", "bad") : tag("up", "ok")),
+    // 🚨 The seed beside what discovery left, plus whether the engine publishes
+    // it AT ALL — because "discovery agreed" and "discovery never ran" are
+    // indistinguishable from the numbers alone, and that ambiguity is what
+    // /v1/status has and this view exists to remove.
+    el("td", {}, pair(pick(e, "capacity.slots.declared"), pick(e, "capacity.slots.in_force"),
+      { why: discoverable ? "discovery is authoritative for this engine"
+                          : "this engine publishes no slot count — the config seed is all there is" }),
+      discoverable === false ? [" ", tag("config-seeded", "warn")] : null),
+    el("td", {}, pair(pick(e, "capacity.context_per_slot.declared"),
+                      pick(e, "capacity.context_per_slot.in_force"))),
+    // 🚨 `real` separates an invoice from an avoided cost, and only the invoice
+    // counts against a threshold. Branch on it, never on whether the endpoint
+    // looks remote.
+    el("td", {}, inPrice === null || inPrice === undefined
+      ? tag("—")
+      : [String(inPrice) + " / " + String(pick(e, "price.output_usd_per_mtok")) + " per Mtok ",
+         pick(e, "price.real") ? tag("invoice", "warn") : tag("avoided", "ok")]),
+    el("td", {}, failover ? el("code", { text: failover }) : "—"),
+    el("td", {}, spill ? el("code", { text: spill }) : "—"));
+}
+
+/* --- Control ----------------------------------------------------------- */
+async function viewControl(root) {
+  const f = await api(API.flags);
+  const flags = pick(f, "flags", {});
+  root.append(el("section", {},
+    el("h2", { text: "Runtime flags" }),
+    el("p", { class: "lede", text: "The shadow-to-enforce switches and the kill switches. A change takes effect immediately and is persisted across restarts; no process restart is needed." }),
+    table(["flag", "state", ""], Object.entries(flags).sort().map(([name, on]) => el("tr", {},
+      el("td", {}, el("code", { text: name })),
+      el("td", {}, on ? tag("on", "ok") : tag("off", "")),
+      el("td", {}, el("button", { class: "act", text: on ? "Turn off" : "Turn on",
+        onclick: () => setFlag(name, !on) })))))));
+
+  let windows = { windows: [] };
+  try { windows = await api(API.maintenance); } catch (e) { /* no persistence backend is not an error here */ }
+  root.append(el("section", {},
+    el("h2", { text: "Maintenance windows" }),
+    el("p", { class: "lede", text: "Tag a deliberate restart so its burst of timeouts reads as planned rather than as an incident. Pause/resume records one automatically; this is for a restart taken without the drain." }),
+    el("div", { class: "row" },
+      field("endpoint", el("input", { id: "mw-ep", placeholder: "tier1 or *" })),
+      field("reason", el("input", { id: "mw-reason", placeholder: "model swap", style: "width:220px" })),
+      field("backdate (s)", el("input", { id: "mw-dur", type: "number", placeholder: "open now", style: "width:120px" })),
+      el("button", { class: "act", text: "Record", onclick: recordWindow })),
+    pick(windows, "windows", []).length
+      ? table(["endpoint", "started", "ended", "reason", "operator"],
+          pick(windows, "windows", []).map((w) => el("tr", {},
+            el("td", {}, el("code", { text: pick(w, "endpoint", "?") })),
+            el("td", { text: fmt.when(pick(w, "started_at")) }),
+            el("td", { text: pick(w, "ended_at") ? fmt.when(pick(w, "ended_at")) : "open" }),
+            el("td", { text: pick(w, "reason", "") }),
+            el("td", { text: pick(w, "operator", "") }))))
+      : empty("no windows in the last 24 hours")));
+}
+async function setFlag(name, on) {
+  try {
+    await api(API.flags, { method: "POST", headers: { "Content-Type": "application/json" },
+                           body: JSON.stringify({ [name]: on }) });
+    banner("ok", "Flag " + name + " is now " + (on ? "on" : "off") + ".");
+    render();
+  } catch (e) { reportError(e); }
+}
+async function recordWindow() {
+  const body = { endpoint: $("#mw-ep").value.trim(), reason: $("#mw-reason").value.trim() };
+  const dur = $("#mw-dur").value.trim();
+  if (dur) body.duration_s = Number(dur);
+  if (!body.endpoint) { banner("bad", "endpoint is required."); return; }
+  try {
+    const res = await api(API.maintenance, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    banner("ok", "Recorded " + pick(res, "recorded", []).length + " window(s).");
+    render();
+  } catch (e) { reportError(e); }
+}
+async function control(path, body) {
+  try {
+    const res = await api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    banner("ok", el("code", { text: pick(res, "endpoint", "?") }),
+      pick(res, "paused") ? " is paused — it is draining." : " is resumed.");
+    render();
+  } catch (e) { reportError(e); }
+}
+
+/* ---- tabs + lifecycle ------------------------------------------------- */
+
+const TABS = [
+  { id: "fleet",     label: "Fleet",     view: viewFleet },
+  { id: "gap",       label: "The gap",   view: viewGap, badge: () => pick(state.config, "notices", []).length },
+  { id: "keys",      label: "Keys",      view: viewKeys },
+  { id: "callers",   label: "Callers",   view: viewCallers },
+  { id: "providers", label: "Providers", view: viewProviders },
+  { id: "control",   label: "Control",   view: viewControl },
+];
+let current = (location.hash || "#fleet").slice(1);
+if (!TABS.some((t) => t.id === current)) current = "fleet";
+
+function drawTabs() {
+  $("#tabs").replaceChildren(...TABS.map((t) => {
+    const n = t.badge ? t.badge() : 0;
+    return el("button", { "aria-current": t.id === current, onclick: () => { current = t.id; location.hash = t.id; render(); } },
+      t.label, n ? el("span", { class: "badge", text: String(n) }) : null);
+  }));
+}
+
+let rendering = false;
+async function render() {
+  if (rendering) return;
+  rendering = true;
+  const tab = TABS.find((t) => t.id === current) || TABS[0];
+  const root = el("div", {});
+  try {
+    await tab.view(root);
+    $("#view").replaceChildren(root);
+  } catch (e) {
+    reportError(e);
+    $("#view").replaceChildren(el("div", { class: "empty", text: "could not load this view" }));
+  } finally {
+    rendering = false;
+    drawTabs();
+  }
+}
+
+/* The chrome belongs to the page, not to one tab: the gap COUNT and the uptime
+ * are wanted wherever you are. A badge that appears only once you open the tab
+ * it counts is not a notification, and an uptime that blanks when you navigate
+ * away from Fleet reads as the proxy having gone. */
+async function primeChrome() {
+  try { state.config = await api(API.config); drawTabs(); } catch (e) { /* the tab reports it */ }
+  try { state.status = await api(API.status); uptimePill(); } catch (e) { /* likewise */ }
+}
+
+function uptimePill() {
+  const up = pick(state.status, "scheduler.uptime_s");
+  $("#uptime").textContent = up === undefined || up === null ? "—" : "up " + fmt.dur(up);
+}
+
+/* ---- the live stream --------------------------------------------------
+ * EventSource cannot set a request header, so this works only because the page
+ * and the stream sit in one directory and the browser attaches the credential
+ * it already holds. It reconnects on its own; a slow reader is dropped by the
+ * hub rather than allowed to stall the dispatch path, so losing the stream is
+ * never a reason to stop trusting the REST views.
+ * --------------------------------------------------------------------- */
+function connect() {
+  let es;
+  try { es = new EventSource(API.stream); }
+  catch (e) { setLive("lost", "unavailable"); return; }
+  es.addEventListener("hello", () => setLive("live", "live"));
+  es.addEventListener("call.completed", (ev) => {
+    let f; try { f = JSON.parse(ev.data); } catch (_) { return; }
+    state.feed.unshift(f);
+    state.feed = state.feed.slice(0, 60);
+    const feed = $("#feed");
+    if (feed) feed.replaceChildren(...state.feed.map(feedRow));
+  });
+  es.addEventListener("metrics", () => { if (current === "fleet") render(); });
+  es.onerror = () => setLive("lost", "reconnecting");
+  es.onopen = () => setLive("live", "live");
+}
+function setLive(state_, text) {
+  $("#live").setAttribute("data-state", state_);
+  $("#livetext").textContent = text;
+}
+
+$("#refresh").addEventListener("click", () => render());
+window.addEventListener("hashchange", () => {
+  const h = location.hash.slice(1);
+  if (h && h !== current && TABS.some((t) => t.id === h)) { current = h; render(); }
+});
+
+render().then(uptimePill);
+primeChrome();
+connect();
+/* A slow heartbeat, not a poll: the stream carries what changes quickly, and
+ * this only catches what it does not — a config edit made from a terminal, an
+ * endpoint that went unhealthy between metrics frames. 30s is chosen to be
+ * boring; a dashboard on a fast cadence is exactly the load that finds a
+ * concurrency violation, which is the other constraint this page has. */
+setInterval(() => { if (!document.hidden) { render(); primeChrome(); } }, 30000);
+</script>
+</body>
+</html>

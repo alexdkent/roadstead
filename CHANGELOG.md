@@ -8,6 +8,66 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Added — the management UI (Workstream G)
+
+Landed 2026-09-01. `GET /rs/v1/admin/ui` — the roadmap's "manage and monitor Roadstead as a
+standalone product" line. **Off by default**: unset `ROADSTEAD_ADMIN_UI` and the route does not
+exist, which is absence rather than refusal, the same posture as `ROADSTEAD_TRUSTED_PROXIES`.
+
+- **One static HTML file, vanilla JS, no bundler and no external references at all.** The
+  dependency list is still six packages and a test asserts it. The file ships in the wheel, so it is
+  public surface — the same argument as `roadstead.testing` — and the CSP it is served with
+  (`default-src 'none'`, `connect-src 'self'`, no host anywhere) forbids an external reference
+  outright rather than trusting a reviewer to notice one.
+- **It shows the GAP, not the config.** Declared beside in force wherever the two can disagree:
+  the catalog's slot seed against what discovery left (with whether the engine publishes it at all),
+  quota `in_force`/`declared`/`runtime`, declared band against effective band — which is the only
+  place a spend threshold is visible, since crossing one mints no error code. A pair collapses to
+  one value when they agree, so a highlight means something.
+- **🚨 Auth is HTTP Basic and the credential is an API key.** A browser cannot attach a bearer token
+  to a navigation and `EventSource` cannot set a header at all, so a browser-facing surface needs a
+  scheme the browser carries. Minting a *password* to go in it would be a second credential kind
+  with its own store, rotation and revocation, parallel to a registry that already does all three.
+  So the key goes in the password half and the username is ignored. **No cookie is minted, so CSRF
+  never becomes reachable** on the mutating routes — the concern that has bound this since the
+  roadmap was written is answered by not creating it.
+- **The door refuses 401 where the plane answers 403**, with `WWW-Authenticate: Basic`. The
+  401/403 split is right for an API client and a dead end for a browser: a 403 produces no password
+  box, so an operator arriving with no credential — everyone, the first time — has no way to answer
+  the refusal. The challenge is identical whether or not keys are configured, so it discloses
+  nothing about which §1.5 regime is in play.
+- **🚨 Every field the page reads is pinned against a real response.** There is no compiler, no
+  schema and no types here: rename a field on the server and one cell renders "—" forever while the
+  page looks healthy. So every read goes through `pick(obj, "a.b.c")` — a rule with a test, not a
+  style — and the guard walks every extracted path against responses a real service produced. It
+  found a live bug on its first run (the feed read `agent_id`/`total_ms` off a frame publishing
+  `agent`/`duration_s`), and rendering the page in a browser found two more the tests could not see:
+  a one-level `flat()` stringifying nested nodes as `[object HTMLSpanElement]`, and boolean
+  attributes rendered empty so `[data-same="true"]` never matched and no pair ever collapsed.
+- **The asset read goes off-loop** and is cached after the first hit. A dashboard on a fast cadence
+  is exactly the load that finds a concurrency violation.
+- `docs/api.md` §1.5, §3 and a new §3.7. Sixteen mutations, every guard observed going red.
+
+### Changed — `GET /v1/stream` is admin-gated 🚨 BREAKING
+
+It was not, and a frame there names the caller, the endpoint, the tokens and the timing of **every
+call the fleet serves** — the live form of `/rs/v1/admin/callers`, which has been gated since it
+existed. `handle_maintenance_list` carries a note from the previous round of this tightening ("was
+unauthenticated — tightened with the rest"); the stream was missed because it reads as plumbing
+rather than as a view. A consumer polling it from a host outside the admin nets, with no admin key,
+now gets a 403. It is also aliased at `/rs/v1/admin/stream` — same handler, same gate — because
+`EventSource` cannot set a request header, so the UI can only reach it through credentials the
+browser attaches by directory.
+
+### Changed — `Authorization: Basic` is now one of our credential forms 🚨 BREAKING
+
+Previously ignored as "somebody else's auth". The key rides in the **password** half. A deployment
+that has keys configured *and* callers presenting an unrelated Basic header will now see those
+callers refused with a 401 rather than quietly identified by address — which is §1.5 rule 1 working,
+but it is a behaviour change and it is recorded as one. A header that cannot be base64-decoded is
+**no credential at all** rather than a failed one, so it still falls through to the address: a header
+we cannot parse was probably never meant as ours. Unrecognised schemes are still ignored.
+
 ### Fixed — trusted proxies, and the admin grant behind one 🚨
 
 Landed 2026-09-01. **Not breaking**: `ROADSTEAD_TRUSTED_PROXIES` is empty by default, so a

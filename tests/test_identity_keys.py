@@ -271,7 +271,18 @@ def test_require_key_without_any_key_configured_is_reported(caplog):
     ({"Authorization": "Bearer abc"}, "abc"),
     ({"authorization": "bearer abc"}, "abc"),      # scheme is case-insensitive
     ({"X-API-Key": "abc"}, "abc"),
-    ({"Authorization": "Basic dXNlcjpwdw=="}, ""),  # somebody else's auth
+    # 🚨 CHANGED 2026-09-01 (Workstream G). This case asserted `""` — Basic was
+    # "somebody else's auth". It is now OURS, and the key rides in the PASSWORD
+    # half (`user:pw` → `pw`), because a browser cannot attach a bearer token to
+    # a navigation and `EventSource` cannot set a header at all. The alternative
+    # was minting a password, which is a second credential kind with its own
+    # store, rotation and revocation, parallel to a registry that already does
+    # all three. Recorded in CHANGELOG.md as the wire-contract change it is.
+    ({"Authorization": "Basic dXNlcjpwdw=="}, "pw"),
+    # A scheme we do not recognise is still ignored rather than treated as a
+    # malformed key of ours. That claim is what the Basic case used to carry,
+    # and it still needs carrying.
+    ({"Authorization": "Negotiate YIIC…"}, ""),
     ({}, ""),
 ])
 def test_where_a_key_may_be_presented(headers, expected):

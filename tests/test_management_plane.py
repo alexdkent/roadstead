@@ -757,10 +757,17 @@ def _documented_routes(doc: str) -> set[str]:
     return paths
 
 
-def test_every_management_route_is_documented(doc):
+def test_every_management_route_is_documented(doc, monkeypatch):
     """§3 publishes the route table and the suite reads it back, the same way
     §2.1's codes and §1.6's admission table are pinned. A route added to the
-    code and not the document is a control surface nobody can find."""
+    code and not the document is a control surface nobody can find.
+
+    🚨 The UI is enabled for the sweep. `ROADSTEAD_ADMIN_UI` gates whether two
+    routes are REGISTERED, so leaving it unset would hide them from the guard —
+    a documented surface that the contract test cannot see is the guard going
+    blind rather than green.
+    """
+    monkeypatch.setenv("ROADSTEAD_ADMIN_UI", "1")
     documented = _documented_routes(doc)
     assert documented, "the table parser found no routes — it is asserting nothing"
     routed = {r.path for r in make_routes(_FakeSvc())
@@ -771,9 +778,10 @@ def test_every_management_route_is_documented(doc):
             f"{path} is served and is not a row in docs/api.md §3's route table")
 
 
-def test_the_document_publishes_no_route_that_is_not_served(doc):
+def test_the_document_publishes_no_route_that_is_not_served(doc, monkeypatch):
     """The direction that actually rots: a route removed from the code leaves
     its row behind, and an operator reads a control surface that 404s."""
+    monkeypatch.setenv("ROADSTEAD_ADMIN_UI", "1")   # see the sweep above
     served = {r.path for r in make_routes(_FakeSvc())}
     for path in _documented_routes(doc):
         assert path in served, (
