@@ -40,10 +40,10 @@ Four things make it different from every gateway surveyed in `docs/evaluation.md
 ## Provenance — and why the authority rule is GONE
 
 This code was extracted on 2026-08-31 from a private monorepo (`OriginFleet`), where it still runs
-in production as `originfleet.llmproxy`. The history here is the real thing — 282 commits going back
-to `9b11729` (2026-05-27, *"centralized LLM scheduler proxy — DRR scheduling, priority bands"*),
-extracted with `git filter-repo` rather than copied, so `git log`/`git blame` on any line still
-reaches its original rationale. **Use that.** It is the best documentation this project has.
+in production as `originfleet.llmproxy`. The history here is the real thing — 282 commits at
+extraction, going back to `9b11729` (2026-05-27, *"centralized LLM scheduler proxy — DRR scheduling,
+priority bands"*), extracted with `git filter-repo` rather than copied, so `git log`/`git blame` on
+any line still reaches its original rationale. **Use that.** It is the best documentation this project has.
 
 🚨 **For a few hours on 2026-08-31 this file said the monorepo copy was AUTHORITATIVE FOR BEHAVIOUR
 and told you not to fix behaviour here. That rule is retired.** If you are reading a cached summary,
@@ -338,6 +338,33 @@ which reads as "the edit did nothing" for exactly the busy caller it was aimed a
 key: many keys → one `agent_id` is already team-level quota inheritance, which is what the roadmap's
 "multi-tenancy depth" question was asking for.
 
+🚨 **`admin_readonly` NARROWS `admin`, and a narrowing is never cancellable by a wider grant.**
+A credential with `admin: true, admin_readonly: true` reaches every `GET` on the management plane and
+is refused a 403 that says why on everything else; on a key without `admin` it is a **400 at
+enrolment**, because an operator who wrote it believes they issued a safer credential than they have.
+🚨 **The read/write split comes from the HTTP METHOD**, in the one shared gate — a list of write
+routes is a second thing to keep in step with `routes.py`, and when it falls behind the failure is
+silent and *widening*. All 11 mutating admin routes inherit it, the four control routes that predate
+the plane included. It is spelled `:readonly` in the shared identity grammar, so `ROADSTEAD_API_KEYS`
+and `ROADSTEAD_ACL` express it too — and `127.0.0.1=ops:admin:readonly` is read-only **even though
+loopback is a built-in admin net**. If the widest grant won there, that line would silently be a full
+grant for every operator who wrote it. `identity.py` decides and everything else renders:
+`IdentityResolver.admin_denial` owns which of the three refusals applies, and an AST guard fails if
+`may_admin_write` or `admin_readonly` is read anywhere else — a second place deciding what a scope
+permits is the `_remote_ip` shape again.
+
+🚨 **`GET /rs/v1/admin/audit` says who changed what, and EVERY mutating admin route records.**
+Flags, pause, resume and maintenance touch no overlay state and would otherwise record nothing; a
+trail covering only some of them is worse than none, because a reader assumes completeness. The
+completeness guard is driven from `routes.py`, not from a list. **A record names the credential and
+never carries one** — `key_id`, never the key or the digest — and it records the key label *and* the
+address always: a record with an address and no `key_id` means an address-derived admin made the
+change, which is meaningful and slightly alarming, and collapsing the two into one actor string would
+hide which factor authorized it. It **reports its own limits as data** (`persisted` — in-memory is
+the default — `dropped`, `capacity`), because it is an operator-facing change trail rather than a
+security log of record, and presenting itself as complete while being neither durable nor unbounded
+is the gap this repo keeps paying for. Written on the loop, persisted off it.
+
 🚨 **The management UI is ONE static file, and the credential is still a key.** `roadstead/ui/index.html`
 (`GET /rs/v1/admin/ui`, registered only when `ROADSTEAD_ADMIN_UI` is set — off means the route does
 not exist) is vanilla JS with no bundler and no external reference of any kind; it ships in the wheel,
@@ -391,6 +418,31 @@ bites, all in `docs/api.md` §1.5:
 one — `management.py` had grown its own `_remote_ip`, and a sweep for `client.host` is walked past by
 `getattr(getattr(request, "client", None), "host", "")`, which is the same bug.
 
+🚨 **A key has a LIFE, a SUCCESSOR and a PLACE, and every one of the three may only narrow.**
+`created_at` was written, surfaced in two views and read for no decision until 2026-09-01.
+
+- **Expiry** — `expires_at` (an absolute instant in a keys file) / `expires_in_s` (a duration over
+  the API). No expiry means never expires, so an existing registry behaves exactly as it did. An
+  expired key is a `401 invalid_api_key`: **its own sentence, the same code**, because a caller can
+  act on no distinction between "expired" and "unknown" while the operator reading the log can — one
+  means check what you pasted, the other means issue a successor. The store holds the absolute
+  instant, never the duration it came from, so a restart cannot extend a key.
+- **Rotation** — `POST /rs/v1/admin/keys/{key_id}/rotate`, ONE action, because the manual version is
+  two calls in an order that matters and **both orders are wrong**: enrol-then-revoke leaves the
+  successor live and unknown to the caller, revoke-then-enrol leaves nothing working. The successor
+  inherits the predecessor's policy but **not its expiry** (inheriting an absolute instant would mint
+  a successor that expired seconds later) — right, and therefore *disclosed* rather than changed.
+  `overlap_s` defaults to 0; with an overlap the predecessor gets an **expiry** rather than a
+  tombstone, so it survives a restart a timer would not. 🚨 An overlap may **shorten** a
+  predecessor's life and never lengthen it — a day-long overlap on a two-hour key pushed its expiry a
+  day out, which is a rotation quietly widening a credential. If the successor cannot be minted the
+  predecessor is untouched.
+- **Binding** — per-key `bind` CIDRs are an ADDITIONAL constraint, never a way for a key to widen
+  what an address grants. An unparseable entry is a 400 at enrolment and matches nothing at
+  resolution: a narrowing that failed open would be worse than none. 🚨 It is checked against the
+  *resolved* address, so a binding is only as trustworthy as `ROADSTEAD_TRUSTED_PROXIES` — and
+  `GET /rs/v1/admin/keys` reports `checked_against` rather than leaving an operator to infer it.
+
 `/v1/submit` is gated like the OpenAI doors as of 2026-09-01. It was not, on the same port, which
 meant the fair-share key was self-asserted by anyone who used that door.
 
@@ -409,6 +461,18 @@ about *capacity*, not billing, and a misconfigured quota must not be able to tak
 a runaway caller is already bounded by what is free and by DRR fairness. `docs/api.md` §1.6, and
 `tests/test_spend.py` fails if a spend-shaped code ever appears in §2.1.
 
+🚨 **There are TWO thresholds now, and degradations do NOT STACK.** `requests_per_minute` joins
+`daily_spend_usd` and costs a caller exactly what that one costs it — **one priority band and paid
+spill, never local capacity** — and mints no code either. DRR is fairness *under contention*, so a
+caller alone on a quiet fleet is unthrottled by design; that is correct for fairness and exactly why
+it does not bound a runaway, which is the gap this fills. A rate *limit* would be a fourth spelling
+of "no" and would put a mistyped threshold in a position to take a caller offline. 🚨 A caller over
+**both** thresholds drops **one** band, not two — `ProxyState.effective_priority` consults at most
+one standing by construction, so a third threshold cannot compose by accident. Each crossing reports
+through the degradation seam **separately**, because one means "look at the bill" and the other means
+"look for a loop". `effective_priority` is split from `spend_demote` so a management *read* fires no
+notice. `roadstead/rate.py` is the **sixth** pure-computation module.
+
 🚨 **Admission is ONE decision with THREE outcomes** — `Scheduler._admit` returns
 `DISPATCH` / `SPILL` / `DEFER`. **Local capacity is tried first, for everybody**: no test involving
 money appears above that line, so an over-cap caller, an un-opted-in caller and a caller nobody
@@ -416,6 +480,20 @@ configured all reach the same local dispatch. Spill is considered only once loca
 is what makes remote capacity *overflow* rather than a parallel system with its own fairness. It
 never chains — a spilled request does not spill again, or two endpoints pointing at each other would
 hand one request back and forth a hop per tick forever.
+
+🚨 **"Does this fit in the context?" is asked in ONE place — `cost_model.context_fit`.** It was
+written out by hand at four sites, and the fourth (the WAL-recovery shadow tally) had diverged and
+was **dead**: it read `req.est_input_tokens or 0`, but that field is cached by `scheduler.enqueue`
+and `recover_queued` builds its `QueuedRequest` straight from the WAL row, so the estimate was always
+0 and the tally could only fire when `max_tokens` *alone* exceeded the ceiling. It disagreed with the
+live predicate on 27 of 153 corpus cases. 🚨 **`context_fit` returns the answer and its arithmetic
+and takes NO action** — the consequences stay deliberately different (admission is shadow-or-422
+behind `context_gate_enforce`; failover refuses unconditionally, because there the alternative is a
+guaranteed backend 400; spill defers; recovery counts and never rejects), and folding the consequence
+in would have armed a flag nobody flipped. A test pins that. An AST guard fails if any module
+re-derives a ceiling comparison from `estimate_input_tokens` instead of calling it, and a second
+constant sweep allows exactly one spelling of `CONTEXT_OVERFLOW_MARKER` per side of the client
+boundary.
 
 🚨 **`spill_to` is not `failover_to`, and `spill_ok` is not `degrade_ok`.** Failover asks "this
 backend is DOWN, may a smaller model answer" — a quality judgement, answered by whether the output is
@@ -481,6 +559,6 @@ that is not the same as no personal data, and the sweep in S5 now runs both patt
 🚨 **What remains under fleet names is COMMENTS RECORDING MEASUREMENTS, and they stay.** Same rule as
 `models.yaml`: those are records of what was measured, not references to anything that exists here.
 
-🚨 **And scrubbing the working tree is not enough — it is in the history**, across 282 commits, which
-means another `git filter-repo` pass (S6, last, because it invalidates every SHA). Read that plan
-before changing visibility.
+🚨 **And scrubbing the working tree is not enough — it is in the history**, across all 312 commits
+(282 of them extracted), which means another `git filter-repo` pass (S6, last, because it invalidates
+every SHA). Read that plan before changing visibility.

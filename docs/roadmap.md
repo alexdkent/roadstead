@@ -143,9 +143,12 @@ is for.
 
 Manage and monitor Roadstead as a standalone product — keys, quotas, budgets, providers, backends,
 and the live picture of what the fleet is doing. **The HTTP half landed 2026-09-01** (`/rs/v1/admin`
-— Workstream E); a UI has not, and the two constraints still bind: it must not violate the
-concurrency invariant (`CLAUDE.md` — heavy reads go off-loop, mutations stay on it), and it must not
-drag a frontend toolchain into a package whose dependency list is deliberately short.
+— Workstream E) and **the UI with it** (Workstream G), with both constraints held rather than
+relaxed: it does not violate the concurrency invariant (`CLAUDE.md` — heavy reads go off-loop,
+mutations stay on it, and the only server-side work is an asset read that goes off-loop), and it
+drags no frontend toolchain into a package whose dependency list is deliberately short — one static
+file, vanilla JS, no bundler, and the dependency list is still six. **H** then split the scope it
+needed (`admin_readonly`) and added the trail it made everyone want (`/rs/v1/admin/audit`).
 
 ---
 
@@ -155,9 +158,10 @@ Not phases. Several can run concurrently; the dependencies between them are what
 
 ### A · Provider abstraction — *the foundation*
 
-Extract a provider interface out of `backend.py` (llama.cpp/vLLM branching inline). Formalise the
-capability descriptor. Nothing else on this list is buildable first: OpenRouter needs it, spill needs
-it, per-provider costing needs it, and enriched model information is largely a readout of it.
+**Landed 2026-08-31** (`455e736`). The case for it, which every workstream after this one drew on:
+extract a provider interface out of `backend.py` (llama.cpp/vLLM branching inline) and formalise the
+capability descriptor. Nothing else on this list was buildable first — OpenRouter needed it, spill
+needed it, per-provider costing needed it, and enriched model information is largely a readout of it.
 
 **Landed 2026-08-31 — the local half.** `roadstead/providers/` is the interface, with llama.cpp and
 vLLM behind it: `prepare_chat_payload`, `path_for`, `discover_capacity` / `parse_capacity`, and a
@@ -186,18 +190,19 @@ not own, and with it the assumptions the local engines let us keep:
   bearer token, and a two-entry catalogue with `context_length` and per-token pricing. The suite
   exercises the remote path on a real socket, with no network.
 
-**Still open in A:**
-
 **Landed 2026-08-31 — the catalog.** `models.yaml` is now `providers:` + `endpoints:`: connection and
 engine on one side, capacity and policy on the other, each endpoint naming its provider. A local
 provider hosts one endpoint; a remote one hosts many, which is what makes the split earn its keep.
 Shipped as a generic example on RFC 5737 addresses — the same piece of work as scrub item **S2**,
 done together as planned rather than twice.
-- **Per-provider costing** is descriptor-shaped (`publishes_token_costs`, and OpenRouter's catalogue
-  carries the prices) but has no reader; it lands with **D**.
-- **A second remote provider** would be the real test of the abstraction. One of each is enough to
-  find the `host:port` assumption; it is not enough to know which of OpenRouter's shapes are
-  *OpenRouter's* and which are *remote's*.
+
+**~~Per-provider costing has no reader.~~ Closed 2026-09-01 by D.** `publishes_token_costs` was
+descriptor-shaped and unread; OpenRouter's catalogue prices now arrive on the same discovery pass
+that reads the context ceiling.
+
+**Still open in A:** a **second remote provider** would be the real test of the abstraction. One of
+each is enough to find the `host:port` assumption; it is not enough to know which of OpenRouter's
+shapes are *OpenRouter's* and which are *remote's*.
 
 ### B · Identity and API-key auth
 
@@ -277,8 +282,8 @@ caller working around one bad model actually wants.
 
 ### D · Spill, token management and costing
 
-**Landed 2026-09-01.** `spend.py` is the fourth pure-computation module: prices, per-caller accounting,
-and the threshold. `Scheduler._admit` returns `DISPATCH` / `SPILL` / `DEFER` — one decision, three
+**Landed 2026-09-01.** `spend.py` joined the pure-computation modules — the fourth at the time, of
+**six** today — with prices, per-caller accounting, and the threshold. `Scheduler._admit` returns `DISPATCH` / `SPILL` / `DEFER` — one decision, three
 outcomes, with local capacity tried first for every caller before anything about money is consulted.
 
 - **Two kinds of money, never summed.** A local endpoint is priced at what renting the same class of
@@ -378,17 +383,26 @@ test asserts it), and the only server-side work is an asset read that goes **off
   `/rs/v1/admin/stream` for the reason above.
 - Sixteen mutations, every guard observed going red.
 
-**Still open in G.** `admin` is one scope, so browsing the fleet and revoking a key are the same
-privilege — a read-only scope is the obvious next split, and it changes what a key *means*, which is
-why it did not land with the UI. There is also no audit trail: the plane shows what changed, not who
-changed it or when (open in E too), and the UI makes that gap easier to reach. Nothing here is
-covered by a browser-driven test; the guards are contract pins plus a rendered walkthrough by hand.
+**~~Still open in G: one scope, and no audit trail.~~ Both closed 2026-09-01 by H** — and the UI is
+what made them urgent, exactly as predicted here.
+
+**Still open in G.** Nothing here is covered by a **browser-driven test**; the guards are contract
+pins (`tests/test_admin_ui.py` walks every `pick()` path against a real response) plus a rendered
+walkthrough by hand. Rendering the page has now found five real bugs across two workstreams that no
+test in this repo could have — which is the argument *for* one, against a page whose whole discipline
+is no bundler, no external reference, six packages. When the page finds something the pattern is to
+leave a **source-level** guard behind (two landed with H), and the open question is whether the class
+those cannot reach is worth the dependency. If the answer is no, it belongs here as a decision rather
+than as an open item.
+
+**~~Nothing here is audited.~~ Closed 2026-09-01 by H**, in the overlay, which is where this
+predicted it would go.
 
 **Still open in E.** Providers and endpoints are **read-only**: adding a backend
 is still a `models.yaml` edit and a restart, deliberately, because an endpoint is a routing-table
 entry that discovery, health and the DRR denominator all key on, and hot-adding one is a much larger
-question than hot-adding a key. Nothing here is audited: an operator can see what changed but not
-*who* changed it or *when*, and the overlay is the obvious place for that.
+question than hot-adding a key. Leave it unless there is a reason — and write the reason down before
+the code.
 
 ### F · Hardening — the concurrency invariant, guarded
 
@@ -431,12 +445,92 @@ indistinguishable from one that cannot fire.
   the vision capability nothing read: a property true when written, with no mechanism to notice the
   commit that ends it.
 
+**~~The shutdown budgets are measured but not bounded.~~ Closed 2026-09-01** — every phase is named
+and bounded, `SHUTDOWN_DEADLINE_S` is their sum rather than a literal, and the recommended container
+stop-grace went **up** (90 → 108s) because 90 had been an observation of a fast tail rather than a
+ceiling. See the Unreleased entry in `CHANGELOG.md` for why there is deliberately no outer
+`wait_for`.
+
 **Still open in F.** The soak runs against `roadstead.testing`, so it exercises concurrency and not
 *duration*: nothing yet watches memory growth, WAL size or connection-pool behaviour over hours,
 and nothing covers a **remote provider over a real network**, where the failure modes are latency
-variance and partial responses rather than contention. The shutdown budgets (`CLAUDE.md`: 78.25s
-measured against a 48s budget that reads as though it covers everything) are measured and
-documented but still not *bounded* — uvicorn never bounds the lifespan shutdown at all.
+variance and partial responses rather than contention. `tools/soak.py` is the experiment and already
+takes `--seconds` / `--concurrency` / `--stream-fraction`; what it lacks is somebody running it long
+and turning what accumulates into either a bounded assertion or a ledger entry. Two pieces of
+in-memory state landed after it and have never been soaked for duration: `rate.RateLedger.windows`
+and `AdminOverlay.audit` (bounded at 500, and the store is rewritten whole on every control action).
+
+### H · A read-only admin scope, and the audit trail
+
+**Landed 2026-09-01.** Both halves of what G left open, together, because they touch the same three
+files and answer halves of one question: the read views report a **state**, and a state cannot say
+who put it there; and an operator who wanted somebody to be able to *look* had to give them the
+ability to change everything.
+
+- **`admin_readonly` narrows and can never widen.** `admin: true, admin_readonly: true` reaches every
+  `GET` on the plane and is refused a 403 that says why on everything else; on a key without `admin`
+  it is a **400 at enrolment**, not a silent no-op, because an operator who wrote it believes they
+  issued a safer credential than they have.
+- **The read/write split comes from the HTTP METHOD**, in the one shared gate — not from a list of
+  write routes, which is a second thing to keep in step with `routes.py` and fails silently and
+  *widening* when it falls behind. All 11 mutating admin routes inherit it, both spellings.
+- **A narrowing beats an overlapping grant.** `127.0.0.1=ops:admin:readonly` is read-only even though
+  loopback is a built-in admin net. If the widest grant won, that line would silently be a full grant
+  for every operator who wrote it.
+- **`identity.py` decides, everything else renders.** `IdentityResolver.admin_denial` owns which of
+  the three refusals applies, under an AST guard — a second place deciding what a scope permits is
+  the `_remote_ip` that had to be removed from `management.py`, in a new costume.
+- **`GET /rs/v1/admin/audit`, and every mutating route records** — flags, pause, resume and
+  maintenance included, which touch no overlay state and would otherwise record nothing. A trail
+  covering only some of them is worse than none, because a reader assumes completeness; the guard is
+  driven from `routes.py` rather than from a list.
+- **A record names the credential and never carries one.** `key_id`, never the key or the digest.
+  Label *and* address always: a record with an address and no `key_id` means an address-derived admin
+  made the change, which is meaningful and slightly alarming, and one collapsed actor string would
+  hide which factor authorized it.
+- **It reports its own limits as data** — `persisted`, `dropped`, `capacity`. An operator-facing
+  change trail, not a security log of record, and it says so rather than presenting itself as
+  complete while being neither durable nor unbounded.
+- **Two of the three bugs were found by RUNNING the page**, with the suite green for all three: a
+  control-route record that only reached disk on a *later* overlay write (so the entry an operator
+  looks for after an incident is the one a restart lost, and a drain is taken right before the
+  restart that drops the record of it); the Fleet view's Pause/Resume being the one write control not
+  scope-guarded; and `render()` racing `primeChrome()`, so the **first paint had no scope** and every
+  write control was live for a read-only operator until the 30-second heartbeat. The first paint is
+  the one somebody clicks. Two now have source-level guards, which is the pattern.
+
+### I · Key lifecycle, and the abuse control DRR is not
+
+**Landed 2026-09-01.** What was left of **B**, and the oldest unclosed thing in the repo: `created_at`
+was written, surfaced in two views, and read for no decision.
+
+- **Expiry** — `expires_at` / `expires_in_s`. No expiry means never expires, so an existing registry
+  is unchanged. An expired key is a `401 invalid_api_key` with **its own sentence and the same
+  code**: a caller can act on no distinction between "expired" and "unknown", the operator reading
+  the log can. The store holds the absolute instant, so a restart never extends a key.
+- **Rotation** — `POST /rs/v1/admin/keys/{key_id}/rotate`, one action, because the manual version is
+  two calls in an order that matters and **both orders are wrong**. `overlap_s` defaults to 0; with
+  an overlap the predecessor gets an expiry rather than a tombstone, so it survives a restart a timer
+  would not, and 🚨 an overlap may only ever **shorten** a predecessor's life. If the successor cannot
+  be minted the predecessor is untouched.
+- **Per-key `bind` CIDRs** are an additional constraint and never a widening. Unparseable is a 400 at
+  enrolment and matches nothing at resolution — a narrowing that failed open would be worse than
+  none. Checked against the *resolved* address, so it is only as trustworthy as
+  `ROADSTEAD_TRUSTED_PROXIES`, and `GET /rs/v1/admin/keys` reports `checked_against`.
+- **`requests_per_minute`, and no 429.** DRR is fairness *under contention*, so a caller alone on a
+  quiet fleet is unthrottled by design — correct for fairness, and exactly why it does not bound a
+  runaway. Crossing this costs what crossing `daily_spend_usd` costs: one band and paid spill, never
+  local capacity, and no code. A rate *limit* would be a fourth spelling of "no". `rate.py` is the
+  **sixth** pure-computation module.
+- 🚨 **Degradations do not stack.** Over both thresholds is **one** band, not two, enforced in
+  `ProxyState.effective_priority`, which consults at most one standing — so a third threshold cannot
+  compose by accident. Each crossing reports separately, because one means "look at the bill" and the
+  other means "look for a loop".
+- **Three more found by running it**, and the third is the interesting one: `overlap_s` *extended* a
+  predecessor past its own expiry, which is a rotation quietly lengthening a credential. Truncated,
+  and said out loud. The other two are disclosures rather than changes — a successor inherits policy
+  but not expiry, and the rotate response now reads back from the registry rather than being
+  assembled from the predecessor's row.
 
 ### Cross-cutting · The scrub
 
@@ -455,9 +549,18 @@ vocabulary around them — and it corrected this plan's own headline finding, wh
 data out of the repo on the strength of no bulk corpus having come across. The synthesized prompts
 were written around real identifiers. The straggler sweep now looks for both.
 
-**Only the history rewrite (S6) is left**, and it is the expensive one.
+**S5 — the straggler sweep — is NOT marked done**, and its working-tree half needs re-running rather
+than trusting: it was reported clean on 2026-09-01, and a great deal has changed since. 🚨 **Two
+patterns, not one.** The topology grep could never have found a person's name typed into an example
+prompt, and S4 found exactly that, so the identifier half has to be written out by hand — there is no
+`10.0.0.` to key on.
 
-⚠️ The history rewrite stays last — it invalidates every SHA.
+**Then the history rewrite (S6)**, which is the expensive one.
+
+⚠️ The history rewrite stays last — it invalidates every SHA, `CLAUDE.md` cites `9b11729`, and the
+origin monorepo's extraction plan cites commits from here. It runs on a fresh clone, and the
+definition of done requires re-verification on a fresh clone rather than on the tree that did the
+scrubbing.
 
 ---
 
@@ -469,8 +572,12 @@ planned.
 
 **`models.yaml` grows a provider dimension** and stops being a description of one fleet's hardware.
 
-**`docs/api.md` is executable** — six test files read it back and fail when code and document
-disagree. Every change above lands with its contract, or the suite says so.
+**`docs/api.md` is executable** — **19** test files read it back and fail when code and document
+disagree: §1.6's admission table, §2.1's codes (pinned from the server *and* the client side), §3's
+route table (parsed from the table rows), §3.6's analytics schemas, §1.5's trusted-proxy rule. Every
+change above lands with its contract, or the suite says so. 🚨 The route-table sweep sets
+`ROADSTEAD_ADMIN_UI=1`, because two routes only exist when it is — any future env-gated route needs
+the same treatment.
 
 **Not everything from the origin generalises.** The retired `creative` endpoint name, the
 fleet-specific roles, the `degrade_ok` spelling: these are one deployment's vocabulary. Keep the
@@ -483,7 +590,12 @@ in ways the name does not suggest (`history.md`, "Things that will mislead you")
 
 - **Where the intent vocabulary lives.** Profiles are built into `intent.py` today. A deployment
   whose fleet has a capability the built-ins do not name has to edit the package — which is the
-  `models.yaml` argument again, one layer up.
+  `models.yaml` argument again, one layer up. The seam exists and says so: `BUILTIN_PROFILES` carries
+  a note that `resolve_profile` and `parse_intent` both already take a table and nothing reads one
+  out of `models.yaml`. 🚨 A config-supplied table must stay in **declared capabilities, never
+  endpoint names**, or it becomes a second routing table to keep in step with `models.yaml`. Related,
+  and possibly a different shape: intent cannot express a **negative** constraint ("anything but this
+  endpoint"), which is what a caller working around one bad model wants.
 - ~~**Multi-tenancy depth.**~~ **Settled 2026-09-01 with E: keys stay flat, because the shape that
   was wanted already exists.** The quota holder, the DRR fair share and the spend cap are keyed on
   the `agent_id`, never on the key — so several keys naming one `agent_id` give a team one budget
