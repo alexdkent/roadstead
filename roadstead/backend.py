@@ -24,7 +24,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from .config import EndpointConfig
-from .providers import DEFAULT_PROVIDER, provider_for
+from .providers import DEFAULT_PROVIDER, ProviderError, provider_for
 
 logger = logging.getLogger(__name__)
 
@@ -212,9 +212,15 @@ class BackendClientPool:
         self._retired: list[httpx.AsyncClient] = []
 
     def _client_for(
-        self, host: str, port: int, min_pool: int = 0,
+        self, base_url: str, min_pool: int = 0,
     ) -> httpx.AsyncClient:
         """Connection-pooled client for a backend, sized to its concurrency.
+
+        ``base_url`` is the full origin (plus any base path) — ``ep_cfg.
+        backend_url``, which is ``http://host:port`` for a local engine and a
+        real URL for a remote provider. It doubles as the pool key, so two
+        endpoints on one origin share connections exactly as they did when the
+        key was ``host:port``, and a remote provider on https gets its own.
 
         ``min_pool`` is the caller's concurrency requirement — the dispatch
         path passes ``effective_max_slots + headroom`` so the pool can never
@@ -225,7 +231,7 @@ class BackendClientPool:
         client has (slot discovery raised max_slots), the old client is
         retired (not closed — in-flight requests finish on it) and replaced.
         """
-        key = f"{host}:{port}"
+        key = base_url
         want = max(20, min_pool)
         cur = self._clients.get(key)
         if cur is not None:
@@ -234,7 +240,7 @@ class BackendClientPool:
                 return client
             self._retired.append(client)
         client = httpx.AsyncClient(
-            base_url=f"http://{host}:{port}",
+            base_url=base_url,
             # Default deadline for callers that pass none. The NON-STREAMING
             # path overrides this per request (`_transport_timeout`) so a
             # declared deadline above 600s is honoured instead of being cut here
@@ -273,16 +279,25 @@ class BackendClientPool:
     ) -> BackendResponse:
         """Make a non-streaming backend call."""
         client = self._client_for(
-            ep_cfg.host, ep_cfg.port, ep_cfg.effective_max_slots + 4)
+            ep_cfg.backend_url, ep_cfg.effective_max_slots + 4)
         provider = provider_for(ep_cfg)
-        path = provider.path_for(payload_type)
-        headers = {"X-Request-ID": request_id}
-        if payload_type == "chat_completion":
-            payload = provider.prepare_chat_payload(
-                payload,
-                model_id=ep_cfg.effective_model_id,
-                thinking_budget_ratio=ep_cfg.thinking_budget_ratio,
-                thinking_kwargs=ep_cfg.thinking_kwargs)
+        # 🚨 A provider that cannot serve this request says so HERE, before a
+        # socket is used, and the refusal is typed as a 400 rather than dressed
+        # up as a backend fault: the backend is fine, the pairing is wrong. See
+        # providers/base.ProviderError — a dropped constraint would be
+        # indistinguishable, to the caller, from a model that answered badly.
+        try:
+            path = provider.path_for(payload_type)
+            headers = provider.request_headers(ep_cfg, request_id)
+            if payload_type == "chat_completion":
+                payload = provider.prepare_chat_payload(
+                    payload,
+                    model_id=ep_cfg.effective_model_id,
+                    thinking_budget_ratio=ep_cfg.thinking_budget_ratio,
+                    thinking_kwargs=ep_cfg.thinking_kwargs)
+        except ProviderError as exc:
+            raise BackendError(
+                400, f"backend {ep_cfg.role} ({provider.name}): {exc}")
 
         t0 = time.monotonic()
         try:
@@ -368,16 +383,25 @@ class BackendClientPool:
     ) -> AsyncIterator[BackendStreamEvent]:
         """Make a streaming backend call.  Yields SSE events."""
         client = self._client_for(
-            ep_cfg.host, ep_cfg.port, ep_cfg.effective_max_slots + 4)
+            ep_cfg.backend_url, ep_cfg.effective_max_slots + 4)
         provider = provider_for(ep_cfg)
-        path = provider.path_for(payload_type)
-        headers = {"X-Request-ID": request_id}
-        if payload_type == "chat_completion":
-            payload = provider.prepare_chat_payload(
-                payload,
-                model_id=ep_cfg.effective_model_id,
-                thinking_budget_ratio=ep_cfg.thinking_budget_ratio,
-                thinking_kwargs=ep_cfg.thinking_kwargs)
+        # 🚨 A provider that cannot serve this request says so HERE, before a
+        # socket is used, and the refusal is typed as a 400 rather than dressed
+        # up as a backend fault: the backend is fine, the pairing is wrong. See
+        # providers/base.ProviderError — a dropped constraint would be
+        # indistinguishable, to the caller, from a model that answered badly.
+        try:
+            path = provider.path_for(payload_type)
+            headers = provider.request_headers(ep_cfg, request_id)
+            if payload_type == "chat_completion":
+                payload = provider.prepare_chat_payload(
+                    payload,
+                    model_id=ep_cfg.effective_model_id,
+                    thinking_budget_ratio=ep_cfg.thinking_budget_ratio,
+                    thinking_kwargs=ep_cfg.thinking_kwargs)
+        except ProviderError as exc:
+            raise BackendError(
+                400, f"backend {ep_cfg.role} ({provider.name}): {exc}")
 
         try:
             async with client.stream(
@@ -427,7 +451,7 @@ class BackendClientPool:
 
     async def probe_props(self, ep_cfg: EndpointConfig) -> dict | None:
         """Probe backend /props for capacity discovery."""
-        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        client = self._client_for(ep_cfg.backend_url)
         try:
             resp = await asyncio.wait_for(
                 client.get("/props"),
@@ -443,7 +467,7 @@ class BackendClientPool:
         """Probe backend /v1/models for the served model id (the name the
         backend answers to in the `model` field). Returns the first model
         id, or None on any failure."""
-        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        client = self._client_for(ep_cfg.backend_url)
         try:
             resp = await asyncio.wait_for(client.get("/v1/models"), timeout=5.0)
             if resp.status_code == 200:
@@ -462,7 +486,7 @@ class BackendClientPool:
         `max_model_len`. Concurrency (--max-num-seqs) is NOT exposed over the
         API, so max_slots stays config-driven. Returns
         ``{"max_model_len": int}`` or None on any failure."""
-        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        client = self._client_for(ep_cfg.backend_url)
         try:
             resp = await asyncio.wait_for(client.get("/v1/models"), timeout=5.0)
             if resp.status_code == 200:
@@ -499,7 +523,7 @@ class BackendClientPool:
         Returns the fingerprint string, or None on any failure (a missing
         fingerprint must read as "cannot tell", never as "changed" — see the
         drift alert, which stays silent while this is None)."""
-        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        client = self._client_for(ep_cfg.backend_url)
         try:
             resp = await asyncio.wait_for(client.get("/v1/models"), timeout=5.0)
             if resp.status_code != 200:
@@ -555,7 +579,7 @@ class BackendClientPool:
         proves nothing about today's template. Returns
         ``{"reasoning_chars": int, "content_chars": int}`` or None if the call
         did not complete (unreachable/busy → we say nothing, never "broken")."""
-        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        client = self._client_for(ep_cfg.backend_url)
         payload = {
             "model": ep_cfg.effective_model_id,
             "messages": [{"role": "user", "content":
@@ -582,7 +606,7 @@ class BackendClientPool:
 
     async def probe_health(self, ep_cfg: EndpointConfig) -> bool:
         """Simple health check."""
-        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        client = self._client_for(ep_cfg.backend_url)
         try:
             resp = await asyncio.wait_for(
                 client.get("/health"),
@@ -591,6 +615,33 @@ class BackendClientPool:
             return resp.status_code == 200
         except Exception:
             return False
+
+    async def probe_json(
+        self, ep_cfg: EndpointConfig, path: str,
+        headers: dict[str, str] | None = None, timeout_s: float = 5.0,
+    ) -> dict | None:
+        """Generic GET-and-parse, for a provider that needs a probe this class
+        does not have a named method for.
+
+        The named probes above encode ENGINE knowledge (which route, which
+        field) and predate the provider split; this one encodes none, so a
+        provider can own the route and the parsing while the transport keeps
+        owning the connection pool and the deadline. New providers should use
+        it rather than growing another `probe_<engine>_<thing>` here.
+
+        Returns the decoded object, or None on any failure — a probe that
+        cannot answer must say "cannot tell", never raise into the poller.
+        """
+        client = self._client_for(ep_cfg.backend_url)
+        try:
+            resp = await asyncio.wait_for(
+                client.get(path, headers=headers or {}), timeout=timeout_s)
+            if resp.status_code == 200:
+                body = resp.json()
+                return body if isinstance(body, dict) else None
+        except Exception:
+            pass
+        return None
 
     async def probe_prefix_cache(self, ep_cfg: EndpointConfig) -> dict | None:
         """Scrape a backend's Prometheus `/metrics` for prefix-cache counters.
@@ -601,7 +652,7 @@ class BackendClientPool:
         llama.cpp has no equivalent, so its endpoints read as actual-rate ``n/a``
         (the cache-ability screen still covers them). Best-effort: any error → None.
         """
-        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        client = self._client_for(ep_cfg.backend_url)
         try:
             resp = await asyncio.wait_for(client.get("/metrics"), timeout=5.0)
             if resp.status_code != 200:
@@ -667,7 +718,7 @@ class BackendClientPool:
         stream that is already unhappy, so it must never become the thing that
         hangs. Any error → None.
         """
-        client = self._client_for(ep_cfg.host, ep_cfg.port)
+        client = self._client_for(ep_cfg.backend_url)
         try:
             resp = await asyncio.wait_for(client.get("/metrics"), timeout=3.0)
             if resp.status_code != 200:
@@ -714,7 +765,7 @@ class BackendClientPool:
         Returns the response on success, None on any failure.
         Never raises — shadow failures must not affect the primary path.
         """
-        client = self._client_for(shadow_host, shadow_port)
+        client = self._client_for(f"http://{shadow_host}:{shadow_port}")
         # The shadow target is a bare host:port with no EndpointConfig behind
         # it, so there is no provider to resolve. Routing is identical across
         # the local engines today; when a provider appears whose routes differ,

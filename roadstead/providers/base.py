@@ -41,6 +41,32 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..config import EndpointConfig
 
 
+class ProviderError(Exception):
+    """A provider cannot serve this request, and saying so is the point.
+
+    🚨 The alternative — quietly dropping what a provider cannot honour — is
+    the failure mode this codebase treats as worst: a caller that asked for a
+    grammar and got free-form text back has no way to tell that its constraint
+    was discarded, and will read the result as a bad model rather than a bad
+    route. A provider that must drop a CONSTRAINT raises; a provider dropping
+    an engine HINT (a slot id, a chat-template switch) just drops it.
+    """
+
+
+class UnsupportedRequest(ProviderError):
+    """This provider cannot do what the request asks — an enforced grammar, a
+    payload type it has no route for. A property of the pairing, not a fault:
+    the same request to a different provider is fine."""
+
+
+class ProviderMisconfigured(ProviderError):
+    """The endpoint's own configuration is incomplete — most often a declared
+    API key that is not in the environment. Distinct from
+    :class:`UnsupportedRequest` because nothing the caller does can fix it, and
+    because an endpoint in this state should fail its health probe and stop
+    being dispatched to rather than 502 live traffic one call at a time."""
+
+
 @dataclass(frozen=True)
 class ProviderDescriptor:
     """What this kind of backend publishes, requires, and gets wrong.
@@ -69,6 +95,11 @@ class ProviderDescriptor:
     publishes_slot_context: bool = False
     #: Publishes a whole-request context ceiling (vLLM ``max_model_len``).
     publishes_context_ceiling: bool = False
+    #: Serves ONE model and will name it — so the poller can discover what this
+    #: endpoint answers to, and notice the weights changing under it. False for
+    #: a provider fronting a catalogue of models, where "which model" is a
+    #: routing choice we make rather than a fact to read off the backend.
+    publishes_served_model_id: bool = False
     #: Publishes Prometheus prefix-cache counters on ``/metrics``. Gates the
     #: cache-stats scrape; llama.cpp has no equivalent, so its endpoints read
     #: as ``n/a`` rather than as a 0% hit rate.
@@ -146,6 +177,18 @@ class Provider(ABC):
         if payload_type == "rerank":
             return "/rerank"
         return "/v1/chat/completions"
+
+    def request_headers(
+        self, ep_cfg: "EndpointConfig", request_id: str,
+    ) -> dict[str, str]:
+        """Headers for one backend call. The local engines take no auth; a
+        remote provider adds its own here rather than having the transport
+        learn about credentials.
+
+        May raise :class:`ProviderMisconfigured` — an endpoint that cannot
+        authenticate must not send the request anyway.
+        """
+        return {"X-Request-ID": request_id}
 
     @abstractmethod
     def prepare_chat_payload(

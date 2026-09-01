@@ -19,8 +19,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .base import CapacityReport, Provider, ProviderDescriptor
+from .base import (
+    CapacityReport,
+    Provider,
+    ProviderDescriptor,
+    ProviderError,
+    ProviderMisconfigured,
+    UnsupportedRequest,
+)
 from .llamacpp import LLAMACPP, LlamaCppProvider
+from .openrouter import OPENROUTER, OpenRouterProvider
 from .vllm import VLLM, VLLMProvider
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -30,8 +38,13 @@ __all__ = [
     "CapacityReport",
     "LLAMACPP",
     "LlamaCppProvider",
+    "OPENROUTER",
+    "OpenRouterProvider",
     "Provider",
     "ProviderDescriptor",
+    "ProviderError",
+    "ProviderMisconfigured",
+    "UnsupportedRequest",
     "VLLM",
     "VLLMProvider",
     "provider_for",
@@ -52,6 +65,7 @@ def register_provider(provider: Provider) -> None:
 
 register_provider(LLAMACPP)
 register_provider(VLLM)
+register_provider(OPENROUTER)
 
 
 def provider_for_engine(engine: str | None) -> Provider:

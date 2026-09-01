@@ -155,7 +155,15 @@ class FakeBackend:
     subsequent call, or sends a per-call ``X-Fault`` header. All received calls
     are recorded in ``requests`` for assertions.
     """
-    # engine shape this endpoint imitates: "llama.cpp" or "vllm"
+    # engine shape this endpoint imitates: "llama.cpp", "vllm", or "openrouter"
+    #
+    # 🚨 "openrouter" is a REMOTE shape and differs in more than a field name:
+    # its routes hang off a base path (/api/v1) instead of the origin, it
+    # REQUIRES a bearer token and 401s without one, and its /models is a
+    # CATALOGUE carrying context_length and per-token pricing rather than one
+    # served model. Those are the four things a local engine never makes a
+    # gateway deal with, so a fake that only spoke the local shapes could not
+    # exercise a remote provider at all.
     engine: str = "llama.cpp"
     served_model_id: str = "fake-model"
     props_n_parallel: int = 4
@@ -178,6 +186,18 @@ class FakeBackend:
     #       any observed engine emits all of it.
     props_profile: str = "modern"
     max_model_len: int = 40960
+    # --- remote ("openrouter") shape knobs --------------------------------- #
+    # The token this fake accepts. A request without `Authorization: Bearer
+    # <api_key>` gets a 401, so a provider that forgets its credential fails
+    # here the way it would fail against the real thing rather than passing.
+    api_key: str = "fake-openrouter-key"
+    # The catalogue /models publishes. Deliberately MORE than one entry: picking
+    # the right row out of a catalogue is the parsing step a single-model fake
+    # would let a provider skip, and "took the first row" is a confidently wrong
+    # context ceiling feeding the admission gate.
+    catalogue_context_length: int = 131072
+    catalogue_prompt_cost: str = "0.0000005"
+    catalogue_completion_cost: str = "0.0000015"
     # prefix-cache counters exposed on /metrics (vLLM shape)
     prefix_cache_hits: int = 0
     prefix_cache_queries: int = 0
@@ -673,15 +693,65 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
     async def health(request: Request) -> Response:
         return JSONResponse({"status": "ok"})
 
-    routes = [
-        Route("/v1/chat/completions", chat, methods=["POST"]),
-        Route("/embed", embed, methods=["POST"]),
-        Route("/rerank", rerank, methods=["POST"]),
-        Route("/props", props, methods=["GET"]),
-        Route("/v1/models", models, methods=["GET"]),
-        Route("/metrics", metrics, methods=["GET"]),
-        Route("/health", health, methods=["GET"]),
-    ]
+    # ---- remote shape ----------------------------------------------------- #
+    def _unauthorized(request: Request) -> Optional[Response]:
+        """A remote provider's first difference from a local one: it says no.
+
+        Checked BEFORE anything else, including faults, because that is the
+        order a real gateway hits it in — a credential problem is not one of the
+        pathologies this fake injects, it is the wall in front of them."""
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {controller.api_key}":
+            return JSONResponse(
+                {"error": {"message": "No auth credentials found",
+                           "code": 401}}, status_code=401)
+        return None
+
+    async def remote_chat(request: Request) -> Response:
+        denied = _unauthorized(request)
+        if denied is not None:
+            return denied
+        return await chat(request)
+
+    async def remote_models(request: Request) -> Response:
+        """The catalogue. Two entries, one of which is ours — see
+        ``catalogue_context_length``."""
+        denied = _unauthorized(request)
+        if denied is not None:
+            return denied
+        pricing = {"prompt": controller.catalogue_prompt_cost,
+                   "completion": controller.catalogue_completion_cost,
+                   "image": "0", "request": "0"}
+        return JSONResponse({"data": [
+            {"id": "someone-else/some-other-model",
+             "name": "Not the one this endpoint is pinned to",
+             "context_length": 8192,
+             "pricing": dict(pricing, prompt="0.09")},
+            {"id": controller.served_model_id,
+             "name": "The pinned model",
+             "context_length": controller.catalogue_context_length,
+             "pricing": pricing},
+        ]})
+
+    if controller.engine == "openrouter":
+        # Deliberately NOT a superset: a remote provider gets the remote routes
+        # and nothing else. No /props, no /health, no /metrics — the fake is as
+        # stingy as the real thing, so a probe that only works because the fake
+        # was generous fails here instead of in production.
+        routes = [
+            Route("/api/v1/chat/completions", remote_chat, methods=["POST"]),
+            Route("/api/v1/models", remote_models, methods=["GET"]),
+        ]
+    else:
+        routes = [
+            Route("/v1/chat/completions", chat, methods=["POST"]),
+            Route("/embed", embed, methods=["POST"]),
+            Route("/rerank", rerank, methods=["POST"]),
+            Route("/props", props, methods=["GET"]),
+            Route("/v1/models", models, methods=["GET"]),
+            Route("/metrics", metrics, methods=["GET"]),
+            Route("/health", health, methods=["GET"]),
+        ]
     app = Starlette(routes=routes)
     app.state.controller = controller
     return app
@@ -725,6 +795,18 @@ class FakeBackendServer:
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}"
+
+    @property
+    def base_url(self) -> str:
+        """What an ``EndpointConfig.base_url`` should be pointed at.
+
+        Same as ``url`` for a local engine shape. The remote shape adds the
+        ``/api/v1`` base path, because "the routes are not at the origin" is one
+        of the things that make a remote provider different, and a test that
+        papered over it would leave the base-path composition untested."""
+        if self.controller.engine == "openrouter":
+            return f"{self.url}/api/v1"
+        return self.url
 
     def start(self, timeout: float = 5.0) -> "FakeBackendServer":
         config = uvicorn.Config(

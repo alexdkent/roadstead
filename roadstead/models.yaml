@@ -43,8 +43,39 @@
 #   endpoint_class  the proxy QoS class (only for proxy_endpoint / shared roles)
 #   role            the proxy EndpointConfig.role / telemetry role string (the
 #                   pre-rename canonical — kept until the call-site sweep lands)
-#   backend_engine  llama.cpp | vllm | shim
-#   served_model_names  vLLM --served-model-name tokens that MUST match here
+#   backend_engine  llama.cpp | vllm | shim | openrouter
+#                   Resolved to a provider (roadstead/providers/) — an unknown
+#                   value falls back to llama.cpp rather than failing, which is
+#                   what the old `!= "vllm"` branches always did.
+#   base_url        REMOTE backends only: the full base URL, which supersedes
+#                   host/port (they cannot express a scheme or a base path).
+#                   e.g. https://openrouter.ai/api/v1
+#   api_key_env     REMOTE backends only: the NAME of the environment variable
+#                   holding the API key. NEVER the key itself — a key in this
+#                   file is a key in the git history.
+#   served_model_names  vLLM --served-model-name tokens that MUST match here.
+#                   For a remote provider fronting a CATALOGUE, the first entry
+#                   is the model slug this endpoint routes on (e.g.
+#                   openai/gpt-oss-120b) — there is nothing to discover, so it
+#                   is seeded from here.
+#
+#   A remote stanza, for reference (Roadstead can dispatch to one today; making
+#   it *spill* under the same admission decision is roadmap Workstream D):
+#
+#     spill-openrouter:
+#       kind: chat
+#       status: planned
+#       proxy_endpoint: true
+#       endpoint_class: spill
+#       role: spill
+#       backend_engine: openrouter
+#       base_url: https://openrouter.ai/api/v1
+#       api_key_env: OPENROUTER_API_KEY
+#       served_model_names: [openai/gpt-oss-120b]
+#       slots: 4              # a POLICY cap on our own concurrency, not a
+#                             # discovered capacity — remote capacity is elastic
+#                             # and is governed by cost, not by occupancy.
+#       capabilities: {streaming: true, tool_calling: true}
 #   context_per_slot    proxy EndpointConfig seed (live value comes from /props)
 #   context_window      framework chunker/preflight default (_DEFAULT_CONTEXT_WINDOW)
 #   slots               max_slots seed

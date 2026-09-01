@@ -300,10 +300,36 @@ class EndpointConfig:
     host: str = ""
     port: int = 0
 
+    # --- backend connection, the general form ---
+    #
+    # A full base URL, which SUPERSEDES host/port when set. host:port is the
+    # shape a local engine on the LAN has, and it cannot express a remote
+    # provider: no scheme (OpenRouter is https), no base path (its routes hang
+    # off /api/v1), no way to reach anything that is not a bare origin. Rather
+    # than overload `host` with a URL and leave every reader guessing which it
+    # holds, the two are separate fields and ``backend_url`` below is the one
+    # thing the transport reads.
+    base_url: str = ""
+
+    # --- Name of the environment variable holding this backend's API key, for
+    # a provider that needs one. THE NAME, NEVER THE KEY: a key in a config file
+    # is a key in a git history, and this repo is heading for public
+    # (`docs/corpus_and_scrub_plan.md`). Empty for every local backend — they
+    # take no auth, which is itself a reason local capacity is the design
+    # centre. Resolved at request time by the provider, so rotating the secret
+    # does not need a restart. ---
+    api_key_env: str = ""
+
     # --- served model id (the name the backend answers to in the `model`
     # field). Discovered from /v1/models at runtime; empty until then.
     # vLLM validates this field and 404s on a mismatch, so the proxy sets
-    # it to ``effective_model_id`` before dispatching to a vLLM backend. ---
+    # it to ``effective_model_id`` before dispatching to a vLLM backend.
+    #
+    # A REMOTE provider seeds it from config instead: OpenRouter serves
+    # hundreds of models behind one base URL, so "the model this endpoint is"
+    # is a choice we make (`openai/gpt-oss-120b`), not a fact to discover, and
+    # its provider declares `publishes_served_model_id=False` so the poller
+    # does not try. ---
     served_model_id: str = ""
 
     # --- shadow backend (A/B testing) ---
@@ -396,6 +422,16 @@ class EndpointConfig:
         else:
             cap = self.background_floor_slots
         return max(self.background_floor_slots, cap)
+
+    @property
+    def backend_url(self) -> str:
+        """Base URL the HTTP client is built against. ``base_url`` when set,
+        otherwise the historic ``http://host:port``. This is the ONLY thing the
+        transport should read — ``host``/``port`` remain for telemetry labels
+        and for config that has not been written as a URL."""
+        if self.base_url:
+            return self.base_url.rstrip("/")
+        return f"http://{self.host}:{self.port}"
 
     @property
     def effective_model_id(self) -> str:

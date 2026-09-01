@@ -41,6 +41,9 @@ class LlamaCppProvider(Provider):
         # It reports context PER SLOT, which is the useful unit; there is no
         # separate whole-request ceiling to discover.
         publishes_context_ceiling=False,
+        # One model per server, named on /v1/models — which is what makes the
+        # served-id and weights-fingerprint probes worth running.
+        publishes_served_model_id=True,
         # No `/metrics` prefix-cache counters and no per-request cached-token
         # field, so its cache hit rate reads as n/a — NOT as 0%. The absent-is-
         # not-zero contract in queue.py depends on this staying honest.

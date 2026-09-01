@@ -176,7 +176,7 @@ roadstead/          the package (32 modules + providers/)
   health.py         capacity discovery, circuit breaker, drain
   queue.py          durable event log + THE single writer thread
   backend.py        south face TRANSPORT: pools, deadlines, error taxonomy, SSE relay
-  providers/        south face ENGINES: one adapter per backend kind (see below)
+  providers/        south face ENGINES: llama.cpp | vllm | openrouter (see below)
   model_catalog.py  reads models.yaml — the naming/capability authority
   hooks.py          the integration seam (see below)
   testing/          SHIPPED test doubles — the programmable fake backend
@@ -196,6 +196,22 @@ backends genuinely disagree about: what a request must look like to be accepted
 deadline, the error taxonomy, the SSE relay — stays in `backend.py`, and providers borrow its
 probe methods rather than opening sockets of their own (which is also what keeps the unit suite off
 the network: it stubs `probe_*` by name on the pool).
+
+**Three providers today: `llama.cpp`, `vllm`, `openrouter`.** The last one is the reason the interface
+exists — it is reached at a `base_url` with a base path instead of `host:port`, it needs a credential
+(`api_key_env` names the environment variable; **never the key itself**), it fronts a *catalogue* so
+there is no served model to discover, and it publishes prices instead of occupancy. 🚨 **Remote
+capacity is not local capacity.** A remote endpoint still carries a config-seeded concurrency cap —
+a policy knob we choose, not a discovered capacity — because slot-seconds are the unit of *local*
+fairness. Making remote capacity an outcome of the same admission decision (dispatch / spill / defer)
+is Workstream D.
+
+🚨 **A provider that cannot honour a CONSTRAINT refuses; one that cannot use a HINT drops it.**
+OpenRouter cannot enforce a GBNF grammar, so `prepare_chat_payload` raises `UnsupportedRequest` and
+the call fails with a reason. Dropping the grammar would hand the caller free-form text it could not
+distinguish from a model answering badly — the same shape as the `finish_reason` repair that became a
+silencer. An engine hint (`id_slot`, `chat_template_kwargs`, `thinking_token_budget`) is ours, not the
+caller's, and is dropped in silence.
 
 🚨 **Branch on a descriptor capability, never on an engine name.** `backend_engine == "vllm"` used
 to appear at four sites and each one meant something narrower — "publishes prefix-cache counters",

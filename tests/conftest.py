@@ -161,6 +161,12 @@ _redirect_scratch_to_tmpfs()
 #: asserts this covers every `probe_*` on the class, so a new probe fails a
 #: test on the day it is written.
 STUBBED_PROBES = {
+    # The generic provider probe (`probe_json`) is stubbed like the rest: it is
+    # a GET at whatever path a provider asks for, so unstubbed it is the one
+    # that could dial anywhere at all. A test that needs the real thing captures
+    # it at import time and calls it unbound — see
+    # test_provider_openrouter.py, which does exactly that against a local fake.
+    "probe_json": None,
     "probe_props": None,
     "probe_models": None,
     "probe_vllm_capacity": None,

@@ -38,6 +38,10 @@ class VLLMProvider(Provider):
         publishes_slot_count=False,
         publishes_slot_context=False,
         publishes_context_ceiling=True,
+        # One model per server. Its `id` is the operator's --served-model-name
+        # and stays put across a weights swap, which is exactly why the
+        # fingerprint probe reads `root` instead.
+        publishes_served_model_id=True,
         # Prometheus vllm:prefix_cache_{hits,queries}_total — the only real
         # per-endpoint cache hit rate either engine gives us.
         publishes_prefix_cache_metrics=True,

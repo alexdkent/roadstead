@@ -158,13 +158,20 @@ def test_no_module_branches_on_an_engine_name():
         f"ProviderDescriptor capability: {offenders}")
 
 
-def test_every_descriptor_field_is_declared_by_both_local_providers():
-    """A descriptor field that only one provider sets reads as False for the
-    other by DEFAULT, which is indistinguishable from "nobody thought about it".
-    Both must be explicit in the source."""
+def test_every_descriptor_field_is_declared_by_every_provider():
+    """A descriptor field a provider does not set reads as False by DEFAULT,
+    which is indistinguishable from "nobody thought about it". Every provider
+    must state every field in its own source — including the ones that are
+    False, because "measured and it does not" and "never considered" are
+    different claims and only one of them is safe to build on."""
     fields = {f.name for f in dataclasses.fields(LLAMACPP.descriptor)}
     fields -= {"name", "kind"}
-    for module in ("llamacpp.py", "vllm.py"):
+    modules = sorted(
+        p.name for p in (_PKG / "providers").glob("*.py")
+        if p.name not in {"__init__.py", "base.py", "payload.py"})
+    assert len(modules) >= 3, (
+        f"the sweep found only {modules} — it has gone blind, not green")
+    for module in modules:
         src = (_PKG / "providers" / module).read_text(encoding="utf-8")
         missing = sorted(f for f in fields if f"{f}=" not in src)
         assert not missing, (

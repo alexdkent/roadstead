@@ -33,7 +33,7 @@ def _pool_with(handler) -> BackendClientPool:
     )
     # Cache shape is (client, pool size it was built with); a huge size keeps
     # _client_for from retiring this mock for a slot-sized rebuild.
-    pool._clients[f"{EP.host}:{EP.port}"] = (client, 10_000)
+    pool._clients[EP.backend_url] = (client, 10_000)
     return pool
 
 

@@ -299,7 +299,7 @@ def _probe_returning(body: str):
             assert path == "/metrics", path
             return _Resp()
 
-    pool._client_for = lambda host, port, min_pool=0: _Client()
+    pool._client_for = lambda base_url, min_pool=0: _Client()
     return pool
 
 

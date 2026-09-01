@@ -430,6 +430,7 @@ class Health:
         if getattr(ep_cfg, "on_demand", False) and not self.state.on_demand.is_loaded(ep_name):
             return
         probe_ok = False
+        provider = provider_for(ep_cfg)
         try:
             if ep_cfg.skip_discovery:
                 # Non-OpenAI FastAPI shim (embed/rerank): no /props or
@@ -444,12 +445,20 @@ class Health:
                 # per-request ceiling from /v1/models max_model_len (its
                 # concurrency stays config-driven). The provider owns which of
                 # those it can get; this loop only applies the answer.
-                report = await provider_for(ep_cfg).discover_capacity(
+                report = await provider.discover_capacity(
                     self.state.backend, ep_cfg)
                 if report is not None:
                     self.apply_discovered_capacity(ep_name, ep_cfg, report)
                     probe_ok = True
-            if not ep_cfg.skip_discovery:
+            if not ep_cfg.skip_discovery and provider.descriptor.publishes_served_model_id:
+                # Both probes below read /v1/models on a server that serves ONE
+                # model, so they are meaningless against a provider fronting a
+                # catalogue: there is no "the" served id to discover, and no
+                # weights to fingerprint — the model is a routing choice we
+                # seeded from config. Skipping them is not an optimisation; the
+                # probes would overwrite `served_model_id` with whatever sorted
+                # first in a catalogue of hundreds.
+                #
                 # Discover the served model id (the name the backend
                 # answers to). vLLM validates it, so the proxy sends
                 # this — not the caller's role/alias — on dispatch.

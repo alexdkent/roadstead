@@ -316,6 +316,11 @@ Documented because it is easy to hit in a test double and never in production.
 **This is the portability contract, and it did not exist before this document.** It is what an
 inference engine must expose for Roadstead to drive it.
 
+**A *provider* is the adapter that meets one kind of backend on its terms** (`roadstead/providers/`).
+Three exist: `llama.cpp`, `vllm`, and `openrouter`. What follows is what each requires and publishes;
+a provider's `ProviderDescriptor` is the machine-readable form of the same thing, and the code
+branches on that rather than on an engine name.
+
 ### 4.1 Dispatch
 
 | Purpose | Method + path on the backend |
@@ -325,6 +330,19 @@ inference engine must expose for Roadstead to drive it.
 | Rerank | `POST /rerank` |
 
 Embed and rerank are FastAPI-shaped shims, not OpenAI-compatible, and have no OpenAI route.
+
+**Remote providers differ in where the routes are and who may call them.** An endpoint may declare a
+`base_url` (superseding `host`/`port`, which cannot express a scheme or a base path), and its
+provider supplies its own auth headers — OpenRouter's chat route is `POST {base_url}/chat/completions`
+with a bearer token, the key read at request time from the environment variable named by
+`api_key_env`. Roadstead never holds a key in config.
+
+🚨 **A provider that cannot honour a request refuses it**, and the call fails as a `400` naming the
+provider. This applies to a caller **constraint** it cannot enforce (a GBNF grammar sent to
+OpenRouter) and to a payload type it has no route for. It does *not* apply to engine **hints** the
+proxy itself added (`id_slot`, `chat_template_kwargs`, `thinking_token_budget`), which are dropped
+silently because no caller asked for them. The distinction matters because a dropped constraint is
+invisible: the caller cannot tell unconstrained output from a model that answered badly.
 
 ### 4.2 Streaming
 
@@ -336,17 +354,24 @@ Standard OpenAI SSE. Two backend behaviours are load-bearing:
   repaired.
 - `finish_reason` conventionally rides **alone** on a final chunk whose `delta` is `{}`.
 
-### 4.3 Capacity discovery — asymmetric by engine
+### 4.3 Capacity discovery — asymmetric by provider
 
-| | llama.cpp | vLLM |
-|---|---|---|
-| Probe | `GET /props` | `GET /v1/models` |
-| Slot count | ✅ `n_parallel` / `total_slots` / `len(slots)` | ❌ **not exposed** |
-| Per-slot context | ✅ `n_ctx` (already per-slot in current builds) | via `max_model_len` |
-| Consequence | discovered at runtime | **concurrency stays config-seeded**, with a drift alert |
+| | llama.cpp | vLLM | OpenRouter |
+|---|---|---|---|
+| Probe | `GET /props` | `GET /v1/models` | `GET {base_url}/models` |
+| Slot count | ✅ `n_parallel` / `total_slots` / `len(slots)` | ❌ **not exposed** | ❌ **none exists** |
+| Per-request context | ✅ `n_ctx` (already per-slot in current builds) | via `max_model_len` | via `context_length` |
+| Served model | ✅ one, named on `/v1/models` | ✅ one (alias; weights via `root`) | ❌ a catalogue — the model is config |
+| Token costs | ❌ | ❌ | ✅ `pricing` (per token, in dollars) |
+| Consequence | discovered at runtime | **concurrency stays config-seeded**, with a drift alert | **concurrency is a policy cap we choose** |
 
 🚨 A vLLM-shaped backend cannot have its concurrency discovered. This is a property of the engine,
 not a gap in Roadstead. A known consequence is configured-vs-actual slot drift.
+
+🚨 **Remote capacity is not local capacity.** A remote provider has no occupancy to publish — what it
+sells is money and rate limit — so nothing reports slots and the endpoint's concurrency stays a
+deliberate cap on *our own* traffic. Slot-seconds remain the unit of fairness because *local* slots
+are the scarce thing.
 
 ### 4.4 Optional signals and what degrades without them
 
@@ -364,6 +389,10 @@ not a gap in Roadstead. A known consequence is configured-vs-actual slot drift.
 
 A liveness endpoint, plus the discovery probes above. Backends that are FastAPI shims with no
 `/props` or `/v1/models` must be declared `skip_discovery` or they generate continuous 404 noise.
+
+A remote provider's discovery probe doubles as its liveness signal, and a credential it cannot
+resolve reads as *cannot tell* — so a misconfigured remote endpoint fails its health probe and stops
+being dispatched to, rather than failing live traffic one call at a time.
 
 ---
 

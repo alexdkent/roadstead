@@ -488,7 +488,15 @@ class Scheduler:
         requests: list[dict] = []
         for ep, active_map in self._active.items():
             ep_cfg = self._config.endpoints.get(ep)
-            backend = f"{ep_cfg.host}:{ep_cfg.port}" if ep_cfg and ep_cfg.host else None
+            # Where this request actually went. `host:port` for a local
+            # engine — the shape the dashboard has always shown — and the base
+            # URL for a remote provider, which has no host:port to show. Left
+            # None only when we genuinely do not know, which stays distinct
+            # from an endpoint that has an address of a shape nobody expected.
+            backend = None
+            if ep_cfg is not None and (ep_cfg.host or ep_cfg.base_url):
+                backend = (f"{ep_cfg.host}:{ep_cfg.port}" if ep_cfg.host
+                           else ep_cfg.backend_url)
             served_model = ep_cfg.effective_model_id if ep_cfg else None
             for ar in active_map.values():
                 req = ar.request

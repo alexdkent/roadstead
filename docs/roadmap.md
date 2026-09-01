@@ -165,18 +165,36 @@ now read the capability they meant, and a test fails if a new engine-name compar
 Behaviour-preserving, checked by differential comparison against the pre-split code rather than
 asserted.
 
+**Landed 2026-08-31 — the remote half.** `providers/openrouter.py`, the first backend Roadstead does
+not own, and with it the assumptions the local engines let us keep:
+
+- **`base_url` + `api_key_env` on `EndpointConfig`**, and a transport keyed on the URL rather than
+  building `http://host:port` itself. The key is read from the environment by the *name* the config
+  declares — a key in a config file is a key in a git history.
+- **Auth is the provider's business.** `Provider.request_headers` supplies it; the transport never
+  learns about credentials. A missing key refuses before a socket is used, and makes the endpoint
+  fail its health probe rather than 502-ing live traffic one call at a time.
+- **`ProviderError`**: a provider that cannot honour a *constraint* refuses (OpenRouter and GBNF);
+  one that cannot use a *hint* drops it (`id_slot`, `chat_template_kwargs`). Dropping a constraint
+  silently is the failure this codebase treats as worst.
+- **`probe_json`** — a generic probe, so a provider owns its route and its parsing while the
+  transport keeps owning the pool and the deadline. New providers use it instead of growing another
+  `probe_<engine>_<thing>`.
+- **`roadstead.testing` speaks the remote shape** (`engine="openrouter"`): base path, a 401 without a
+  bearer token, and a two-entry catalogue with `context_length` and per-token pricing. The suite
+  exercises the remote path on a real socket, with no network.
+
 **Still open in A:**
 
-- **A remote provider** (OpenRouter first). The interface was shaped for one — `kind: "remote"`,
-  `publishes_token_costs` and an abstract `discover_capacity` are all there and all unexercised —
-  but nothing has been through it yet, and an interface with one kind of implementor has not been
-  tested as an interface. Needs: base URL and API key on the endpoint (not `host`/`port`), auth
-  headers, a cost readout, and an answer to what "capacity discovery" means for a backend that has
-  none to report.
 - **The catalog's provider dimension.** `models.yaml` still describes engines by name in a
-  `backend_engine` string, which the registry resolves tolerantly. Redesigning the catalog around
-  providers is the same piece of work as scrub item **S2** — see the cross-cutting scrub below.
-- **Per-provider costing** is descriptor-shaped but not wired; it lands with **D**.
+  `backend_engine` string, which the registry resolves tolerantly, and a remote stanza is documented
+  in its header rather than modelled. Redesigning the catalog around providers is the same piece of
+  work as scrub item **S2** — see the cross-cutting scrub below.
+- **Per-provider costing** is descriptor-shaped (`publishes_token_costs`, and OpenRouter's catalogue
+  carries the prices) but has no reader; it lands with **D**.
+- **A second remote provider** would be the real test of the abstraction. One of each is enough to
+  find the `host:port` assumption; it is not enough to know which of OpenRouter's shapes are
+  *OpenRouter's* and which are *remote's*.
 
 ### B · Identity and API-key auth
 

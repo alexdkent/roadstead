@@ -34,6 +34,24 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
   - Behaviour-preserving, and checked rather than asserted: 563,200 payloads and 105 discovery
     bodies compared old-vs-new, zero differences, side effects included.
 
+- **An OpenRouter provider — the first backend Roadstead does not own.** `EndpointConfig` grew
+  `base_url` (superseding `host`/`port`, which cannot express a scheme or a base path) and
+  `api_key_env` (the NAME of the environment variable holding the key, never the key), and the
+  connection pool is keyed on the URL. Auth is the provider's business, not the transport's.
+  - **A provider that cannot honour a constraint now refuses.** OpenRouter cannot enforce a GBNF
+    grammar, so the request fails with a reason instead of silently returning free-form text a
+    caller could not distinguish from a model answering badly. Engine *hints* (`id_slot`,
+    `chat_template_kwargs`, `thinking_token_budget`) are still dropped in silence — they are ours,
+    not the caller's.
+  - **`BackendClientPool.probe_json`** — a generic probe, so a provider owns its route and its
+    parsing. New providers use it rather than growing another `probe_<engine>_<thing>`.
+  - Remote capacity is **not** modelled as local capacity: nothing reports slots, and a remote
+    endpoint keeps a config-seeded concurrency cap. Spill under one admission decision is
+    Workstream D.
+- **`roadstead.testing` speaks a remote wire shape** — `FakeBackend(engine="openrouter")` serves its
+  routes off a base path, 401s without a bearer token, and publishes a two-entry catalogue with
+  `context_length` and per-token pricing. `FakeBackendServer.base_url` is what an endpoint points at.
+
 - **A stated mission** (`docs/roadmap.md`, and the README lead): Roadstead is a **local-first LLM
   scheduler** that stands between many kinds of caller and many kinds of model and absorbs the
   mismatch, so neither side has to model the other. Positioning note: *scheduler*, not

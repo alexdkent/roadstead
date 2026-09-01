@@ -46,11 +46,11 @@ def test_pool_sized_to_slots_with_floor(monkeypatch):
     pool = BackendClientPool()
 
     # Small endpoint: floor of 20 applies.
-    pool._client_for("h1", 1, min_pool=3 + 4)
+    pool._client_for("http://h1:1", min_pool=3 + 4)
     assert created[-1]["limits"].max_connections == 20
 
     # Thinker-sized endpoint: pool >= admission ceiling.
-    pool._client_for("h2", 1, min_pool=32 + 4)
+    pool._client_for("http://h2:1", min_pool=32 + 4)
     assert created[-1]["limits"].max_connections == 36
     assert created[-1]["limits"].max_keepalive_connections >= 18
 
@@ -66,16 +66,16 @@ def test_pool_grows_and_retires_old_client(monkeypatch):
     monkeypatch.setattr(backend_mod.httpx, "AsyncClient", spy_client)
     pool = BackendClientPool()
 
-    small = pool._client_for("h", 1, min_pool=0)          # built at 20
-    same = pool._client_for("h", 1, min_pool=10)          # 20 suffices → reused
+    small = pool._client_for("http://h:1", min_pool=0)          # built at 20
+    same = pool._client_for("http://h:1", min_pool=10)          # 20 suffices → reused
     assert same is small
-    grown = pool._client_for("h", 1, min_pool=36)         # needs rebuild
+    grown = pool._client_for("http://h:1", min_pool=36)         # needs rebuild
     assert grown is not small
     assert created[-1]["limits"].max_connections == 36
     # Old client is retired (still open for in-flight), not closed in place.
     assert small in pool._retired
     # And a subsequent smaller requirement reuses the grown client.
-    assert pool._client_for("h", 1, min_pool=5) is grown
+    assert pool._client_for("http://h:1", min_pool=5) is grown
 
 
 @pytest.mark.asyncio
@@ -83,7 +83,7 @@ async def test_call_and_stream_request_slot_sized_pool():
     pool = BackendClientPool()
     seen: list[int] = []
 
-    def spy(host, port, min_pool=0):
+    def spy(base_url, min_pool=0):
         seen.append(min_pool)
         raise RuntimeError("stop before any network I/O")
 

@@ -27,7 +27,7 @@ from typing import Any
 
 import yaml
 
-from .providers import provider_for_engine
+from .providers import DEFAULT_PROVIDER, provider_for_engine
 
 _DEFAULT_PATH = Path(__file__).resolve().parent / "models.yaml"
 
@@ -55,6 +55,12 @@ class ModelEntry:
     port: int = 0
     wyoming_port: int = 0
     backend_engine: str = ""
+    #: Full base URL of a REMOTE backend, superseding host/port (which cannot
+    #: express a scheme or a base path). Empty for every local engine.
+    base_url: str = ""
+    #: NAME of the environment variable holding this backend's API key — never
+    #: the key. See EndpointConfig.api_key_env.
+    api_key_env: str = ""
     # --- off-package derive fields (telemetry UNITS + dispatcher registry) ---
     systemd_unit: str = ""          # box unit name (no .service) for telemetry UNITS
     probe_kind: str = ""            # telemetry probe type: vllm | llama | infinity | health
@@ -156,6 +162,8 @@ def _coerce_entry(name: str, raw: dict[str, Any]) -> ModelEntry:
         port=int(raw.get("port", 0) or 0),
         wyoming_port=int(raw.get("wyoming_port", 0) or 0),
         backend_engine=raw.get("backend_engine", ""),
+        base_url=raw.get("base_url", ""),
+        api_key_env=raw.get("api_key_env", ""),
         systemd_unit=raw.get("systemd_unit", ""),
         probe_kind=raw.get("probe_kind", ""),
         dispatcher_unit_key=raw.get("dispatcher_unit_key", ""),
@@ -251,8 +259,28 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
             # deliberately-stopped backend logged CRITICAL "UNHEALTHY — 3 consecutive probe
             # failures" every cycle. Found 2026-07-31 after tier3-backup was stopped per §2b.
             kw["on_demand"] = True
-        if e.backend_engine == "vllm":
-            kw["backend_engine"] = "vllm"
+        # Mirror the engine whenever it names a provider that is NOT the
+        # default. Previously this read `== "vllm"`, which was the same rule
+        # while vLLM was the only non-default engine and silently dropped every
+        # other name — including `openrouter`, which would have arrived as a
+        # llama.cpp endpoint pointed at a remote URL. `shim` and
+        # `llama.cpp (Vulkan)` still resolve to the default and are still not
+        # mirrored, so nothing about a local endpoint changes.
+        if provider_for_engine(e.backend_engine) is not DEFAULT_PROVIDER:
+            kw["backend_engine"] = e.backend_engine
+        # Remote connection details. Absent on every local stanza, and absent
+        # is not empty-string-equivalent here: setting base_url at all is what
+        # switches the transport off host:port.
+        if e.base_url:
+            kw["base_url"] = e.base_url
+        if e.api_key_env:
+            kw["api_key_env"] = e.api_key_env
+        if e.served_model_names and not e.host:
+            # A remote provider fronts a catalogue, so the model it serves is a
+            # choice we seed rather than a fact the poller can discover (its
+            # descriptor says `publishes_served_model_id=False`). The first
+            # declared name is the slug we route on.
+            kw["served_model_id"] = e.served_model_names[0]
         if (e.capabilities.get("reasoning")
                 and not provider_for_engine(
                     e.backend_engine).descriptor.reasoning_is_switchable):
