@@ -158,7 +158,7 @@ Not phases. Several can run concurrently; the dependencies between them are what
 
 ### A · Provider abstraction — *the foundation*
 
-**Landed 2026-08-31** (`0799e83`, *"Extract the provider interface out of backend.py"*). The case
+**Landed 2026-08-31** (`321bd82`, *"Extract the provider interface out of backend.py"*). The case
 for it, which every workstream after this one drew on:
 extract a provider interface out of `backend.py` (llama.cpp/vLLM branching inline) and formalise the
 capability descriptor. Nothing else on this list was buildable first — OpenRouter needed it, spill
