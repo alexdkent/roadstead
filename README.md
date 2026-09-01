@@ -169,6 +169,27 @@ disagree the key wins, and a presented key that does not resolve is a 401 rather
 demotion to whatever the address would have given. `docs/api.md` §1.5 has the full precedence and
 the reasoning.
 
+### Behind a reverse proxy
+
+🚨 **If anything sits in front of Roadstead — a TLS terminator, an ingress, a sidecar — say so.**
+Otherwise every caller arrives at the proxy's address, the whole address layer becomes one identity,
+and if that address is loopback or docker-internal (a sidecar usually is) it carries the built-in
+admin grant with it.
+
+```sh
+ROADSTEAD_TRUSTED_PROXIES='127.0.0.1,172.18.0.0/16'   # empty by default
+```
+
+`X-Forwarded-For` is then read **only** on connections from those addresses, and the caller is taken
+as the rightmost hop that is not itself a trusted proxy — never the leftmost, which is whatever the
+caller wrote before any proxy appended what it saw.
+
+Configuring this also **withdraws the built-in loopback/docker admin grant from forwarded requests**,
+deliberately: "it arrived on loopback" stops meaning "somebody is already on the machine" the moment
+a front door exists. Administer with an `admin` API key, which works from anywhere and can be
+revoked, or name the address in `ROADSTEAD_ADMIN_NETS`. `GET /rs/v1/admin/config` shows what is
+trusted and which admin nets are built in versus yours.
+
 ## Managing it — `/rs/v1/admin`
 
 Keys, quotas and budgets are also **runtime** operations, so enrolling a caller does not mean editing

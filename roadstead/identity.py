@@ -47,6 +47,13 @@ world on upgrade, for a credential nobody chose.
 OVERRIDES a body-declared ``agent_id`` and an address only fills in one that was
 omitted. Anything else would let the body launder a claim past the credential.
 
+🚨 **A forwarded address is believed only from a trusted proxy.**
+``X-Forwarded-For`` is a caller-supplied string. Honouring one unconditionally
+would let any caller assert any source address — the self-asserted ``agent_id``
+bug in its third costume — so it is read ONLY when the peer is in
+``ROADSTEAD_TRUSTED_PROXIES``, which is empty by default. Until an operator opts
+in, the peer address decides exactly as it always has.
+
 Keys are held as SHA-256 digests and compared by digest, so the plaintext exists
 only for as long as it takes to load the config. A key in a config file is a key
 in a git history, which is why ``key_sha256:`` is the documented form and
@@ -56,6 +63,7 @@ in a git history, which is why ``key_sha256:`` is the documented form and
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import os
 import time
@@ -552,10 +560,215 @@ def presented_key(request: Any) -> str:
 
 
 def remote_ip(request: Any) -> str:
-    """Source address of ``request``, or ``"unknown"`` when it has none."""
+    """The PEER address — the far end of the socket — or ``"unknown"``.
+
+    This is what the transport observed and is never caller-supplied, so it is
+    the address the trust decision below is *made about*. It is NOT necessarily
+    the caller: behind a reverse proxy it is the proxy. Use
+    :meth:`IdentityResolver.client_ip`, which is the resolved answer.
+    """
     client = getattr(request, "client", None)
     host = getattr(client, "host", None)
-    return str(host) if host else "unknown"
+    return str(host) if host else _UNKNOWN_ADDRESS
+
+
+# ---------------------------------------------------------------------------
+# Forwarded addresses — the reverse-proxy case
+# ---------------------------------------------------------------------------
+#
+# 🚨 The whole of this section exists to answer one question safely: when the
+# peer is a reverse proxy, WHICH of the addresses it forwarded is the caller?
+#
+# Get it wrong in one direction and every caller collapses into the proxy's
+# address — the IP layer becomes a single identity, ``ROADSTEAD_ACL`` stops
+# distinguishing anybody, and if the proxy sits in the admin nets (loopback and
+# docker-internal are there by DEFAULT, and a sidecar proxy usually is one of
+# them) the control plane is granted to whoever can reach the proxy.
+#
+# Get it wrong in the other direction — believe ``X-Forwarded-For`` from anyone,
+# or take its LEFTMOST element — and a caller asserts its own source address,
+# which is the self-asserted ``agent_id`` bug wearing a different hat.
+
+#: The address reported when there is no usable one. Deliberately not an IP:
+#: ``IPIdentityMap`` cannot match it, so it is refused rather than admitted, and
+#: ``is_admin`` is False for it. Fail-closed by construction.
+_UNKNOWN_ADDRESS = "unknown"
+
+_FORWARDED_FOR = "X-Forwarded-For"
+
+#: Cap on hops examined. The walk below stops at the first UNTRUSTED hop, so a
+#: caller cannot lengthen it — except by repeating a trusted proxy's address
+#: thousands of times, which is the only reason this exists. A chain longer than
+#: this is not parsed at all; it is a hostile header, not a deployment.
+_MAX_FORWARDED_HOPS = 32
+
+
+class TrustedProxies:
+    """The addresses whose ``X-Forwarded-For`` header may be believed.
+
+    🚨 **Empty by default, and an empty set means the header is never read.**
+    Trusting a forwarded address is an operator statement about their own
+    topology — that a specific box sits in front and rewrites this header — and
+    nothing about the request itself can supply that statement.
+    """
+
+    def __init__(self, nets: Any = ()) -> None:
+        self._nets: list[Any] = list(nets)
+
+    def __bool__(self) -> bool:
+        return bool(self._nets)
+
+    def __len__(self) -> int:
+        return len(self._nets)
+
+    def trusts(self, address: str) -> bool:
+        """Whether ``address`` is one of the configured proxies.
+
+        A non-address (``"unknown"``, a hostname, junk from a header) is not
+        trusted — never raises, because this runs on the request path.
+        """
+        if not self._nets or not address:
+            return False
+        try:
+            addr = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        return any(addr in net for net in self._nets)
+
+    def networks(self) -> list[str]:
+        """The configured entries, for the management plane's config view."""
+        return [str(net) for net in self._nets]
+
+    @classmethod
+    def parse(cls, raw: str, *, source: str = "ROADSTEAD_TRUSTED_PROXIES") -> "TrustedProxies":
+        """Comma-separated addresses or CIDRs. An unparseable entry is DROPPED.
+
+        Dropping is the safe direction — a typo removes trust rather than
+        granting it — but a dropped entry is exactly the shape of failure
+        ``hooks.config_notice`` exists for: the operator believes they are
+        behind a proxy, the header is being ignored, and every caller is
+        collapsing into one identity with nothing failing.
+        """
+        nets = []
+        for entry in (raw or "").split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                nets.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                logger.warning(
+                    "%s: %r is not an address or CIDR; it is NOT trusted",
+                    source, entry)
+                hooks.config_notice(
+                    source=source,
+                    subject=entry,
+                    problem="unparseable",
+                    detail=("not an address or CIDR — this proxy is NOT trusted, "
+                            "so X-Forwarded-For from it is ignored and its "
+                            "callers all resolve to its own address"),
+                )
+        return cls(nets)
+
+    @classmethod
+    def from_env(cls) -> "TrustedProxies":
+        """``ROADSTEAD_TRUSTED_PROXIES`` — empty by default."""
+        proxies = cls.parse(os.environ.get("ROADSTEAD_TRUSTED_PROXIES", ""))
+        if proxies:
+            logger.info(
+                "trusting X-Forwarded-For from %d proxy network(s): %s. The "
+                "built-in loopback/docker admin grant no longer applies to a "
+                "FORWARDED request — grant admin with an admin API key or "
+                "ROADSTEAD_ADMIN_NETS.",
+                len(proxies), ", ".join(proxies.networks()))
+        return proxies
+
+
+@dataclass(frozen=True)
+class ClientAddress:
+    """The address a request is FROM, and how sure we are of it."""
+
+    #: The caller's address, or ``"unknown"``.
+    ip: str
+    #: True when this came out of ``X-Forwarded-For`` on a connection from a
+    #: trusted proxy. 🚨 Branch on THIS rather than on whether the ip differs
+    #: from the peer — a proxy forwarding its own address is still forwarded,
+    #: and the point of the flag is what the transport can vouch for.
+    forwarded: bool = False
+
+
+def _forwarded_hop(raw: str) -> str | None:
+    """One ``X-Forwarded-For`` element as a bare address, or None.
+
+    Proxies vary: bare addresses, ``ip:port`` for v4, ``[v6]:port``. Anything
+    that is not an address after that is not guessed at.
+    """
+    text = raw.strip()
+    if text.startswith("["):                    # [2001:db8::1]:443
+        end = text.find("]")
+        if end == -1:
+            return None
+        text = text[1:end]
+    elif text.count(":") == 1:                  # 192.0.2.4:51234 — never bare v6
+        text = text.split(":", 1)[0]
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return None
+
+
+def client_address(request: Any, trusted: TrustedProxies | None = None) -> ClientAddress:
+    """Resolve ``request`` to the address of the caller.
+
+    🚨 **The hop is chosen by walking the chain from the RIGHT, stopping at the
+    first address that is not a trusted proxy.** ``X-Forwarded-For`` is appended
+    to left-to-right, so the rightmost element is what the closest proxy
+    observed and the leftmost is whatever the original caller sent — which is to
+    say, caller-controlled. Taking the leftmost re-introduces the spoof this
+    exists to close; a caller that prepends ten fake hops simply has them
+    ignored, because the walk stops before it ever reaches them.
+
+    The walk is used rather than counting ``N`` trusted proxies and taking the
+    ``(N+1)``th from the right: the trusted set is expressed as CIDRs, so its
+    *width* is not its depth, and a chain that is one hop shorter than expected
+    would silently return a proxy's address as a caller's.
+    """
+    peer = remote_ip(request)
+    if not trusted or not trusted.trusts(peer):
+        # The overwhelmingly common case, and the default: no proxy is trusted,
+        # or this connection did not come from one. The header is not read at
+        # all — it is not "validated and rejected", it is never consulted.
+        return ClientAddress(ip=peer, forwarded=False)
+
+    chain = [part for part in _header(request, _FORWARDED_FOR).split(",") if part.strip()]
+    if not chain:
+        # A trusted proxy that forwards nothing has told us nothing. The peer is
+        # all we have, and it is the proxy — so this is exactly the collapse
+        # case, and marking it forwarded is what withdraws the built-in admin
+        # grant from it. A misconfigured front proxy must not be an admin.
+        return ClientAddress(ip=peer, forwarded=True)
+    if len(chain) > _MAX_FORWARDED_HOPS:
+        logger.warning("X-Forwarded-For from %s has %d hops (cap %d); ignoring it",
+                       peer, len(chain), _MAX_FORWARDED_HOPS)
+        return ClientAddress(ip=_UNKNOWN_ADDRESS, forwarded=True)
+
+    hop = None
+    for raw in reversed(chain):
+        hop = _forwarded_hop(raw)
+        if hop is None:
+            # 🚨 Unparseable, and REACHED by the walk — so it is standing where
+            # a caller's address should be. Resolving to the peer here would
+            # hand the proxy's identity (and its admin grant) to anyone who
+            # sends junk, so this fails closed instead.
+            logger.warning("X-Forwarded-For from %s contains an unparseable hop; "
+                           "the caller cannot be identified", peer)
+            return ClientAddress(ip=_UNKNOWN_ADDRESS, forwarded=True)
+        if not trusted.trusts(hop):
+            return ClientAddress(ip=hop, forwarded=True)
+
+    # Every hop was itself a trusted proxy. The caller is further left than the
+    # chain goes, so the leftmost is the closest thing to an answer we have.
+    return ClientAddress(ip=str(hop), forwarded=True)
 
 
 class IdentityResolver:
@@ -573,9 +786,13 @@ class IdentityResolver:
         keys: KeyRegistry | None = None,
         *,
         require_key: bool | None = None,
+        trusted_proxies: TrustedProxies | None = None,
     ) -> None:
         self.acl = acl
         self.keys = keys if keys is not None else KeyRegistry()
+        self.proxies = (
+            TrustedProxies.from_env() if trusted_proxies is None else trusted_proxies
+        )
         self.require_key = (
             _require_key_from_env() if require_key is None else require_key
         )
@@ -587,6 +804,23 @@ class IdentityResolver:
                 "ROADSTEAD_REQUIRE_API_KEY is set but NO keys are configured — "
                 "every request will be refused. Set ROADSTEAD_API_KEYS or "
                 "ROADSTEAD_API_KEYS_FILE, or unset the requirement.")
+
+    # -- addressing -------------------------------------------------------
+
+    def client_address(self, request: Any) -> ClientAddress:
+        """Who this request is FROM, honouring a trusted proxy's forwarding.
+
+        🚨 The ONE place an address is resolved. ``http_handlers`` and
+        ``management`` call this rather than reading ``request.client``: a call
+        site that reads the peer directly is a call site where a reverse proxy
+        collapses every caller into one identity, and there is nothing about
+        such a bug that fails loudly.
+        """
+        return client_address(request, self.proxies)
+
+    def client_ip(self, request: Any) -> str:
+        """:meth:`client_address` when only the string is wanted (audit, logs)."""
+        return self.client_address(request).ip
 
     # -- resolution -------------------------------------------------------
 
@@ -620,7 +854,8 @@ class IdentityResolver:
                          "'Authorization: Bearer <key>' or 'X-API-Key: <key>'"),
             ))
 
-        ip = remote_ip(request)
+        address = self.client_address(request)
+        ip = address.ip
         identity = self.acl.identify(ip)
         if identity is None:
             return Resolution(denial=Denial(
@@ -633,7 +868,15 @@ class IdentityResolver:
             agent_id=agent_id,
             priority=priority,
             min_timeout_s=self.acl.min_timeout_s(ip),
-            admin=self.acl.is_admin(ip),
+            # 🚨 A FORWARDED address does not inherit the BUILT-IN admin nets.
+            # Those nets are loopback and docker-internal, and the whole
+            # justification for auto-granting admin to them is that reaching
+            # them meant already being on the box. A front proxy negates that
+            # exactly: "arrived on loopback" now means "came in the front door".
+            # An operator who genuinely wants a forwarded address to be admin
+            # says so in ROADSTEAD_ADMIN_NETS — or, better, issues an admin key,
+            # which works from anywhere and is revocable.
+            admin=self.acl.is_admin(ip, trust_builtin_nets=not address.forwarded),
             source="ip",
         ))
 

@@ -170,6 +170,37 @@ Three rules, each of which is a decision rather than an implementation detail:
    *(Kept as doctrine although row 3 is now empty: it is the rule that decides what a future body
    field, or a third identity factor, may and may not override — and it is the reason removing the
    body claim was safe rather than the reason it stopped mattering.)*
+4. 🚨 **A forwarded address is believed only from a trusted proxy, and the caller is the rightmost
+   hop that is not one.** `X-Forwarded-For` is a caller-supplied string. It is read only when the
+   peer is listed in **`ROADSTEAD_TRUSTED_PROXIES`** (a comma-separated list of addresses or CIDRs,
+   **empty by default**, so the peer address decides until an operator opts in). Rule 4 is rule 3
+   one level down: honouring the header unconditionally would let any caller assert any source
+   address, and taking its *leftmost* element — the intuitive reading — would do the same, because
+   the leftmost is exactly the part the caller wrote before any proxy appended what it observed.
+
+#### What a trusted proxy changes
+
+Put a reverse proxy or TLS terminator in front of Roadstead without configuring one and **every
+caller collapses into the proxy's address**: the address layer becomes a single identity, so
+`ROADSTEAD_ACL` stops distinguishing anybody, and if the proxy sits in the admin nets — loopback and
+docker-internal are there by default, and a sidecar usually is one of them — the control plane is
+granted to everyone who can reach the proxy.
+
+Configuring `ROADSTEAD_TRUSTED_PROXIES` fixes that, and changes one other thing on purpose:
+
+🚨 **A forwarded address does not inherit the built-in admin nets.** Loopback and docker-internal are
+auto-granted admin because reaching them meant already being on the machine; a front proxy is
+precisely what makes that untrue. A forwarded request is admin only via an **`admin` API key** (the
+recommended path — it works from anywhere and is revocable) or an address the operator named in
+`ROADSTEAD_ADMIN_NETS`. A trusted proxy that forwards *no* header is treated as forwarded too, so a
+front proxy that lost its configuration does not become an administrator.
+
+Two chain shapes fail closed rather than back to the peer, because resolving to the peer would hand
+the proxy's identity — and its grants — to whoever sent the header: an **unparseable hop** where a
+caller's address should be, and a **chain longer than 32 hops**. Both resolve to `unknown`, which is
+not an address, matches no registration, and is therefore refused.
+
+`GET /rs/v1/admin/config` reports what is trusted and what that changed (§3.5).
 
 **Every door is gated**, the three `/rs/v1` routes included. Out of the box, loopback and docker-internal
 addresses resolve to the identity `internal` and everything else is refused — default-deny, and the
@@ -499,7 +530,8 @@ Deterministic 4xx are non-deferrable (the caller must change something). 429 and
 **Admin is narrower than inference, deliberately.** An operator who enrols a subnet for inference has
 said nothing about who may pause a backend fleet-wide. Two ways in: an **API key with the `admin`
 scope** (from anywhere), or a **source address** in the admin nets — loopback and docker-internal by
-default, extended by `ROADSTEAD_ADMIN_NETS`.
+default, extended by `ROADSTEAD_ADMIN_NETS`. 🚨 The **default** half of that is withdrawn from any
+request that arrived through a trusted proxy (§1.5 rule 4); what `ROADSTEAD_ADMIN_NETS` names is not.
 
 🚨 **An authenticated non-admin identity is refused even from a host in the admin nets.** Once a
 caller says who it is, its privileges are that identity's; inheriting the host's would mean a scoped
@@ -627,6 +659,12 @@ operator who asks why a knob does nothing are usually not the same person, a wee
 
 An empty `notices` list is the healthy state. It is not the same as "no config was loaded": the
 `sources` block says which files were read.
+
+`sources` also carries **`trusted_proxies`** — what is trusted, and the flag
+`builtin_admin_nets_apply_to_forwarded: false` — beside **`admin_nets`**, split into `builtin` and
+`operator`. Which of those two an admin grant came from decides whether it survives a proxy being
+put in front (§1.5 rule 4), and an operator whose only admin path was "curl from the box" should
+read that here rather than meet it as a 403.
 
 The same principle shapes the other two read views. `GET /rs/v1/admin/providers` reports each
 endpoint's **declared** capacity (the `models.yaml` seed) beside what is **in force** (what discovery

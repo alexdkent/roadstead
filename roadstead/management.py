@@ -502,7 +502,10 @@ class ManagementApi:
     # ---- gate -----------------------------------------------------------
 
     def _gate(self, route: str, request: Request) -> Response | None:
-        remote_ip = _remote_ip(request)
+        # 🚨 Through the resolver, never off ``request.client``: this is the
+        # surface where reading the peer directly would grant admin to every
+        # caller behind a front proxy at once.
+        remote_ip = self.state.identity.client_ip(request)
         self._http.audit_admin_ip(route, remote_ip)
         return self._http.deny_non_admin(request, remote_ip)
 
@@ -538,6 +541,8 @@ class ManagementApi:
         if denied is not None:
             return denied
         overlay = self.state.admin_overlay
+        acl = self.state.acl
+        proxies = self.state.identity.proxies
         return JSONResponse({
             "sources": {
                 "catalog": {
@@ -555,6 +560,24 @@ class ManagementApi:
                     "file": os.environ.get("ROADSTEAD_API_KEYS_FILE", ""),
                 },
                 "acl": {"env_var": "ROADSTEAD_ACL"},
+                # 🚨 The two halves of "which address is this request from, and
+                # what does that address get". Reported together because the
+                # first silently changes the second: configuring a trusted proxy
+                # withdraws the BUILT-IN loopback/docker admin grant from any
+                # forwarded request, so an operator whose only admin path was
+                # "curl from the box" needs to see that here rather than
+                # discover it as a 403.
+                "trusted_proxies": {
+                    "env_var": "ROADSTEAD_TRUSTED_PROXIES",
+                    "networks": proxies.networks(),
+                    "forwarded_headers_honoured": bool(proxies),
+                    "builtin_admin_nets_apply_to_forwarded": False,
+                },
+                "admin_nets": {
+                    "env_var": "ROADSTEAD_ADMIN_NETS",
+                    "builtin": acl.builtin_admin_nets(),
+                    "operator": acl.operator_admin_nets(),
+                },
                 "runtime_flags": {"path": self.state.config.runtime_flags_path},
                 "admin_store": {
                     "path": overlay.path,
@@ -980,11 +1003,6 @@ class ManagementApi:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _remote_ip(request: Request) -> str:
-    client = getattr(request, "client", None)
-    return getattr(client, "host", "") or ""
-
 
 def _acl_addresses(acl: Any) -> dict[str, list[str]]:
     """agent_id → the addresses an operator registered for it.

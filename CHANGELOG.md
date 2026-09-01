@@ -8,6 +8,51 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — trusted proxies, and the admin grant behind one 🚨
+
+Landed 2026-09-01. **Not breaking**: `ROADSTEAD_TRUSTED_PROXIES` is empty by default, so a
+deployment that sets nothing behaves exactly as before, byte for byte. The header is not "validated
+and rejected" by default — it is never consulted.
+
+- **`identity.remote_ip` read `request.client.host` and nothing else**, so anything in front of
+  Roadstead — a TLS terminator, an ingress, a sidecar — collapsed every caller into the proxy's
+  address. Two consequences, and the second is a security bug: `ROADSTEAD_ACL` silently stopped
+  distinguishing anybody, and if the proxy's address fell in the admin nets (**loopback and
+  docker-internal are there by default**, and a sidecar usually is one of them) the control plane
+  was granted to everyone who could reach the proxy. Latent only because nothing told anybody to
+  deploy that way — and Workstream G's UI is what makes a front proxy normal.
+- **`ROADSTEAD_TRUSTED_PROXIES`** (addresses or CIDRs, comma-separated, empty by default) is the
+  opt-in. `X-Forwarded-For` is read only from a listed peer, and **the caller is the rightmost hop
+  that is not itself a trusted proxy**. Not the leftmost: that element is whatever the caller wrote
+  before a proxy appended what it observed, so reading it re-introduces the spoof — the
+  self-asserted `agent_id` bug in its third costume. The walk is used rather than counting hops
+  because the trusted set is CIDRs, whose *width* is not its depth.
+- **🚨 A forwarded address does not inherit the BUILT-IN admin nets.** The whole justification for
+  auto-granting admin to loopback and docker-internal is that reaching them meant already being on
+  the box, and a front proxy is exactly what makes that untrue. `ROADSTEAD_ADMIN_NETS` and an
+  `admin` API key are unaffected — the operator's explicit statements stand, the inherited default
+  does not. Safe to do unconditionally *because* it is gated on trusted-proxy configuration, which
+  is empty until somebody opts in, so no deployment can lose a grant it has today. A trusted proxy
+  that forwards **no** header is marked forwarded too: a front proxy that lost its config must not
+  become an administrator.
+- **Two chain shapes fail closed rather than back to the peer** — an unparseable hop standing where
+  a caller's address should be, and a chain longer than 32 hops. Resolving to the peer there would
+  hand the proxy's identity and its grants to anyone who typed junk into a header. Both become
+  `unknown`, which is not an address, matches no registration and is refused.
+- **`identity.py` is now the only place an address is resolved**, with an **AST** guard rather than
+  a substring one (`management.py` had its own `_remote_ip`; a second was a second answer to a
+  question with one owner, on the surface where getting it wrong grants the control plane). A
+  substring sweep for `client.host` is satisfied by prose — `getattr(getattr(request, "client",
+  None), "host", "")` is the same bug and walks straight past it.
+- **The management plane shows it**: `GET /rs/v1/admin/config` reports `trusted_proxies` beside
+  `admin_nets` split into `builtin` and `operator`, and an unparseable `ROADSTEAD_TRUSTED_PROXIES`
+  entry becomes a `hooks.config_notice` — a typo removes trust rather than granting it, which is the
+  safe direction and for that reason a completely silent one.
+- `docs/api.md` §1.5 rule **4**, §3 and §3.5. `tests/test_trusted_proxies.py`; thirteen mutations,
+  every guard observed going red — one of which **survived** the first pass and was real (the
+  spelling-sensitive sweep above), and one of which errored at collection instead of asserting and
+  had to be rewritten before it proved anything.
+
 ### Added — the management plane (Workstream E)
 
 Landed 2026-09-01. **Nothing here is breaking, deliberately**: the plane is additive, the four

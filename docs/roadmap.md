@@ -217,6 +217,14 @@ answer off a `Principal` rather than asking about an address.
 - **Clears scrub S1**, as planned — and S3 with it, plus a fourth private inventory the plan had not
   listed (`agents.yaml`, the same way S2 turned up `usage_rates.py`).
 
+**Also landed 2026-09-01 — trusted proxies.** `identity.remote_ip` read the peer address and nothing
+else, so anything in front of Roadstead collapsed every caller into one identity and, where that
+address fell in the default admin nets (loopback, docker-internal — a sidecar is usually one), handed
+the control plane to everyone who could reach the proxy. `ROADSTEAD_TRUSTED_PROXIES` is the opt-in;
+the caller is the rightmost hop that is not itself trusted; and a forwarded address stops inheriting
+the *built-in* admin grant, because "it arrived on loopback" means nothing once a front door exists.
+Latent until now, and Workstream G is what makes a front proxy normal — so it went first, alone.
+
 **~~Still open in B~~ — closed 2026-09-01 by E.** Enrolment and revocation are now runtime
 operations on `/rs/v1/admin/keys`, so a key is no longer created by editing config and restarting.
 Keys stay flat, and that turned out to be the answer rather than a gap: the budget holder is the

@@ -350,6 +350,21 @@ bites, all in `docs/api.md` §1.5:
   an authenticated non-admin identity does NOT inherit its host's admin privileges — a scoped key
   that can only widen access and never narrow it is worthless on the machine it runs on.
 
+- **A forwarded address is believed only from a trusted proxy, and the caller is the RIGHTMOST hop
+  that is not one.** `ROADSTEAD_TRUSTED_PROXIES` is empty by default, so `X-Forwarded-For` is not
+  consulted at all until an operator opts in. The leftmost element — the intuitive reading — is
+  precisely the part the caller wrote before any proxy appended what it observed. 🚨 And a forwarded
+  address does **not** inherit the BUILT-IN admin nets: loopback and docker-internal are auto-granted
+  admin because reaching them meant already being on the box, and a front proxy is exactly what makes
+  that untrue. `ROADSTEAD_ADMIN_NETS` and an `admin` key are unaffected — what the operator said
+  stands, what was inherited does not. An unparseable hop or a chain over 32 long resolves to
+  `unknown` (not an address, matches nothing, refused) rather than back to the peer, because falling
+  back to the peer hands the proxy's grants to whoever sent the header.
+
+`identity.py` is the ONLY place an address is resolved, and that is an **AST** guard, not a substring
+one — `management.py` had grown its own `_remote_ip`, and a sweep for `client.host` is walked past by
+`getattr(getattr(request, "client", None), "host", "")`, which is the same bug.
+
 `/v1/submit` is gated like the OpenAI doors as of 2026-09-01. It was not, on the same port, which
 meant the fair-share key was self-asserted by anyone who used that door.
 

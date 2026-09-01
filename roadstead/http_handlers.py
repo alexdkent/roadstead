@@ -24,7 +24,6 @@ from . import cache_stats
 from .config import LLMPriority, normalize_endpoint
 from .constants import _PAYLOAD_KIND
 from .enriched import WIRE_OPENAI
-from .identity import remote_ip as _remote_ip
 from .lifecycle import _openai_error
 from .observability import structured_empty_rates
 from .sse_hub import DROP_SENTINEL
@@ -792,7 +791,7 @@ class ProxyHttpHandlers:
         flag→bool), persisted across restarts. Internal-only (ACL). This is the
         flip surface for the shadow→enforce switches and kill-switches — flags
         change behaviour immediately, no process restart."""
-        remote_ip = _remote_ip(request)
+        remote_ip = self.state.identity.client_ip(request)
         self.audit_admin_ip("/v1/admin/flags", remote_ip)
         denied = self.deny_non_admin(request, remote_ip)
         if denied is not None:
@@ -824,7 +823,7 @@ class ProxyHttpHandlers:
         ~30s auto-circuit-trip lag. RESUME hands it back to the poller, which
         re-probes, recovers on /health, re-discovers capacity (the new
         max_model_len), and the deferred queue drains."""
-        remote_ip = _remote_ip(request)
+        remote_ip = self.state.identity.client_ip(request)
         self.audit_admin_ip("/v1/admin/endpoints", remote_ip)
         denied = self.deny_non_admin(request, remote_ip)
         if denied is not None:
@@ -885,7 +884,7 @@ class ProxyHttpHandlers:
           started_at / ended_at: epoch s   explicit bounds (override duration_s)
         With none of duration_s/started_at/ended_at, opens an OPEN window now
         (close it later via the drain resume, or re-POST with ended_at)."""
-        remote_ip = _remote_ip(request)
+        remote_ip = self.state.identity.client_ip(request)
         self.audit_admin_ip("/v1/admin/maintenance", remote_ip)
         denied = self.deny_non_admin(request, remote_ip)
         if denied is not None:
@@ -951,7 +950,7 @@ class ProxyHttpHandlers:
     async def handle_maintenance_list(self, request: Request) -> Response:
         """List maintenance windows overlapping the last ``hours`` (default 24).
         Admin surface (was unauthenticated — tightened with the rest)."""
-        remote_ip = _remote_ip(request)
+        remote_ip = self.state.identity.client_ip(request)
         self.audit_admin_ip("/v1/admin/maintenance", remote_ip)
         denied = self.deny_non_admin(request, remote_ip)
         if denied is not None:
@@ -1078,7 +1077,7 @@ class ProxyHttpHandlers:
         never traversed the scheduler, so the proxy is the single fleet
         call-metrics store. Internal/LAN — gated by the same ACL as admin.
         Best-effort: validates the minimum, records, fans out, returns ok."""
-        remote_ip = _remote_ip(request)
+        remote_ip = self.state.identity.client_ip(request)
         self.audit_admin_ip("/v1/calls/log", remote_ip)
         denied = self.deny_non_admin(request, remote_ip)
         if denied is not None:

@@ -84,6 +84,14 @@ class IPIdentityMap:
         # removing it. An API key with the ``admin`` scope is now the better
         # answer; this stays for the pre-key deployment shape.
         self._admin_nets = list(self._internal_nets)
+        # 🚨 What the OPERATOR added, kept apart from the built-ins above.
+        # The two are the same list until somebody configures a reverse proxy,
+        # at which point they stop meaning the same thing: "came from loopback"
+        # is a statement about the box when the connection is direct and a
+        # statement about nothing at all when a front proxy made it. A forwarded
+        # address is checked against THIS list only — see
+        # ``identity.IdentityResolver.resolve``.
+        self._operator_admin_nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 
     def register(
         self,
@@ -107,9 +115,12 @@ class IPIdentityMap:
         granting admin to a host must never quietly promote its inference
         traffic into a better band."""
         try:
-            self._admin_nets.append(ipaddress.ip_network(ip_or_subnet, strict=False))
+            net = ipaddress.ip_network(ip_or_subnet, strict=False)
         except ValueError:
             logger.warning("invalid IP/subnet in admin nets: %s", ip_or_subnet)
+            return
+        self._admin_nets.append(net)
+        self._operator_admin_nets.append(net)
 
     def _lookup(self, remote_ip: str) -> _Registration | None:
         """Resolve an IP to its registration, or None if unregistered.
@@ -180,10 +191,32 @@ class IPIdentityMap:
     def is_allowed(self, remote_ip: str) -> bool:
         return self.identify(remote_ip) is not None
 
-    def is_admin(self, remote_ip: str) -> bool:
+    def builtin_admin_nets(self) -> list[str]:
+        """The nets admin is granted to WITHOUT an operator saying so.
+
+        Reported by the management plane beside :meth:`operator_admin_nets`,
+        because which of the two a grant came from decides whether it survives a
+        reverse proxy being put in front (see ``is_admin``).
+        """
+        return [str(net) for net in self._internal_nets]
+
+    def operator_admin_nets(self) -> list[str]:
+        """The nets an operator added, via ``ROADSTEAD_ADMIN_NETS`` or ``:admin``."""
+        return [str(net) for net in self._operator_admin_nets]
+
+    def is_admin(self, remote_ip: str, *, trust_builtin_nets: bool = True) -> bool:
         """Admin surfaces (drain/pause, maintenance windows, runtime flags,
         calls-log ingest) accept loopback + docker-internal sources, plus
         anything ``ROADSTEAD_ADMIN_NETS`` adds.
+
+        🚨 ``trust_builtin_nets=False`` drops the loopback/docker grant and
+        honours only what the operator registered. The request path passes it
+        for an address that arrived via ``X-Forwarded-For``: the built-in grant
+        assumes reaching loopback meant already being on the machine, and a
+        reverse proxy is precisely the thing that makes that untrue. Narrowing
+        it is safe to do unconditionally *because* it is gated on trusted-proxy
+        configuration, which is empty until an operator opts in — so no existing
+        deployment can lose an admin grant it has today.
 
         Deliberately NARROWER than ``identify``: an operator who enrols a whole
         LAN subnet for inference has said nothing about who may pause a backend
@@ -201,7 +234,8 @@ class IPIdentityMap:
             addr = ipaddress.ip_address(remote_ip)
         except ValueError:
             return False
-        return any(addr in net for net in self._admin_nets)
+        nets = self._admin_nets if trust_builtin_nets else self._operator_admin_nets
+        return any(addr in net for net in nets)
 
     @classmethod
     def from_env(cls) -> "IPIdentityMap":
