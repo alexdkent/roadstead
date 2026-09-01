@@ -194,7 +194,7 @@ without new, backend-correct A/B evidence.
 ## Layout
 
 ```
-roadstead/          the package (37 modules + providers/ + client/)
+roadstead/          the package (38 modules + providers/ + client/ + ui/)
   scheduler.py      DRR + priority bands + admission        — pure computation, no I/O
   cost_model.py     slot-second cost, EWMA-calibrated       — pure computation, no I/O
   timeout_model.py  learned latency → recommended deadline  — pure computation, no I/O

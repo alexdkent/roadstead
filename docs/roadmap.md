@@ -667,12 +667,16 @@ planned.
 
 **`models.yaml` grows a provider dimension** and stops being a description of one fleet's hardware.
 
-**`docs/api.md` is executable** — **19** test files read it back and fail when code and document
-disagree: §1.6's admission table, §2.1's codes (pinned from the server *and* the client side), §3's
-route table (parsed from the table rows), §3.6's analytics schemas, §1.5's trusted-proxy rule. Every
-change above lands with its contract, or the suite says so. 🚨 The route-table sweep sets
-`ROADSTEAD_ADMIN_UI=1`, because two routes only exist when it is — any future env-gated route needs
-the same treatment.
+**`docs/api.md` is executable** — a score of test files read it back and fail when code and document
+disagree: §1.6's admission table, §2.1's codes (pinned from the server *and* the client side, and
+again from `__main__`'s shutdown envelope), §3's route table (parsed from the table rows), §3.6's
+analytics schemas, §1.5's trusted-proxy rule, §1.7.1's intent fields. Every change above lands with
+its contract, or the suite says so. 🚨 The route-table sweep sets `ROADSTEAD_ADMIN_UI=1`, because two
+routes only exist when it is — any future env-gated route needs the same treatment.
+
+⚠️ Deliberately not a *number*: it was "six" for long enough to be wrong by a factor of three, and
+was corrected to 19 on 2026-09-01 and outdated by two within the same session. The list of what is
+pinned is the useful half and does not rot; a count in prose that nothing checks always does.
 
 **Not everything from the origin generalises.** The retired `creative` endpoint name, the
 fleet-specific roles, the `degrade_ok` spelling: these are one deployment's vocabulary. Keep the
