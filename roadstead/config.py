@@ -138,12 +138,21 @@ CLASS_TO_ROLE: dict[str, str] = model_catalog.build_class_to_role()
 
 
 def normalize_endpoint(endpoint: str) -> str:
-    """Collapse a role name to its QoS endpoint class."""
+    """Collapse a role name to its QoS endpoint class.
+
+    🚨 The ONLY name-rewriting rule is the catalog's. Until 2026-09-01 this
+    also stripped a ``nexus-`` prefix and mapped a bare ``nexus`` to
+    ``chat`` — one private fleet's host naming, hardcoded here since the first
+    commit and shipped to everyone. It was a *second* aliasing mechanism beside
+    ``models.yaml``'s ``aliases:``, which is the thing this codebase refuses
+    everywhere else: it could not be configured, could not be overridden, was
+    invisible to the duplicate-alias notice in ``model_catalog``, and silently
+    rewrote any endpoint whose name happened to start with those seven
+    characters. A deployment that wants that mapping writes
+    ``aliases: [nexus]`` on the endpoint, where it is declared, reported and
+    collision-checked like every other name.
+    """
     text = str(endpoint).strip().lower()
-    if text.startswith("nexus-"):
-        text = text.split("-", 1)[1]
-    if text == "nexus":
-        text = "chat"
     if text in ROLE_TO_CLASS:
         text = ROLE_TO_CLASS[text]
     return text

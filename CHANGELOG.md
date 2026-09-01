@@ -8,6 +8,40 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Removed — BREAKING: `normalize_endpoint` no longer rewrites a `nexus-` prefix
+
+Landed 2026-09-01, found by re-running the straggler sweep (`docs/corpus_and_scrub_plan.md` S5).
+Recorded here per `docs/compatibility.md`: this is internal behaviour rather than the wire contract,
+but it changes how a *name a caller sends* resolves, which is as close to the contract as internal
+gets.
+
+`normalize_endpoint` stripped a `nexus-` prefix and mapped a bare `nexus` to `chat` — **one private
+fleet's host naming, hardcoded since the first commit (`9b11729`) and shipped to everyone.** It was a
+scrub finding and a design defect at once, and the second is the reason it is removed rather than
+renamed:
+
+- It was a **second aliasing mechanism** beside `models.yaml`'s `aliases:`, which is exactly what
+  this codebase refuses everywhere else — and the refusal has a name here, since the alias
+  duplicate/shadow notice added in the same release cannot see this one at all.
+- It could not be configured, overridden or disabled, and it silently rewrote **any** endpoint whose
+  name happened to begin with those seven characters. An operator with `nexus-a` and `a` had a pin
+  at the first silently reaching the second.
+
+**Migration**, if you actually want that mapping: put it where every other name lives —
+`aliases: [nexus]` on the endpoint, which is declared, reported and collision-checked. The whole
+suite passed unchanged with the branch removed, which is how long it had been dead weight.
+
+Two smaller findings from the same sweep: three arbitrary test addresses that merely *looked* like
+the private subnet (a sweep cannot tell, so each cost a human adjudication per re-run and S6 would
+have rewritten them through the history for nothing), and a sibling private project's name used as a
+shipped `ROADSTEAD_ACL` example.
+
+🚨 **The topology half of S5 now runs on every commit** (`tests/test_scrub_sweep.py`) — a sweep that
+lives in a shell command in a document is one somebody has to remember. The identifier half stays a
+human pass **and the test says so**, because there is no pattern to key on for a name, which is
+exactly how S4's finding survived the first sweep. Four mutations, all red.
+
+
 ### Fixed — a cancelled straggler's caller gets the envelope, not a raw 500
 
 Landed 2026-09-01. `docs/ledger.md` carried this as "Open, and ours to fix"; it was parked as

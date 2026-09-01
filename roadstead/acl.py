@@ -284,7 +284,7 @@ class IPIdentityMap:
         ``ROADSTEAD_ACL`` entries are comma-separated
         ``ip_or_subnet=agent_id[:priority][:min_timeout_s][:admin][:readonly]``, e.g.::
 
-            ROADSTEAD_ACL=192.0.2.9=tideway:P3_INGESTION,192.0.2.0/24=lan:P3_INGESTION:1800
+            ROADSTEAD_ACL=192.0.2.9=ingest-worker:P3_INGESTION,192.0.2.0/24=lan:P3_INGESTION:1800
 
         The right-hand side is the same grammar API keys use
         (``identity.parse_identity_spec``) — segments are recognised by shape,
