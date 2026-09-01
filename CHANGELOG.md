@@ -17,6 +17,23 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ### Added
 
+- **`roadstead/providers/` — the provider interface** (roadmap Workstream A, the foundation the rest
+  of the roadmap depends on). The llama.cpp/vLLM branching that was inline in `backend.py` is now
+  two adapters behind one interface: `prepare_chat_payload`, `path_for`, `discover_capacity` /
+  `parse_capacity`, and a `ProviderDescriptor` that states what a backend publishes, what it
+  requires of a request, and what it gets wrong. `backend.py` keeps the transport — pools,
+  deadlines, error taxonomy, SSE relay — and providers borrow its probes rather than opening
+  sockets of their own.
+  - The descriptor makes the capacity asymmetry a declaration rather than a comment: llama.cpp
+    publishes real slots and per-slot context, vLLM publishes only a context ceiling and keeps
+    `--max-num-seqs` off the API, so its concurrency stays config-seeded.
+  - Four call sites that asked `backend_engine == "vllm"` now read the capability they actually
+    meant (prefix-cache counters, truncated-tool-call mislabelling, switchable reasoning, which
+    discovery probe to run), and `tests/test_provider_interface.py` fails if a new engine-name
+    comparison appears outside the config plumbing.
+  - Behaviour-preserving, and checked rather than asserted: 563,200 payloads and 105 discovery
+    bodies compared old-vs-new, zero differences, side effects included.
+
 - **A stated mission** (`docs/roadmap.md`, and the README lead): Roadstead is a **local-first LLM
   scheduler** that stands between many kinds of caller and many kinds of model and absorbs the
   mismatch, so neither side has to model the other. Positioning note: *scheduler*, not

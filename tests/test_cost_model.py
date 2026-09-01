@@ -138,7 +138,7 @@ class TestEstimateInputTokens:
 
     def test_top_level_system_string_counted(self):
         # The Anthropic-shaped `system` field (inlined into messages later by
-        # backend._normalize_chat_payload) must count toward est_in.
+        # the provider's prepare_chat_payload) must count toward est_in.
         msg = "Tell me about cats."
         system = "S" * 400
         base = estimate_input_tokens({"messages": [{"role": "user", "content": msg}]})

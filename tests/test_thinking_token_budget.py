@@ -22,11 +22,11 @@ from __future__ import annotations
 
 import pytest
 
-from roadstead.backend import (
+from roadstead.providers import VLLM
+from roadstead.providers.payload import (
     _THINKING_BUDGET_CEILING,
     _THINKING_BUDGET_FLOOR,
     _apply_thinking_token_budget,
-    _normalize_chat_payload,
 )
 
 
@@ -52,7 +52,7 @@ def test_an_endpoint_that_does_not_declare_support_gets_nothing():
 def test_normalize_does_not_inject_without_a_declared_ratio():
     """Same thing through the real entry point, since the early-return short-circuit
     in `_normalize_chat_payload` is a separate way to skip it."""
-    out = _normalize_chat_payload(_payload(), vllm=True, model_id="tier3")
+    out = VLLM.prepare_chat_payload(_payload(), model_id="tier3")
     assert "thinking_token_budget" not in out
 
 
@@ -67,7 +67,7 @@ def test_a_declared_endpoint_gets_a_budget_proportional_to_max_tokens():
 
 
 def test_it_reaches_the_wire_through_normalize():
-    out = _normalize_chat_payload(_payload(), vllm=True, model_id="tier3",
+    out = VLLM.prepare_chat_payload(_payload(), model_id="tier3",
                                   thinking_budget_ratio=0.6)
     assert out["thinking_token_budget"] == 7200
 

@@ -1,0 +1,183 @@
+"""The provider interface — Roadstead's south face, made explicit.
+
+A *provider* is the adapter for one kind of inference backend. It owns the two
+things engines genuinely disagree about, and nothing else:
+
+1. **What a request has to look like to be accepted** (:meth:`Provider.path_for`,
+   :meth:`Provider.prepare_chat_payload`). vLLM validates the ``model`` field and
+   enforces GBNF only via ``structured_outputs.grammar``; llama.cpp ignores the
+   first and reads the second at the top level. Neither is a preference — send
+   the wrong shape and the call 404s, 400s, or silently drops the constraint.
+
+2. **What it can tell us about itself** (:meth:`Provider.discover_capacity` and
+   :class:`ProviderDescriptor`). This is deliberately ASYMMETRIC, and the
+   asymmetry is a property of the engines rather than an oversight: llama.cpp
+   ``/props`` publishes real slot counts and per-slot context, while vLLM
+   publishes only ``max_model_len`` and keeps ``--max-num-seqs`` off the API
+   entirely, so vLLM concurrency stays config-seeded with a drift alert. The
+   descriptor states which is which, so a caller branches on a CAPABILITY it
+   needs instead of on an engine name it recognises.
+
+**Transport is not a provider concern.** Connection pools, deadlines, the error
+taxonomy and the SSE relay live in ``backend.py`` and are the same for every
+backend; a provider that opened its own sockets would fork the single-loop
+concurrency invariant (``CLAUDE.md``). Providers are handed the pool and ask it
+to probe, which is also what keeps the unit suite's network isolation working —
+it stubs probes by name on ``BackendClientPool``.
+
+🚨 **Providers are stateless singletons and must stay that way.** One instance
+is shared by every endpoint of its engine on the single event loop. Per-endpoint
+state belongs on ``EndpointConfig``; anything mutable here is a data race that
+no test in this repo would catch.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..config import EndpointConfig
+
+
+@dataclass(frozen=True)
+class ProviderDescriptor:
+    """What this kind of backend publishes, requires, and gets wrong.
+
+    Every field exists because some call site used to ask ``backend_engine ==
+    "vllm"`` and mean one of these instead. Keep it that way: a field with no
+    reader is a claim nobody checks. The one deliberate exception is
+    ``publishes_token_costs``, which is False everywhere today and is the seam
+    Workstream D (spill + costing) needs from a remote provider.
+    """
+
+    #: Registry key, and what ``models.yaml`` spells in ``backend_engine``.
+    name: str
+    #: ``"local"`` capacity is the scarce thing DRR fair-shares in slot-seconds;
+    #: ``"remote"`` capacity is elastic and governed by cost instead. No remote
+    #: provider exists yet — the distinction is stated now because admission
+    #: (local / spill / defer) is a single decision, not two systems.
+    kind: str = "local"
+
+    # --- what it can TELL us -------------------------------------------------
+    #: Publishes its real concurrency (llama.cpp ``/props``). When False the
+    #: endpoint's ``max_slots`` stays config-seeded and only a drift alert can
+    #: notice it is wrong.
+    publishes_slot_count: bool = False
+    #: Publishes per-slot context (llama.cpp ``default_generation_settings.n_ctx``).
+    publishes_slot_context: bool = False
+    #: Publishes a whole-request context ceiling (vLLM ``max_model_len``).
+    publishes_context_ceiling: bool = False
+    #: Publishes Prometheus prefix-cache counters on ``/metrics``. Gates the
+    #: cache-stats scrape; llama.cpp has no equivalent, so its endpoints read
+    #: as ``n/a`` rather than as a 0% hit rate.
+    publishes_prefix_cache_metrics: bool = False
+    #: Can report per-request cached prompt tokens in ``usage``. Note this is
+    #: an engine CAPABILITY, not a promise: vLLM only fills it when launched
+    #: with ``--enable-prompt-tokens-details`` (see ``health.compute_cache_stats``).
+    publishes_cached_tokens: bool = False
+    #: Reports what a call actually cost in money. Nothing local does.
+    publishes_token_costs: bool = False
+
+    # --- what it REQUIRES of a request ---------------------------------------
+    #: 404s unless the ``model`` field names what it is serving, so the proxy
+    #: must overwrite the caller's alias with the discovered served id.
+    validates_model_field: bool = False
+    #: Where a GBNF grammar has to sit to be enforced: ``"grammar"`` (top level,
+    #: llama.cpp) or ``"structured_outputs"`` (vLLM). ``None`` = no grammar
+    #: support. Put it in the wrong place and the backend accepts the request
+    #: and ignores the constraint, which is the failure that looks like a bad
+    #: model rather than a bad request.
+    grammar_field: str | None = None
+    #: Its chat templates require strict user/assistant alternation and 500 on
+    #: consecutive same-role turns (Mistral/Ministral).
+    strict_alternation_templates: bool = False
+    #: Reasoning can be turned OFF from the proxy side, by defaulting the
+    #: endpoint's declared switch in ``chat_template_kwargs``. Two readers, one
+    #: fact: the vLLM provider injects that default, and ``model_catalog`` sets
+    #: ``forces_reasoning`` on a reasoning model where this is False — its CoT
+    #: is unconditional, so the submit path has to reserve answer headroom on
+    #: top of the caller's cap. The switch's SPELLING is per model family and
+    #: lives in the catalog, never here.
+    reasoning_is_switchable: bool = False
+
+    # --- characterised DEFECTS -----------------------------------------------
+    #: Labels a tool-call response ``finish_reason=tool_calls`` even when the
+    #: arguments were cut mid-JSON. llama.cpp labels that truncation ``length``
+    #: correctly, so the structured-validity guard is engine-specific.
+    mislabels_truncated_tool_calls: bool = False
+
+
+@dataclass(frozen=True)
+class CapacityReport:
+    """One discovery pass, parsed. ``None`` means *this backend cannot tell us*
+    — never zero, and never "unchanged". Both callers must be able to keep a
+    config-seeded value rather than overwrite it with a guess."""
+
+    #: Where the numbers came from, for the discovery log line.
+    source: str
+    #: Real concurrency, when the backend publishes it.
+    slots: int | None = None
+    #: Context available to ONE request. Already per-slot — the divide-by-
+    #: n_parallel decision belongs to the parser that knows the engine's units
+    #: (see ``LlamaCppProvider.parse_capacity``).
+    context_per_slot: int | None = None
+
+
+class Provider(ABC):
+    """Adapter for one kind of backend. Stateless; see the module docstring."""
+
+    #: Immutable declaration. Read it instead of testing ``isinstance``.
+    descriptor: ProviderDescriptor
+
+    @property
+    def name(self) -> str:
+        return self.descriptor.name
+
+    # --- request shaping -----------------------------------------------------
+
+    def path_for(self, payload_type: str) -> str:
+        """Route for a payload type. Shared by both local engines today because
+        both speak the OpenAI chat route and both sit behind the same embed /
+        rerank shims; a remote provider will override it."""
+        if payload_type == "embedding":
+            return "/embed"
+        if payload_type == "rerank":
+            return "/rerank"
+        return "/v1/chat/completions"
+
+    @abstractmethod
+    def prepare_chat_payload(
+        self,
+        payload: dict,
+        *,
+        model_id: str | None = None,
+        thinking_budget_ratio: float = 0.0,
+        thinking_kwargs: tuple[str, ...] = (),
+    ) -> dict:
+        """Make a caller's chat payload wire-correct for this backend.
+
+        Must never mutate ``payload`` — corpus capture stores ``req.payload``
+        and the retry path re-sends it. Returns the original object unchanged
+        when there is nothing to do, so the common case allocates nothing.
+        """
+
+    # --- capacity discovery --------------------------------------------------
+
+    @abstractmethod
+    async def discover_capacity(
+        self, pool: Any, ep_cfg: "EndpointConfig",
+    ) -> CapacityReport | None:
+        """Probe this backend and report what it will admit to.
+
+        ``pool`` is the ``BackendClientPool`` — providers borrow its connection
+        pools and its probe methods rather than opening sockets of their own.
+        ``None`` on any failure: an unreachable backend must read as "cannot
+        tell", which is what leaves the configured capacity standing.
+        """
+
+    def parse_capacity(self, raw: dict) -> CapacityReport | None:
+        """Pure parse of a probe body, split out from the I/O so the engine
+        knowledge is testable without a socket."""
+        raise NotImplementedError

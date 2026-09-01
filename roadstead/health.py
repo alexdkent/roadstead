@@ -35,6 +35,7 @@ from .observability import (
     structured_empty_alerts,
 )
 from .hooks import record_security_event
+from .providers import LLAMACPP, VLLM, CapacityReport, provider_for
 
 if TYPE_CHECKING:
     from .config import EndpointConfig
@@ -436,19 +437,17 @@ class Health:
                 # Without this branch the discovery probes 404 every cycle
                 # forever (log spam + a meaningless failure counter).
                 probe_ok = await self.state.backend.probe_health(ep_cfg)
-            elif ep_cfg.backend_engine == "vllm":
-                # Capacity discovery is engine-specific. llama.cpp reports
-                # slots + context via /props; vLLM has no /props or /slots,
-                # so the per-request context ceiling comes from /v1/models
-                # max_model_len (concurrency/max_slots stays config-driven).
-                cap = await self.state.backend.probe_vllm_capacity(ep_cfg)
-                if cap:
-                    self.apply_discovered_vllm_capacity(ep_name, ep_cfg, cap)
-                    probe_ok = True
             else:
-                props = await self.state.backend.probe_props(ep_cfg)
-                if props:
-                    self.apply_discovered_props(ep_name, ep_cfg, props)
+                # Capacity discovery is engine-specific, and ASYMMETRIC on
+                # purpose: llama.cpp reports real slots + per-slot context via
+                # /props, while vLLM has neither and can only give the
+                # per-request ceiling from /v1/models max_model_len (its
+                # concurrency stays config-driven). The provider owns which of
+                # those it can get; this loop only applies the answer.
+                report = await provider_for(ep_cfg).discover_capacity(
+                    self.state.backend, ep_cfg)
+                if report is not None:
+                    self.apply_discovered_capacity(ep_name, ep_cfg, report)
                     probe_ok = True
             if not ep_cfg.skip_discovery:
                 # Discover the served model id (the name the backend
@@ -661,7 +660,11 @@ class Health:
             if ep_name not in chat_classes or ep_name in self.state.paused_endpoints:
                 continue
             cum_hits = cum_queries = None
-            if ep_cfg.backend_engine == "vllm":
+            # Descriptor, not engine name: what this branch actually needs to
+            # know is whether the backend publishes prefix-cache counters at
+            # all. llama.cpp does not, so its endpoints read as n/a — never as
+            # a 0% hit rate (the absent-is-not-zero contract in queue.py).
+            if provider_for(ep_cfg).descriptor.publishes_prefix_cache_metrics:
                 try:
                     pc = await self.state.backend.probe_prefix_cache(ep_cfg)
                     if pc:
@@ -758,20 +761,19 @@ class Health:
                 reason=f"prefix LCP% {d['from']}->{d['to']}",
                 metadata={"call_site": d["call_site"], "endpoint": d["endpoint"],
                           "lcp_from": d["from"], "lcp_to": d["to"]})
-    def apply_discovered_props(
-        self, ep_name: str, ep_cfg: EndpointConfig, props: dict,
+    def apply_discovered_capacity(
+        self, ep_name: str, ep_cfg: EndpointConfig, report: CapacityReport,
     ) -> None:
-        """Update endpoint config from discovered /props data."""
-        # llama.cpp format
-        gen_settings = props.get("default_generation_settings", {})
-        n_parallel = gen_settings.get("n_parallel")
-        if n_parallel is None:
-            n_parallel = props.get("total_slots")
-        if n_parallel is None:
-            slots = props.get("slots")
-            if isinstance(slots, list):
-                n_parallel = len(slots)
+        """Apply one parsed discovery pass to an endpoint.
 
+        Engine-neutral by construction: PARSING a probe body is provider work
+        (the units differ — llama.cpp's n_ctx is already per-slot, vLLM's
+        max_model_len is a whole-request ceiling), while deciding what a new
+        number means to the scheduler is the same either way. A field left
+        ``None`` means the backend could not tell us, and the configured value
+        stands — it is never read as zero.
+        """
+        n_parallel = report.slots
         if n_parallel and n_parallel != ep_cfg.max_slots:
             old = ep_cfg.max_slots
             ep_cfg.max_slots = n_parallel
@@ -788,39 +790,30 @@ class Health:
                     ep_name, old, n_parallel,
                 )
 
-        # Context size. default_generation_settings.n_ctx is ALREADY per-slot
-        # in current llama.cpp builds (confirmed live: --ctx-size 131072
-        # --parallel 4 reports n_ctx=32768 there, not 131072) — dividing it by
-        # n_parallel again silently quartered every multi-slot llama.cpp
-        # endpoint's discovered context_per_slot (e.g. 32768 -> 8192 for a
-        # 4-slot unit), which feeds the context-gate admission check and could
-        # wrongly reject requests that actually fit. Only the top-level
-        # `props["n_ctx"]` fallback (older/different builds, unconfirmed
-        # whether it's ever populated as an aggregate) still gets divided.
-        gen_n_ctx = gen_settings.get("n_ctx")
-        if gen_n_ctx:
-            if gen_n_ctx != ep_cfg.context_per_slot:
-                ep_cfg.context_per_slot = gen_n_ctx
-        else:
-            top_n_ctx = props.get("n_ctx")
-            if top_n_ctx and n_parallel:
-                ctx_per_slot = top_n_ctx // n_parallel
-                if ctx_per_slot != ep_cfg.context_per_slot:
-                    ep_cfg.context_per_slot = ctx_per_slot
+        ctx = report.context_per_slot
+        if ctx and ctx != ep_cfg.context_per_slot:
+            old_ctx = ep_cfg.context_per_slot
+            ep_cfg.context_per_slot = ctx
+            logger.info(
+                "endpoint %s: context_per_slot %d → %d (%s)",
+                ep_name, old_ctx, ctx, report.source,
+            )
+
+    def apply_discovered_props(
+        self, ep_name: str, ep_cfg: EndpointConfig, props: dict,
+    ) -> None:
+        """Update endpoint config from discovered llama.cpp /props data.
+
+        Kept as a named entry point because the /props units are the subtlest
+        thing in discovery and the regressions that pin them
+        (``tests/test_context_discovery.py``) test exactly this pair: parse,
+        then apply."""
+        self.apply_discovered_capacity(
+            ep_name, ep_cfg, LLAMACPP.parse_capacity(props))
+
     def apply_discovered_vllm_capacity(
         self, ep_name: str, ep_cfg: EndpointConfig, cap: dict,
     ) -> None:
-        """Update a vLLM endpoint's context ceiling from /v1/models.
-
-        vLLM's ``max_model_len`` is the per-request context window directly
-        (not a fleet n_ctx to divide by slots). max_slots is left as configured
-        — vLLM doesn't expose --max-num-seqs over the API and the proxy's
-        admission cap is a deliberate policy knob, not a discovered value."""
-        mlen = cap.get("max_model_len")
-        if mlen and mlen != ep_cfg.context_per_slot:
-            old = ep_cfg.context_per_slot
-            ep_cfg.context_per_slot = mlen
-            logger.info(
-                "endpoint %s: context_per_slot %d → %d (vLLM max_model_len)",
-                ep_name, old, mlen,
-            )
+        """Update a vLLM endpoint's context ceiling from /v1/models."""
+        self.apply_discovered_capacity(
+            ep_name, ep_cfg, VLLM.parse_capacity(cap))

@@ -153,10 +153,30 @@ Not phases. Several can run concurrently; the dependencies between them are what
 
 ### A · Provider abstraction — *the foundation*
 
-Extract a provider interface out of `backend.py` (54KB, with llama.cpp/vLLM branching inline).
-Formalise the capability descriptor. Nothing else on this list is buildable first: OpenRouter needs
-it, spill needs it, per-provider costing needs it, and enriched model information is largely a
-readout of it.
+Extract a provider interface out of `backend.py` (llama.cpp/vLLM branching inline). Formalise the
+capability descriptor. Nothing else on this list is buildable first: OpenRouter needs it, spill needs
+it, per-provider costing needs it, and enriched model information is largely a readout of it.
+
+**Landed 2026-08-31 — the local half.** `roadstead/providers/` is the interface, with llama.cpp and
+vLLM behind it: `prepare_chat_payload`, `path_for`, `discover_capacity` / `parse_capacity`, and a
+`ProviderDescriptor` declaring what a backend publishes, what it requires of a request, and what it
+gets wrong. `backend.py` keeps the transport. The four sites that asked `backend_engine == "vllm"`
+now read the capability they meant, and a test fails if a new engine-name comparison appears.
+Behaviour-preserving, checked by differential comparison against the pre-split code rather than
+asserted.
+
+**Still open in A:**
+
+- **A remote provider** (OpenRouter first). The interface was shaped for one — `kind: "remote"`,
+  `publishes_token_costs` and an abstract `discover_capacity` are all there and all unexercised —
+  but nothing has been through it yet, and an interface with one kind of implementor has not been
+  tested as an interface. Needs: base URL and API key on the endpoint (not `host`/`port`), auth
+  headers, a cost readout, and an answer to what "capacity discovery" means for a backend that has
+  none to report.
+- **The catalog's provider dimension.** `models.yaml` still describes engines by name in a
+  `backend_engine` string, which the registry resolves tolerantly. Redesigning the catalog around
+  providers is the same piece of work as scrub item **S2** — see the cross-cutting scrub below.
+- **Per-provider costing** is descriptor-shaped but not wired; it lands with **D**.
 
 ### B · Identity and API-key auth
 

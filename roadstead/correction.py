@@ -39,6 +39,7 @@ from .grammar import (
 )
 from .hooks import degradation
 from .observability import MetricsSample, record_structured_outcome
+from .providers import provider_for
 
 # Phase 3 schema-repair backstop deps. json-repair recovers parseable-but-not-
 # valid JSON (fences / trailing prose / trailing commas / a missing brace) before
@@ -1563,7 +1564,13 @@ class Correction:
             if not isinstance(response, dict):
                 return
             ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
-            if ep is None or ep.backend_engine != "vllm":
+            # A characterised DEFECT, declared by the provider rather than
+            # inferred from an engine name: llama.cpp labels a truncated tool
+            # call `length` correctly, so this guard would be pure overhead
+            # there — and on a backend that gets it right, "arguments do not
+            # parse" would mean something else entirely.
+            if ep is None or not (
+                    provider_for(ep).descriptor.mislabels_truncated_tool_calls):
                 return
             tool_calls = _response_tool_calls(response)
             if not tool_calls or all(

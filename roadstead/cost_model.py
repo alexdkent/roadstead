@@ -368,7 +368,7 @@ def estimate_input_tokens(payload: dict) -> int:
     a request row showing est/actual, not a synthetic repro.
 
     Counts the top-level Anthropic-shaped ``system`` field (which
-    ``backend._normalize_chat_payload`` later inlines into ``messages``) and
+    ``the provider's prepare_chat_payload`` later inlines into ``messages``) and
     serialized ``tools`` schemas — both invisible to the old messages-only
     walk, which undercounted est_in for exactly the big-prompt callers
     (orchestrator tool loops) where the estimate matters most.

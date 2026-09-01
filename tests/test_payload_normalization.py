@@ -11,9 +11,9 @@ This is the test that would have caught the original bug.
 
 from __future__ import annotations
 
-from roadstead.backend import (
+from roadstead.providers import LLAMACPP, VLLM
+from roadstead.providers.payload import (
     _needs_alternation_fix,
-    _normalize_chat_payload,
     _normalize_strict_alternation,
     _translate_anthropic_image_blocks,
 )
@@ -29,7 +29,7 @@ def test_vllm_moves_grammar_to_structured_outputs():
         "messages": [{"role": "user", "content": "extract"}],
         "extra_body": {"grammar": "root ::= object"},
     }
-    out = _normalize_chat_payload(payload, vllm=True)
+    out = VLLM.prepare_chat_payload(payload)
     assert "grammar" not in out
     assert out["structured_outputs"] == {"grammar": "root ::= object"}
 
@@ -41,7 +41,7 @@ def test_llamacpp_keeps_top_level_grammar():
         "messages": [{"role": "user", "content": "extract"}],
         "extra_body": {"grammar": "root ::= object"},
     }
-    out = _normalize_chat_payload(payload)  # vllm=False
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert out["grammar"] == "root ::= object"
     assert "structured_outputs" not in out
 
@@ -52,7 +52,7 @@ def test_normalize_inlines_system_into_messages():
         "system": "You extract entities. Output JSON only.",
         "messages": [{"role": "user", "content": "Alex met Barbara."}],
     }
-    out = _normalize_chat_payload(payload)
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert "system" not in out
     assert out["messages"][0] == {
         "role": "system",
@@ -67,7 +67,7 @@ def test_normalize_lifts_grammar_from_extra_body():
         "messages": [{"role": "user", "content": "x"}],
         "extra_body": {"grammar": "root ::= object"},
     }
-    out = _normalize_chat_payload(payload)
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert "extra_body" not in out
     assert out["grammar"] == "root ::= object"
 
@@ -78,7 +78,7 @@ def test_normalize_handles_both_together():
         "messages": [{"role": "user", "content": "content"}],
         "extra_body": {"grammar": "g"},
     }
-    out = _normalize_chat_payload(payload)
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert out["messages"][0]["content"] == "schema rules"
     assert out["grammar"] == "g"
     assert "system" not in out
@@ -96,7 +96,7 @@ def test_normalize_noop_for_clean_payload():
         ],
         "grammar": "already top-level",
     }
-    out = _normalize_chat_payload(payload)
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert out == payload
 
 
@@ -105,7 +105,7 @@ def test_normalize_does_not_mutate_input():
         "system": "s",
         "messages": [{"role": "user", "content": "x"}],
     }
-    _normalize_chat_payload(payload)
+    LLAMACPP.prepare_chat_payload(payload)
     # original must be unmodified (corpus capture stores req.payload)
     assert payload["system"] == "s"
     assert len(payload["messages"]) == 1
@@ -125,7 +125,7 @@ def test_coalesce_merges_adjacent_system_messages_llamacpp():
             {"role": "user", "content": "tell a joke"},
         ],
     }
-    out = _normalize_chat_payload(payload)  # vllm=False
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert [m["role"] for m in out["messages"]] == ["system", "user"]
     assert out["messages"][0]["content"] == "Crew roster + craft.\n\nYou are Nils."
 
@@ -139,7 +139,7 @@ def test_coalesce_left_untouched_on_vllm():
             {"role": "user", "content": "x"},
         ],
     }
-    out = _normalize_chat_payload(payload, vllm=True, model_id="llama-thinker")
+    out = VLLM.prepare_chat_payload(payload, model_id="llama-thinker")
     # vLLM (thinker) tolerates multiple system messages — leave them intact.
     assert [m["role"] for m in out["messages"]] == ["system", "system", "user"]
 
@@ -152,7 +152,7 @@ def test_coalesce_noop_for_single_system():
             {"role": "user", "content": "x"},
         ],
     }
-    out = _normalize_chat_payload(payload)
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert out == payload
 
 
@@ -167,7 +167,7 @@ def test_coalesce_of_inlined_top_level_system():
             {"role": "user", "content": "x"},
         ],
     }
-    out = _normalize_chat_payload(payload)
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert "system" not in out
     assert [m["role"] for m in out["messages"]] == ["system", "user"]
     assert out["messages"][0]["content"] == "leading\n\npersona"
@@ -182,7 +182,7 @@ def test_coalesce_does_not_mutate_input():
             {"role": "user", "content": "x"},
         ],
     }
-    _normalize_chat_payload(payload)
+    LLAMACPP.prepare_chat_payload(payload)
     assert len(payload["messages"]) == 3
     assert payload["messages"][0]["content"] == "A."
 
@@ -310,7 +310,7 @@ def test_normalize_consecutive_user_via_full_payload_llamacpp():
             {"role": "user", "content": "two"},
         ],
     }
-    out = _normalize_chat_payload(payload)  # vllm=False
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert [m["role"] for m in out["messages"]] == ["user"]
     assert out["messages"][0]["content"] == "one\n\ntwo"
 
@@ -333,7 +333,7 @@ def test_normalize_consecutive_user_via_full_payload_llamacpp():
 
 def test_vllm_defaults_the_declared_switch_to_false():
     payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
-    out = _normalize_chat_payload(payload, vllm=True,
+    out = VLLM.prepare_chat_payload(payload,
                                   thinking_kwargs=("thinking", "enable_thinking"))
     assert out["chat_template_kwargs"]["thinking"] is False
     assert out["chat_template_kwargs"]["enable_thinking"] is False
@@ -343,14 +343,14 @@ def test_vllm_injects_nothing_when_the_model_declares_no_switch():
     """No declaration → no guess. An unmeasured template must not have a key
     driven at it on the strength of what the LAST model happened to read."""
     payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
-    out = _normalize_chat_payload(payload, vllm=True)
+    out = VLLM.prepare_chat_payload(payload)
     assert "chat_template_kwargs" not in out
 
 
 def test_llamacpp_does_not_touch_thinking():
     # vLLM-only: a clean llama.cpp payload passes through untouched.
     payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
-    out = _normalize_chat_payload(payload)  # vllm=False
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert "chat_template_kwargs" not in out
     assert out == payload
 
@@ -361,7 +361,7 @@ def test_vllm_preserves_caller_enable_thinking_top_level():
         "messages": [{"role": "user", "content": "x"}],
         "chat_template_kwargs": {"enable_thinking": True},
     }
-    out = _normalize_chat_payload(payload, vllm=True,
+    out = VLLM.prepare_chat_payload(payload,
                                   thinking_kwargs=("thinking", "enable_thinking"))
     assert out["chat_template_kwargs"]["enable_thinking"] is True
     assert "thinking" not in out["chat_template_kwargs"], (
@@ -375,14 +375,14 @@ def test_vllm_preserves_caller_enable_thinking_in_extra_body():
         "messages": [{"role": "user", "content": "x"}],
         "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
     }
-    out = _normalize_chat_payload(payload, vllm=True)
+    out = VLLM.prepare_chat_payload(payload)
     assert out["chat_template_kwargs"]["enable_thinking"] is True
     assert "extra_body" not in out
 
 
 def test_vllm_thinking_default_does_not_mutate_input():
     payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "x"}]}
-    _normalize_chat_payload(payload, vllm=True)
+    VLLM.prepare_chat_payload(payload)
     assert "chat_template_kwargs" not in payload  # input untouched (corpus capture)
 
 
@@ -409,7 +409,7 @@ def test_normalize_translates_anthropic_image_block():
         "system": "You are an image-vision assistant.",
         "messages": [_ANTHROPIC_IMG_MSG],
     }
-    out = _normalize_chat_payload(payload)
+    out = LLAMACPP.prepare_chat_payload(payload)
     # system inlined first; user message is second
     user = out["messages"][1]
     img = user["content"][0]
@@ -428,7 +428,7 @@ def test_normalize_translates_image_without_system():
         "model": "qwen-analyst",
         "messages": [_ANTHROPIC_IMG_MSG],
     }
-    out = _normalize_chat_payload(payload)
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert out["messages"][0]["content"][0]["type"] == "image_url"
     assert (
         out["messages"][0]["content"][0]["image_url"]["url"]
@@ -438,7 +438,7 @@ def test_normalize_translates_image_without_system():
 
 def test_normalize_vision_does_not_mutate_input():
     payload = {"model": "qwen-analyst", "messages": [_ANTHROPIC_IMG_MSG]}
-    _normalize_chat_payload(payload)
+    LLAMACPP.prepare_chat_payload(payload)
     # original Anthropic block untouched (corpus capture stores req.payload)
     assert payload["messages"][0]["content"][0]["type"] == "image"
     assert payload["messages"][0]["content"][0]["source"]["data"] == "QUJD"
@@ -458,7 +458,7 @@ def test_normalize_passthrough_existing_image_url():
             ],
         }],
     }
-    out = _normalize_chat_payload(payload)
+    out = LLAMACPP.prepare_chat_payload(payload)
     assert out == payload
 
 
@@ -514,6 +514,7 @@ def test_ab_harness_normalizes_before_shadow_dispatch():
     import inspect
     from roadstead import test_harness
     src = inspect.getsource(test_harness.ProxyTestHarness._ab_one)
-    assert "_normalize_chat_payload" in src, (
-        "A/B path must apply _normalize_chat_payload to the shadow payload"
+    assert "prepare_chat_payload" in src, (
+        "A/B path must apply the provider's prepare_chat_payload to the "
+        "shadow payload"
     )

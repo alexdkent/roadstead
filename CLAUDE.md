@@ -119,7 +119,9 @@ reason. **Do not simplify these away.**
 **Capacity discovery is asymmetric, deliberately.** llama.cpp `/props` yields real
 `n_parallel`/`total_slots` and per-slot `n_ctx`. vLLM exposes only `max_model_len`, so vLLM
 concurrency stays **config-seeded** with a drift alert. This is a property of the engines, not an
-oversight.
+oversight — and it is now *declared*, in each provider's `ProviderDescriptor`
+(`publishes_slot_count` / `publishes_slot_context` / `publishes_context_ceiling`) rather than left
+for a reader to infer from a branch.
 
 **`finish_reason` rides alone on a terminal SSE chunk whose `delta` is `{}`.** It carries no text, so
 losing it is invisible if you only inspect content. The proxy synthesizes a missing terminal chunk —
@@ -165,7 +167,7 @@ without new, backend-correct A/B evidence.
 ## Layout
 
 ```
-roadstead/          the package (34 modules)
+roadstead/          the package (32 modules + providers/)
   scheduler.py      DRR + priority bands + admission        — pure computation, no I/O
   cost_model.py     slot-second cost, EWMA-calibrated       — pure computation, no I/O
   timeout_model.py  learned latency → recommended deadline  — pure computation, no I/O
@@ -173,7 +175,8 @@ roadstead/          the package (34 modules)
   lifecycle.py      admission → dispatch → streaming → timeout recording
   health.py         capacity discovery, circuit breaker, drain
   queue.py          durable event log + THE single writer thread
-  backend.py        south face: the HTTP client to inference engines
+  backend.py        south face TRANSPORT: pools, deadlines, error taxonomy, SSE relay
+  providers/        south face ENGINES: one adapter per backend kind (see below)
   model_catalog.py  reads models.yaml — the naming/capability authority
   hooks.py          the integration seam (see below)
   testing/          SHIPPED test doubles — the programmable fake backend
@@ -185,6 +188,24 @@ docs/               specs, plan, evaluation, ledger
 
 The three `pure computation, no I/O` modules are the crown jewels and the easiest to test — keep
 them that way.
+
+**`providers/` is where engine differences live, and nowhere else.** A provider owns the two things
+backends genuinely disagree about: what a request must look like to be accepted
+(`prepare_chat_payload`, `path_for`) and what the backend will tell us about itself
+(`discover_capacity`, and the `ProviderDescriptor`). Everything shared — connection pools, the
+deadline, the error taxonomy, the SSE relay — stays in `backend.py`, and providers borrow its
+probe methods rather than opening sockets of their own (which is also what keeps the unit suite off
+the network: it stubs `probe_*` by name on the pool).
+
+🚨 **Branch on a descriptor capability, never on an engine name.** `backend_engine == "vllm"` used
+to appear at four sites and each one meant something narrower — "publishes prefix-cache counters",
+"mislabels a truncated tool call", "reasoning can be switched off", "has no `/props`". A third
+engine would have had to be added at every site by hand, and a missed one fails silently in one
+direction. `tests/test_provider_interface.py` fails if such a comparison reappears outside
+`config.py` / `model_catalog.py`, where the engine name is a config value rather than a decision.
+Providers are **stateless singletons** shared across every endpoint on the single loop — per-request
+state on one is a data race no test here would catch. An unknown engine string resolves to
+llama.cpp, deliberately: that is what `!= "vllm"` always did.
 
 **`hooks.py` is the integration seam.** A host application can register a degradation sink; the
 default is a WARNING log. Everything else in the package reports through it. Keep this module

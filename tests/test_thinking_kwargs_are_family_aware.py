@@ -33,7 +33,9 @@ model_catalog = importlib.import_module("roadstead.model_catalog")
 correction = importlib.import_module("roadstead.correction")
 C = correction.Correction
 
-_norm = backend._normalize_chat_payload
+providers = importlib.import_module("roadstead.providers")
+payload_mod = importlib.import_module("roadstead.providers.payload")
+VLLM, LLAMACPP = providers.VLLM, providers.LLAMACPP
 
 DEEPSEEK = ("thinking", "enable_thinking")   # tier3 (reasoner)
 QWEN = ("enable_thinking",)                  # tier2-analyst / tier2-chat
@@ -46,7 +48,7 @@ QWEN = ("enable_thinking",)                  # tier2-analyst / tier2-chat
 def test_default_off_emits_the_deepseek_key_on_a_deepseek_endpoint():
     """THE BUG. Before this change the proxy emitted `enable_thinking` here
     because that is what Qwen read, and nothing tied the key to the model."""
-    out = _norm({"messages": []}, vllm=True, thinking_kwargs=DEEPSEEK)
+    out = VLLM.prepare_chat_payload({"messages": []}, thinking_kwargs=DEEPSEEK)
     ck = out["chat_template_kwargs"]
     assert ck["thinking"] is False, (
         "tier3 runs DeepSeek-V4-Flash, whose template + serve script both spell "
@@ -59,7 +61,7 @@ def test_default_off_emits_only_the_qwen_key_on_a_qwen_endpoint():
     """The mirror. Sending DeepSeek's `thinking` to a Qwen template is a
     measured no-op (0 chars of reasoning on both tier2 endpoints), so shipping
     it would be noise that hides a wrong declaration."""
-    out = _norm({"messages": []}, vllm=True, thinking_kwargs=QWEN)
+    out = VLLM.prepare_chat_payload({"messages": []}, thinking_kwargs=QWEN)
     ck = out["chat_template_kwargs"]
     assert ck == {"enable_thinking": False}, ck
 
@@ -68,7 +70,7 @@ def test_undeclared_endpoint_gets_no_injection_at_all():
     """An endpoint whose template we have not measured gets NOTHING. Guessing a
     key is exactly how the tier3 swap went unnoticed; a missing declaration must
     fail visible-and-inert, not silently drive an unknown switch."""
-    out = _norm({"messages": []}, vllm=True, thinking_kwargs=())
+    out = VLLM.prepare_chat_payload({"messages": []}, thinking_kwargs=())
     assert "chat_template_kwargs" not in out
 
 
@@ -77,7 +79,7 @@ def test_llamacpp_is_never_injected_into():
     false}'` at launch, so OFF is already the server-side default there. The
     family-aware change must not start writing into Qwen-family payloads —
     that would be a live behaviour change to callers nobody asked for."""
-    out = _norm({"messages": []}, vllm=False, thinking_kwargs=QWEN)
+    out = LLAMACPP.prepare_chat_payload({"messages": []}, thinking_kwargs=QWEN)
     assert "chat_template_kwargs" not in out
 
 
@@ -91,17 +93,17 @@ def test_a_caller_pinning_the_deepseek_key_is_left_completely_alone():
     appended a contradictory `enable_thinking: False`. It survived only because
     V4's template ORs the two names — a template that ANDed them would have
     turned every opt-in into a silent no-op."""
-    out = _norm({"messages": [], "chat_template_kwargs": {"thinking": True}},
-                vllm=True, thinking_kwargs=DEEPSEEK)
+    out = VLLM.prepare_chat_payload(
+        {"messages": [], "chat_template_kwargs": {"thinking": True}},
+        thinking_kwargs=DEEPSEEK)
     assert out["chat_template_kwargs"] == {"thinking": True}, (
         "the proxy must not append a contradictory second switch to a payload "
         "the caller has already made up its mind about")
 
 
 def test_a_caller_pinning_the_qwen_key_is_left_completely_alone():
-    out = _norm({"messages": [],
-                 "chat_template_kwargs": {"enable_thinking": True}},
-                vllm=True, thinking_kwargs=DEEPSEEK)
+    out = VLLM.prepare_chat_payload({"messages": [],
+                 "chat_template_kwargs": {"enable_thinking": True}}, thinking_kwargs=DEEPSEEK)
     assert out["chat_template_kwargs"] == {"enable_thinking": True}
 
 
@@ -109,8 +111,9 @@ def test_a_caller_pinning_FALSE_is_also_left_alone():
     """A pin is a pin whatever its value — re-asserting a caller's `false` would
     be harmless today and is still wrong: it makes the payload the proxy sends
     differ from the payload the caller wrote."""
-    out = _norm({"messages": [], "chat_template_kwargs": {"thinking": False}},
-                vllm=True, thinking_kwargs=DEEPSEEK)
+    out = VLLM.prepare_chat_payload(
+        {"messages": [], "chat_template_kwargs": {"thinking": False}},
+        thinking_kwargs=DEEPSEEK)
     assert out["chat_template_kwargs"] == {"thinking": False}
 
 
@@ -118,9 +121,10 @@ def test_a_pin_nested_in_extra_body_is_detected():
     """extra_body is merged into the top level further down `_normalize_chat_
     payload`; detection must see the pin BEFORE that merge or the injection
     races it."""
-    out = _norm({"messages": [],
-                 "extra_body": {"chat_template_kwargs": {"thinking": True}}},
-                vllm=True, thinking_kwargs=DEEPSEEK)
+    out = VLLM.prepare_chat_payload(
+        {"messages": [],
+         "extra_body": {"chat_template_kwargs": {"thinking": True}}},
+        thinking_kwargs=DEEPSEEK)
     assert out["chat_template_kwargs"] == {"thinking": True}
 
 
@@ -129,10 +133,11 @@ def test_detection_covers_every_known_spelling_not_just_the_declared_one():
     only Qwen's key must still notice a caller who pinned DeepSeek's — the
     caller may know something the declaration does not, and overriding them is
     the failure this whole change is about."""
-    assert backend._THINKING_KWARG_NAMES >= {"thinking", "enable_thinking"}
-    for name in backend._THINKING_KWARG_NAMES:
-        out = _norm({"messages": [], "chat_template_kwargs": {name: True}},
-                    vllm=True, thinking_kwargs=QWEN)
+    assert payload_mod._THINKING_KWARG_NAMES >= {"thinking", "enable_thinking"}
+    for name in payload_mod._THINKING_KWARG_NAMES:
+        out = VLLM.prepare_chat_payload(
+            {"messages": [], "chat_template_kwargs": {name: True}},
+            thinking_kwargs=QWEN)
         assert out["chat_template_kwargs"] == {name: True}, name
 
 
@@ -158,7 +163,7 @@ def test_declared_keys_are_all_names_detection_knows():
     inject a key it would then fail to recognise as a caller's pin."""
     for cls, kw in model_catalog.build_endpoint_kwargs().items():
         for key in kw.get("thinking_kwargs", ()):  # noqa: B007
-            assert key in backend._THINKING_KWARG_NAMES, (cls, key)
+            assert key in payload_mod._THINKING_KWARG_NAMES, (cls, key)
 
 
 # ---------------------------------------------------------------------------

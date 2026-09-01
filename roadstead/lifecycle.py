@@ -457,7 +457,7 @@ class Lifecycle:
         # Payload-shape gate (north-face hardening). A chat payload whose
         # ``messages`` is not a list of objects is unambiguously malformed: the
         # backend would 400 on it, and worse, ``estimate_input_tokens`` (context
-        # gate below) and ``backend._normalize_chat_payload`` both do
+        # gate below) and ``the provider's prepare_chat_payload`` both do
         # ``msg.get(...)`` on each element → ``AttributeError`` → a confusing
         # generic 500 instead of a clean rejection. Reject here as a typed 400.
         # No shadow phase: unlike the unknown-endpoint / context heuristics a

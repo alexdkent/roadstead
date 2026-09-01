@@ -27,6 +27,8 @@ from typing import Any
 
 import yaml
 
+from .providers import provider_for_engine
+
 _DEFAULT_PATH = Path(__file__).resolve().parent / "models.yaml"
 
 
@@ -251,14 +253,16 @@ def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any
             kw["on_demand"] = True
         if e.backend_engine == "vllm":
             kw["backend_engine"] = "vllm"
-        if e.capabilities.get("reasoning") and e.backend_engine != "vllm":
-            # A non-vLLM (llama.cpp) reasoning model emits its CoT UNCONDITIONALLY —
-            # there is no proxy-side kill switch (unlike vLLM, where reasoning is OFF
-            # by default and only a per-request `thinking:true` opt-in turns it on, via
-            # apply_thinking which adds its OWN budget). So only the forced/llama.cpp
-            # case needs the submit-time answer-headroom reserve (forced_reasoning_budget);
-            # a vLLM reasoning endpoint (e.g. the thinker) must NOT get it. e.g. creative
-            # / Trinity-Mini.
+        if (e.capabilities.get("reasoning")
+                and not provider_for_engine(
+                    e.backend_engine).descriptor.reasoning_is_switchable):
+            # A reasoning model on a backend with no proxy-side kill switch
+            # (llama.cpp) emits its CoT UNCONDITIONALLY — unlike vLLM, where
+            # reasoning is OFF by default and only a per-request `thinking:true`
+            # opt-in turns it on, via apply_thinking which adds its OWN budget.
+            # So only the forced case needs the submit-time answer-headroom
+            # reserve (forced_reasoning_budget); a vLLM reasoning endpoint (the
+            # thinker) must NOT get it. e.g. creative / Trinity-Mini.
             kw["forces_reasoning"] = True
         if e.capabilities.get("vision"):
             # Mirror the declaration so the submit path can READ it. Until

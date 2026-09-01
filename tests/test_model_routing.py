@@ -13,7 +13,7 @@ import logging
 
 import pytest
 
-from roadstead.backend import _normalize_chat_payload
+from roadstead.providers import LLAMACPP, VLLM
 from roadstead.config import EndpointConfig, ProxyConfig
 from roadstead.scheduler import QueuedRequest
 from roadstead.service import ProxyService
@@ -125,20 +125,19 @@ def test_effective_model_id_falls_back_to_role():
 # ----- vLLM model-field normalization -----
 
 def test_vllm_forces_served_model_id():
-    out = _normalize_chat_payload(
+    out = VLLM.prepare_chat_payload(
         {"model": "qwen-analyst", "messages": [{"role": "user", "content": "hi"}]},
-        vllm=True, model_id="llama-thinker",
-    )
+        model_id="llama-thinker")
     assert out["model"] == "llama-thinker"
 
 
 def test_llamacpp_model_left_untouched():
     payload = {"model": "qwen-analyst", "messages": [{"role": "user", "content": "hi"}]}
-    out = _normalize_chat_payload(payload, vllm=False, model_id="llama-thinker")
+    out = LLAMACPP.prepare_chat_payload(payload, model_id="llama-thinker")
     assert out["model"] == "qwen-analyst"  # llama.cpp ignores it; we don't touch it
 
 
 def test_vllm_noop_when_model_already_correct():
     payload = {"model": "llama-thinker", "messages": [{"role": "user", "content": "hi"}]}
-    out = _normalize_chat_payload(payload, vllm=True, model_id="llama-thinker")
+    out = VLLM.prepare_chat_payload(payload, model_id="llama-thinker")
     assert out["model"] == "llama-thinker"

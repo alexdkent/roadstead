@@ -987,7 +987,9 @@ class ProxyHttpHandlers:
         #      `--enable-prompt-tokens-details` was added to its launch args.
         # So an unconditional overlay now DISCARDS good per-request data in favour
         # of a coarser number. Worse, `state.endpoint_cache_hit_rate` is populated
-        # only `if ep_cfg.backend_engine == "vllm"` (health.compute_cache_stats),
+        # only for backends whose provider declares
+        # `publishes_prefix_cache_metrics` (health.compute_cache_stats — vLLM
+        # alone, today),
         # and those counters are CUMULATIVE-SINCE-BACKEND-BOOT — so the old
         # fleet "query-weighted mean" was a mean of ONE endpoint, reporting a
         # single backend's LIFETIME rate under a window-scoped `fleet` label
