@@ -116,15 +116,25 @@ what SIGKILL loses — *and* it really can hang, for longer than the code's own 
 
 🚨 **The two shutdown budgets are serial, not nested.** uvicorn's `timeout_graceful_shutdown` bounds
 the in-flight HTTP *connections*; only when it expires does uvicorn send `lifespan.shutdown`, and
-only then does `ProxyService.shutdown`'s `_DRAIN_DEADLINE_S` drain begin. uvicorn never bounds the
-lifespan shutdown at all. Worst case is their **sum** — 78.25s measured, against a 48s budget that
-reads as though it covers everything.
+only then does `ProxyService.shutdown`'s drain begin. uvicorn never bounds the lifespan shutdown at
+all, so the worst case is their **sum**.
 
-🚨 **Any container stop-grace-period must be ≥90s.** Measured in a real container
-(`tools/docker_stop_probe/`): at `docker stop`'s **default 10s** with work in flight, the proxy is
-**SIGKILLed with zero budget and zero completion rows persisted** — the shutdown handler never runs
-at all. With `-t 90` the same case exits cleanly at 78.31s with both persisted. The default *works
-while the proxy is quiet*, which is how it will be tested and why it would first fail under load.
+🚨 **Every phase is bounded and the ceiling is PUBLISHED, as of 2026-09-01.** It was not before: the
+drain was bounded and the tail after it was not, and `OnDemandManager.close` makes a network call per
+held GPU lease — so a wedged dispatcher hung shutdown indefinitely. `service.py` names each phase
+(drain 30s, straggler unwind 3s, lease-release + pool-close 5s concurrently, queue flush+join 10s),
+sums them into `SHUTDOWN_DEADLINE_S`, and computes `RECOMMENDED_STOP_GRACE_S` from that plus
+uvicorn's own budget plus margin. 🚨 **There is deliberately no outer `wait_for` around `shutdown()`**
+— it would cancel `queue_db.close()` mid-flush, which is the SIGKILL failure the drain exists to
+avoid — so the ceiling is true by arithmetic and `tests/test_shutdown_budget.py` pins the arithmetic.
+
+🚨 **Any container stop-grace-period must be ≥108s** (it was 90 until 2026-09-01, and it went **up**
+because 90 was a *measurement* of a fast-but-unbounded tail rather than a bound). Measured in a real
+container (`tools/docker_stop_probe/`): at `docker stop`'s **default 10s** with work in flight, the
+proxy is **SIGKILLed with zero budget and zero completion rows persisted** — the shutdown handler
+never runs at all. The default *works while the proxy is quiet*, which is how it will be tested and
+why it would first fail under load. The number is computed in one place and the `Dockerfile` label,
+the prose and the runtime log all read it.
 
 ---
 

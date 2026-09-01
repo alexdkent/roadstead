@@ -138,7 +138,8 @@ which assumes a nesting that does not hold. The margin is real but it is not doi
 persists the DRR budget row and the completion row even for a straggler it had to cancel — exactly
 what SIGKILL would lose. But the drain is slow enough to matter:
 
-- 🚨 **A container stop-grace-period must be ≥90s.** No longer derived — **measured**, in a real
+- 🚨 **A container stop-grace-period must be ≥108s.** *(Was ≥90s until 2026-09-01 — see "the tail
+  had no ceiling" below for why the number went up rather than down.)* Measured, in a real
   container on a real Docker daemon (`tools/docker_stop_probe/`, 2026-08-31):
 
   | `docker stop` | in flight | outcome | persisted |
@@ -158,6 +159,27 @@ what SIGKILL would lose. But the drain is slow enough to matter:
   `--stop-timeout 90`. `Dockerfile` carries the requirement as a label so the image documents it.
 - Re-run `tools/sigterm_drain_probe.py` if either budget changes — the two are independent knobs
   that look coupled.
+- 🚨 **The tail had no ceiling, and 90 was a measurement rather than a bound (closed 2026-09-01).**
+  The drain itself was bounded at 30s; everything after it was not. In particular
+  `OnDemandManager.close` makes a **network call per held GPU lease**, so a dispatcher that stopped
+  answering hung the lifespan shutdown for as long as it liked — past any stop-grace an operator had
+  set, at which point the container SIGKILLs a process that has not flushed anything. The observed
+  78.25s was a tail that happened to be fast.
+
+  Every phase is bounded now — drain 30s, straggler unwind 3s, lease-release and pool-close 5s
+  (concurrently), queue flush+join 10s — summing to a **48s ceiling on the lifespan shutdown**, which
+  with uvicorn's own 48s and 12s of margin gives **108s**. It is computed once, in
+  `service.RECOMMENDED_STOP_GRACE_S`, and `tests/test_shutdown_budget.py` fails if the Dockerfile
+  label, the prose or the arithmetic disagree. So the recommendation went **up**: 108 is the first
+  number that is a ceiling instead of an observation.
+
+  Two things deliberately NOT done. There is no outer `wait_for` around `shutdown()` — it would
+  cancel `queue_db.close()` mid-flush, which is the SIGKILL failure the drain exists to avoid, and a
+  half-written completion row is worse than a slow exit. And uvicorn's `timeout_graceful_shutdown`
+  was **not** retuned: it is now its own knob rather than `_DRAIN_DEADLINE_S + 18`, because that
+  derivation encoded the nesting this entry disproves, but its VALUE is unchanged so the drain
+  semantics settled by experiment stay settled.
+
 - **Open, and ours to fix.** The caller of the straggler receives a raw `500 Internal Server Error`
   at the 48s mark, not the proxy's clean JSON error envelope — uvicorn cancels the handler task,
   which bypasses the `exception_handlers` backstop in `build_app`. Parked as "belongs upstream"

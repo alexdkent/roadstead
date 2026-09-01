@@ -28,7 +28,12 @@ from starlette.responses import JSONResponse
 from .config import ProxyConfig, load_agent_configs
 from .hooks import set_degradation_sink
 from .routes import make_routes
-from .service import _DRAIN_DEADLINE_S, ProxyService
+from .service import (
+    RECOMMENDED_STOP_GRACE_S,
+    SHUTDOWN_DEADLINE_S,
+    UVICORN_GRACEFUL_S,
+    ProxyService,
+)
 
 logger = logging.getLogger("roadstead")
 
@@ -244,13 +249,14 @@ def main() -> None:
         port=args.port,
         log_level=args.log_level,
         access_log=False,
-        # Phase 2.1/5C: bound the graceful (SIGTERM) shutdown so it can't hang
-        # forever behind a slow in-flight request. svc.shutdown() drains within
-        # _DRAIN_DEADLINE_S, then the queue DB close() does flush(5s)+join(5s).
-        # uvicorn's budget MUST exceed drain + close-tail (+margin) or it
-        # hard-kills the process mid-flush and drops queued writes (budgets +
-        # completions). Derive it so the two can't drift apart.
-        timeout_graceful_shutdown=int(_DRAIN_DEADLINE_S) + 18,  # 30 + 18 = 48s
+        # 🚨 This bounds the in-flight HTTP CONNECTIONS and nothing else. It does
+        # NOT bound `ProxyService.shutdown` — uvicorn hands over to the lifespan
+        # shutdown once this expires and never bounds that at all, so the worst
+        # case is the SUM of the two (docs/ledger.md). The old value was derived
+        # as `_DRAIN_DEADLINE_S + 18` under the opposite assumption; it is its
+        # own knob now, for its own job, and `service.py` owns the arithmetic
+        # that turns both into the operator's stop-grace.
+        timeout_graceful_shutdown=int(UVICORN_GRACEFUL_S),
         # Idle keepalive close — raised above the client's keepalive_expiry so the
         # client retires idle sockets first (no stale-reuse RemoteProtocolError).
         timeout_keep_alive=PROXY_SERVER_KEEPALIVE_S,

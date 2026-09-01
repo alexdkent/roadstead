@@ -44,7 +44,12 @@ import httpx
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from roadstead.service import _DRAIN_DEADLINE_S  # noqa: E402
+from roadstead.service import (
+    RECOMMENDED_STOP_GRACE_S,
+    SHUTDOWN_DEADLINE_S,
+    UVICORN_GRACEFUL_S,
+    _DRAIN_DEADLINE_S,
+)  # noqa: E402
 from roadstead.testing import FAULT_TIMEOUT, FakeBackend, FakeBackendServer  # noqa: E402
 
 # The child is written out at run time rather than kept as a second file: it is
@@ -234,9 +239,21 @@ def main() -> None:
         print(f"{r['scenario']:<24}{str(r['exit_s']) + 's':>14}"
               f"{str(r['hard_killed']):>13}{str(r.get('persisted')):>44}")
     worst = max((r["exit_s"] or 0) for r in results)
-    print(f"\nworst observed SIGTERM→exit: {worst}s "
+    print(f"\nworst OBSERVED SIGTERM→exit: {worst}s "
           f"(uvicorn {graceful}s THEN app drain {_DRAIN_DEADLINE_S}s — serial, not nested)")
-    print(f"→ a container stop-grace-period below ~{int(worst) + 12}s truncates the drain.")
+    # 🚨 An observation is not a bound, and confusing the two is what produced
+    # the old ≥90s advice: the tail after the drain (releasing GPU leases,
+    # closing pools) had no ceiling at all, so a scenario nobody probed — a
+    # wedged dispatcher — could exceed anything measured here. Every phase is
+    # bounded as of 2026-09-01 and the ceiling is computed in service.py; this
+    # prints BOTH so the gap between them stays visible.
+    print(f"published CEILING: uvicorn {int(UVICORN_GRACEFUL_S)}s + app "
+          f"{int(SHUTDOWN_DEADLINE_S)}s + margin")
+    print(f"→ set the container stop-grace-period to at least "
+          f"{RECOMMENDED_STOP_GRACE_S}s (service.RECOMMENDED_STOP_GRACE_S).")
+    if worst > RECOMMENDED_STOP_GRACE_S:
+        print(f"🚨 OBSERVED {worst}s EXCEEDS THE PUBLISHED CEILING — a phase is "
+              f"escaping its budget; docs/ledger.md needs a new entry.")
 
 
 if __name__ == "__main__":

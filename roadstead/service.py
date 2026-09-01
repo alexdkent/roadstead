@@ -49,7 +49,78 @@ from .config import (
 # Phase 2.1 — bounded in-flight drain on graceful shutdown. The BOUND is the fix
 # for the historic SIGTERM hang (uvicorn waiting forever behind a slow request):
 # drain up to this long, then force-cancel stragglers. (Imported by __main__.)
+# ---------------------------------------------------------------------------
+# The shutdown budget — every phase bounded, and the total PUBLISHED
+# ---------------------------------------------------------------------------
+#
+# 🚨 uvicorn's ``timeout_graceful_shutdown`` does NOT bound this. It bounds the
+# in-flight HTTP *connections*; only once it expires does uvicorn send
+# ``lifespan.shutdown``, and only at THAT point does ``ProxyService.shutdown``
+# begin. uvicorn never bounds the lifespan shutdown at all, so the worst case is
+# their **sum**, not the larger of the two (measured 2026-08-31,
+# ``tools/sigterm_drain_probe.py``; full result in ``docs/ledger.md``).
+#
+# 🚨 And until 2026-09-01 the app half had no ceiling. The drain was bounded and
+# everything after it was not — in particular ``OnDemandManager.close`` makes a
+# network call per held GPU lease, so a wedged dispatcher hung shutdown for as
+# long as it felt like. The measured 78.25s was a MEASUREMENT of a tail that
+# happened to be fast, never a bound, and the container stop-grace derived from
+# it inherited that. Every phase below is bounded now and the total is a real
+# ceiling, which is why the recommended stop-grace went UP: it is the first one
+# that is true rather than observed.
+#
+# The phases are SEQUENTIAL and each has its own budget, so the teardown is
+# reserved by construction rather than getting whatever the drain left. That
+# matters: persisting the DRR budget row and the completion row is the entire
+# reason SIGTERM is the correct signal, and a teardown starved by a slow drain
+# would lose exactly what the drain exists to keep.
+#
+# 🚨 There is deliberately no OUTER ``wait_for`` around the whole thing. One
+# would cancel ``queue_db.close()`` mid-flush, which is the SIGKILL failure this
+# drain exists to avoid — a half-written completion is worse than a slow exit.
+# The ceiling is the SUM of the parts, and `tests/test_shutdown_budget.py` pins
+# the arithmetic so it cannot drift.
+
+#: In-flight dispatches get this long to finish on their own.
 _DRAIN_DEADLINE_S = 30.0
+#: Then stragglers are cancelled, and their CancelledError handlers get this
+#: long to resolve the caller and record the completion.
+_CANCEL_UNWIND_S = 3.0
+#: Releasing GPU leases and closing HTTP pools, run CONCURRENTLY — they are
+#: independent and serialising them would spend the sum for no reason.
+_TEARDOWN_CLOSE_S = 5.0
+#: ``PersistentQueue.close`` bounds itself: flush(5s) then join(5s). Restated
+#: here because it is part of the published ceiling and a change there has to
+#: reach this number.
+_QUEUE_CLOSE_S = 10.0
+
+#: 🚨 THE ceiling on the lifespan shutdown. The sum of the phases above, and the
+#: number an operator adds to uvicorn's own budget.
+SHUTDOWN_DEADLINE_S = (
+    _DRAIN_DEADLINE_S + _CANCEL_UNWIND_S + _TEARDOWN_CLOSE_S + _QUEUE_CLOSE_S
+)
+
+#: What uvicorn waits for in-flight HTTP connections before it sends
+#: ``lifespan.shutdown``. 🚨 NOT derived from the drain deadline any more. The
+#: old derivation (``_DRAIN_DEADLINE_S + 18``) carried the comment "uvicorn's
+#: budget MUST exceed drain + close-tail or it hard-kills the process
+#: mid-flush", which assumes a nesting that does not hold — uvicorn hands over
+#: to the app rather than killing it. It is its own knob, for its own job:
+#: how long an ordinary handler gets to return before uvicorn cancels it (a
+#: cancelled handler is the raw-500 still open in the ledger).
+UVICORN_GRACEFUL_S = 48.0
+
+#: Signal delivery, interpreter teardown, and the container's own overhead.
+_STOP_GRACE_MARGIN_S = 12.0
+
+#: 🚨 The number an operator puts in `stop_grace_period` / `--stop-timeout`.
+#: Computed HERE, once, so the Dockerfile label, the docs and the runtime all
+#: read the same arithmetic instead of three people doing it separately. Below
+#: it, `docker stop` SIGKILLs the proxy with **zero budget and zero completion
+#: rows persisted** — and the default 10s works fine while the proxy is quiet,
+#: which is how it gets tested and why it first fails under load.
+RECOMMENDED_STOP_GRACE_S = int(
+    UVICORN_GRACEFUL_S + SHUTDOWN_DEADLINE_S + _STOP_GRACE_MARGIN_S)
 
 
 from .cost_model import CostModel, context_fit
@@ -448,6 +519,18 @@ class ProxyService:
             "llmproxy started: %d endpoints, %d total slots",
             len(self._config.endpoints), self._config.total_fleet_slots,
         )
+        # 🚨 Said at STARTUP, once, because the number is needed by whoever
+        # writes the container's stop-grace and they are not reading the source.
+        # Below it, `docker stop` SIGKILLs the proxy with zero budget and zero
+        # completion rows persisted — and the 10s default works while the proxy
+        # is quiet, which is how it gets tested and why it first fails under
+        # load.
+        logger.info(
+            "shutdown budget: %.0fs for in-flight connections (uvicorn) then "
+            "≤%.0fs to drain and flush (this process) — set the container "
+            "stop-grace-period to at least %ds or SIGKILL truncates it",
+            UVICORN_GRACEFUL_S, SHUTDOWN_DEADLINE_S, RECOMMENDED_STOP_GRACE_S,
+        )
 
     def _bootstrap_cost_model(self) -> None:
         """Replay recent successful completions to calibrate the cost model.
@@ -532,29 +615,52 @@ class ProxyService:
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*pending, return_exceptions=True),
-                        timeout=3.0,
+                        timeout=_CANCEL_UNWIND_S,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "drain: %d straggler(s) didn't unwind within 3s of cancel",
-                        len([t for t in pending if not t.done()]))
+                        "drain: %d straggler(s) didn't unwind within %.0fs of "
+                        "cancel", len([t for t in pending if not t.done()]),
+                        _CANCEL_UNWIND_S)
         if self._poller_task:
             self._poller_task.cancel()
         if self._inflight_task:
             self._inflight_task.cancel()
         # Release any held on-demand dispatcher lease so the GPU slot frees for
-        # other services across the restart (don't wait out the lease TTL).
+        # other services across the restart (don't wait out the lease TTL), and
+        # close the HTTP pools. CONCURRENTLY and BOUNDED, together, for two
+        # reasons: they are independent, and `OnDemandManager.close` makes a
+        # NETWORK call per held lease — which is what made this tail unbounded.
+        # A dispatcher that stops answering used to hang shutdown for as long as
+        # it liked, past every budget an operator had computed.
+        #
+        # 🚨 A failure here costs a GPU lease its TTL and nothing else. It must
+        # never cost the persistence below, which is the whole point of draining
+        # rather than being killed.
         try:
-            await self._on_demand.close()
-        except Exception:
-            logger.warning("on_demand close failed during shutdown", exc_info=True)
+            await asyncio.wait_for(
+                asyncio.gather(self._on_demand.close(), self._backend.close(),
+                               return_exceptions=True),
+                timeout=_TEARDOWN_CLOSE_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "shutdown: lease release / pool close did not finish within "
+                "%.0fs — continuing to the flush, which is the part that "
+                "matters", _TEARDOWN_CLOSE_S)
+        except Exception:  # noqa: BLE001
+            logger.warning("shutdown teardown failed", exc_info=True)
         # Persist DRR balances so fairness survives the restart (Phase 3.4); the
-        # writer flushes this during close().
+        # writer flushes this during close(). Enqueued, not written here, so it
+        # costs nothing against the budget.
         try:
             self._queue_db.save_budgets(self._budget_mgr.snapshot())
         except Exception as exc:  # noqa: BLE001
             logger.debug("budget save on shutdown failed: %s", exc)
-        await self._backend.close()
+        # 🚨 Bounded INSIDE `PersistentQueue.close` (flush 5s, join 5s) rather
+        # than out here, and deliberately not wrapped in a `wait_for`: cancelling
+        # a flush mid-write is the SIGKILL failure this whole drain exists to
+        # avoid. A half-written completion row is worse than a slow exit.
         self._queue_db.close()  # flushes the writer queue, then closes connections
         self._request_logger.close()
 

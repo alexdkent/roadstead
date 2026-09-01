@@ -8,6 +8,41 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — the shutdown drain now has a ceiling, and it is published once
+
+Landed 2026-09-01. SIGTERM was already the correct signal and that stayed settled by experiment
+(`docs/ledger.md`); the drain semantics are unchanged and `tools/sigterm_drain_probe.py` still
+measures **78.2s** for the same scenario. What was wrong is that **nothing enforced a ceiling**.
+
+- 🚨 **The tail after the drain was unbounded.** The 30s drain was bounded; everything after it was
+  not — and `OnDemandManager.close` makes a **network call per held GPU lease**, so a dispatcher that
+  stopped answering hung the lifespan shutdown indefinitely, past any stop-grace an operator had set,
+  at which point the container SIGKILLs a process that has flushed nothing. Lease release and pool
+  close now run **concurrently under one bound**, and a timeout there costs a lease its TTL and never
+  the flush that follows.
+- **Every phase is named and bounded**, and `SHUTDOWN_DEADLINE_S` is their **sum** rather than a
+  literal: drain 30s, straggler unwind 3s, teardown 5s, queue flush+join 10s → a 48s ceiling on the
+  lifespan shutdown. 🚨 There is deliberately **no outer `wait_for`** around `shutdown()` — it would
+  cancel `queue_db.close()` mid-flush, which is the SIGKILL failure the drain exists to avoid, and a
+  half-written completion row is worse than a slow exit. The ceiling is true by arithmetic and the
+  arithmetic is pinned.
+- **`RECOMMENDED_STOP_GRACE_S` is computed in one place** and read by the uvicorn argument, the
+  `Dockerfile` label, the Dockerfile prose, a startup log line and the probe. It used to be three
+  numbers and a comment.
+- ⚠️ **The recommended container stop-grace went UP, from 90s to 108s** — and that is the fix rather
+  than a regression. 90 came from a *measured* worst case (~78s) taken while the tail had no bound at
+  all, so it was an observation rather than a ceiling and a wedged dispatcher would have blown
+  through it. 108 is the first number that is a ceiling. **Update `stop_grace_period` /
+  `--stop-timeout` accordingly**; below it, `docker stop` SIGKILLs the proxy with zero budgets and
+  zero completion rows persisted, and the 10s default works fine while the proxy is quiet — which is
+  how it gets tested and why it first fails under load.
+- **`timeout_graceful_shutdown` is no longer derived from `_DRAIN_DEADLINE_S`.** The old
+  `_DRAIN_DEADLINE_S + 18` carried a comment claiming uvicorn's budget must exceed the drain "or it
+  hard-kills the process mid-flush", which assumes a nesting that does not hold — uvicorn hands over
+  to the lifespan shutdown. Its **value is unchanged**, so nothing about the measured behaviour moves;
+  what changed is that it is its own knob for its own job.
+- `tests/test_shutdown_budget.py`. Ten mutations, every guard observed going red by assertion.
+
 ### Added — key lifecycle, and the abuse control DRR is not (Workstream I)
 
 Landed 2026-09-01. What was left of Workstream B, and the oldest unclosed thing in the repo:
