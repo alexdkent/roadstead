@@ -529,6 +529,19 @@ class AgentQuotaConfig:
     # all" — distinct from None, which is why this is Optional and not a float
     # with a zero default.
     daily_spend_usd: float | None = None
+    # Requests per minute this caller should not exceed, or None for no
+    # threshold (the default, and what every caller was before 2026-09-01).
+    #
+    # 🚨 The abuse control DRR is NOT. DRR is fairness under contention, so a
+    # caller alone on a quiet fleet is unthrottled by design — correct for
+    # fairness, and exactly why it does not bound a runaway.
+    #
+    # 🚨 Crossing it DEGRADES and never rejects, identically to
+    # daily_spend_usd: one priority band and paid spill, never local capacity,
+    # and NO error code. See rate.RateStanding. A threshold of 0.0 is a real one
+    # meaning "this caller should not be sending at all", distinct from None —
+    # which is why this is Optional rather than a float with a zero default.
+    requests_per_minute: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -946,7 +959,7 @@ _DEFAULT_AGENTS_CONFIG_PATH = Path(__file__).resolve().parent / "agents.yaml"
 #: ``tests/test_management_plane.py::test_agent_config_fields_match_the_parser``.
 _AGENT_CONFIG_FIELDS = frozenset({
     "weight", "max_balance_ss", "default_priority",
-    "degrade_ok", "spill_ok", "daily_spend_usd",
+    "degrade_ok", "spill_ok", "daily_spend_usd", "requests_per_minute",
 })
 
 
@@ -1023,6 +1036,18 @@ def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaCo
             kwargs["degrade_ok"] = bool(cfg["degrade_ok"])
         if "spill_ok" in cfg:
             kwargs["spill_ok"] = bool(cfg["spill_ok"])
+        if "requests_per_minute" in cfg:
+            raw_rate = cfg["requests_per_minute"]
+            # Same shape as daily_spend_usd below, and the same reason: null is
+            # "no threshold" and 0 is a real one, so the None check is explicit
+            # rather than a truthiness test.
+            try:
+                kwargs["requests_per_minute"] = (
+                    None if raw_rate is None else float(raw_rate))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "agent %s: requests_per_minute %r is not a number; ignoring",
+                    agent_id, raw_rate)
         if "daily_spend_usd" in cfg:
             raw_cap = cfg["daily_spend_usd"]
             # An explicit null means "uncapped", which is a thing an operator may

@@ -126,6 +126,7 @@ def test_a_snapshot_never_carries_the_secret_or_its_digest():
     assert row == {"key_id": "a-key", "agent_id": "a",
                    "priority": "P3_INGESTION", "min_timeout_s": None,
                    "admin": False, "admin_readonly": False, "may_write": False,
+                   "expires_at": None, "expired": False, "bind": [],
                    "source": "file"}
 
 

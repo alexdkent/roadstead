@@ -8,6 +8,62 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Added — key lifecycle, and the abuse control DRR is not (Workstream I)
+
+Landed 2026-09-01. What was left of Workstream B, and the oldest unclosed thing in the repo:
+`created_at` was written, surfaced in two views, and **read for no decision**.
+
+**Expiry.** `expires_at` (an absolute date in a keys file) / `expires_in_s` (a duration over the API).
+A key with no expiry never expires, so an existing registry behaves exactly as it did. An expired key
+is a `401 invalid_api_key` with **its own sentence and the same code**: a caller can act on no
+distinction between "expired" and "unknown", so §2.1 mints nothing new, but the operator reading the
+log can — one means check what you pasted, the other means issue a successor. A restart never extends
+a key; the store holds the absolute instant, not the duration it came from.
+
+**Rotation.** `POST /rs/v1/admin/keys/{key_id}/rotate`, one action, because the manual version is two
+calls in an order that matters and **both orders are wrong** — enrol-then-revoke leaves the successor
+live and unknown to the caller, revoke-then-enrol leaves nothing working. The successor inherits the
+predecessor's policy. `overlap_s` defaults to **0** (revoke now, and the response says so); with an
+overlap the predecessor gets an **expiry** rather than a tombstone, so it survives a restart a timer
+would not. If the successor cannot be minted the predecessor is **untouched**.
+
+**Per-key address binding.** `bind` is an ADDITIONAL constraint, never a way for a key to widen what
+an address grants: a bound key is refused outside its CIDRs and is otherwise exactly the credential it
+always was. An unparseable entry is a 400 at enrolment and matches nothing at resolution — a narrowing
+that failed open would be worse than none. 🚨 It is checked against the *resolved* address, so a
+binding is only as trustworthy as `ROADSTEAD_TRUSTED_PROXIES`, and `GET /rs/v1/admin/keys` reports
+`checked_against` rather than leaving an operator to infer which case they are in.
+
+**`requests_per_minute` — and no 429.** DRR is fairness *under contention*: a caller alone on a quiet
+fleet is unthrottled by design, which is correct for fairness and exactly why it does not bound a
+runaway. Crossing this costs a caller exactly what crossing `daily_spend_usd` costs it — **one
+priority band and paid spill, never local capacity** — and mints no code. A rate *limit* would be a
+fourth spelling of "no" and would put a mistyped threshold in a position to take a caller offline.
+`roadstead/rate.py` is the **sixth** pure-computation module; CLAUDE.md's layout was updated because
+`tests/test_pure_modules.py` fails until it is.
+
+🚨 **Degradations do not STACK.** A caller over both thresholds drops **one** band, not two — enforced
+in `ProxyState.effective_priority`, which consults at most one standing, so a third threshold cannot
+compose by accident. Each crossing reports through the degradation seam **separately**, because one
+means "look at the bill" and the other means "look for a loop". `effective_priority` is split from
+`spend_demote` so a management *read* fires no notice.
+
+**Three more found by running it, none of which a test would have reached.**
+
+1. The rotate response was assembled from the **predecessor's** row, so a successor registered with
+   the wrong policy would still have been reported as inheriting it — the response was not evidence.
+   It now reads back from the registry, and the test asserts against the registry too.
+2. A successor inherits the policy but **not the expiry**, and came out permanent — a silent
+   weakening of a control the operator deliberately set. The default is right (inheriting an absolute
+   instant would mint a successor that expired seconds later) so it is **disclosed**, not changed.
+3. 🚨 `overlap_s` **extended** a predecessor past its own expiry. A day-long overlap on a two-hour key
+   pushed its expiry a day out — a rotation quietly lengthening a credential, which is the widening
+   this repo refuses everywhere else. Truncated to the earlier instant, and said out loud.
+
+`docs/api.md` §1.5, §1.6 (a two-threshold table, and the non-stacking rule), §3.3, §3.4, one row in
+§3's route table. `tests/test_key_lifecycle.py`, `tests/test_rate_threshold.py`. Twenty-six mutations,
+every guard observed going red by assertion.
+
 ### Added — a read-only admin scope, and the audit trail (Workstream H)
 
 Landed 2026-09-01. Two changes to what an admin identity *is*, landed together because they touch the

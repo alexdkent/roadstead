@@ -115,6 +115,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -129,6 +130,7 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from . import hooks, model_catalog
 from .config import AgentQuotaConfig, LLMPriority
 from .enriched import _error
+from .identity import iso_time
 from .providers import provider_for_engine
 from .spend import declared_price
 
@@ -213,14 +215,17 @@ _SECRET_BYTES = 32
 #: drift.
 EDITABLE_QUOTA_FIELDS = (
     "weight", "max_balance_ss", "default_priority",
-    "degrade_ok", "spill_ok", "daily_spend_usd",
+    "degrade_ok", "spill_ok", "daily_spend_usd", "requests_per_minute",
 )
 
 #: Fields a ``POST /rs/v1/admin/keys`` accepts.
 _KEY_CREATE_FIELDS = frozenset({
     "agent_id", "priority", "min_timeout_s", "admin", "admin_readonly",
-    "id", "key_sha256",
+    "expires_in_s", "bind", "id", "key_sha256",
 })
+
+#: Fields a ``POST /rs/v1/admin/keys/{key_id}/rotate`` accepts.
+_KEY_ROTATE_FIELDS = frozenset({"id", "key_sha256", "overlap_s", "expires_in_s"})
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +250,8 @@ class AdminOverlay:
 
     #: Top-level keys the file may carry. An unknown one is REPORTED rather than
     #: dropped, for the reason this whole module exists.
-    _FILE_SECTIONS = frozenset({"version", "keys", "revoked", "agents", "audit"})
+    _FILE_SECTIONS = frozenset({
+        "version", "keys", "revoked", "retired", "agents", "audit"})
 
     #: How many audit records to keep. Bounded because this is an append-only
     #: list on a long-lived process and the store is rewritten whole on every
@@ -260,6 +266,9 @@ class AdminOverlay:
         self._path = Path(path) if path else None
         self.keys: list[dict] = []
         self.revoked: list[str] = []
+        #: {key_id: expires_at} — retirements for keys this layer did not enrol.
+        #: A softer tombstone: the key still works until the instant recorded.
+        self.retired: dict[str, float] = {}
         self.agents: dict[str, dict] = {}
         #: Newest LAST, matching the file. Bounded by ``_AUDIT_MAX``.
         self.audit: list[dict] = []
@@ -333,6 +342,15 @@ class AdminOverlay:
             )
         self.keys = [k for k in raw.get("keys", []) if isinstance(k, dict)]
         self.revoked = [str(k) for k in raw.get("revoked", [])]
+        retired = raw.get("retired", {})
+        if isinstance(retired, dict):
+            self.retired = {}
+            for k, v in retired.items():
+                try:
+                    self.retired[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    logger.warning("admin store: retirement for %r has an "
+                                   "unreadable expiry %r; ignoring", k, v)
         agents = raw.get("agents", {})
         if isinstance(agents, dict):
             self.agents = {str(k): dict(v) for k, v in agents.items()
@@ -345,9 +363,9 @@ class AdminOverlay:
             except (TypeError, ValueError):
                 self.audit_dropped = 0
         logger.info("admin overlay: %d runtime key(s), %d revocation(s), "
-                    "%d caller override(s) from %s",
-                    len(self.keys), len(self.revoked), len(self.agents),
-                    self._path)
+                    "%d retirement(s), %d caller override(s) from %s",
+                    len(self.keys), len(self.revoked), len(self.retired),
+                    len(self.agents), self._path)
 
     def persist(self) -> None:
         """Rewrite the store atomically. Blocking — call via ``to_thread``.
@@ -365,6 +383,7 @@ class AdminOverlay:
                     "version": 1,
                     "keys": self.keys,
                     "revoked": self.revoked,
+                    "retired": self.retired,
                     "agents": self.agents,
                     "audit": {"entries": self.audit,
                               "dropped": self.audit_dropped},
@@ -394,9 +413,23 @@ class AdminOverlay:
                                else float(entry["min_timeout_s"])),
                 admin=bool(entry.get("admin", False)),
                 admin_readonly=bool(entry.get("admin_readonly", False)),
+                # 🚨 The ABSOLUTE instant, replayed as-is. A key enrolled with a
+                # one-hour life and restarted after two hours must come back
+                # expired, not with a fresh hour — which is what re-deriving it
+                # from a stored duration would do, and it would make a restart a
+                # way to extend a credential.
+                expires_at=(None if entry.get("expires_at") is None
+                            else float(entry["expires_at"])),
+                bind=entry.get("bind") or [],
                 key_id=str(entry["id"]) if entry.get("id") else None,
                 source="runtime",
             )
+        # 🚨 Retire BEFORE revoke, and both after enrol. A retirement is a
+        # softer statement than a revocation, so a key id in both sections must
+        # end up revoked — the same "a later statement wins" rule that puts
+        # revoke after enrol, one step further down.
+        for key_id, expires_at in self.retired.items():
+            registry.set_expiry(key_id, expires_at)
         for key_id in self.revoked:
             registry.revoke(key_id)
 
@@ -419,14 +452,33 @@ class AdminOverlay:
 
     def add_key(self, record: dict) -> None:
         self.keys.append(record)
+        self.retired.pop(str(record.get("id")), None)
         # An id being re-enrolled is no longer revoked. Without this, a key id
         # reused after a revocation would be tombstoned on the next restart and
         # work fine until then — a credential that stops working at a moment
         # unrelated to anything anyone did.
         self.revoked = [k for k in self.revoked if k != record.get("id")]
 
+    def expire_key(self, key_id: str, expires_at: float) -> None:
+        """Record a retirement DATE for a key, rather than a tombstone.
+
+        🚨 The difference from :meth:`revoke_key` is the whole point of an
+        overlap: a revoked key is gone at the next restart, while an expiring
+        one must come back on restart AND come back expiring at the same
+        instant. So a key already in the overlay is edited in place, and one
+        that is not — an env- or file-declared predecessor this layer cannot
+        edit — gets a `retired` entry carrying just the expiry, which
+        :meth:`apply` replays over the declaration.
+        """
+        for entry in self.keys:
+            if entry.get("id") == key_id:
+                entry["expires_at"] = expires_at
+                return
+        self.retired[key_id] = expires_at
+
     def revoke_key(self, key_id: str) -> None:
         self.keys = [k for k in self.keys if k.get("id") != key_id]
+        self.retired.pop(key_id, None)
         if key_id not in self.revoked:
             self.revoked.append(key_id)
 
@@ -489,7 +541,9 @@ def _coerce_quota(name: str, value: Any) -> Any:
         return LLMPriority.coerce(value)
     if name in ("degrade_ok", "spill_ok"):
         return bool(value)
-    if name == "daily_spend_usd":
+    if name in ("daily_spend_usd", "requests_per_minute"):
+        # Both are Optional for the same reason: null means "no threshold" and 0
+        # is a real one. See AgentQuotaConfig.
         return None if value is None else float(value)
     return float(value)
 
@@ -538,11 +592,12 @@ def validate_quota_patch(body: Any) -> dict:
             if not isinstance(value, bool):
                 raise Invalid(f"{name} must be a JSON boolean")
             out[name] = value
-        elif name == "daily_spend_usd":
-            # 🚨 `null` is not `0`. None means uncapped; 0.0 is a real cap
-            # meaning "no paid spend at all" (see AgentQuotaConfig). They are one
-            # keystroke apart and mean opposite things, so the JSON null survives
-            # rather than being coerced through float().
+        elif name in ("daily_spend_usd", "requests_per_minute"):
+            # 🚨 `null` is not `0`. None means no threshold at all; 0.0 is a
+            # real one — "no paid spend at all", "this caller should not be
+            # sending" (see AgentQuotaConfig). They are one keystroke apart and
+            # mean opposite things, so the JSON null survives rather than being
+            # coerced through float().
             if value is None:
                 out[name] = None
             else:
@@ -559,6 +614,70 @@ def _positive_number(name: str, value: Any, *, allow_zero: bool) -> float:
     if number < 0 or (number == 0 and not allow_zero):
         raise Invalid(f"{name} must be {'>= 0' if allow_zero else '> 0'}")
     return number
+
+
+def _binding(raw: Any) -> list[str]:
+    """Coerce and CHECK a ``bind`` list. Raises :class:`Invalid`.
+
+    🚨 Validated here rather than at use. A binding is a narrowing, and a
+    narrowing that silently matches nothing because of a typo is a key that
+    stops working from everywhere — while a binding that silently matched
+    EVERYTHING would be worse. ``identity._address_in_any`` fails closed on an
+    unparseable entry; this makes sure an operator never gets that far.
+    """
+    values = raw if isinstance(raw, list) else [raw]
+    out: list[str] = []
+    for entry in values:
+        text = str(entry).strip()
+        if not text:
+            continue
+        try:
+            ipaddress.ip_network(text, strict=False)
+        except ValueError as exc:
+            raise Invalid(f"bind: {text!r} is not an address or CIDR ({exc})") from exc
+        out.append(text)
+    if not out:
+        raise Invalid("bind must name at least one address or CIDR; omit it "
+                      "for a key usable from anywhere")
+    return out
+
+
+def validate_key_rotate(body: Any) -> dict:
+    """Coerce and check a rotation body. Raises :class:`Invalid`.
+
+    🚨 ``overlap_s`` defaults to 0 — the predecessor is revoked NOW. The other
+    default is tempting and wrong: a rotation that silently left the old
+    credential alive is the one an operator believes they have completed, and
+    the reason to rotate is usually that the old one should stop working. An
+    overlap is a deliberate ask, and it is expressed as an EXPIRY on the
+    predecessor rather than a timer, so it survives a restart.
+    """
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        raise Invalid("expected a JSON object")
+    unknown = sorted(set(body) - _KEY_ROTATE_FIELDS)
+    if unknown:
+        raise Invalid(f"unknown field(s) {unknown}; accepted fields are "
+                      f"{sorted(_KEY_ROTATE_FIELDS)}")
+    out: dict[str, Any] = {}
+    if body.get("overlap_s") is not None:
+        out["overlap_s"] = _positive_number(
+            "overlap_s", body["overlap_s"], allow_zero=True)
+    if body.get("expires_in_s") is not None:
+        out["expires_in_s"] = _positive_number(
+            "expires_in_s", body["expires_in_s"], allow_zero=False)
+    if body.get("id") is not None:
+        key_id = str(body["id"]).strip()
+        if not key_id:
+            raise Invalid("id must be a non-empty string when given")
+        out["id"] = key_id
+    if body.get("key_sha256") is not None:
+        digest = str(body["key_sha256"]).strip().lower()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise Invalid("key_sha256 must be 64 hex characters")
+        out["key_sha256"] = digest
+    return out
 
 
 def validate_key_create(body: Any) -> dict:
@@ -606,6 +725,17 @@ def validate_key_create(body: Any) -> dict:
                 "admin_readonly narrows the admin scope and grants nothing on "
                 "its own — set admin: true beside it, or omit it")
         out["admin_readonly"] = body["admin_readonly"]
+    if body.get("expires_in_s") is not None:
+        # 🚨 A DURATION, not an instant. A caller sending an absolute time has
+        # to agree with this process about the clock and the zone, and the
+        # commonest way that goes wrong — a local-time string read as UTC —
+        # produces a key that expires hours early or late with nothing to show
+        # for it. The keys FILE takes an absolute date, because a file is
+        # written once and read at every boot; an API call happens now.
+        out["expires_in_s"] = _positive_number(
+            "expires_in_s", body["expires_in_s"], allow_zero=False)
+    if body.get("bind") is not None:
+        out["bind"] = _binding(body["bind"])
     if body.get("id") is not None:
         key_id = str(body["id"]).strip()
         if not key_id:
@@ -772,6 +902,10 @@ class ManagementApi:
         secret: str | None = None
         if digest is None:
             secret = _SECRET_PREFIX + secrets.token_urlsafe(_SECRET_BYTES)
+        # A DURATION on the wire, an instant in the store. Resolved once, here,
+        # so the record and the response agree to the second.
+        expires_at = (time.time() + spec["expires_in_s"]
+                      if spec.get("expires_in_s") is not None else None)
         registry = self.state.identity.keys
         was_configured = registry.configured
         key_id = registry.register(
@@ -782,6 +916,8 @@ class ManagementApi:
             min_timeout_s=spec.get("min_timeout_s"),
             admin=bool(spec.get("admin", False)),
             admin_readonly=bool(spec.get("admin_readonly", False)),
+            expires_at=expires_at,
+            bind=spec.get("bind"),
             key_id=spec.get("id"),
             source="runtime",
         )
@@ -803,6 +939,8 @@ class ManagementApi:
             "min_timeout_s": spec.get("min_timeout_s"),
             "admin": bool(spec.get("admin", False)),
             "admin_readonly": bool(spec.get("admin_readonly", False)),
+            "expires_at": expires_at,
+            "bind": spec.get("bind", []),
             "created_at": time.time(),
         }
         self.state.admin_overlay.add_key(record)
@@ -816,6 +954,8 @@ class ManagementApi:
             "min_timeout_s": record["min_timeout_s"],
             "admin": record["admin"],
             "admin_readonly": record["admin_readonly"],
+            "expires_at": record["expires_at"],
+            "bind": record["bind"],
             "secret_generated": secret is not None,
         })
         outcome = await self._persist()
@@ -827,6 +967,8 @@ class ManagementApi:
             "min_timeout_s": record["min_timeout_s"],
             "admin": record["admin"],
             "admin_readonly": record["admin_readonly"],
+            "expires_at": record["expires_at"],
+            "bind": record["bind"],
             **outcome,
         }
         if secret is not None:
@@ -918,6 +1060,193 @@ class ManagementApi:
             payload["warnings"] = warnings
         return JSONResponse(payload)
 
+    async def handle_admin_key_rotate(self, request: Request) -> Response:
+        """POST — issue a successor and retire the predecessor, as ONE action.
+
+        🚨 This exists because doing it by hand is two calls in an order that
+        matters, and both orders are wrong. Enrol-then-revoke leaves a window
+        where the successor is live and unknown to the caller; revoke-then-enrol
+        leaves one where NOTHING works. Rotation is the operation an operator
+        actually performs, so it is the operation the API offers, and it applies
+        in memory as a unit before anything is persisted.
+
+        ``overlap_s`` expresses the window an operator wants: the predecessor is
+        given an EXPIRY rather than being revoked, so it keeps working while the
+        successor is deployed and then stops on its own. It defaults to **0** —
+        revoke now. The other default is tempting and wrong: the usual reason to
+        rotate is that the old credential should stop working, and a rotation
+        that silently left it alive is the one an operator believes they have
+        completed.
+
+        The successor INHERITS the predecessor's policy — agent_id, priority,
+        deadline floor, admin scope, binding — because a rotation is a new
+        secret for the same identity. Changing policy at the same time would
+        make one call do two things, and the one it did silently would be the
+        one nobody reviewed.
+        """
+        denied = self._gate(f"{PREFIX}/keys", request)
+        if denied is not None:
+            return denied
+        key_id = request.path_params["key_id"]
+        registry = self.state.identity.keys
+        row = next((r for r in registry.snapshot() if r["key_id"] == key_id), None)
+        if row is None:
+            return _error("invalid_request_error",
+                          f"no key with id {key_id!r} is registered", 404)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 — an empty body is the common case
+            body = {}
+        try:
+            spec = validate_key_rotate(body)
+        except Invalid as exc:
+            return _error("invalid_request_error", str(exc), 400)
+
+        digest = spec.get("key_sha256")
+        secret: str | None = None
+        if digest is None:
+            secret = _SECRET_PREFIX + secrets.token_urlsafe(_SECRET_BYTES)
+        successor_id = spec.get("id") or f"{key_id}-r{int(time.time())}"
+        expires_at = (time.time() + spec["expires_in_s"]
+                      if spec.get("expires_in_s") is not None else None)
+
+        new_id = registry.register(
+            agent_id=row["agent_id"],
+            secret=secret,
+            key_sha256=digest,
+            priority=_coerce_priority(row["priority"]),
+            min_timeout_s=row["min_timeout_s"],
+            admin=bool(row["admin"]),
+            admin_readonly=bool(row["admin_readonly"]),
+            expires_at=expires_at,
+            bind=row["bind"],
+            key_id=successor_id,
+            source="runtime",
+        )
+        if new_id is None:
+            # 🚨 The predecessor is UNTOUCHED. A rotation that revoked the old
+            # key and then failed to mint the new one is an outage, and the
+            # commonest cause — re-POSTing a digest already enrolled — is
+            # entirely recoverable while nothing has been taken away.
+            return _error(
+                "invalid_request_error",
+                "the successor was not registered — the digest is already "
+                "enrolled or is unusable; the predecessor is UNCHANGED and "
+                "still works", 409)
+
+        record = {
+            "id": new_id,
+            "agent_id": row["agent_id"],
+            "key_sha256": digest or hashlib.sha256(
+                secret.encode("utf-8")).hexdigest(),
+            "priority": row["priority"],
+            "min_timeout_s": row["min_timeout_s"],
+            "admin": bool(row["admin"]),
+            "admin_readonly": bool(row["admin_readonly"]),
+            "expires_at": expires_at,
+            "bind": list(row["bind"]),
+            "created_at": time.time(),
+            "rotated_from": key_id,
+        }
+        self.state.admin_overlay.add_key(record)
+
+        overlap_s = float(spec.get("overlap_s") or 0.0)
+        warnings: list[str] = []
+        if overlap_s > 0:
+            retires_at = time.time() + overlap_s
+            # 🚨 An overlap may SHORTEN a predecessor's life and must never
+            # lengthen it. `overlap_s: 86400` on a key the operator gave two
+            # hours would otherwise push its expiry a day out — a rotation
+            # quietly extending a credential, which is the same widening this
+            # repo refuses everywhere else (a narrowing another statement can
+            # cancel is not a narrowing). Truncated to the earlier instant, and
+            # said out loud, because the operator asked for a window they are
+            # not getting.
+            if row["expires_at"] is not None and retires_at > float(row["expires_at"]):
+                retires_at = float(row["expires_at"])
+                warnings.append(
+                    f"the requested overlap would have extended {key_id!r} past "
+                    f"its own expiry; it retires at {iso_time(retires_at)} as "
+                    f"already declared. A rotation never lengthens a credential")
+            registry.set_expiry(key_id, retires_at)
+            self.state.admin_overlay.expire_key(key_id, retires_at)
+            predecessor = {"key_id": key_id, "retired": False,
+                           "expires_at": retires_at}
+            if row["source"] == "env":
+                warnings.append(
+                    f"key {key_id!r} is declared in ROADSTEAD_API_KEYS; the "
+                    "expiry is recorded and survives a restart, but the "
+                    "declaration does too — remove it once the overlap has "
+                    "passed")
+        else:
+            registry.revoke(key_id)
+            self.state.admin_overlay.revoke_key(key_id)
+            predecessor = {"key_id": key_id, "retired": True, "expires_at": None}
+            if row["source"] == "env":
+                warnings.append(
+                    f"key {key_id!r} is also declared in ROADSTEAD_API_KEYS; "
+                    "the revocation is recorded and survives a restart, but "
+                    "remove it from the environment too or the declaration "
+                    "will outlive the reason it is dead")
+
+        self._record(request, "key.rotate", key_id, {
+            "successor": new_id,
+            "overlap_s": overlap_s,
+            "predecessor_retired": predecessor["retired"],
+            "expires_at": expires_at,
+        })
+        outcome = await self._persist()
+        # 🚨 Read back from the REGISTRY, not echoed from the predecessor's row.
+        # Reporting what we meant to register makes the response agree with the
+        # intent by construction and unable to disagree with the outcome — the
+        # same argument that keeps `roadstead.client` from importing the
+        # server's constants. A mutation that registered the successor with
+        # default policy left this response still claiming the inherited one.
+        landed = next((r for r in registry.snapshot() if r["key_id"] == new_id), {})
+        payload = {
+            "key_id": new_id,
+            "rotated_from": key_id,
+            "agent_id": landed.get("agent_id"),
+            "priority": landed.get("priority"),
+            "min_timeout_s": landed.get("min_timeout_s"),
+            "admin": landed.get("admin"),
+            "admin_readonly": landed.get("admin_readonly"),
+            "expires_at": landed.get("expires_at"),
+            "bind": landed.get("bind", []),
+            "predecessor": predecessor,
+            **outcome,
+        }
+        if secret is not None:
+            payload["key"] = secret
+            payload["note"] = ("this secret is shown once and cannot be "
+                               "recovered — store it now")
+        if row["expires_at"] is not None and expires_at is None:
+            # 🚨 Found by rotating a key with a two-hour life and reading the
+            # response: the successor inherits the POLICY but not the EXPIRY,
+            # and comes out permanent. That is the right default — inheriting an
+            # absolute instant would mint a successor that expired at the
+            # predecessor's moment, possibly seconds later — but it silently
+            # weakens a control the operator deliberately set, which is the one
+            # thing this plane must never do quietly. The duration is not
+            # recoverable either: `created_at` on an env- or file-declared key
+            # is process start, not enrolment, so deriving it would be a guess
+            # dressed as an inheritance. So it is DISCLOSED.
+            warnings.append(
+                f"key {key_id!r} expires at {iso_time(row['expires_at'])}; the "
+                f"successor has NO expiry. A rotation cannot inherit an "
+                f"absolute instant — pass `expires_in_s` to give the successor "
+                f"a life of its own")
+        if overlap_s <= 0:
+            # 🚨 Said out loud. The default is the safe one and it is also the
+            # one that breaks a running caller the instant it is chosen.
+            warnings.append(
+                f"the predecessor was revoked immediately (overlap_s 0): any "
+                f"caller still presenting {key_id!r} is refused NOW. Re-run "
+                f"with overlap_s to give a deployment window instead")
+        if warnings:
+            payload["warnings"] = warnings
+        return JSONResponse(payload, status_code=201)
+
     def _keys_view(self) -> dict:
         registry = self.state.identity.keys
         rows = registry.snapshot()
@@ -939,6 +1268,30 @@ class ManagementApi:
             # holder is the agent_id, not the key. See the module docstring.
             "by_agent": by_agent,
             "revoked": list(overlay.revoked),
+            "retired": dict(overlay.retired),
+            # 🚨 What a per-key BINDING is actually worth here, reported rather
+            # than left to be worked out. A binding is checked against the
+            # RESOLVED address, which is a forwarded one as soon as an operator
+            # configures a trusted proxy — so the same `bind: [10.0.0.0/8]` is a
+            # network-level fact on a direct deployment and a statement about
+            # what a front proxy vouches for behind one. The §3.5 rule applied
+            # to a security control: two sources that agree most of the time are
+            # where the expensive failures live.
+            "binding": {
+                "checked_against": ("the forwarded caller address"
+                                    if self.state.identity.proxies
+                                    else "the peer address"),
+                "forwarded_headers_honoured": bool(self.state.identity.proxies),
+                "trusted_proxies": self.state.identity.proxies.networks(),
+                "note": (
+                    "a binding is only as trustworthy as ROADSTEAD_TRUSTED_PROXIES: "
+                    "with no trusted proxy the address is the TCP peer and cannot "
+                    "be spoofed; with one it is whatever that proxy reported"
+                    if self.state.identity.proxies else
+                    "no trusted proxy is configured, so a binding is checked "
+                    "against the TCP peer address and cannot be spoofed by a "
+                    "caller"),
+            },
             "store": {"path": overlay.path,
                       "writable": overlay.writable,
                       "reason": overlay.unwritable_reason()},
@@ -1036,6 +1389,7 @@ class ManagementApi:
         out: list[dict] = []
         for agent_id in self._known_agent_ids():
             standing = self.state.spend_standing(agent_id)
+            rate = self.state.rate_standing(agent_id)
             cfg = self.state.config.agent_config(agent_id)
             spend_row = spends.get(agent_id, {})
             out.append({
@@ -1066,8 +1420,21 @@ class ManagementApi:
                     # spill, never local capacity and never a refusal (§1.6).
                     "may_spill": standing.may_spill,
                     "declared_priority": cfg.default_priority.name,
-                    "effective_priority":
-                        standing.effective_priority(cfg.default_priority).name,
+                    # 🚨 The COMBINED answer, from ProxyState — a caller can be
+                    # demoted by its rate rather than its spend, and reporting
+                    # the spend standing's own view here would show a caller at
+                    # its declared band while it was actually running one below.
+                    "effective_priority": self.state.effective_priority(
+                        agent_id, cfg.default_priority).name,
+                },
+                # The abuse control DRR is not (rate.py). Reported beside spend
+                # because it is the same threshold shape with the same
+                # consequence, and an operator asking "why is this caller slow"
+                # needs both answers in one place.
+                "rate": rate.as_dict() | {
+                    "declared_priority": cfg.default_priority.name,
+                    "effective_priority": rate.effective_priority(
+                        cfg.default_priority).name,
                 },
                 "live": self.state.scheduler.agent_snapshot(agent_id),
             })

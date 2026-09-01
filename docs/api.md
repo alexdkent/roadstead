@@ -254,15 +254,38 @@ model *would* have cost — a saving, reported as `avoided_usd`. A remote provid
 is an invoice, reported as `spent_usd`. Only the second counts against a threshold; a threshold that
 counted the first would throttle a caller for using capacity that is free.
 
-🚨 **Thresholds DEGRADE. They never reject.** Crossing `daily_spend_usd` costs a caller exactly two
-things: **one priority band** (floored at the lowest, however far over it is) and **access to paid
-spill**. It never costs local capacity, and **no error code exists for it** — the absence from §2.1
-is the contract, not an omission. Two reasons: admission control is about capacity rather than
-billing, and a misconfigured quota must not be able to take a caller offline. A runaway caller stays
-bounded by what is free and by DRR fairness.
+🚨 **Thresholds DEGRADE. They never reject.** Crossing one costs a caller exactly two things: **one
+priority band** (floored at the lowest, however far over it is) and **access to paid spill**. It never
+costs local capacity, and **no error code exists for it** — the absence from §2.1 is the contract, not
+an omission. Two reasons: admission control is about capacity rather than billing, and a misconfigured
+quota must not be able to take a caller offline.
 
-A caller cannot observe its own demotion in a response; it is reported to the operator through the
-degradation seam (§5) once per caller per day, and shown on `/v1/status` under `spend`.
+**There are two thresholds, and they have the same consequence on purpose.**
+
+| | crossing it means | why it exists |
+|---|---|---|
+| `daily_spend_usd` | one band, no paid spill | real money left the machine |
+| `requests_per_minute` | one band, no paid spill | **the abuse control DRR is not** |
+
+DRR is fairness *under contention*: a caller alone on a quiet fleet is unthrottled by design, which is
+correct for fairness and exactly why it does not bound a runaway. `requests_per_minute` closes that
+gap without becoming a rate *limit* — a 429 would be a fourth spelling of "no" and would put a
+misconfigured threshold in a position to take a caller offline, which is the same argument that keeps
+a spend cap from refusing anything. A caller going too fast ends up behind every caller behaving
+itself, and that is enough.
+
+🚨 **Degradations do not STACK.** A caller over both thresholds drops **one** band, not two. Two
+independent one-band penalties would mean that adding a second threshold silently doubled the first
+one's, and the unbounded-penalty argument above applies with more force to two of them than to one.
+
+Both are keyed on the **`agent_id`**, like every other quota: the budget holder is the caller, not the
+key, and a per-key threshold whose penalty landed on the caller's band would punish a team for one
+credential's behaviour anyway. The answer to a single credential misbehaving is to **revoke** it,
+which is instant (§3.3).
+
+A caller cannot observe its own demotion in a response; each crossing is reported to the operator
+through the degradation seam (§5) once per caller per day — **separately**, because a rate problem
+must not look like a billing one — and shown on `/v1/status` and `GET /rs/v1/admin/callers`.
 
 ### 1.7 The enriched API — `/rs/v1/*` 🚨
 
@@ -580,6 +603,7 @@ is not an error: see §3.2.
 | `GET /rs/v1/admin/keys` | The key registry, redacted. Never a key, never a digest. |
 | `POST /rs/v1/admin/keys` | Enrol a credential. Returns the secret **once** (§3.3). |
 | `DELETE /rs/v1/admin/keys/{key_id}` | Revoke one credential, whatever declared it. |
+| `POST /rs/v1/admin/keys/{key_id}/rotate` | Issue a successor and retire this one, as **one** action (§3.3). Returns the new secret once. |
 | `GET /rs/v1/admin/callers` | Per caller: identities, quota (declared vs in force), DRR budget, spend, live occupancy. |
 | `PATCH /rs/v1/admin/callers/{agent_id}` | Edit one caller's quota (§3.4). Partial; absent fields untouched. |
 | `GET /rs/v1/admin/providers` | Providers and endpoints: declared vs discovered capacity, credential presence, prices, health. |
@@ -665,6 +689,60 @@ with the table above, and when it falls behind, the failure is silent and in the
 admin net: if the widest overlapping grant won, that line would silently be a full grant, since every
 operator writing it is on loopback. A narrowing another grant can cancel is not a narrowing.
 
+#### Lifecycle: expiry, rotation, binding
+
+**A key expires or it does not.** `expires_at` (an absolute date in a keys file, `expires_in_s` — a
+**duration** — over the API) makes a credential stop working at an instant, without anybody having to
+remember to revoke it. A key with no expiry never expires, which is what every key was before
+2026-09-01, so an existing registry behaves exactly as it did.
+
+🚨 **An expired key gets its own sentence, and the same code.** Both an expired and an unknown key are
+`401 invalid_api_key` and neither falls back to the address — a caller can act on no distinction, so
+§2.1 mints no second code. What differs is the message, because the *operator* reading the log can:
+"not registered" sends them to check whether they pasted the right string, and "expired at T" sends
+them to issue a successor. A restart never extends a key: the store holds the absolute instant, not
+the duration it was created from.
+
+**`POST /rs/v1/admin/keys/{key_id}/rotate` is one action because the manual version is two calls in
+an order that matters — and both orders are wrong.** Enrol-then-revoke leaves a window where the
+successor is live and the caller does not have it; revoke-then-enrol leaves one where nothing works.
+The successor **inherits** the predecessor's policy (agent_id, priority, deadline floor, admin scope,
+binding): a rotation is a new secret for the same identity, and changing policy in the same call
+would make one request do two things, of which the unreviewed one is the dangerous one.
+
+🚨 **`overlap_s` defaults to 0 — the predecessor is revoked immediately, and the response says so in
+a `warnings` entry.** The other default is tempting and wrong: the usual reason to rotate is that the
+old credential should stop working, and a rotation that silently left it alive is the one an operator
+believes they have completed. With an overlap the predecessor is given an **expiry** rather than a
+tombstone, so it keeps working for the deployment window and then stops on its own — and it survives
+a restart, because a timer would not. If the successor cannot be registered the predecessor is
+**untouched**: a rotation that revoked the old key and then failed to mint the new one is an outage.
+
+🚨 **An overlap may shorten a predecessor's life and never lengthens it.** `overlap_s: 86400` on a
+key the operator gave two hours retires it at the two hours it already had, and says so — a rotation
+quietly extending a credential is the same widening refused everywhere else here.
+
+🚨 **A successor inherits the policy but not the expiry, and the response says so.** Inheriting an
+absolute instant would mint a successor that expired at the predecessor's moment — possibly seconds
+later — and the original *duration* is not recoverable, because `created_at` on an env- or
+file-declared key is process start rather than enrolment. So the successor is permanent unless
+`expires_in_s` is given, and a rotation of a key that *had* an expiry warns that it now has none.
+Silently weakening a control the operator deliberately set is the one thing this plane must not do.
+
+**`bind` is an ADDITIONAL constraint on a key, never a way for one to widen what an address grants.**
+A bound key is refused when presented from outside its CIDRs, and is otherwise exactly the credential
+it always was — it does not *become* an address identity inside the binding. An unparseable entry is
+a 400 at enrolment and matches nothing at resolution: a narrowing that failed open would be worse
+than no narrowing at all.
+
+🚨 **A binding is only as trustworthy as `ROADSTEAD_TRUSTED_PROXIES`, and `GET /rs/v1/admin/keys`
+says which case you are in.** It is checked against the *resolved* address (§1.5 rule 4), so with no
+trusted proxy configured that is the TCP peer and a caller cannot spoof it; with one configured it is
+whatever the front proxy reported. The same `bind: ["10.0.0.0/8"]` is therefore a network-level fact
+on a direct deployment and a statement about what a proxy vouches for behind one. The `binding` block
+in the read view reports `checked_against` rather than leaving an operator to infer it — the §3.5 rule
+applied to a security control.
+
 🚨 **Keys are flat, and that is the answer to team-level quotas rather than a gap in it.** The quota
 holder, the DRR fair share and the spend cap are all keyed on `agent_id`, never on the key — so
 several keys naming one `agent_id` already give a team one budget with per-key revocation and per-key
@@ -674,19 +752,27 @@ inferable.
 ### 3.4 Caller quotas 🚨
 
 `PATCH /rs/v1/admin/callers/{agent_id}` accepts exactly the fields an `agents.yaml` stanza accepts:
-`weight`, `max_balance_ss`, `default_priority`, `degrade_ok`, `spill_ok`, `daily_spend_usd`. An
-unknown field is a **400 that names the known set** — never a silent drop, on the surface whose
-purpose is to expose silent drops. `daily_spend_usd: null` is *uncapped*; `0` is a real cap meaning
-*no paid spend at all*, and they are one keystroke apart.
+`weight`, `max_balance_ss`, `default_priority`, `degrade_ok`, `spill_ok`, `daily_spend_usd`,
+`requests_per_minute`. An unknown field is a **400 that names the known set** — never a silent drop,
+on the surface whose purpose is to expose silent drops. For both thresholds `null` is *no threshold*
+and `0` is a real one (*no paid spend at all*; *this caller should not be sending*), and they are one
+keystroke apart.
 
 🚨 **An edit changes policy, never history.** A new weight moves the replenish rate and leaves the
 deficit already run; lowering a cap charges nobody retroactively. Clearing a balance on a config edit
 would hand a fresh allowance to precisely the caller being reweighted because it consumes too much.
 
 🚨 **§1.6 is inherited here, not re-implemented.** There is no field with which to express a
-rejection — every knob changes a share, a band or a cap, and crossing a cap still costs one priority
-band and paid spill and nothing else. A `blocked` or `max_requests` field would break that without
-touching a line of admission code, which is why the editable set is closed and pinned.
+rejection — every knob changes a share, a band or a threshold, and crossing a threshold still costs
+one priority band and paid spill and nothing else. A `blocked` field, or a `max_requests` that
+*refused* the request after it, would break that without touching a line of admission code, which is
+why the editable set is closed and pinned.
+
+That is the line `requests_per_minute` had to stay on the right side of, and the distinction is the
+**consequence**, not the unit. A field counting requests is fine; a field that answers a request with
+"no" is not. `requests_per_minute` reaches exactly the same two levers a spend cap reaches, mints no
+code, and is unreachable from any path that can refuse — which is why it could be added to a set whose
+whole property is that nothing in it can express a rejection.
 
 ### 3.5 The gap — what you wrote that is not in force 🚨
 

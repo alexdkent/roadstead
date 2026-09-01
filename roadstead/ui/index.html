@@ -204,6 +204,7 @@ const API = {
   config:      "/rs/v1/admin/config",
   keys:        "/rs/v1/admin/keys",
   key:         (id) => "/rs/v1/admin/keys/" + encodeURIComponent(id),
+  rotate:      (id) => "/rs/v1/admin/keys/" + encodeURIComponent(id) + "/rotate",
   callers:     "/rs/v1/admin/callers",
   caller:      (id) => "/rs/v1/admin/callers/" + encodeURIComponent(id),
   providers:   "/rs/v1/admin/providers",
@@ -542,7 +543,15 @@ async function viewKeys(root) {
       pick(k, "require_key") ? tag("a key is required", "ok") : tag("a key is optional", ""),
       pick(k, "store.writable", true) ? null
         : tag("overlay read-only: " + pick(k, "store.reason", ""), "bad")),
-    readonlyNote()));
+    readonlyNote(),
+    // 🚨 What a per-key binding is actually WORTH here. The same
+    // `bind: [10.0.0.0/8]` is a network-level fact on a direct deployment and a
+    // statement about what a front proxy vouches for behind one, and an
+    // operator must not have to infer which from the absence of a note.
+    el("div", { class: "notice" }, el("div", { class: "d" },
+      el("b", { text: "Bindings are checked against " +
+                      pick(k, "binding.checked_against", "the peer address") }),
+      " — " + pick(k, "binding.note", "")))));
 
   const rows = pick(k, "keys", []).map((row) => {
     const floor = pick(row, "min_timeout_s");
@@ -551,6 +560,17 @@ async function viewKeys(root) {
       el("td", {}, el("code", { text: pick(row, "agent_id", "?") })),
       el("td", {}, tag(pick(row, "priority", "—"))),
       el("td", { class: "num", text: floor === null || floor === undefined ? "—" : floor + "s" }),
+      // 🚨 A key that expires in an hour and one that never expires look the
+      // same everywhere else, and the difference is a caller that stops working
+      // at a moment unrelated to anything anyone did.
+      el("td", {}, pick(row, "expired")
+        ? tag("expired " + fmt.when(pick(row, "expires_at")), "bad")
+        : (pick(row, "expires_at")
+            ? tag("until " + fmt.when(pick(row, "expires_at")), "warn")
+            : "—")),
+      el("td", {}, pick(row, "bind", []).length
+        ? pick(row, "bind", []).map((c) => [el("code", { text: c }), " "])
+        : "—"),
       // 🚨 A narrowed admin key is NOT the same badge as a full one. Collapsing
       // them would make the two indistinguishable at exactly the glance an
       // operator takes when auditing who can change things.
@@ -562,13 +582,18 @@ async function viewKeys(root) {
       // and this column is why an operator is not surprised by it.
       el("td", {}, tag(pick(row, "source", "file"))),
       el("td", { text: fmt.when(pick(row, "created_at")) }),
-      el("td", {}, guarded(el("button", {
-        class: "act danger", text: "Revoke",
-        onclick: () => revoke(pick(row, "key_id"), pick(row, "agent_id")),
-      }))));
+      el("td", {},
+        guarded(el("button", {
+          class: "act", text: "Rotate",
+          onclick: () => rotate(pick(row, "key_id"), pick(row, "agent_id")),
+        })), " ",
+        guarded(el("button", {
+          class: "act danger", text: "Revoke",
+          onclick: () => revoke(pick(row, "key_id"), pick(row, "agent_id")),
+        }))));
   });
   root.append(el("section", {},
-    rows.length ? table(["key id", "agent_id", "priority", "floor", "scope", "declared in", "created", ""], rows)
+    rows.length ? table(["key id", "agent_id", "priority", "floor", "expires", "bound to", "scope", "declared in", "created", ""], rows)
                 : empty("no keys registered — every caller is identified by address")));
 
   root.append(el("section", {},
@@ -583,6 +608,8 @@ async function viewKeys(root) {
       // Narrows the box beside it and grants nothing alone — the server refuses
       // it without `admin`, so the page does not pretend otherwise.
       field("read-only", guarded(el("input", { id: "nk-admin-ro", type: "checkbox" }))),
+      field("expires in (s)", guarded(el("input", { id: "nk-exp", type: "number", step: "1", placeholder: "never", style: "width:130px" }))),
+      field("bind (CIDRs)", guarded(el("input", { id: "nk-bind", placeholder: "any address", style: "width:180px" }))),
       guarded(el("button", { class: "act", text: "Enrol", onclick: enrol })))));
 }
 function field(label, control) { return el("label", { class: "f" }, label, control); }
@@ -597,6 +624,10 @@ async function enrol() {
   const id = $("#nk-id").value.trim();
   if (id) body.id = id;
   if ($("#nk-admin").checked) body.admin = true;
+  const exp = $("#nk-exp").value.trim();
+  if (exp) body.expires_in_s = Number(exp);
+  const bind = $("#nk-bind").value.trim();
+  if (bind) body.bind = bind.split(",").map((c) => c.trim()).filter(Boolean);
   if ($("#nk-admin-ro").checked) {
     if (!body.admin) { banner("bad", "read-only narrows the admin scope — tick admin beside it, or leave it off."); return; }
     body.admin_readonly = true;
@@ -606,6 +637,43 @@ async function enrol() {
     const res = await api(API.keys, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     banner("ok",
       el("b", { text: "Enrolled " + pick(res, "key_id", "") }),
+      " — copy this now. It is not stored and cannot be shown again.",
+      el("code", { class: "secret", text: pick(res, "key", "(no secret returned)") }),
+      warnings(res), persisted(res));
+    render();
+  } catch (e) { reportError(e); }
+}
+/* 🚨 One call, because doing it by hand is two in an order that matters and
+ * both orders are wrong. The overlap is ASKED FOR rather than defaulted: the
+ * usual reason to rotate is that the old credential should stop working, and a
+ * rotation that silently left it alive is the one an operator believes they
+ * have completed. An inline form rather than a prompt(), matching editCaller —
+ * a browser prompt blocks the page's event loop and cannot be styled or read
+ * back, which is why confirmish() is confined to the one action it guards. */
+function rotate(keyId, agentId) {
+  const box = el("div", { class: "banner" },
+    el("b", { text: "Rotate " + keyId + " (" + agentId + ")" }),
+    el("p", { class: "lede", text: "The successor inherits this key's agent_id, priority, deadline floor, admin scope and binding — a rotation is a new secret for the same identity. The overlap is how long the OLD key keeps working while you deploy the new one; 0 revokes it immediately, which breaks any caller still presenting it." }),
+    el("div", { class: "row" },
+      field("overlap (s)", el("input", { id: "rk-overlap", type: "number", step: "1", value: "3600", style: "width:130px" })),
+      field("successor id", el("input", { id: "rk-id", placeholder: "auto" })),
+      guarded(el("button", { class: "act", text: "Rotate", onclick: () => doRotate(keyId) })),
+      el("button", { class: "act", text: "Cancel", onclick: () => banner("") })));
+  $("#banner").replaceChildren(box);
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+async function doRotate(keyId) {
+  const overlap = Number($("#rk-overlap").value.trim() || "0");
+  if (!Number.isFinite(overlap) || overlap < 0) { banner("bad", "overlap must be a number of seconds."); return; }
+  const body = { overlap_s: overlap };
+  const id = $("#rk-id").value.trim();
+  if (id) body.id = id;
+  try {
+    const res = await api(API.rotate(keyId), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body) });
+    banner("ok",
+      el("b", { text: "Rotated " + keyId + " → " + pick(res, "key_id", "") }),
       " — copy this now. It is not stored and cannot be shown again.",
       el("code", { class: "secret", text: pick(res, "key", "(no secret returned)") }),
       warnings(res), persisted(res));
@@ -649,9 +717,10 @@ async function viewCallers(root) {
   const rows = pick(c, "callers", []).map(callerRow);
   root.append(el("section", {},
     el("h2", { text: "Callers" }),
-    el("p", { class: "lede", text: "Quota is shown three ways: what is in force, what the file declared, and what this API changed. An override reads as a difference rather than as a label. Spend and savings are never summed — one is an invoice, the other is capacity that was free." }),
+    el("p", { class: "lede", text: "Quota is shown three ways: what is in force, what the file declared, and what this API changed. An override reads as a difference rather than as a label. Spend and savings are never summed — one is an invoice, the other is capacity that was free. Both thresholds degrade and neither rejects; crossing both still costs one band, not two." }),
     rows.length ? table(["agent_id", "identities", "weight", "band", "degrade", "spill",
-                         "daily cap", "spent today", "avoided", "drr balance", ""], rows)
+                         "daily cap", "req/min", "spent today", "avoided",
+                         "drr balance", ""], rows)
                 : empty("no callers yet"),
     readonlyNote()));
 }
@@ -681,10 +750,16 @@ function callerRow(row) {
   const addresses = pick(row, "identities.addresses", []);
   const cap = pick(row, "spend.cap_usd");
   const drr = pick(row, "drr.balance_ss");
+  const rpm = pick(row, "rate.limit_per_min");
   return el("tr", {},
     el("td", {}, el("code", { text: pick(row, "agent_id", "?") }),
       pick(row, "spend.over") === true
-        ? el("div", {}, tag("over cap — one band down, no paid spill", "warn")) : null),
+        ? el("div", {}, tag("over cap — one band down, no paid spill", "warn")) : null,
+      // 🚨 Named separately from the spend one. Both cost exactly the same
+      // thing, so a merged badge would leave an operator unable to tell a
+      // billing problem from a caller in a loop — and the fix is different.
+      pick(row, "rate.over") === true
+        ? el("div", {}, tag("over rate — one band down, no paid spill", "warn")) : null),
     el("td", {}, keys.map((k) => [tag(k), " "]), addresses.map((a) => [tag(a), " "]),
       (!keys.length && !addresses.length) ? el("span", { class: "tag", text: "unregistered" }) : null),
     el("td", { class: "num" }, quotaCell(row, "weight")),
@@ -696,6 +771,12 @@ function callerRow(row) {
     el("td", {}, quotaCell(row, "degrade_ok")),
     el("td", {}, quotaCell(row, "spill_ok")),
     el("td", { class: "num", text: cap === null || cap === undefined ? "—" : fmt.usd(cap) }),
+    // The abuse control DRR is not. Observed beside the threshold, because a
+    // threshold with no observation is a number nobody can calibrate.
+    el("td", { class: "num" },
+      rpm === null || rpm === undefined
+        ? "—"
+        : fmt.n(pick(row, "rate.observed_per_min", 0), 1) + " / " + fmt.n(rpm, 0)),
     // Two kinds of money, side by side and never added: the first is an
     // invoice, the second is capacity that was free. A total would be neither.
     el("td", { class: "num", text: fmt.usd(pick(row, "spend.spent_today_usd")) }),
@@ -713,6 +794,7 @@ function editCaller(row) {
       field("max_balance_ss", el("input", { id: "eq-bal", type: "number", step: "1", value: q.max_balance_ss ?? "", style: "width:130px" })),
       field("default_priority", select("eq-prio", ["P0_REALTIME", "P1_TURN_SUPPORT", "P2_POST_TURN", "P3_INGESTION", "P4_HYGIENE"], q.default_priority)),
       field("daily_spend_usd", el("input", { id: "eq-cap", type: "number", step: "0.01", value: q.daily_spend_usd ?? "", style: "width:120px" })),
+      field("requests_per_minute", el("input", { id: "eq-rpm", type: "number", step: "1", value: q.requests_per_minute ?? "", style: "width:150px" })),
       field("degrade_ok", el("input", { id: "eq-degrade", type: "checkbox", checked: !!q.degrade_ok })),
       field("spill_ok", el("input", { id: "eq-spill", type: "checkbox", checked: !!q.spill_ok })),
       guarded(el("button", { class: "act", text: "Apply", onclick: () => patchCaller(row.agent_id) })),
@@ -726,6 +808,7 @@ async function patchCaller(agentId) {
   if (num("#eq-weight") !== null) body.weight = num("#eq-weight");
   if (num("#eq-bal") !== null) body.max_balance_ss = num("#eq-bal");
   if (num("#eq-cap") !== null) body.daily_spend_usd = num("#eq-cap");
+  if (num("#eq-rpm") !== null) body.requests_per_minute = num("#eq-rpm");
   body.default_priority = $("#eq-prio").value;
   body.degrade_ok = $("#eq-degrade").checked;
   body.spill_ok = $("#eq-spill").checked;

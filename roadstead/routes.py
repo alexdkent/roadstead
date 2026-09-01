@@ -26,6 +26,7 @@ Provides:
   - GET  /rs/v1/admin/config    — configuration sources + what is NOT in force
   - GET/POST /rs/v1/admin/keys  — the key registry (redacted) / enrol a key
   - DELETE /rs/v1/admin/keys/{key_id} — revoke a key
+  - POST /rs/v1/admin/keys/{key_id}/rotate — issue a successor, retire this one
   - GET  /rs/v1/admin/callers   — per-caller identity, quota, DRR, spend
   - PATCH /rs/v1/admin/callers/{agent_id} — edit one caller's quota
   - GET  /rs/v1/admin/providers — providers + endpoints: declared vs in force
@@ -183,6 +184,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_admin_providers(request: Request) -> Response:
         return await svc.handle_admin_providers(request)
 
+    async def handle_admin_key_rotate(request: Request) -> Response:
+        return await svc.handle_admin_key_rotate(request)
+
     async def handle_admin_audit(request: Request) -> Response:
         return await svc.handle_admin_audit(request)
 
@@ -259,6 +263,10 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         Route(f"{ADMIN_PREFIX}/config", handle_admin_config, methods=["GET"]),
         Route(f"{ADMIN_PREFIX}/keys", handle_admin_keys, methods=["GET", "POST"]),
         Route(f"{ADMIN_PREFIX}/keys/{{key_id}}", handle_admin_key, methods=["DELETE"]),
+        # 🚨 One action, because doing it by hand is two calls in an order that
+        # matters and both orders are wrong. See ManagementApi.
+        Route(f"{ADMIN_PREFIX}/keys/{{key_id}}/rotate", handle_admin_key_rotate,
+              methods=["POST"]),
         Route(f"{ADMIN_PREFIX}/callers", handle_admin_callers, methods=["GET"]),
         Route(f"{ADMIN_PREFIX}/callers/{{agent_id}}", handle_admin_caller,
               methods=["PATCH"]),

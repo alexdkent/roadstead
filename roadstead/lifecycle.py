@@ -401,11 +401,17 @@ class Lifecycle:
         declared_priority = body.get("priority")
         if declared_priority is None:
             declared_priority = principal.priority
-        # Workstream D: a caller over its daily spend cap drops one band.
+        # 🚨 Recorded BEFORE the standing is taken, so a caller's own request
+        # counts toward the rate it is judged on. The alternative — record after
+        # — lets a caller sit exactly one request under its threshold forever.
+        self.state.record_request(agent_id)
+        # Workstream D: a caller over its daily spend cap drops one band; since
+        # 2026-09-01, so does one over its request-rate threshold, and crossing
+        # both still costs exactly one band (see ProxyState.spend_demote).
         # 🚨 Applied HERE, to the priority, and nowhere near the admission
         # decision — the whole doctrine is that a threshold costs a caller its
         # PLACE IN THE QUEUE and never its access to local capacity. There is
-        # deliberately no branch below this line that can turn an over-cap
+        # deliberately no branch below this line that can turn an over-threshold
         # caller into an error.
         declared_priority = self.state.spend_demote(
             agent_id, LLMPriority.coerce(declared_priority,

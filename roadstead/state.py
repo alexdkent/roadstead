@@ -44,6 +44,8 @@ from .spend import (
     declared_price,
     standing,
 )
+from .rate import RateLedger, RateStanding
+from .rate import standing as rate_standing
 from .sse_hub import SSEHub
 from .timeout_model import TimeoutModel
 
@@ -126,6 +128,12 @@ class ProxyState:
         # every request. A report per call would bury the event it exists to
         # surface.
         self.spend_demotion_noted: dict[str, int] = {}
+        # The rate window, and the same once-a-day notice bookkeeping. Separate
+        # from the spend one because an operator needs to know WHICH threshold
+        # moved a caller — one merged notice would make a rate problem look like
+        # a billing one.
+        self.rate = RateLedger()
+        self.rate_demotion_noted: dict[str, int] = {}
         # source endpoint class -> how many requests it has spilled to remote
         # capacity. The counterpart to `degraded_rerouted`, and separate from it
         # for the same reason the two request fields are separate: a reroute is
@@ -434,6 +442,18 @@ class ProxyState:
             self.config.agent_config(agent_id).daily_spend_usd,
         )
 
+    def rate_standing(self, agent_id: str) -> "RateStanding":
+        """How fast ``agent_id`` is going, against its threshold, right now."""
+        return rate_standing(
+            self.rate, agent_id,
+            self.config.agent_config(agent_id).requests_per_minute,
+            now=time.time(),
+        )
+
+    def record_request(self, agent_id: str) -> None:
+        """Note one request against ``agent_id``'s rate window. On the loop."""
+        self.rate.record(agent_id, time.time())
+
     def spend_may_spill(self, agent_id: str) -> bool:
         """Whether ``agent_id`` may currently be served by PAID remote capacity.
 
@@ -442,28 +462,75 @@ class ProxyState:
         could refuse a request: ``Scheduler._admit`` calls it strictly after
         local capacity has already said no.
         """
-        return self.spend_standing(agent_id).may_spill
+        # 🚨 BOTH thresholds, and an AND: either one removes paid spill. A
+        # caller going far too fast is the last one whose overflow should become
+        # an invoice on somebody else's hardware, and a caller over its money
+        # cap is the obvious one. Unlike the band demotion below, these do not
+        # need a non-stacking rule — "may not spill" has no second step.
+        return (self.spend_standing(agent_id).may_spill
+                and self.rate_standing(agent_id).may_spill)
+
+    def effective_priority(
+        self, agent_id: str, declared: LLMPriority,
+    ) -> LLMPriority:
+        """The band ``agent_id`` actually gets. **Read-only — no notice.**
+
+        🚨 THE non-stacking rule, and it is non-stacking BY CONSTRUCTION: at
+        most one standing is ever consulted, so a caller over two thresholds
+        drops one band and a third threshold added later cannot quietly make it
+        three. The alternative — compose the two answers — is the shape where
+        adding a threshold silently doubles the penalty of the ones already
+        there, which is the unbounded-penalty argument in
+        ``spend.SpendStanding.effective_priority`` with more force.
+
+        Split from :meth:`spend_demote` because the management plane reports
+        this number on a read, and a read that fired a degradation notice would
+        make opening a dashboard look like a caller misbehaving.
+        """
+        spend_st = self.spend_standing(agent_id)
+        if spend_st.over:
+            return spend_st.effective_priority(declared)
+        rate_st = self.rate_standing(agent_id)
+        if rate_st.over:
+            return rate_st.effective_priority(declared)
+        return declared
 
     def spend_demote(self, agent_id: str, declared: LLMPriority) -> LLMPriority:
         """The band ``agent_id`` actually gets, given what it declared.
 
-        One step down while it is over its daily cap, and no further. Called on
-        the submit path before the request is queued, because the band is fixed
-        at enqueue and re-banding a queued request would mean moving it between
-        per-agent deques mid-flight for no gain.
+        🚨 **One step down, however many thresholds it has crossed.** THE place
+        that rule lives, because this is the one place every standing is known.
+        Two independent one-band penalties would mean that adding a second
+        threshold silently doubled the first one's — and the unbounded-penalty
+        argument in ``spend.SpendStanding.effective_priority`` applies with more
+        force to two of them than to one. A caller over its money cap AND going
+        far too fast is behind everyone behaving themselves, which is all any of
+        this is for; putting it two bands down would be a rejection taking its
+        time.
 
-        The demotion is reported through ``hooks.degradation`` the first time it
-        bites in a day. A caller that suddenly waits longer with nothing logged
-        is indistinguishable from a slow backend, and that ambiguity is the whole
+        Called on the submit path before the request is queued, because the band
+        is fixed at enqueue and re-banding a queued request would mean moving it
+        between per-agent deques mid-flight for no gain.
+
+        Each crossing is reported through ``hooks.degradation`` the first time it
+        bites in a day, SEPARATELY — an operator needs to know which threshold
+        moved a caller, and one merged notice would make a rate problem look like
+        a billing one. A caller that suddenly waits longer with nothing logged is
+        indistinguishable from a slow backend, and that ambiguity is the whole
         cost of choosing to degrade rather than to reject — worth paying, but
         only if somebody can see it happening.
+
+        The name is Workstream D's and is kept: it is called from the submit
+        path and from nothing else, and renaming a seam to describe its second
+        reason is churn that reaches ``git blame`` before it reaches anybody.
         """
-        st = self.spend_standing(agent_id)
-        effective = st.effective_priority(declared)
+        spend_st = self.spend_standing(agent_id)
+        rate_st = self.rate_standing(agent_id)
+        effective = self.effective_priority(agent_id, declared)
         if effective is declared:
             return declared
         today = day_bucket(time.time())
-        if self.spend_demotion_noted.get(agent_id) != today:
+        if spend_st.over and self.spend_demotion_noted.get(agent_id) != today:
             self.spend_demotion_noted[agent_id] = today
             hooks.degradation(
                 component="spend",
@@ -471,8 +538,22 @@ class ProxyState:
                 impact=("its requests drop one priority band and it may not use "
                         "paid remote spill; local capacity is unaffected"),
                 agent_id=agent_id,
-                spent_today_usd=round(st.spent_today_usd, 6),
-                cap_usd=st.cap_usd,
+                spent_today_usd=round(spend_st.spent_today_usd, 6),
+                cap_usd=spend_st.cap_usd,
+                priority_declared=declared.name,
+                priority_effective=effective.name,
+            )
+        if rate_st.over and self.rate_demotion_noted.get(agent_id) != today:
+            self.rate_demotion_noted[agent_id] = today
+            hooks.degradation(
+                component="rate",
+                reason="caller is over its request-rate threshold",
+                impact=("its requests drop one priority band and it may not use "
+                        "paid remote spill; local capacity is unaffected. This "
+                        "is not a rate LIMIT: nothing is refused"),
+                agent_id=agent_id,
+                observed_per_min=round(rate_st.observed_per_min, 2),
+                limit_per_min=rate_st.limit_per_min,
                 priority_declared=declared.name,
                 priority_effective=effective.name,
             )

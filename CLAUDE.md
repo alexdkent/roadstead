@@ -189,6 +189,7 @@ roadstead/          the package (37 modules + providers/ + client/)
   cost_model.py     slot-second cost, EWMA-calibrated       — pure computation, no I/O
   timeout_model.py  learned latency → recommended deadline  — pure computation, no I/O
   spend.py          prices, per-caller spend, thresholds    — pure computation, no I/O
+  rate.py           per-caller request rate, same shape     — pure computation, no I/O
   intent.py         a declared capability → an endpoint     — pure computation, no I/O
   correction.py     the output-integrity layer
   lifecycle.py      admission → dispatch → streaming → timeout recording
@@ -211,7 +212,7 @@ tools/              off-default-path experiments (real processes, real signals, 
 docs/               specs, plan, evaluation, ledger
 ```
 
-The five `pure computation, no I/O` modules are the crown jewels and the easiest to test — keep
+The six `pure computation, no I/O` modules are the crown jewels and the easiest to test — keep
 them that way.
 
 **`models.yaml` has two sections, and the split is load-bearing.** `providers:` is *how to reach a

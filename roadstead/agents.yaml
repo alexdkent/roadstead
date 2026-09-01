@@ -73,6 +73,14 @@ extractor:
   weight: 1.0
   max_balance_ss: 240.0
   default_priority: P3_INGESTION
+  # The one caller in this example with a rate threshold, and the shape of
+  # caller that wants one: a fan-out ingester is the thing that runs away, and
+  # it does so at 3am when there is nobody to be unfair to — which is exactly
+  # when DRR does nothing. See the rate section at the foot of this file.
+  # 🚨 Set WELL above what a healthy burst does. This is not a capacity plan; it
+  # is the number that says "something is wrong", and a threshold tight enough
+  # to catch a busy hour will fire on every busy hour and be ignored.
+  requests_per_minute: 600.0
 
 hygiene:
   # Lowest-urgency maintenance work — reindexing, backfills, cleanup. It should
@@ -80,6 +88,33 @@ hygiene:
   weight: 1.0
   max_balance_ss: 240.0
   default_priority: P4_HYGIENE
+
+
+# --- requests_per_minute: the abuse control DRR is NOT ------------------------
+# DRR is fairness UNDER CONTENTION. A caller alone on a quiet fleet is
+# unthrottled by design — correct for fairness, and exactly why it does not
+# bound a runaway. A caller stuck in a loop at 3am contends with nobody and is
+# bounded by nothing until somebody else shows up.
+#
+# 🚨 Crossing this DEGRADES and never rejects, identically to `daily_spend_usd`:
+# the caller drops ONE priority band and loses paid spill, and keeps its full
+# access to local capacity. There is no error code for it and no 429 — a rate
+# LIMIT would be a fourth spelling of "no", and it would put a mistyped
+# threshold in a position to take a caller offline. The caller ends up behind
+# every caller behaving itself, which is the whole point and is enough.
+#
+# 🚨 Degradations do NOT stack: a caller over this AND over `daily_spend_usd`
+# drops one band, not two. Otherwise adding a second threshold would silently
+# double the first one's penalty.
+#
+# Absent = no threshold, which is the right default and what every caller was
+# before this field existed. `0.0` is NOT absent — it is a real threshold
+# meaning "this caller should not be sending at all", one keystroke away and a
+# very different statement.
+#
+# Measured over a trailing 60s window (rate.WINDOW_S), keyed on the `agent_id`
+# like every other quota — the budget holder is the caller, not the key. To stop
+# ONE credential, revoke it; that is instant and already exists.
 
 
 # --- degrade_ok: the tier3 failover opt-IN (§ 9.5) ---------------------------

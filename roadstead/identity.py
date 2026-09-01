@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import calendar
 import hashlib
 import ipaddress
 import logging
@@ -243,6 +244,43 @@ class Principal:
         return self.admin and not self.admin_readonly
 
 
+def iso_time(epoch: float | None) -> str:
+    """An epoch as something an operator can read in a log line.
+
+    Public because ``management.py`` renders the same instants back to an
+    operator, and two spellings of "when did this credential die" is the shape
+    ``cost_model.context_fit`` exists to answer one layer down.
+    """
+    if epoch is None:
+        return "an unknown time"
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(epoch)))
+    except (TypeError, ValueError, OSError):
+        return "an unknown time"
+
+
+def _address_in_any(ip: str, cidrs: "tuple[str, ...] | list[str]") -> bool:
+    """Whether ``ip`` falls in any of ``cidrs``.
+
+    🚨 Fails CLOSED on anything it cannot parse — an unreadable address or an
+    unreadable CIDR is not a match. The alternative direction (a malformed entry
+    that matches everything) turns a typo in a binding into no binding at all,
+    silently, on the one field whose whole purpose is to narrow.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for raw in cidrs:
+        try:
+            if addr in ipaddress.ip_network(str(raw), strict=False):
+                return True
+        except ValueError:
+            logger.warning("api key binding: %r is not an address or CIDR; it "
+                           "matches nothing", raw)
+    return False
+
+
 #: HTTP methods that only READ. Anything else is treated as a mutation by the
 #: admin gate — DEFAULT-DENY, so a method nobody anticipated is refused to a
 #: read-only identity rather than waved through. Derived from the METHOD rather
@@ -276,6 +314,30 @@ class Denial:
 
 
 @dataclass(frozen=True)
+class KeyLookup:
+    """The outcome of matching one presented secret against the registry.
+
+    Three states, and the third is the one this type exists for: no match, a
+    match, and a match that is no longer usable. Collapsing the last two into
+    ``None`` is what made an expired credential indistinguishable from a typo.
+    """
+
+    #: The identity, when the key matched AND is still usable.
+    principal: Principal | None = None
+    #: Set when the key matched but has passed its expiry.
+    expired_at: float | None = None
+    #: The matched key's public label, set even when it expired — an operator
+    #: needs to know WHICH key it was.
+    key_id: str | None = None
+    #: CIDRs the key may be presented from. Empty means anywhere.
+    bind: tuple[str, ...] = ()
+
+    @property
+    def expired(self) -> bool:
+        return self.expired_at is not None
+
+
+@dataclass(frozen=True)
 class Resolution:
     """The outcome of identifying one request: exactly one half is set."""
 
@@ -306,12 +368,22 @@ class KeyRegistry:
 
     def __init__(self) -> None:
         self._by_digest: dict[str, Principal] = {}
-        # Provenance, kept OUT of the hot-path dict on purpose: ``resolve`` runs
-        # on every request and must stay a single dict hit returning the
-        # principal itself. Where a key came from is an operator question asked
-        # by the management plane a few times a day, not a request-path one.
-        # {digest: {"source": "env" | "file" | "runtime", "created_at": float}}
-        self._provenance: dict[str, dict] = {}
+        # Facts about the CREDENTIAL, as opposed to the identity it confers.
+        # Kept out of the Principal because a Principal is what a caller IS and
+        # these are conditions on the key being usable at all — one of them
+        # (``bind``) cannot even be evaluated without the request.
+        #
+        #   source      "env" | "file" | "runtime"
+        #   created_at  epoch seconds
+        #   expires_at  epoch seconds, or None for "until revoked"
+        #   bind        list of CIDR strings the key may be presented from
+        #
+        # 🚨 ``expires_at`` and ``bind`` ARE read on the request path, which the
+        # older comment here (which called this dict pure provenance) said they
+        # were not. ``lookup`` stays one dict hit for the principal and one for
+        # this; binding is checked by ``IdentityResolver``, which is the only
+        # thing that has an address to check it against.
+        self._credential: dict[str, dict] = {}
 
     def __len__(self) -> int:
         return len(self._by_digest)
@@ -332,6 +404,8 @@ class KeyRegistry:
         min_timeout_s: float | None = None,
         admin: bool = False,
         admin_readonly: bool = False,
+        expires_at: float | None = None,
+        bind: "list[str] | tuple[str, ...] | None" = None,
         key_id: str | None = None,
         source: str = "file",
     ) -> str | None:
@@ -389,7 +463,12 @@ class KeyRegistry:
             source="api_key",
             key_id=label,
         )
-        self._provenance[digest] = {"source": source, "created_at": time.time()}
+        self._credential[digest] = {
+            "source": source,
+            "created_at": time.time(),
+            "expires_at": expires_at,
+            "bind": list(bind or ()),
+        }
         return label
 
     def revoke(self, key_id: str) -> bool:
@@ -407,15 +486,78 @@ class KeyRegistry:
         for digest, principal in list(self._by_digest.items()):
             if principal.key_id == key_id:
                 del self._by_digest[digest]
-                self._provenance.pop(digest, None)
+                self._credential.pop(digest, None)
+                return True
+        return False
+
+    def is_expired(self, digest: str, *, now: float | None = None) -> bool:
+        """Whether the key stored under ``digest`` has passed its expiry.
+
+        A key with no ``expires_at`` never expires — which is what every key was
+        before 2026-09-01, so an existing registry behaves exactly as it did.
+        """
+        expires_at = self._credential.get(digest, {}).get("expires_at")
+        if expires_at is None:
+            return False
+        return (time.time() if now is None else now) >= float(expires_at)
+
+    def binding(self, key_id: str) -> list[str]:
+        """The CIDRs ``key_id`` may be presented from. Empty means anywhere."""
+        for digest, principal in self._by_digest.items():
+            if principal.key_id == key_id:
+                return list(self._credential.get(digest, {}).get("bind", ()))
+        return []
+
+    def lookup(self, presented: str) -> "KeyLookup":
+        """Resolve ``presented``, distinguishing WHY it failed.
+
+        🚨 An expired key and an unknown one are both refused and must not be
+        refused with the same words. "not registered" sends an operator to check
+        whether they pasted the right string; "expired at T" sends them to
+        enrol a successor. Both are 401 and neither falls back to the address
+        (§1.5 rule 1) — what differs is the sentence, which is the part a human
+        acts on. Same argument as the 401/403 split on the admin gate.
+
+        The binding is NOT checked here: it needs the request's address, and
+        ``identity.py`` resolves an address in exactly one place, which is
+        ``IdentityResolver``.
+        """
+        if not presented:
+            return KeyLookup()
+        digest = _digest(presented)
+        principal = self._by_digest.get(digest)
+        if principal is None:
+            return KeyLookup()
+        if self.is_expired(digest):
+            return KeyLookup(
+                expired_at=self._credential.get(digest, {}).get("expires_at"),
+                key_id=principal.key_id)
+        return KeyLookup(principal=principal, key_id=principal.key_id,
+                         bind=tuple(self._credential.get(digest, {}).get("bind", ())))
+
+    def set_expiry(self, key_id: str, expires_at: float | None) -> bool:
+        """Give ``key_id`` an expiry (or clear one). True if a key was found.
+
+        The half of a rotation that RETIRES rather than revokes. Same argument
+        as :meth:`revoke`: it works regardless of where the key was declared,
+        because a credential being wound down has to actually wind down; what
+        the declaration decides is whether the change survives a restart, which
+        the management plane reports rather than silently getting wrong.
+        """
+        for digest, principal in self._by_digest.items():
+            if principal.key_id == key_id:
+                self._credential.setdefault(digest, {})["expires_at"] = expires_at
                 return True
         return False
 
     def resolve(self, presented: str) -> Principal | None:
-        """The principal behind ``presented``, or None if no key matches."""
-        if not presented:
-            return None
-        return self._by_digest.get(_digest(presented))
+        """The principal behind ``presented``, or None if no key matches.
+
+        The plain accessor. It reports an expired key as no key at all, which is
+        correct for a caller asking "does this work"; a caller that needs to
+        say WHY it does not wants :meth:`lookup`.
+        """
+        return self.lookup(presented).principal
 
     def snapshot(self) -> list[dict]:
         """Serialisable registry state for observability.
@@ -442,8 +584,18 @@ class KeyRegistry:
                     "may_write": p.may_admin_write,
                     # Where the registration came from, so an operator can tell
                     # a runtime enrolment from a line in the environment.
-                    "source": self._provenance.get(d, {}).get("source", "file"),
-                    "created_at": self._provenance.get(d, {}).get("created_at"),
+                    "source": self._credential.get(d, {}).get("source", "file"),
+                    "created_at": self._credential.get(d, {}).get("created_at"),
+                    # 🚨 Lifecycle, reported because nothing else can report it.
+                    # A key that expires in an hour and one that never expires
+                    # are indistinguishable everywhere else, and the difference
+                    # is a caller that stops working at a moment unrelated to
+                    # anything anyone did.
+                    "expires_at": self._credential.get(d, {}).get("expires_at"),
+                    "expired": self.is_expired(d),
+                    # The addresses it may be presented from. Empty = anywhere,
+                    # which is what every key was before 2026-09-01.
+                    "bind": list(self._credential.get(d, {}).get("bind", ())),
                 }
                 for d, p in self._by_digest.items()
             ),
@@ -503,7 +655,7 @@ class KeyRegistry:
     #: already had once each.
     _FILE_FIELDS = frozenset({
         "id", "agent_id", "key", "key_sha256", "priority", "min_timeout_s",
-        "admin", "admin_readonly",
+        "admin", "admin_readonly", "expires_at", "bind",
     })
 
     def _load_file(self, path: str | Path) -> None:
@@ -557,10 +709,51 @@ class KeyRegistry:
                 min_timeout_s=(float(floor) if floor is not None else None),
                 admin=bool(entry.get("admin", False)),
                 admin_readonly=bool(entry.get("admin_readonly", False)),
+                expires_at=_expiry_from_file(entry),
+                bind=_binding_from_file(entry),
                 key_id=(str(entry["id"]) if entry.get("id") else None),
             ):
                 loaded += 1
         logger.info("loaded %d API key(s) from %s", loaded, p)
+
+
+def _expiry_from_file(entry: dict) -> float | None:
+    """``expires_at`` from a keys-file entry: an epoch, or an ISO-8601 date.
+
+    Both spellings, because an operator writing a keys file by hand writes
+    ``2027-01-01`` and an operator generating one writes an epoch. An
+    unparseable value is a WARNING and NO expiry rather than an immediate one:
+    this runs at startup over operator-supplied strings, and a typo that quietly
+    killed a credential would look exactly like a revocation nobody made.
+    """
+    raw = entry.get("expires_at")
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return float(raw)
+    text = str(raw).strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return calendar.timegm(time.strptime(text, fmt))
+        except ValueError:
+            continue
+    try:
+        return float(text)
+    except ValueError:
+        logger.warning(
+            "api keys file: entry %r has unparseable expires_at %r — the key is "
+            "loaded WITHOUT an expiry rather than as already expired",
+            entry.get("id"), raw)
+        return None
+
+
+def _binding_from_file(entry: dict) -> list[str]:
+    """``bind`` from a keys-file entry: one CIDR or a list of them."""
+    raw = entry.get("bind")
+    if raw is None:
+        return []
+    values = raw if isinstance(raw, list) else [raw]
+    return [str(v).strip() for v in values if str(v).strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -941,9 +1134,28 @@ class IdentityResolver:
         # Rule 2: with no keys configured the registry is not in play, so a
         # placeholder Authorization header from an OpenAI client is invisible.
         if key and self.keys.configured:
-            principal = self.keys.resolve(key)
-            if principal is not None:
-                return Resolution(principal=principal)
+            found = self.keys.lookup(key)
+            if found.principal is not None:
+                bound = self._binding_denial(request, found)
+                return Resolution(denial=bound) if bound else Resolution(
+                    principal=found.principal)
+            if found.expired:
+                # 🚨 Its OWN sentence. "Not registered" would send an operator
+                # to check whether they pasted the right string; the key is
+                # exactly right and simply out of time, and the fix is a
+                # successor rather than a correction. Same code and same status
+                # as below — a caller can do nothing differently either way, and
+                # §2.1 mints no code it does not need.
+                return Resolution(denial=Denial(
+                    code="invalid_api_key",
+                    status=401,
+                    message=(f"expired API key — credential {found.key_id!r} "
+                             f"expired at {iso_time(found.expired_at)} and is no "
+                             f"longer accepted. It is NOT ignored in favour of "
+                             f"the source address; rotate it "
+                             f"(POST /rs/v1/admin/keys/{found.key_id}/rotate) "
+                             f"or enrol a successor"),
+                ))
             # Rule 1: never fall back to the address. Say so in the message —
             # a caller whose key was revoked and whose address happens to be
             # enrolled must not discover the difference in a latency graph.
@@ -994,6 +1206,46 @@ class IdentityResolver:
             admin_readonly=self.acl.is_admin_readonly(ip),
             source="ip",
         ))
+
+    def _binding_denial(self, request: Any, found: "KeyLookup") -> Denial | None:
+        """Whether this key may be presented from THIS address. None to proceed.
+
+        🚨 An ADDITIONAL constraint on a credential, never a way for one to
+        widen what an address grants. A key with no binding is unconstrained,
+        which is what every key was before 2026-09-01; a bound key can only ever
+        be refused somewhere it would otherwise have worked. The identity it
+        confers is untouched — a bound key does not *become* an address
+        identity, and a caller inside the binding gets exactly the principal the
+        key always carried.
+
+        🚨 It is checked against the RESOLVED address, which may be a forwarded
+        one. A binding written for a deployment behind a reverse proxy is
+        therefore only as trustworthy as ``ROADSTEAD_TRUSTED_PROXIES``: if that
+        is empty the address is the peer and cannot be spoofed, and if it is
+        configured the binding inherits whatever that list vouches for. The
+        management plane says so where an operator reads it (``docs/api.md``
+        §3.3) rather than leaving it to be worked out — this is the §3.5 rule
+        applied to a security control.
+
+        Refused with the same code and status as every other bad credential.
+        A caller cannot act on the distinction; the operator reading the log
+        can, and the message is where that goes.
+        """
+        if not found.bind:
+            return None
+        address = self.client_address(request)
+        if _address_in_any(address.ip, found.bind):
+            return None
+        return Denial(
+            code="invalid_api_key",
+            status=401,
+            message=(f"API key {found.key_id!r} is bound to "
+                     f"{', '.join(found.bind)} and was presented from "
+                     f"{address.ip}"
+                     + (" (a FORWARDED address — the binding is only as "
+                        "trustworthy as ROADSTEAD_TRUSTED_PROXIES)"
+                        if address.forwarded else "")),
+        )
 
     def min_timeout_s(self, request: Any) -> float | None:
         """This caller's registered deadline floor, or None.

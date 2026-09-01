@@ -42,6 +42,7 @@ PURE_MODULES = (
     "timeout_model", # learned latency -> recommended deadline
     "spend",         # prices, per-caller spend, thresholds
     "intent",        # a declared capability -> an endpoint
+    "rate",          # per-caller request rate, and the same threshold shape
 )
 
 #: Top-level packages that mean I/O. Network, disk, process, framework.
@@ -81,7 +82,7 @@ def test_the_list_is_not_empty_and_every_module_exists():
     """🚨 An empty or stale list would make every parametrized test below
     collect nothing and pass — the failure mode this file exists to prevent,
     reproduced in the guard itself."""
-    assert len(PURE_MODULES) == 5
+    assert len(PURE_MODULES) == 6
     for module in PURE_MODULES:
         assert (_ROOT / "roadstead" / f"{module}.py").exists(), module
 
@@ -187,11 +188,12 @@ def test_the_guard_is_not_vacuous():
                and n.names[0].name in FORBIDDEN_IMPORTS for n in ast.walk(bad))
 
 
-def test_claude_md_still_names_all_five():
+def test_claude_md_still_names_them_all():
     """The document and the code have to agree about which modules are the
-    crown jewels — a sixth added to CLAUDE.md and not to `PURE_MODULES` would be
+    crown jewels — one added to CLAUDE.md and not to `PURE_MODULES` would be
     unguarded, and a module dropped from the list here should have been dropped
-    there too."""
+    there too. `rate.py` is the sixth, added 2026-09-01; this test is what made
+    the layout section get updated with it rather than a week later."""
     text = (_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
     for module in PURE_MODULES:
         assert f"{module}.py" in text, (

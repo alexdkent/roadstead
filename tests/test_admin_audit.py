@@ -363,6 +363,11 @@ async def test_every_mutating_admin_route_records_something(tmp_path, monkeypatc
         if path.endswith("/keys"):
             return await svc.handle_admin_keys(_Req(
                 method=method, body={"agent_id": "audit-probe"}))
+        if path.endswith("/keys/{key_id}/rotate"):
+            svc._state.identity.keys.register(
+                secret="rotate-me", agent_id="r", key_id="rotate-me")
+            return await svc.handle_admin_key_rotate(_Req(
+                method=method, path_params={"key_id": "rotate-me"}, body={}))
         if path.endswith("/keys/{key_id}"):
             svc._state.identity.keys.register(
                 secret="doomed", agent_id="d", key_id="doomed-key")
