@@ -415,14 +415,36 @@ test asserts it), and the only server-side work is an asset read that goes **off
 **~~Still open in G: one scope, and no audit trail.~~ Both closed 2026-09-01 by H** — and the UI is
 what made them urgent, exactly as predicted here.
 
-**Still open in G.** Nothing here is covered by a **browser-driven test**; the guards are contract
-pins (`tests/test_admin_ui.py` walks every `pick()` path against a real response) plus a rendered
-walkthrough by hand. Rendering the page has now found five real bugs across two workstreams that no
-test in this repo could have — which is the argument *for* one, against a page whose whole discipline
-is no bundler, no external reference, six packages. When the page finds something the pattern is to
-leave a **source-level** guard behind (two landed with H), and the open question is whether the class
-those cannot reach is worth the dependency. If the answer is no, it belongs here as a decision rather
-than as an open item.
+**~~Still open in G: a browser-driven test.~~ DECIDED 2026-09-01: no, and the reason usually given
+for it is wrong.**
+
+🚨 **The dependency argument does not hold, and citing it should stop.** "It must not drag a frontend
+toolchain into a package whose dependency list is six" is about the **runtime** list —
+`tests/test_admin_ui.py::test_the_dependency_list_did_not_grow_a_frontend` reads
+`project.dependencies` and asserts exactly those six, plus the absence of `package.json` /
+`node_modules` / a bundler config. A test-time browser driver is a **dev** dependency, in a list that
+already carries three, and it would violate none of that. A decision resting on a reason that does
+not survive reading the test it cites is the shape of every entry in `docs/ledger.md`.
+
+**The real constraint is the suite's promise**, stated in `CLAUDE.md`: `pip install -e '.[dev]'` then
+`pytest` — *no fleet, no network, no backends required*. A browser driver needs a browser binary
+fetched over the network at install time. That is a second install step, an offline failure mode, and
+a new class of flake, for every contributor, to cover **one page**.
+
+**What is already covered**, measured against the running page on 2026-09-01: **163** `pick()` paths,
+each walked against a response a real service produced; **14** `guarded(...)` write controls, each
+found from the HTTP method it sends rather than from a list; and the scope proven known before the
+first paint.
+
+**What is NOT covered, and is accepted as a known gap:** DOM-level faults in the render helpers — a
+node stringified into a cell as `[object HTMLSpanElement]`, a boolean attribute rendered empty so no
+declared-vs-in-force pair collapses. Both of those actually happened, and both were found by a human
+rendering the page. **The compensating discipline is the one already in use:** when rendering finds
+something, leave behind a guard a *source read* can make. That has worked twice (H).
+
+**Revisit if** the page grows a second interactive surface — a form with client-side validation, or
+state that has to survive a navigation. Today every control is one request and one re-render, which
+is the regime where a source-level guard can stand in for a rendered one.
 
 **~~Nothing here is audited.~~ Closed 2026-09-01 by H**, in the overlay, which is where this
 predicted it would go.

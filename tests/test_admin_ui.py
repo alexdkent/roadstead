@@ -119,7 +119,16 @@ def test_the_page_references_nothing_outside_itself():
 def test_the_dependency_list_did_not_grow_a_frontend():
     """The constraint the roadmap states in as many words. A build step, a
     node_modules or a React dependency is out — this is what "out" looks like as
-    an assertion rather than as an intention."""
+    an assertion rather than as an intention.
+
+    🚨 It reads `project.dependencies`, i.e. the **runtime** list, and that
+    scope is deliberate but has been misread: this rule does NOT forbid a
+    test-time dependency, and `[project.optional-dependencies].dev` already
+    carries three. The roadmap once argued against a browser-driven UI test on
+    the strength of this test, which does not say that. What actually rules one
+    out is the suite's promise in CLAUDE.md — install and run, no network — and
+    `docs/roadmap.md` under G now says so instead.
+    """
     meta = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     names = {re.split(r"[<>=!\[ ]", d)[0].lower().replace("_", "-")
              for d in meta["project"]["dependencies"]}

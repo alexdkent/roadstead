@@ -399,7 +399,16 @@ never becomes reachable. The door refuses **401 + `WWW-Authenticate`** where the
 because a 403 gives a browser no way to answer it. 🚨 **Every field the page reads goes through
 `pick(obj, "a.b.c")`** so the paths are extractable, and `tests/test_admin_ui.py` walks each one
 against a real response — a UI has no compiler and no schema, so a renamed field renders "—" forever
-in one cell while the page looks healthy.
+in one cell while the page looks healthy. 163 paths and 14 `guarded(...)` write controls as of
+2026-09-01.
+
+🚨 **There is deliberately NO browser-driven test, and the usual reason for that is wrong.** The
+"dependency list is six" rule is about the **runtime** list (the test reads `project.dependencies`);
+a browser driver is a *dev* dependency and would violate none of it. What rules one out is the
+suite's promise above — install and run, **no network** — which a downloaded browser binary breaks
+for every contributor, to cover one page. The accepted gap is DOM-level faults in the render helpers,
+and the compensating discipline is: **when rendering the page finds something, leave behind a guard a
+source read can make.** `docs/roadmap.md` under G carries the decision and what would reopen it.
 
 🚨 **`roadstead.client` imports nothing from the server, and that is a rule with a test.** Two
 reasons, and the second is the one that would be lost silently: a consumer sending an HTTP request
