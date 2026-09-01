@@ -158,7 +158,8 @@ Not phases. Several can run concurrently; the dependencies between them are what
 
 ### A · Provider abstraction — *the foundation*
 
-**Landed 2026-08-31** (`f04df61`, *"Extract the provider interface out of backend.py"*). The case for it, which every workstream after this one drew on:
+**Landed 2026-08-31** (`0799e83`, *"Extract the provider interface out of backend.py"*). The case
+for it, which every workstream after this one drew on:
 extract a provider interface out of `backend.py` (llama.cpp/vLLM branching inline) and formalise the
 capability descriptor. Nothing else on this list was buildable first — OpenRouter needed it, spill
 needed it, per-provider costing needed it, and enriched model information is largely a readout of it.
@@ -660,9 +661,13 @@ this section used to say about it, both found by doing it:
   future rewrite cannot orphan them silently. Two SHAs in `docs/evaluation.md` turned out never to
   have been commits here at all — they cite the origin monorepo.
 
-⚠️ **What remains is a visibility decision, and it is not this plan's to make.** Two items of commit
-metadata (`--replace-text` cannot reach either) were left deliberately: the author name and the
-author email's private hostname, on all 321 commits.
+**Commit metadata took a second pass** the same day: `--replace-text` reaches blobs, `--replace-
+message` reaches messages, and *neither* reaches author or committer identity. A `--mailmap` run
+normalised all 322 commits onto one public address — and turned up a second private hostname nobody
+had flagged, on 103 commits. 🚨 **A sweep over tracked files cannot see the author line**, which is
+why that one survived every check until somebody looked directly at it.
+
+⚠️ **What remains is a visibility decision, and it is not this plan's to make.**
 
 ---
 

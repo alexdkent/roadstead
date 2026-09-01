@@ -15,6 +15,13 @@ Landed 2026-09-01. The second and final `git filter-repo` pass, the last item in
 before this date shares no ancestor with `main` and cannot be fast-forwarded; re-clone rather than
 pull. Any SHA cited in an external document, a branch name, or a bookmark is dead.
 
+**It took two passes, not one.** The first rewrote blobs and commit messages. The second was a
+`--mailmap` run over commit *metadata*: author and committer identity is neither blob content nor a
+commit message, so it survived the first pass entirely. All 322 commits now carry one identity at a
+public address. 🚨 **That pass found a second private hostname on 103 commits that nothing had
+flagged** — because a sweep over tracked files cannot see the author line, and every check to that
+point had been a sweep over tracked files.
+
 This is recorded here rather than passed over as housekeeping because it is the most broadly
 breaking change the project has made — it breaks something for every holder of a copy, which no API
 break does — and because two things about it were wrong in the plan that specified it:
@@ -94,7 +101,8 @@ but it changes how a *name a caller sends* resolves, which is as close to the co
 gets.
 
 `normalize_endpoint` stripped a `nexus-` prefix and mapped a bare `nexus` to `chat` — **one private
-fleet's host naming, hardcoded since the first commit (`7f209ca`, 2026-05-27) and shipped to everyone.** It was a
+fleet's host naming, hardcoded since the first commit (`1becf53`, 2026-05-27) and shipped to
+everyone.** It was a
 scrub finding and a design defect at once, and the second is the reason it is removed rather than
 renamed:
 
@@ -494,7 +502,8 @@ spill gate (`scheduler._admit`) and the WAL-recovery shadow tally (`service`). I
   residue of a fix that meant to call it.
 - **Nothing else changes behaviour.** The three live gates were byte-identical in effect and are
   verified so rather than asserted so: a differential harness ran the pre-split implementations
-  transcribed verbatim from `048c133` (2026-09-01, *"Give the operator a face"*) against the shared one over **2295** combinations of payload
+  transcribed verbatim from `87ed8fa` (2026-09-01, *"Give the operator a face"*) against the
+  shared one over **2295** combinations of payload
   shape, payload type, ceiling and endpoint name, comparing the boolean *and* the refusal-message
   bytes. Zero mismatches.
 - **🚨 The consequences stay different, which is the whole risk of this refactor.** Admission is

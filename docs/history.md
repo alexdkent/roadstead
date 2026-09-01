@@ -43,7 +43,7 @@ both are soft.
 **Phase 1 — done.** (Completed 2026-08-31; the three items below were what remained.)
 
 - Extracted with `git filter-repo`, **not** copied: 282 commits preserved, reaching back to
-  `7f209ca` (the first commit, 2026-05-27, *"centralized LLM scheduler proxy — DRR
+  `1becf53` (the first commit, 2026-05-27, *"centralized LLM scheduler proxy — DRR
   scheduling, priority bands"*).
   `git blame` still finds original rationale.
 - Namespace rewritten `originfleet.llmproxy` → `roadstead` across 96 files, with test root-anchor

@@ -41,7 +41,7 @@ Four things make it different from every gateway surveyed in `docs/evaluation.md
 
 This code was extracted on 2026-08-31 from a private monorepo (`OriginFleet`), where it still runs
 in production as `originfleet.llmproxy`. The history here is the real thing — 282 commits at
-extraction, going back to `7f209ca` (the first commit, 2026-05-27, *"centralized LLM scheduler
+extraction, going back to `1becf53` (the first commit, 2026-05-27, *"centralized LLM scheduler
 proxy — DRR scheduling, priority bands"*), extracted with `git filter-repo` rather than copied, so `git log`/`git blame` on
 any line still reaches its original rationale. **Use that.** It is the best documentation this project has.
 
@@ -608,8 +608,9 @@ that is not the same as no personal data, and the sweep in S5 now runs both patt
 🚨 **Host names within them are pseudonyms as of S6** (see Provenance above); the model and
 endpoint-class vocabulary is not.
 
-✅ **S6 is DONE (2026-09-01)** — the second `git filter-repo` pass ran over all 321 commits
-(282 of them extracted), rewriting blobs *and* commit messages. 🚨 **Every SHA in this repository
+✅ **S6 is DONE (2026-09-01)** — `git filter-repo` ran over all 322 commits (282 of them
+extracted), rewriting blobs, commit messages *and*, in a second pass, commit metadata: author and
+committer identity is reached by none of the text flags and needs `--mailmap`. 🚨 **Every SHA in this repository
 changed on that date**, so any SHA cited in a document, a branch, or an external reference from
 before it is dead. The citations in this file, `CHANGELOG.md`, `docs/history.md` and
 `docs/roadmap.md` were translated through filter-repo's `commit-map` and now carry a date and
