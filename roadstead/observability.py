@@ -189,6 +189,16 @@ class RollingMetrics:
         self._window_s = window_s
         self._samples: deque[MetricsSample] = deque()
 
+    @property
+    def window_s(self) -> float:
+        """How many seconds of samples are retained.
+
+        Public because it is the length of this process's RSS warm-up: memory
+        cannot be flat until the window is full, so `tools/soak.py` reads it to
+        separate "still filling" from "leaking" rather than transcribing 300.
+        """
+        return self._window_s
+
     def record(self, sample: MetricsSample) -> None:
         self._samples.append(sample)
         self._prune(sample.timestamp)

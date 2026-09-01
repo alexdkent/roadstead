@@ -63,6 +63,7 @@ from .fake_backend import (
     FakeBackendServer,
     MidStreamReset,
     RecordedRequest,
+    REQUEST_LOG_CAPACITY,
     make_fake_app,
     mock_transport_handler,
 )
@@ -76,6 +77,7 @@ __all__ = [
     "mock_transport_handler",
     # introspection
     "RecordedRequest",
+    "REQUEST_LOG_CAPACITY",
     "MidStreamReset",
     # usage-shape knobs (see FakeBackend.usage_override)
     "USAGE_DEFAULT",

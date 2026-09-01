@@ -48,8 +48,11 @@ import json
 import socket
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
+from typing import (
+    Any, AsyncIterator, Callable, Deque, Dict, List, Optional, Tuple,
+)
 
 import uvicorn
 from starlette.applications import Starlette
@@ -145,6 +148,12 @@ class RecordedRequest:
     fault: str
     body: Optional[dict]
     headers: Dict[str, str]
+
+
+#: How many recorded requests :class:`FakeBackend` keeps. Large enough that no
+#: test in this repo notices, small enough that a multi-hour load run does not
+#: turn the recorder into the thing being measured. See ``FakeBackend.requests``.
+REQUEST_LOG_CAPACITY = 1000
 
 
 @dataclass
@@ -247,11 +256,39 @@ class FakeBackend:
     # so a test can emit tool-call args that are repairable or hopeless.
     structured_tool_args: Optional[str] = None
 
-    requests: List[RecordedRequest] = field(default_factory=list)
+    #: The last :data:`REQUEST_LOG_CAPACITY` requests this backend received,
+    #: oldest first. Indexing, ``len`` and iteration all work as they did.
+    #:
+    #: 🚨 **Bounded, and it was not.** It was a plain list holding a body dict
+    #: and a header dict per request, kept for the life of the process — so a
+    #: sustained run accumulated one record per request forever. That is a real
+    #: defect for anyone who installs this (it is shipped surface), and it had a
+    #: second, worse consequence here: ``tools/soak.py`` exists to detect leaks
+    #: by RSS slope, and its headline number was dominated by its own test
+    #: double's recorder. A measuring instrument was reporting its own artifact.
+    #:
+    #: Dropping silently would be the wrong fix on this codebase's own terms, so
+    #: the bound reports itself: :attr:`requests_seen` counts every request ever
+    #: recorded and :attr:`requests_dropped` says how many aged out. A test that
+    #: needs more than the cap can read the totals instead of the records.
+    requests: Deque[RecordedRequest] = field(
+        default_factory=lambda: deque(maxlen=REQUEST_LOG_CAPACITY))
+    #: Total requests ever recorded, including those the bound has dropped.
+    requests_seen: int = 0
     # live concurrency counter (capacity_desync)
     _inflight: int = 0
     _hits: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def requests_dropped(self) -> int:
+        """How many recorded requests the bound has aged out.
+
+        Reported rather than hidden: a caller that asserts on ``len(requests)``
+        over a long run is entitled to know the list stopped being complete,
+        instead of reading a number that silently means something else.
+        """
+        return max(0, self.requests_seen - len(self.requests))
 
     def set_fault(self, name: str, arg: float = 0.0, max_hits: int = 0) -> None:
         if name not in ALL_FAULTS:
@@ -271,6 +308,7 @@ class FakeBackend:
         self.structured_content = None
         self.structured_tool_args = None
         self.requests.clear()
+        self.requests_seen = 0
         with self._lock:
             self._inflight = 0
             self._hits = 0
@@ -365,6 +403,7 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
     """Build the Starlette ASGI app bound to ``controller``."""
 
     async def _record(request: Request, fault: str, body: Optional[dict]) -> None:
+        controller.requests_seen += 1
         controller.requests.append(RecordedRequest(
             method=request.method, path=request.url.path, fault=fault,
             body=body, headers={k: v for k, v in request.headers.items()},

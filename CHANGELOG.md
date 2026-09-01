@@ -8,6 +8,49 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — an alias claimed twice routed silently, and the soak was measuring itself
+
+Landed 2026-09-01. Two unrelated defects, both found by doing the thing rather than reading it: one
+by the first pass of the origin-ledger transplant, one by running `tools/soak.py` for 25 minutes.
+
+**An alias claimed by two endpoints resolved in silence.** Transplanted from the origin monorepo's
+`models-yaml-alias-collision` (2026-07-30) — and it turned out not to be a transplant. The origin
+**raised** at module import on a duplicate alias, which took a whole gateway down and crash-looped it
+to FATAL over one duplicated line. This repo builds the same map with `setdefault`, so the second
+claim is discarded in file order, in silence: the operator's name reaches an endpoint they did not
+intend, on every request, forever. **The lesson survived the extraction and the guard did not.**
+🚨 Neither behaviour was right — refusing to load contradicts this repo's own rule that a typo must
+not stop a fleet booting. So it loads, resolution is unchanged, and both cases report through
+`hooks.config_notice`: `duplicate` for two endpoints claiming one alias, `shadowed` for an alias that
+another endpoint's class or role wins (that ordering is deliberate and stays, and it still killed an
+alias somebody wrote). Each names the endpoint the name actually reaches in an **`in_force`** field —
+the management plane's own vocabulary, and read by `GET /rs/v1/admin/config`. A self-alias is
+deliberately not reported: it maps to itself, it is common, and a notice that fires on every boot is
+one nobody reads. `tests/test_alias_collision.py`, `docs/ledger.md`. Six mutations, all red — one
+first SURVIVED because the test read the winner out of the prose sentence, which interpolates the
+same value the emptied field held.
+
+**🚨 `tools/soak.py` was measuring its own test double.** A 25-minute run climbed
+**118MB → 1867MB (+72.8 MB/min, linear, no plateau)** — precisely the shape that tool's docstring
+calls unhealthy. The growth was `FakeBackend.requests`: an unbounded list holding a body dict and a
+header dict per request, for the life of the process. Two defects in one:
+
+- `roadstead.testing` is **shipped public surface**, so that is a real leak for anyone who installs
+  it and drives sustained load through it.
+- The soak exists to detect leaks by RSS slope, and its headline number — the field it explicitly
+  tells you is "the number to look at" — was dominated by the harness rather than the proxy.
+
+The recorder is now a bounded deque (`REQUEST_LOG_CAPACITY`, exported, 1000) that **reports what it
+drops** (`requests_seen`, `requests_dropped`) rather than truncating in silence — the same answer the
+audit trail gives. Slope after the fix: **+8.2 MB/min and flattening**, the remainder being
+`RollingMetrics` filling its own 300s window toward steady state. `tests/test_fake_backend_recorder.py`.
+Six mutations plus a no-op control; one first SURVIVED because the ordering test drove a local helper
+instead of the app's real record path, so it was asserting the file's own model of the recorder
+against itself.
+
+**Also fixed on the way past:** `RateLedger.prune` was never called — see the entry below.
+
+
 ### Fixed — the rate ledger grew without bound, and nothing was watching it
 
 Landed 2026-09-01. `RateLedger.prune` shipped with Workstream I carrying a docstring that said

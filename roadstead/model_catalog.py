@@ -343,8 +343,11 @@ def load_catalog(path: str | os.PathLike | None = None, *, force: bool = False) 
                  for name, body in (raw.get("endpoints") or {}).items()}
 
     by_name: dict[str, str] = {}
+    #: alias -> the endpoints that claimed it, in file order.
+    alias_claims: dict[str, list[str]] = {}
     for e in endpoints.values():
         for alias in e.aliases:
+            alias_claims.setdefault(alias, []).append(e.name)
             by_name.setdefault(alias, e.name)
     # Class and role are registered AFTER the aliases so neither can be
     # shadowed by another endpoint's alias — a collision there once routed a
@@ -353,6 +356,50 @@ def load_catalog(path: str | os.PathLike | None = None, *, force: bool = False) 
         by_name[e.role] = e.name
     for e in endpoints.values():
         by_name[e.name] = e.name
+
+    # 🚨 An alias resolves to exactly ONE endpoint, and until 2026-09-01 a second
+    # claim on it was resolved silently by file order. The origin monorepo
+    # RAISED here, and that took a whole gateway down at import when somebody
+    # moved an alias between two stanzas without deleting the old one — so
+    # refusing to load is not the answer either (a typo must not stop a fleet
+    # booting; same rule as `policy:` below). Reporting is. The operator wrote a
+    # name that routes somewhere they did not intend, which is precisely the
+    # declared-vs-in-force gap `hooks.config_notice` exists to close.
+    #
+    # A MOVE is a delete plus an add — the ledger's lesson, and the shape that
+    # produces this every time.
+    for alias, claimants in alias_claims.items():
+        if len(claimants) > 1:
+            hooks.config_notice(
+                source="models.yaml", subject=f"endpoints.aliases.{alias}",
+                problem="duplicate",
+                detail=(f"alias {alias!r} is claimed by {claimants} — an alias "
+                        f"resolves to exactly one endpoint, so it routes to "
+                        f"{by_name[alias]!r} and the other claim(s) have NO "
+                        f"effect. A move is a delete plus an add"),
+                # `in_force` rather than `known`: every other notice uses
+                # `known` for the set of VALID keys, and the question here
+                # is not which names are legal but which endpoint the name
+                # actually reaches. That is the plane's own vocabulary.
+                keys=claimants, in_force=by_name[alias])
+
+    # The other half of the same ambiguity: an alias that is some OTHER
+    # endpoint's class or role is overwritten by the two loops above. That
+    # ordering is deliberate and stays — a class must be reachable by its own
+    # name — but the alias it silently kills was still written by somebody.
+    for e in endpoints.values():
+        for alias in e.aliases:
+            winner = by_name.get(alias)
+            if winner is not None and winner != e.name:
+                if alias in alias_claims and len(alias_claims[alias]) > 1:
+                    continue                      # already reported above
+                hooks.config_notice(
+                    source="models.yaml", subject=f"endpoints.{e.name}.aliases",
+                    problem="shadowed",
+                    detail=(f"alias {alias!r} on {e.name!r} is also the class or "
+                            f"role of {winner!r}, which wins — so this alias has "
+                            f"NO effect and callers using it reach {winner!r}"),
+                    keys=[alias], in_force=winner)
 
     cat = Catalog(providers=providers, endpoints=endpoints,
                   hosts=dict(raw.get("hosts") or {}), _by_name=by_name,

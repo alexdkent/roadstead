@@ -23,6 +23,16 @@ Per interval, and again as a summary:
 * **RSS**, and the slope over the run. The number to look at is the slope, not
   the peak: Python's allocator does not return everything, so a run that rises
   and plateaus is healthy and one that rises linearly is not.
+
+  🚨 **This number measures the whole process, proxy AND fake backend**, which
+  share it — and on 2026-09-01 that mattered. A 25-minute run climbed
+  118MB → 1867MB (+72.8 MB/min, linear, no plateau) and the growth was
+  ``FakeBackend.requests``: an unbounded list holding a body and a header dict
+  per request. The instrument was reporting its own artifact, in the exact field
+  it tells you to look at. The recorder is bounded now
+  (``testing.REQUEST_LOG_CAPACITY``, and it reports what it drops), so the slope
+  is the proxy's again. If you add per-request retention to the fake, this
+  number stops meaning what it says.
 * **In-flight, queue depth, and the peak of each** — the proof that load
   actually overlapped, and the first place a leaked slot shows.
 * **DRR budget map size**, which should track distinct callers and not requests.
@@ -239,10 +249,35 @@ async def run(args) -> int:
           f"p99={pct(0.99):.0f}ms max={lat[-1] if lat else 0:.0f}ms")
     print(f"peak       inflight={peak_inflight} queued={peak_queued}")
     if len(samples) >= 2:
+        def _slope(pts) -> float:
+            a, b = pts[0], pts[-1]
+            return (b[1] - a[1]) / max(b[0] - a[0], 1e-9) * 60.0
+
         first, last = samples[0], samples[-1]
-        slope = (last[1] - first[1]) / max(last[0] - first[0], 1e-9) * 60.0
+        overall = _slope(samples)
         print(f"rss        {first[1]:.1f}MB -> {last[1]:.1f}MB "
-              f"({slope:+.2f} MB/min)")
+              f"({overall:+.2f} MB/min over the whole run)")
+        # 🚨 The whole-run slope folds in the WARM-UP, and this process has a
+        # long one: `RollingMetrics` keeps a 300s window, so RSS necessarily
+        # rises for the first ~300s and then flattens. A run shorter than about
+        # 2x that reports a positive slope which is steady state being reached,
+        # not a leak — and this tool exists to tell those apart, so it must not
+        # be the thing that confuses them. Measured 2026-09-01: a 900s run rose
+        # to 115MB at 300s and sat at 123MB for the remaining 600s, while the
+        # whole-run slope still read +3.62 MB/min.
+        # Read off the live object, never transcribed: if the retention window
+        # changes, the warm-up this subtracts changes with it.
+        window_s = svc._state.metrics.window_s
+        tail = [pt for pt in samples if pt[0] >= window_s]
+        if len(tail) >= 2:
+            steady = _slope(tail)
+            print(f"           {tail[0][1]:.1f}MB -> {last[1]:.1f}MB "
+                  f"({steady:+.2f} MB/min after the {window_s:.0f}s "
+                  f"metrics window filled)  <-- THIS is the leak number")
+        else:
+            print(f"           ⚠️  run is shorter than the {window_s:.0f}s "
+                  f"metrics window, so the slope above is WARM-UP, not a leak. "
+                  f"Use --seconds {int(window_s * 3)} or more.")
         print("           🚨 the SLOPE is the number. A run that rises and "
               "plateaus is healthy; linear growth is not.")
     print(f"budgets    {len(svc._state.budget_mgr.agents)} agents "

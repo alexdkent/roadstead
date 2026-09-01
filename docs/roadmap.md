@@ -480,19 +480,33 @@ stop-grace went **up** (90 → 108s) because 90 had been an observation of a fas
 ceiling. See the Unreleased entry in `CHANGELOG.md` for why there is deliberately no outer
 `wait_for`.
 
-**Still open in F.** The soak runs against `roadstead.testing`, so it exercises concurrency and not
-*duration*: nothing yet watches memory growth, WAL size or connection-pool behaviour over hours,
-and nothing covers a **remote provider over a real network**, where the failure modes are latency
-variance and partial responses rather than contention. `tools/soak.py` is the experiment and already
-takes `--seconds` / `--concurrency` / `--stream-fraction`; what it lacks is somebody running it long
-and turning what accumulates into either a bounded assertion or a ledger entry. Two pieces of
-in-memory state landed after it and have never been soaked for duration — and looking at the first
-of them found a bug before any soak ran. **`rate.RateLedger.windows` grew without bound**: `prune`
-existed, said in its docstring that the maintenance tick called it, and nothing did, so both dicts
-behind the rate threshold accumulated one entry per caller-supplied `agent_id` ever seen. Fixed
-2026-09-01, on wall time rather than the poller's monotonic clock (the trap one line above it), and
-the ledger is now armed in `loop_affinity` — it had been outside the guard entirely. **`AdminOverlay.audit`
-is the remaining one** (bounded at 500, and the store is rewritten whole on every control action).
+**Duration answered 2026-09-01, and the answer took three runs.** The soak had never been run long.
+
+- **`rate.RateLedger.windows` grew without bound** — found before any soak ran, by reading. `prune`
+  existed, its docstring said the maintenance tick called it, and nothing did, so both dicts behind
+  the rate threshold accumulated one entry per caller-supplied `agent_id` ever seen. Fixed on wall
+  time rather than the poller's monotonic clock (the trap one line above it), and the ledger is now
+  armed in `loop_affinity` — it had been outside the guard entirely.
+- **A 25-minute run then reported a large leak — in the instrument.** RSS climbed
+  118MB → 1867MB (+72.8 MB/min, linear, no plateau) and the growth was `FakeBackend.requests`, an
+  unbounded list holding a body and a header dict per request. 🚨 `tools/soak.py` exists to detect
+  leaks by RSS slope and its headline number was dominated by its own test double. The recorder is
+  bounded now, and reports what it drops.
+- **The proxy itself does not leak.** A 900s run at 462 req/s rose to 115MB while the 300s metrics
+  window filled and then sat at **123MB for the remaining 600s** across 416,000 requests, every one
+  answered, single-threaded throughout. WAL stayed at ~4.5MB, so checkpointing keeps up.
+- **The tool now separates warm-up from leak.** `RollingMetrics` retains 300s, so RSS *cannot* be
+  flat before then and any run shorter than that reports a positive slope that is steady state being
+  reached. It reads the window off the live object and prints the post-warm-up slope as the leak
+  number, or refuses to give one and says why. A leak detector whose own warm-up looks like a leak is
+  the same class of fault as the recorder above.
+
+**Still open in F.** `queue.db` grows ~1KB per request and nothing prunes it — 660MB over 697,000
+requests. That is disk rather than memory and it is the durable record, so retention is a policy
+question rather than a bug, but no deployment has been told to answer it. `AdminOverlay.audit` has
+still never been soaked for duration (bounded at 500, and the store is rewritten whole on every
+control action). And nothing covers a **remote provider over a real network**, where the failure
+modes are latency variance and partial responses rather than contention.
 
 ### H · A read-only admin scope, and the audit trail
 

@@ -3,13 +3,60 @@
 Defects that came back, or that were subtle enough to come back. Format: **symptom → root cause →
 guard**. Add an entry *with* the fix, not after it.
 
-> **Seeded, not complete.** The origin monorepo keeps a large regression ledger; only the entries
-> that are about *this software* (rather than about a fleet deployment) are reproduced here, plus
-> what was learned during the extraction. **Transplanting the rest is an open task** — grep the
-> origin ledger for llmproxy-relevant entries. Start with one distinctive word and widen; entries
-> are multi-line prose, so a two-term regex on one line will miss them.
+> **Seeded, and the transplant has begun.** The origin monorepo keeps a large regression ledger
+> (17,006 lines, 131 entries); only the entries about *this software* — rather than about a fleet
+> deployment — belong here, plus what was learned during the extraction.
+>
+> **First sweep run 2026-09-01.** 131 entries split on their slug bullets and scored against
+> proxy vocabulary; the dense candidates read by hand. Two useful results, and the second is the
+> one worth repeating:
+>
+> - `models-yaml-alias-collision` **transplanted, and it was not a transplant** — the origin
+>   *raised* on a duplicate alias and this repo resolved it *silently*. The lesson survived the
+>   extraction and the guard did not. Entry below.
+> - `thinking-was-a-no-op-and-reported-healthy` **deliberately not transplanted.** Its fix
+>   (`Correction.fold_system_for_thinking`) was removed here on 2026-08-22 after all four cells
+>   were re-measured live against a different model, and `correction.py` carries that reasoning at
+>   the deletion site. 🚨 That is the "look before you fix" rule paying for itself: porting the
+>   entry would have argued for restoring a workaround this repo had already retired on evidence.
+>
+> **Still open.** The three largest origin entries (4,000+ lines each) score high on proxy
+> vocabulary incidentally and have not been read. Entries are multi-line prose, so a two-term regex
+> on one line will miss them — split on the slug bullets, score whole entries, then read.
 
 ---
+
+## An alias claimed twice routed silently to whichever endpoint the file listed first
+
+**Symptom.** None here — which is why it is an entry. In the origin monorepo the same config had a
+loud symptom: a gateway dead, the port refusing connections, a restart reporting only
+`health-poll timeout (300s)`. `tier3` had been added to a second stanza while still present on the
+first, `load_catalog()` raised `name collision` at **module import**, and the process crash-looped
+to FATAL and needed its state cleared by hand.
+
+**Root cause.** An alias resolves to exactly one endpoint. A move is a delete plus an add, and the
+add lands before somebody remembers the delete.
+
+**What the extraction changed, and why it is worse.** This repo builds the same map with
+`by_name.setdefault(alias, e.name)`, so a second claim is not an error — it is discarded, in file
+order, in silence. That trades a loud failure for an invisible one: the operator's name now reaches
+an endpoint they did not intend, on every request, forever, with nothing anywhere saying so. The
+same applies to an alias that collides with another endpoint's *class or role*, which the two later
+registration loops overwrite — that ordering is deliberate and correct (a class must be reachable by
+its own name) and it still silently kills an alias somebody wrote.
+
+🚨 **Neither behaviour was right.** Refusing to load is not the answer either: this repo's own rule
+elsewhere is that a typo must not stop a fleet booting — a dropped `policy:` key is reported, not
+raised — and the origin's version of this took a whole gateway down at import over one duplicated
+line.
+
+**Guard.** `tests/test_alias_collision.py`. It loads, resolution is unchanged, and both cases report
+through `hooks.config_notice` — `duplicate` for two endpoints claiming one alias, `shadowed` for an
+alias another endpoint's class or role wins — each naming the endpoint the name actually reaches in
+an `in_force` field, which is the management plane's own vocabulary and is read by
+`GET /rs/v1/admin/config`. A self-alias is deliberately NOT reported: an alias equal to its own class
+maps to itself, is common, and a notice that fires on every boot is a notice nobody reads. The
+shipped example is asserted clean for the same reason.
 
 ## A fix for an invisible gap was itself invisible for two months
 
