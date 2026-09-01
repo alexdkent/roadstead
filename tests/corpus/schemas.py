@@ -1,16 +1,25 @@
 from __future__ import annotations
 
-"""LLMProxy v2 test-harness — regression corpora seeds (Phase T / WU5).
+"""Regression corpora seeds — the structured-output and chat-loop fixtures.
 
-STATIC test fixtures: real fleet structured-output schemas + a chat-loop slice,
-captured as literal data so Phases 3-5 can grade the proxy's structured/repair
-and chat paths against a known-good, self-consistent corpus.
+STATIC test fixtures the correction layer is graded against: four
+structured-output cases and a five-turn chat-loop slice, captured as literal
+data so `correction.py`'s repair paths have a known-good, self-consistent corpus
+to be measured on rather than examples invented to pass.
 
-These fixtures are COPIED SHAPES from the live agent code (each case cites its
-source file:line). They deliberately DO NOT import agent code — importing the
-agents pulls the whole stack and breaks under the isolated test runner. When a
-schema was large or awkward to reproduce exactly, a faithful REPRESENTATIVE
-subset is captured and marked as such.
+🚨 **These are SHAPES, not records.** Each case was drawn from a structured
+prompt that ran in production, which is what makes the corpus worth having — an
+invented fixture only ever exercises the failures its author already thought of.
+What survived the extraction is the PROPERTY each one pins (a closed enum
+vocabulary, an open one, an array root, a negative constraint); the vocabulary
+around it — agent names, source paths, people, places, brands — was one private
+deployment's and is gone (scrub item S4, `docs/corpus_and_scrub_plan.md`). Every
+name, address and business below is fictional, and the prompts are synthesized.
+Do not read any of it as a record of anything.
+
+Each case's ``source`` says what the shape is and why the fixture exists. It
+used to be a ``file:line`` into the origin monorepo, which resolves nowhere here
+and never will.
 
 This module is DATA ONLY — it does not drive the proxy.
 """
@@ -43,15 +52,15 @@ class StructuredCase:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Case 1 — mail-agent email-triage classifier (GBNF).
-# Source: originfleet/originfleet/agents/mail-agent/grammars/classify_triage.gbnf
-#   + enums in originfleet/originfleet/agents/mail-agent/triage_taxonomy.py:44-65
-#   + payload build in triage_classifier.py:341-375 (mode="triage").
-# The grammar emits the three decision axes + self-assessed confidence + reason.
+# Case 1 — email triage classifier (GBNF): a flat object of CLOSED enums.
+# Three decision axes + a self-assessed confidence + a free-text reason. The
+# property: a grammar whose entire job is to hold the model inside a fixed
+# vocabulary on several axes at once. This is the commonest real shape, and the
+# one where a repair that WIDENS the vocabulary is worse than a clean refusal —
+# a caller cannot tell an invented enum value from a model that chose it.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_TRIAGE_GBNF = r'''# GBNF grammar for the mail-agent email-triage classifier.
-# copied shape of grammars/classify_triage.gbnf
+_TRIAGE_GBNF = r'''# GBNF grammar for an email-triage classifier.
 root ::= (
         "{" ws
         "\"domain\"" ws ":" ws domain ws ","
@@ -90,9 +99,8 @@ TRIAGE_URGENCIES = ["overdue", "due", "upcoming", "info"]
 TRIAGE_CONFIDENCES = ["high", "medium", "low"]
 
 _TRIAGE_CASE = StructuredCase(
-    name="mail-agent_email_triage_gbnf",
-    source="originfleet/originfleet/agents/mail-agent/grammars/classify_triage.gbnf"
-           " + triage_taxonomy.py:44-65",
+    name="email_triage_closed_enums_gbnf",
+    source="a production triage classifier — a flat object of closed enums",
     kind="gbnf",
     schema=_TRIAGE_GBNF,
     prompt=(
@@ -104,8 +112,8 @@ _TRIAGE_CASE = StructuredCase(
         "action = what the user must do (pay|reply|decide|schedule|verify|none).\n"
         "urgency = when it matters (overdue|due|upcoming|info).\n"
         "confidence = high|medium|low. reason = one line.\n\n"
-        "EMAIL: From: billing@example-utility.test  Subject: Your Example Utility bill is "
-        "ready — $142.18 due Jul 15. Autopay is OFF on this account.\n\n"
+        "EMAIL: From: billing@example-utility.test  Subject: Your Example Utility "
+        "bill is ready — $142.18 due Jul 15. Autopay is OFF on this account.\n\n"
         "Return ONLY the JSON object."
     ),
     valid_output=(
@@ -122,15 +130,17 @@ _TRIAGE_CASE = StructuredCase(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Case 2 — mail-agent triage in "understand" (escalation) mode (GBNF+extra).
-# Source: triage_classifier.py:216-240 (TriageVerdict), :363-368 (understand mode
-#   grammar = classify_triage_understand.gbnf), parse_verdict :277-324.
-# The understand grammar additionally emits summary / recommended_action /
-# priority_reason. Represented here as a superset schema case (representative).
+# Case 2 — the same triage in ESCALATION mode (GBNF, superset of case 1).
+# The cheap classifier's five axes PLUS three free-text understanding fields.
+# The property: a grammar that GREW. Case 1 and case 2 differ only by fields
+# appended to one object, which is what makes the pair worth having — a repair
+# tuned to the narrow grammar must not silently drop what the wide one added.
+# Its `invalid_output` is the truncation case: unterminated mid-string, the
+# classic streaming cutoff.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_TRIAGE_UNDERSTAND_GBNF = r'''# representative of grammars/classify_triage_understand.gbnf
-# superset of the cheap triage grammar: same 5 axes PLUS three understanding fields.
+_TRIAGE_UNDERSTAND_GBNF = r'''# superset of the cheap triage grammar:
+# the same 5 axes PLUS three understanding fields.
 root ::= (
         "{" ws
         "\"domain\"" ws ":" ws domain ws ","
@@ -155,16 +165,16 @@ ws    ::= [ \t\n\r]*
 '''
 
 _TRIAGE_UNDERSTAND_CASE = StructuredCase(
-    name="mail-agent_email_triage_understand_gbnf",
-    source="originfleet/originfleet/agents/mail-agent/triage_classifier.py:216-240,363-368",
+    name="email_triage_escalation_gbnf",
+    source="the same classifier's escalation mode — case 1's grammar, widened",
     kind="gbnf",
     schema=_TRIAGE_UNDERSTAND_GBNF,
     prompt=(
         "This email escalated for a deeper read. Emit the same domain/action/"
         "urgency/confidence/reason axes AND a short summary, a recommended_action, "
         "and a priority_reason.\n\n"
-        "EMAIL: From: security@example-bank.test  Subject: New sign-in to your account from "
-        "a device we don't recognize. Review activity now.\n\n"
+        "EMAIL: From: security@example-bank.test  Subject: New sign-in to your "
+        "account from a device we don't recognize. Review activity now.\n\n"
         "Return ONLY the JSON object."
     ),
     valid_output=(
@@ -185,13 +195,14 @@ _TRIAGE_UNDERSTAND_CASE = StructuredCase(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Case 3 — knowledge_v3 refinery "frame extraction" (json_schema).
-# Source: originfleet/originfleet/agents/knowledge_v3/refinery/frame_extract.py
-#   _SYSTEM :48-71 (the output contract) + _normalize :147-164 (the persisted shape).
-# The in-repo gold standard: NO fixed schema is handed to the model — it derives
-# the KIND and coins new component types (open vocab). We represent the OUTPUT
-# CONTRACT as a permissive json_schema (open component-kinds via additionalProperties)
-# so Phase-3 can validate the persisted-frame shape without closing the vocab.
+# Case 3 — open-vocabulary frame extraction (json_schema): the mirror of case 1.
+# NO fixed schema is handed to the model — it derives the KIND and coins new
+# component types. What is pinned is the OUTPUT CONTRACT, as a deliberately
+# permissive json_schema: dynamic keys under `spine`, `additionalProperties: True`
+# throughout, and `components[].type` required but never enumerated.
+# The property: a schema backstop must be able to validate a shape without
+# CLOSING it. Case 1 fails if a repair widens the vocabulary; this one fails if a
+# repair narrows it, and the two failures are the same bug seen from both sides.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _FRAME_JSON_SCHEMA: Dict[str, Any] = {
@@ -242,8 +253,8 @@ _FRAME_JSON_SCHEMA: Dict[str, Any] = {
 }
 
 _FRAME_CASE = StructuredCase(
-    name="knowledge_v3_frame_extract_json_schema",
-    source="originfleet/originfleet/agents/knowledge_v3/refinery/frame_extract.py:48-71,147-164",
+    name="open_vocab_frame_extract_json_schema",
+    source="a production knowledge extractor — an OPEN-vocabulary object contract",
     kind="json_schema",
     schema=_FRAME_JSON_SCHEMA,
     prompt=(
@@ -256,8 +267,8 @@ _FRAME_CASE = StructuredCase(
         "grounded in the source. Set STATUS (proposed|booked|confirmed|completed|"
         "cancelled|unknown). Exclude marketing/boilerplate as noise. Add a "
         "coherence_check.\n\n"
-        "SOURCE: Northwind Air confirmation QQ7X2R — Jordan Rivera, SFO→JFK Jul 12 6:05am flight "
-        "NW2412, seat 14C, Economy. Earn 2,500 miles! Terms apply.\n\n"
+        "SOURCE: Northwind Air confirmation QQ7X2R — Jordan Rivera, SFO→JFK Jul 12 "
+        "6:05am flight NW2412, seat 14C, Economy. Earn 2,500 miles! Terms apply.\n\n"
         "Output ONLY the JSON object."
     ),
     valid_output=(
@@ -286,11 +297,14 @@ _FRAME_CASE = StructuredCase(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Case 4 — investor trade-proposal array (json_schema).
-# Source: originfleet/originfleet/agents/investor/perception/proposals.py
-#   Proposal :66-86, _SYSTEM_PROMPT :43-55, _parse_one :129-164 (validation rules).
-# The model outputs a JSON ARRAY of trade IDEAS (never orders/sizes). Each item:
-#   symbol (ticker), direction long|short|flat, thesis, confidence 0..1, source_refs.
+# Case 4 — a constrained proposal ARRAY (json_schema).
+# Two properties nothing else in the corpus carries: the root is an ARRAY rather
+# than an object, and the item schema states what must NOT be present
+# (`not`/`anyOf`/`required`) as well as what must. The domain here is trade
+# IDEAS, where sizing is deliberately somebody else's job — but the shape is the
+# point: a downstream system owns those fields and a model that emits them has
+# produced a well-formed answer to the wrong question. `test_corpus_smoke.py`'s
+# fallback validator grew negative-constraint support for this case alone.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _INVESTOR_JSON_SCHEMA: Dict[str, Any] = {
@@ -321,8 +335,8 @@ _INVESTOR_JSON_SCHEMA: Dict[str, Any] = {
 }
 
 _INVESTOR_CASE = StructuredCase(
-    name="investor_trade_proposals_json_schema",
-    source="originfleet/originfleet/agents/investor/perception/proposals.py:43-86,129-164",
+    name="constrained_proposal_array_json_schema",
+    source="a production proposal generator — an ARRAY root with a NEGATIVE constraint",
     kind="json_schema",
     schema=_INVESTOR_JSON_SCHEMA,
     prompt=(
@@ -365,16 +379,21 @@ STRUCTURED_CASES: List[StructuredCase] = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHAT_LOOP_CASES — representative orchestrator inner-loop chat request bodies.
-# Representative of the orchestrator tool-calling inner loop; the leading
-# byte-stable block (persona + loop contract + tool catalog) then a user turn,
-# then assistant tool-calls + tool results across iterations.
-# See originfleet/originfleet/orchestrator/prompt_builder.py:14-34 for the
-# leading/trailing split; these are SYNTHESIZED to look like real inner-loop turns.
+# CHAT_LOOP_CASES — an agentic tool-calling inner loop, five iterations deep.
+# The structure is what matters: a LEADING byte-stable block (persona + loop
+# contract + tool catalog) that is identical across every turn, then the dynamic
+# tail — a user turn, then assistant tool-calls and tool results accumulating
+# across iterations. That split is the prompt-cache reuse boundary, so a fixture
+# that got it wrong would grade the cache path against a shape it never sees.
+#
+# 🚨 SYNTHESIZED, and every name, place and business in them is fictional. They
+# are built to LOOK like real inner-loop turns because the shape depends on
+# plausible lengths and a plausible tool ladder — not because they are records
+# of any conversation. See the module docstring (scrub item S4).
 # ─────────────────────────────────────────────────────────────────────────────
 
 _LOOP_SYSTEM_LEADING = (
-    "You are Sidekick, the household's assistant. You run a tool-calling loop: on each "
+    "You are Iris, a household assistant. You run a tool-calling loop: on each "
     "turn either call exactly one tool to gather what you need, or answer the user "
     "directly when you have enough. Tools available:\n"
     "- knowledge_recall: retrieve stored facts about people, trips, and things.\n"
@@ -386,7 +405,7 @@ _LOOP_SYSTEM_LEADING = (
 # Case A — single-turn, tool not yet called (iteration 1).
 _CHAT_CASE_A: Dict[str, Any] = {
     "name": "loop_iter1_user_only",
-    "model": "orchestrator-reasoner",
+    "model": "tier3",
     "messages": [
         {"role": "system", "content": _LOOP_SYSTEM_LEADING},
         {"role": "user", "content": "When is Robin's next dentist appointment?"},
@@ -398,7 +417,7 @@ _CHAT_CASE_A: Dict[str, Any] = {
 # Case B — iteration 2: assistant issued a tool call, tool result came back.
 _CHAT_CASE_B: Dict[str, Any] = {
     "name": "loop_iter2_after_tool_result",
-    "model": "orchestrator-reasoner",
+    "model": "tier3",
     "messages": [
         {"role": "system", "content": _LOOP_SYSTEM_LEADING},
         {"role": "user", "content": "When is Robin's next dentist appointment?"},
@@ -432,7 +451,7 @@ _CHAT_CASE_B: Dict[str, Any] = {
 # Case C — a two-tool chain (temporal then research), iteration 3.
 _CHAT_CASE_C: Dict[str, Any] = {
     "name": "loop_iter3_two_tool_chain",
-    "model": "orchestrator-reasoner",
+    "model": "tier3",
     "messages": [
         {"role": "system", "content": _LOOP_SYSTEM_LEADING},
         {"role": "user", "content": "Do I need a jacket for my walk this afternoon?"},
@@ -490,7 +509,7 @@ _CHAT_CASE_D: Dict[str, Any] = {
         "grammar": (
             'root ::= "{" ws "\\"handler\\"" ws ":" ws handler ws "," ws '
             '"\\"confidence\\"" ws ":" ws conf ws "}"\n'
-            'handler ::= "\\"dj\\"" | "\\"knowledge\\"" | "\\"temporal\\"" | "\\"research\\"" | "\\"chat\\""\n'
+            'handler ::= "\\"music\\"" | "\\"knowledge\\"" | "\\"temporal\\"" | "\\"research\\"" | "\\"chat\\""\n'
             'conf ::= "\\"high\\"" | "\\"medium\\"" | "\\"low\\""\n'
             'ws ::= [ \\t\\n\\r]*'
         )
@@ -500,14 +519,15 @@ _CHAT_CASE_D: Dict[str, Any] = {
 # Case E — a longer summary/carryover turn (trailing dynamic block heavy).
 _CHAT_CASE_E: Dict[str, Any] = {
     "name": "loop_summary_carryover_turn",
-    "model": "orchestrator-reasoner",
+    "model": "tier3",
     "messages": [
         {"role": "system", "content": _LOOP_SYSTEM_LEADING},
         {
             "role": "system",
             "content": (
-                "[rolling summary] Jordan asked about weekend travel; you recalled the "
-                "Jul 12 Delta SFO->JFK flight and the Example Dental appointment for Robin.\n"
+                "[rolling summary] the user asked about weekend travel; you recalled "
+                "the Jul 12 Northwind Air SFO->JFK flight and the Example Dental "
+                "appointment for Robin.\n"
                 "[self_status] knowledge_recall: ok  temporal_context: ok\n"
                 "[carryover] user is planning around Robin's schedule this week."
             ),

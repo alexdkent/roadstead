@@ -188,6 +188,22 @@ in `docs/api.md` — the OpenAI surface is unaffected.
 
 ### Changed
 
+- **The structured-output corpus keeps every fixture and loses the vocabulary around them** (scrub
+  item **S4**). `tests/corpus/schemas.py`'s four structured cases and five chat-loop cases stay —
+  each pins a property no other one does, and they came from prompts that actually ran, which is
+  what an invented fixture can never be. What went: case names that were a private deployment's
+  agent names, `source=` fields that were `file:line` pointers into a monorepo that resolves nowhere
+  here, and `"model": "orchestrator-reasoner"` (both that deployment's vocabulary and a word
+  `CLAUDE.md` rejects — the chat cases now name a catalog endpoint class). No schema, grammar,
+  output shape or message ordering moved.
+- **🚨 And the personal identifiers inside those fixtures, which the scrub plan had ruled out.** Its
+  headline finding was that no replay corpus of real traffic came across — true, and checked — from
+  which it concluded there was no personal data in the repo. That does not follow: the synthesized
+  example prompts were written around whatever was to hand, which included a real full name, a
+  household member, a home town, a named local dental practice, and fabricated notices attributed to
+  a real utility and a real bank. All fictional now, and the module says so at the top. The
+  straggler sweep in `docs/corpus_and_scrub_plan.md` grew a second pattern, because a grep for the
+  thing you imported cannot find the thing somebody typed.
 - **`usage_rates.py` is anchored to model CLASSES, not to one fleet's models.** It was the second
   hardware inventory in the tree — model names, cutover narratives, host-prefixed unit names. A
   remote endpoint maps to `None` (unmetered) rather than to a rate: pricing spill from an

@@ -110,7 +110,9 @@ def _structural_json_schema_check(schema: dict, obj: object) -> bool:
                         return False
                     if hi is not None and obj[key] > hi:
                         return False
-        # forbidden-fields ("not/anyOf/required") support for the investor case.
+        # forbidden-fields ("not/anyOf/required") support — grown for the constrained
+        # proposal-array case, which is the only one in the corpus that carries a
+        # NEGATIVE constraint.
         neg = schema.get("not")
         if isinstance(neg, dict):
             for clause in neg.get("anyOf", []):

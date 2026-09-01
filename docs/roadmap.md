@@ -254,6 +254,11 @@ of private topology. It also turned up a fourth inventory nobody had listed — 
 one fleet's agent roster with weekly volumes and infra paths — which is now a generic example on the
 caller archetypes named above, exactly as `models.yaml` is.
 
+**S4 is done** (2026-09-01): the structured-output corpus keeps every fixture and loses the
+vocabulary around them — and it corrected this plan's own headline finding, which had ruled personal
+data out of the repo on the strength of no bulk corpus having come across. The synthesized prompts
+were written around real identifiers. The straggler sweep now looks for both.
+
 **Only the history rewrite (S6) is left**, and it is the expensive one.
 
 ⚠️ The history rewrite stays last — it invalidates every SHA.

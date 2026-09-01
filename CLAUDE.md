@@ -299,6 +299,12 @@ API key. The working tree carries no private address. It also turned up `agents.
 inventory nobody had listed (one fleet's agent roster, weekly volumes, infra paths — and the package
 DEFAULT), now a generic example on the roadmap's caller archetypes.
 
+**S4 is done** (2026-09-01). `tests/corpus/schemas.py` keeps all nine fixtures — each pins a
+property no other one does — and lost every word of the vocabulary around them. It also turned up
+the thing the scrub plan had explicitly ruled out: **personal identifiers**, in synthesized prompts
+somebody wrote around whatever was to hand. No bulk corpus came across, which is what was checked;
+that is not the same as no personal data, and the sweep in S5 now runs both patterns.
+
 🚨 **What remains under fleet names is COMMENTS RECORDING MEASUREMENTS, and they stay.** Same rule as
 `models.yaml`: those are records of what was measured, not references to anything that exists here.
 
