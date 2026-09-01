@@ -295,6 +295,28 @@ know least about *because* we know least about it). Profiles are expressed in de
 never endpoint names — one that named classes would be a third routing table to keep in step with
 `models.yaml`.
 
+🚨 **The intent VOCABULARY is configurable; the routing table is not.** `models.yaml` has an
+`intents:` section, layered over the nine built-ins rather than replacing them — a file defining one
+profile has said nothing about the other nine — and an override is disclosed through each published
+profile's `source` (`builtin` | `models.yaml`), because a caller reading our docs for a word this
+fleet redefined has no other way to notice. 🚨 **A profile still cannot name an endpoint**, and now
+there is a config parser that must not learn how: guarded from both ends, the allowlist
+(`model_catalog._PROFILE_FIELDS`) and `Profile`'s own fields. An **unusable** stanza — unknown
+capability, kind or preference — is REFUSED rather than offered, because a profile that matches
+nothing sends the caller "no endpoint satisfies requires=[…]", a sentence about the fleet for a fault
+in a config file; refused, they get "unknown intent", which points at the vocabulary. A refused
+*override* does not leave the built-in standing under the operator's spelling.
+
+🚨 **`exclude` is the caller's negative constraint, and the line it respects is CONFIG vs REQUEST —
+not positive vs negative.** A profile is shared, published, operator-written vocabulary and stays in
+capabilities; an intent is one caller's words about one call, where `pin` already names an endpoint.
+So `exclude` names endpoints and adds no table. 🚨 **An `exclude` naming an endpoint this fleet does
+not have is a 404, never a warning.** "Satisfied trivially, the endpoint it forbids is absent"
+assumes the thing we cannot check: a name resolving to nothing is either "not here" or "here, under a
+spelling you got wrong", identical from inside — and serving the second routes to precisely the
+endpoint the exclusion existed to avoid, reporting success. Never collapse "we checked" with "we
+could not tell". `model` and `exclude` naming the same endpoint is a 400.
+
 🚨 **A request may DECLINE a substitution; it may never grant itself one.** `substitution: {degrade,
 spill}` narrows what the operator granted, and both gates take the **AND** — an `or` there would let
 a caller award itself a permission its operator withheld, which is the self-asserted `agent_id` bug

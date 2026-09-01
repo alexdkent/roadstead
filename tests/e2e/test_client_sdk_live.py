@@ -113,7 +113,7 @@ async def test_the_narrowing_flags_ride_the_envelope(sdk):
 
     body = _chat_body(
         messages=[{"role": "user", "content": "secret"}], intent="chat",
-        model="", requires=None, kind="", min_context=0, prefer="",
+        model="", requires=None, exclude=None, kind="", min_context=0, prefer="",
         priority=None, interactive=None, deadline_s=None,
         allow_degrade=None, allow_spill=False, call_site="", session_id=None,
         turn_id=None, stream=False, payload=None, extra_payload=None)
@@ -122,6 +122,34 @@ async def test_the_narrowing_flags_ride_the_envelope(sdk):
     result = await sdk.chat(intent="chat", allow_spill=False,
                             messages=[{"role": "user", "content": "secret"}])
     assert result.attribution.substitution == ""
+
+
+async def test_the_sdk_can_speak_the_negative_constraint(sdk):
+    """`exclude` is a routing declaration, so it belongs OUTSIDE `payload` with
+    the other ones — inside, it would reach a backend as an unknown field.
+
+    And it is a constraint, not a hint: a name this fleet does not serve is
+    refused by the server rather than dropped, so the SDK that can send one must
+    also surface that refusal as `UnroutableError` rather than as a bare 404.
+    """
+    from roadstead.client._client import _chat_body
+
+    body = _chat_body(
+        messages=[{"role": "user", "content": "hi"}], intent="chat",
+        model="", requires=None, exclude=["tier1"], kind="", min_context=0,
+        prefer="", priority=None, interactive=None, deadline_s=None,
+        allow_degrade=None, allow_spill=None, call_site="", session_id=None,
+        turn_id=None, stream=False, payload=None, extra_payload=None)
+    assert body["exclude"] == ["tier1"]
+    assert "exclude" not in body["payload"]
+
+    result = await sdk.chat(intent="chat", exclude=["tier1"],
+                            messages=[{"role": "user", "content": "hi"}])
+    assert result.attribution.endpoint != "tier1"
+
+    with pytest.raises(UnroutableError):
+        await sdk.chat(intent="chat", exclude=["no-such-endpoint"],
+                       messages=[{"role": "user", "content": "hi"}])
 
 
 async def test_unknown_response_fields_stay_reachable():

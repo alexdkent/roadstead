@@ -8,6 +8,71 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Added — the intent vocabulary in config, and the negative constraint (Workstream C)
+
+Landed 2026-09-01. Both of C's open items, and they turned out to be one question — *who owns the
+words a caller may use* — with one line running through it: **config vs request**, not positive vs
+negative.
+
+**`models.yaml` grows an `intents:` section.** Nine profiles still ship built in; a deployment's own
+are **layered over** them rather than replacing them, because a file that defines one profile has
+said nothing about the other nine, and a whole-table swap would silently empty a vocabulary
+`GET /rs/v1/models` publishes and callers code against. Overriding by name is how a fleet says its
+`reasoning` means something particular, and it is **disclosed**: every published profile carries
+`source: builtin | models.yaml`, since a caller reading our documentation for a word this fleet
+redefined has no other way to notice.
+
+🚨 **A profile still cannot name an endpoint — and now there is a config parser that must not learn
+how.** A profile naming endpoints would be a second routing table to keep in step with `endpoints:`,
+and it would break on every fleet spelled differently from the example's. Guarded from both ends: the
+allowlist (`_PROFILE_FIELDS`) and `Profile`'s own fields, so the rule does not rest on a door in a
+wall with a second door.
+
+**An unusable stanza is REFUSED, not offered.** An unknown capability, kind or preference makes a
+profile that matches nothing on every request — and the caller reads "no endpoint satisfies
+requires=[…]", a sentence about the fleet, for a fault in a config file. Refused, they get "unknown
+intent", which points at the vocabulary, where the fault is. Either way the operator gets a
+`hooks.config_notice`, readable at `GET /rs/v1/admin/config`. A refused *override* does not leave the
+built-in standing under the operator's spelling — they would be reading their own summary in the file
+while callers got ours on the wire, which is the declared-vs-in-force gap the management plane exists
+to close, created by us.
+
+**`exclude` — the negative constraint, and why it is expressible.** A caller working around one bad
+model wants "anything but this", and the alternative is enumerating every endpoint it *would* take,
+which is a routing table in the caller. It fits because the vocabulary it needs is not the profile
+vocabulary: a profile is shared, published, operator-written and stays in capabilities; an intent is
+one caller's words about one call, where `pin` already names an endpoint. `exclude` says the same
+kind of thing in the other direction and adds no table. It is normalized through the same callable as
+`pin` (an exclusion compared literally would not match an alias, and would route to exactly the
+endpoint it was written to avoid), it is a complete declaration on its own, and it is reported ahead
+of any property of the endpoint — a caller who excluded something also unrouted needs the reason they
+can act on.
+
+🚨 **An `exclude` naming an endpoint this fleet does not have is a `404 unknown_endpoint`, not a
+warning.** This was built as a disclosure first and changed, because the disclosure argument assumes
+the one thing the proxy cannot check. Such a name is either "not in this fleet" or "in this fleet,
+under a spelling you got wrong", and from inside those are identical bytes; serving the second sends
+the request to precisely the endpoint the exclusion existed to avoid and reports success. Same shape
+as the `finish_reason` repair that became a silencer, and as the GBNF grammar OpenRouter refuses
+rather than drops. It is also what `pin` already does: a caller that must spell an endpoint correctly
+to demand it does not get to misspell one to avoid it. Naming the same endpoint in `model` and
+`exclude` is a `400` — a contradiction wholly visible in the request, refused where the caller can
+see it rather than resolved to an empty candidate set that reads as a fault in the fleet.
+
+**One bug, found by running it.** The refusal echoed the **normalized** name: `normalize` lower-cases
+and strips, so a caller who wrote `"tierX"` was told `'tierx'` — a word it never sent, in the one
+message whose whole job is helping it find a typo. It is the reason `pin_as_written` exists, missed in
+the other direction, and the suite was green throughout because the refusal fired and named something
+plausible. `Intent` now keeps the *pairing* rather than two sets, and matches on the normalized form
+while reporting the written one.
+
+**No new error code.** An unresolvable exclusion is the existing `unknown_endpoint`; a contradiction
+is the existing `invalid_request_error`. `docs/api.md` §1.7.1. The shipped example gains one additive
+profile (`bulk`) so the config path is exercised on every boot rather than documented and unrun.
+`tests/test_intent_config.py`. Sixteen mutations, every guard observed going red — one first failed
+by raising from `intent.py` rather than by asserting, which is half a guard, and was rewritten.
+
+
 ### Changed — two cleanups on the hot path and the client boundary
 
 Landed 2026-09-01. Both were diagnosed and left open; neither changes a contract.

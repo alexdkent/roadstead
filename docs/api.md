@@ -314,23 +314,49 @@ caller has no more business reading that than dispatching to it.
 
 #### 1.7.1 Declaring what you want: intent, or a pin
 
-A request declares **one or both** of:
+A request must declare at least one of `intent`, `model`, `requires` or
+`exclude`, and may combine them — a pin and a profile together (`model: tier3`,
+`intent: vision`) reads as "this endpoint, and it had better be able to see":
 
 | Field | Type | Meaning |
 |---|---|---|
-| `intent` | string | A capability **profile** — `fast-chat`, `chat`, `reasoning`, `vision`, `tools`, `structured`, `long-context`, `embed`, `rerank`. Roadstead owns the choice of model, provider and moment. |
+| `intent` | string | A capability **profile** — `fast-chat`, `chat`, `reasoning`, `vision`, `tools`, `structured`, `long-context`, `embed`, `rerank` ship built in, and a deployment may add or override them. Roadstead owns the choice of model, provider and moment. |
 | `model` | string | A **pin**: an endpoint class, role or alias. A constraint on routing, not a different API. |
+| `exclude` | [string] | Endpoints this request must **not** use — classes, roles or aliases, resolved exactly as `model` is. A negative constraint, for a caller working around one bad model. |
 | `requires` | [string] | Capabilities that must be declared on whatever serves: `vision`, `reasoning`, `streaming`, `tool_calling`, `structured_output`. Composes on top of the profile's own. |
 | `kind` | string | `chat` \| `embed` \| `rerank`. Defaults from the profile, else `chat`. |
 | `min_context` | int | Minimum context window, tokens. |
 | `prefer` | string | How to order candidates: `balanced` (default), `latency`, `capacity`, `context`, `cost`. An explicit value beats the profile's. |
 
-`GET /rs/v1/models` publishes the profile table under `intents` rather than
-asking a caller to read our source for it. ⚠️ **The table is built in today** —
-a deployment cannot yet add or override a profile without editing the package,
-which is an open item in `docs/roadmap.md` under Workstream C. The route
-publishes it anyway, because the day it becomes configurable a caller that had
-been hard-coding our list would break, and one that had been asking would not.
+`GET /rs/v1/models` publishes the profile table under `intents`, and that is the
+only correct place to read it. Nine profiles ship built in; a deployment adds or
+overrides them with an `intents:` section in its catalog, **layered over** the
+built-ins rather than replacing them, so a file that defines one profile has said
+nothing about the other nine. Each published profile carries a `source` of
+`builtin` or `models.yaml`: a fleet may redefine `reasoning` to mean its own
+thing, and a caller reading this document for that word needs to be able to see
+that it no longer applies.
+
+🚨 **A profile is expressed in declared capabilities and can never name an
+endpoint.** There is no config field that can. A profile naming endpoints would
+be a second routing table to keep in step with the catalog, and it would break on
+every fleet whose classes are spelled differently from ours. `exclude` is not an
+exception to this: it is one caller's words about one request — exactly as `model`
+already is — rather than shared, published vocabulary. The line is between config
+and request, not between positive and negative.
+
+🚨 **An `exclude` naming an endpoint this fleet does not have is a
+`404 unknown_endpoint`, not a warning.** The tempting reading is that such an
+exclusion is satisfied trivially, since the endpoint it forbids is absent. That
+assumes the one thing the proxy cannot check: a name that resolves to nothing is
+either "not in this fleet" or "in this fleet, under a spelling you got wrong",
+and from here those are identical. Serving the second sends the request to
+precisely the endpoint the exclusion existed to avoid and reports success — the
+same shape as a repair that becomes a silencer. A caller that must spell an
+endpoint correctly to demand it does not get to misspell one to avoid it. Naming
+the same endpoint in `model` and `exclude` is a `400`: a contradiction wholly
+visible in the request, refused where the caller can see it rather than resolved
+to an empty candidate set that reads as a fault in the fleet.
 
 🚨 **There is deliberately no `quality` preference.** A gateway cannot measure
 model quality, and a key spelled `quality` that resolved to "the one with the

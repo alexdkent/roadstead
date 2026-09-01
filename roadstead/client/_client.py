@@ -101,6 +101,7 @@ def _chat_body(
     intent: str,
     model: str,
     requires: list[str] | tuple[str, ...] | None,
+    exclude: list[str] | tuple[str, ...] | None,
     kind: str,
     min_context: int,
     prefer: str,
@@ -137,6 +138,12 @@ def _chat_body(
         body["model"] = model
     if requires:
         body["requires"] = list(requires)
+    if exclude:
+        # A NEGATIVE constraint, and a constraint rather than a hint: an
+        # entry naming no endpoint this fleet serves is refused by the
+        # server (404), because "not here" and "here, misspelled" are the
+        # same bytes from its side. docs/api.md §1.7.1.
+        body["exclude"] = list(exclude)
     if kind:
         body["kind"] = kind
     if min_context:
@@ -248,6 +255,7 @@ class AsyncRoadsteadClient:
         intent: str = "",
         model: str = "",
         requires: list[str] | tuple[str, ...] | None = None,
+        exclude: list[str] | tuple[str, ...] | None = None,
         kind: str = "",
         min_context: int = 0,
         prefer: str = "",
@@ -264,7 +272,7 @@ class AsyncRoadsteadClient:
         """
         body = _chat_body(
             messages=None, intent=intent, model=model, requires=requires,
-            kind=kind, min_context=min_context, prefer=prefer,
+            exclude=exclude, kind=kind, min_context=min_context, prefer=prefer,
             priority=priority, interactive=None, deadline_s=None,
             allow_degrade=None, allow_spill=None, call_site="",
             session_id=None, turn_id=None, stream=False, payload=payload,
@@ -284,6 +292,7 @@ class AsyncRoadsteadClient:
         intent: str = "",
         model: str = "",
         requires: list[str] | tuple[str, ...] | None = None,
+        exclude: list[str] | tuple[str, ...] | None = None,
         kind: str = "",
         min_context: int = 0,
         prefer: str = "",
@@ -314,7 +323,7 @@ class AsyncRoadsteadClient:
         """
         body = _chat_body(
             messages=messages, intent=intent, model=model, requires=requires,
-            kind=kind, min_context=min_context, prefer=prefer,
+            exclude=exclude, kind=kind, min_context=min_context, prefer=prefer,
             priority=priority, interactive=interactive, deadline_s=deadline_s,
             allow_degrade=allow_degrade, allow_spill=allow_spill,
             call_site=call_site, session_id=session_id, turn_id=turn_id,
@@ -330,6 +339,7 @@ class AsyncRoadsteadClient:
         intent: str = "",
         model: str = "",
         requires: list[str] | tuple[str, ...] | None = None,
+        exclude: list[str] | tuple[str, ...] | None = None,
         kind: str = "",
         min_context: int = 0,
         prefer: str = "",
@@ -364,7 +374,7 @@ class AsyncRoadsteadClient:
         """
         body = _chat_body(
             messages=messages, intent=intent, model=model, requires=requires,
-            kind=kind, min_context=min_context, prefer=prefer,
+            exclude=exclude, kind=kind, min_context=min_context, prefer=prefer,
             priority=priority, interactive=interactive, deadline_s=deadline_s,
             allow_degrade=allow_degrade, allow_spill=allow_spill,
             call_site=call_site, session_id=session_id, turn_id=turn_id,

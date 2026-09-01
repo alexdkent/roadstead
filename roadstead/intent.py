@@ -135,6 +135,15 @@ class Profile:
     but the example one.
     """
 
+    #: 🚨 There is deliberately NO ``exclude`` here, although :class:`Intent`
+    #: has one. A profile is *shared, static vocabulary* — it is published to
+    #: every caller and, once it is configurable, written by an operator — so a
+    #: profile naming endpoints is the third routing table this class exists to
+    #: refuse. An intent's ``exclude`` is one caller's own words about one
+    #: request, exactly as ``pin`` already is, and names no endpoint the caller
+    #: could not already have named. The line is between *config* and *request*,
+    #: not between positive and negative.
+
     name: str
     kind: str = "chat"
     requires: frozenset[str] = frozenset()
@@ -142,6 +151,10 @@ class Profile:
     #: One line, published on ``GET /rs/v1/models`` so a caller can discover the
     #: vocabulary instead of reading this file.
     summary: str = ""
+    #: Where this profile came from — ``"builtin"`` or the config file that
+    #: overrode it. Published, because a caller whose fleet redefined
+    #: ``reasoning`` is reading a word that no longer means what our docs say.
+    source: str = "builtin"
 
 
 #: The built-in profiles. They ship so the abstraction works out of the box
@@ -297,6 +310,30 @@ class Intent:
     min_context: int = 0
     prefer: str = DEFAULT_PREFERENCE
 
+    #: Endpoints the caller will NOT accept, normalized to their classes.
+    #: A negative constraint, and the thing a caller working around one bad
+    #: model actually wants — the alternative is pinning every endpoint they
+    #: *would* take, which is a routing table in the caller.
+    #:
+    #: A concrete field rather than a property over ``exclude_pairs`` because
+    #: ``resolve`` tests membership once per candidate; rebuilding a frozenset
+    #: inside that loop would make a diagnostic field cost O(n²).
+    exclude: frozenset[str] = frozenset()
+    #: ``(normalized, as the caller wrote it)`` per exclusion.
+    #:
+    #: 🚨 The pairing is kept, not just the two sets, because a refusal has to
+    #: name the caller's OWN spelling. ``normalize`` lower-cases and strips, so
+    #: an unknown name does NOT come back unchanged: a caller who wrote
+    #: ``"tierX"`` was told ``'tierx'`` — a word it never sent, about a mistake
+    #: it is trying to find. Same reason ``pin_as_written`` exists.
+    exclude_pairs: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def exclude_as_written(self) -> tuple[str, ...]:
+        """The caller's own spellings, in the order they sent them. Cold path —
+        disclosures and refusals only."""
+        return tuple(written for _, written in self.exclude_pairs)
+
     @property
     def declared(self) -> str:
         """What to echo back as ``attribution.requested`` — the caller's own
@@ -352,11 +389,51 @@ def parse_intent(
     raw_pin = str(body.get("model") or "").strip()
     pin = normalize(raw_pin) if (normalize and raw_pin) else raw_pin
     profile_name = str(body.get("intent") or "").strip()
-    if not pin and not profile_name and body.get("requires") is None:
+
+    # 🚨 ``exclude`` is a declaration in its own right. "anything but tier2" is
+    # a complete statement of where a request may go — it is what a caller
+    # working around one bad model has to say, and requiring them to also name
+    # something positive would make them enumerate the endpoints they *would*
+    # take, which is the routing table we refuse to put in a caller.
+    raw_exclude = body.get("exclude")
+    if raw_exclude is None:
+        excluded_as_written: tuple[str, ...] = ()
+    else:
+        if isinstance(raw_exclude, str):
+            raw_exclude = [raw_exclude]
+        if not isinstance(raw_exclude, (list, tuple)):
+            raise IntentError(
+                "`exclude` must be a list of endpoint names, e.g. "
+                '["tier2", "some-alias"]')
+        excluded_as_written = tuple(
+            n for n in (str(x).strip() for x in raw_exclude) if n)
+    # Normalized through the SAME callable as the pin. An exclusion compared
+    # literally would fail to exclude anything on a fleet where the caller
+    # knows the endpoint by an alias — and a negative constraint that silently
+    # matches nothing routes the request to precisely the endpoint it was
+    # written to avoid.
+    exclude_pairs = tuple(
+        ((normalize(n) if normalize else n), n) for n in excluded_as_written)
+    exclude = {norm for norm, _ in exclude_pairs}
+
+    if not pin and not profile_name and body.get("requires") is None \
+            and not exclude:
         raise IntentError(
             "a request must declare an intent — send `intent` (a capability "
-            f"profile: {sorted(table)}), `model` (a specific endpoint), or "
-            "`requires` (a list of capabilities)")
+            f"profile: {sorted(table)}), `model` (a specific endpoint), "
+            "`requires` (a list of capabilities), or `exclude` (endpoints it "
+            "must not use)")
+
+    # A pin and an exclusion of the same endpoint is a caller contradiction:
+    # deterministic, entirely visible in the request, and satisfiable by
+    # nothing. Refused here rather than resolved to an empty candidate set,
+    # because "no endpoint satisfies model='tier2'" would send the caller
+    # looking at the fleet for a fault that is in their own body.
+    if pin and pin in exclude:
+        raise IntentError(
+            f"`model` and `exclude` name the same endpoint "
+            f"({raw_pin!r} resolves to {pin!r}) — a request cannot both "
+            "require and refuse it")
 
     kind = str(body.get("kind") or "").strip()
     prefer = str(body.get("prefer") or "").strip()
@@ -420,6 +497,8 @@ def parse_intent(
         kind=kind,
         min_context=min_context,
         prefer=prefer,
+        exclude=frozenset(exclude),
+        exclude_pairs=exclude_pairs,
     )
 
 
@@ -434,6 +513,12 @@ REJECT_NOT_ROUTED = "not_routed"
 REJECT_WRONG_KIND = "wrong_kind"
 REJECT_MISSING_CAPABILITY = "missing_capability"
 REJECT_CONTEXT_TOO_SMALL = "context_too_small"
+#: The caller said not this one. Distinct from every other reason here in that
+#: it is a property of the REQUEST rather than of the endpoint — which is why it
+#: is checked first and reported per excluded endpoint: unlike a pin, an
+#: exclusion names only what the caller typed, so the rows are bounded by the
+#: request and are exactly the confirmation that the exclusion was understood.
+REJECT_EXCLUDED = "excluded"
 #: The pinned name resolves to nothing at all. Distinct from every reason above,
 #: which are all "this endpoint exists and cannot serve you": this one is "you
 #: named something that is not here", and it sends the caller to a different fix.
@@ -461,6 +546,24 @@ class Resolution:
     #: alternatives, which is what makes ``/rs/v1/plan`` worth calling.
     ranked: tuple[str, ...] = ()
     rejected: tuple[Rejection, ...] = ()
+    #: Exclusions that named no endpoint in this fleet. Non-empty ⟹ not ``ok``.
+    #:
+    #: 🚨 **This REFUSES; it does not warn.** The tempting argument is that such
+    #: an exclusion is honoured trivially — the endpoint it forbids is absent,
+    #: so the constraint holds — and that argument is wrong, because it assumes
+    #: the reading the proxy cannot check. A name that resolves to nothing is
+    #: either "not in this fleet" or "in this fleet under a spelling you got
+    #: wrong", and from here those are the same bytes. Serving the second one
+    #: sends the request to precisely the endpoint the caller wrote the
+    #: exclusion to avoid, and reports success. That is the ``finish_reason``
+    #: repair that became a silencer, and the grammar OpenRouter refuses rather
+    #: than drops: never collapse "we checked" with "we could not tell".
+    #:
+    #: It is also what a ``pin`` already does. An unknown pin is a 404; an
+    #: unknown exclusion is the same mistake, made about the same catalog, in
+    #: the other direction — and a caller that must spell an endpoint correctly
+    #: to demand it should not be able to misspell one to avoid it.
+    unmatched_exclusions: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -480,7 +583,18 @@ class Resolution:
             want.append(f"requires={sorted(self.intent.requires)}")
         if self.intent.min_context:
             want.append(f"min_context={self.intent.min_context}")
+        if self.intent.exclude:
+            want.append(
+                f"exclude={sorted(self.intent.exclude_as_written or self.intent.exclude)}")
         want.append(f"kind={self.intent.kind!r}")
+        if self.unmatched_exclusions:
+            # Deliberately NOT the pin's sentence, although it carries the same
+            # code: a caller reading "unknown model" after excluding one would
+            # look at what it asked for rather than at what it refused.
+            names = ", ".join(repr(n) for n in self.unmatched_exclusions)
+            return (f"`exclude` names {names} — no such endpoint, role or "
+                    "alias, so the exclusion cannot be checked. Remove it, or "
+                    "correct it to a name this fleet serves.")
         if any(r.reason == REJECT_UNKNOWN_ENDPOINT for r in self.rejected):
             # A pin at a name that does not exist. Deliberately worded like the
             # OpenAI door's own unknown-model error, and carrying the same
@@ -532,6 +646,31 @@ def resolve(intent: Intent, facts: list[ModelFacts] | tuple[ModelFacts, ...]) ->
     eligible: list[ModelFacts] = []
     rejected: list[Rejection] = []
 
+    # Which of the caller's exclusions named nothing that is here — checked
+    # FIRST, because it refuses (see `Resolution.unmatched_exclusions`).
+    #
+    # Measured against the WHOLE fleet, not the candidate set. A pin narrows
+    # `candidates`, so an exclusion naming a real endpoint the pin had already
+    # removed would look unmatched here and 404 a request that is entirely
+    # correct — `model: tier1, exclude: [tier2]` refused for naming tier2,
+    # which is right there in the catalog.
+    #
+    # The normalized name is the right thing to report as well as to test. An
+    # alias the fleet knows normalizes to its class and is found here; one it
+    # does not know is returned unchanged by `normalize`, so what comes back is
+    # the caller's own spelling, which is the word they need to see.
+    present = {f.endpoint for f in facts}
+    # Reported AS WRITTEN, via the pairing — see ``Intent.exclude_pairs``. The
+    # normalized form is what we matched on and is not what the caller sent.
+    unmatched = tuple(
+        written for norm, written in intent.exclude_pairs if norm not in present)
+    if unmatched:
+        return Resolution(intent=intent, unmatched_exclusions=unmatched,
+                          rejected=tuple(
+                              Rejection(n, REJECT_UNKNOWN_ENDPOINT,
+                                        "no such endpoint to exclude")
+                              for n in unmatched))
+
     # 🚨 A pin NARROWS the candidate set; it does not reject the others. Rejecting
     # them produced one "not the pinned endpoint" row per endpoint in the fleet —
     # a diagnostic that grows with the catalog and says nothing, burying the row
@@ -544,6 +683,15 @@ def resolve(intent: Intent, facts: list[ModelFacts] | tuple[ModelFacts, ...]) ->
                       "no such endpoint"),))
 
     for f in candidates:
+        if f.endpoint in intent.exclude:
+            # First, ahead of every property of the endpoint itself. If a
+            # caller excluded an endpoint that is also unrouted and also the
+            # wrong kind, the answer they need is the one they can act on —
+            # "because you said so" — not a fact about our fleet that would
+            # read as though the exclusion had not been understood.
+            rejected.append(Rejection(f.endpoint, REJECT_EXCLUDED,
+                                      "excluded by the request"))
+            continue
         if not f.routed:
             # `planned` and `retired` entries exist to document a name and a
             # shape. Resolving to one would dispatch at a backend nobody has a

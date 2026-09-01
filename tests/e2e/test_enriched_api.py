@@ -74,9 +74,17 @@ async def test_models_publishes_the_intent_vocabulary(proxy):
     """A deployment may extend the profile table, so a caller cannot guess it —
     and an "unknown intent" error is a poor place to learn one."""
     body = (await proxy.client.get("/rs/v1/models")).json()
-    names = {i["name"] for i in body["intents"]}
-    assert names == set(BUILTIN_PROFILES)
+    by_name = {i["name"]: i for i in body["intents"]}
+    # Layered, not replaced: the example catalog adds `bulk` and overrides
+    # nothing, so every built-in is still on the wire beside it. A file that
+    # defined one profile silently emptying the other nine is the failure this
+    # pins — it would break every caller coding against the published table.
+    assert set(by_name) > set(BUILTIN_PROFILES)
     assert all(i["summary"] for i in body["intents"])
+    # `source` is the disclosure that makes an override visible to the caller.
+    assert by_name["reasoning"]["source"] == "builtin"
+    assert by_name["bulk"]["source"] == "models.yaml"
+    assert by_name["bulk"]["prefer"] == "capacity"
 
 
 # ---------------------------------------------------------------------------

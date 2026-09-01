@@ -84,7 +84,6 @@ from starlette.responses import JSONResponse, Response
 from .config import LLMPriority, ROLE_TO_CLASS, normalize_endpoint
 from .cost_model import estimate_input_tokens
 from .intent import (
-    BUILTIN_PROFILES,
     IntentError,
     ModelFacts,
     parse_intent,
@@ -204,6 +203,20 @@ class EnrichedApi:
         return sorted({name for name, cls in ROLE_TO_CLASS.items()
                        if cls == endpoint and name != endpoint})
 
+    def profiles(self) -> dict:
+        """The intent vocabulary in force — built-ins with this deployment's
+        ``intents:`` layered over them.
+
+        Read from the catalog on every call rather than cached on the instance,
+        for the same reason ``facts()`` is: ``load_catalog`` already memoises
+        per resolved path, so this costs a dict lookup, and a table pinned at
+        construction would survive a deliberate reload and quietly serve the
+        vocabulary the process booted with.
+        """
+        from .model_catalog import load_catalog
+
+        return load_catalog().intents
+
     def facts(self) -> list[ModelFacts]:
         """A snapshot of every endpoint in the catalog, routed or not.
 
@@ -288,15 +301,21 @@ class EnrichedApi:
             "object": "roadstead.models",
             "models": rows,
             # The intent vocabulary, published rather than documented — an
-            # "unknown intent" error is a poor place to learn one. Published
-            # even though the table is built in today (see intent.py): a caller
-            # that hard-codes our list breaks the day it becomes configurable,
-            # and one that asks does not.
+            # "unknown intent" error is a poor place to learn one. Asking is
+            # now the only correct way to get it: the table is the built-ins
+            # with this deployment's `intents:` layered over them, so a caller
+            # that hard-coded our list is reading a vocabulary that may not be
+            # the one in force here.
+            #
+            # 🚨 `source` is the disclosure that makes an override visible. A
+            # fleet may redefine `reasoning` to mean its own thing, and a
+            # caller reading our documentation for that word would otherwise
+            # have no way to tell that it no longer applies.
             "intents": [
                 {"name": p.name, "kind": p.kind,
                  "requires": sorted(p.requires), "prefer": p.prefer,
-                 "summary": p.summary}
-                for p in sorted(BUILTIN_PROFILES.values(), key=lambda p: p.name)
+                 "summary": p.summary, "source": p.source}
+                for p in sorted(self.profiles().values(), key=lambda p: p.name)
             ],
         })
 
@@ -318,7 +337,8 @@ class EnrichedApi:
         agent_id = resolved_id.principal.agent_id
 
         try:
-            intent = parse_intent(body, normalize=normalize_endpoint)
+            intent = parse_intent(body, normalize=normalize_endpoint,
+                                  profiles=self.profiles())
         except IntentError as exc:
             return _error("invalid_request_error", str(exc), 400)
 
@@ -409,7 +429,8 @@ class EnrichedApi:
                 "(messages, max_tokens, stream, …)", 400)
 
         try:
-            intent = parse_intent(body, normalize=normalize_endpoint)
+            intent = parse_intent(body, normalize=normalize_endpoint,
+                                  profiles=self.profiles())
         except IntentError as exc:
             return _error("invalid_request_error", str(exc), 400)
 

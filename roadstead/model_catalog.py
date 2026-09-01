@@ -40,7 +40,14 @@ from typing import Any
 import yaml
 
 from . import hooks
-from .intent import KNOWN_CAPABILITIES
+from .intent import (
+    BUILTIN_PROFILES,
+    DEFAULT_PREFERENCE,
+    KNOWN_CAPABILITIES,
+    KNOWN_KINDS,
+    PREFERENCES,
+    Profile,
+)
 from .providers import DEFAULT_PROVIDER, provider_for_engine
 
 logger = logging.getLogger(__name__)
@@ -127,6 +134,10 @@ class Catalog:
     endpoints: dict[str, EndpointEntry]
     hosts: dict[str, str]
     _by_name: dict[str, str]          # any name/alias/role → endpoint class
+    #: The intent vocabulary in force: the built-ins, with this deployment's
+    #: ``intents:`` stanzas layered over them by name. Built once at load
+    #: rather than per request, because it is read on the hot path.
+    intents: dict[str, Profile] = field(default_factory=dict)
 
     # ---- resolution ----
     def canonical(self, name: str) -> str | None:
@@ -211,6 +222,108 @@ def _coerce_endpoint(name: str, raw: dict[str, Any]) -> EndpointEntry:
     )
 
 
+#: Fields an ``intents:`` stanza may set. The mirror of ``Profile``, minus its
+#: ``name`` (the stanza key) and its ``source`` (which we assign).
+#:
+#: 🚨 **There is no field here that names an endpoint, and adding one would be
+#: the bug.** A profile is shared vocabulary — published to every caller, and
+#: from here on written by an operator — so one that named endpoints would be a
+#: second routing table to keep in step with ``endpoints:`` below it, and it
+#: would break the moment a fleet's classes are spelled differently from the
+#: example's. That is the whole reason profiles are expressed in declared
+#: CAPABILITIES. A caller may still refuse a specific endpoint per request
+#: (``exclude``, ``intent.py``); that is one caller's words about one call, not
+#: a table. Guarded by test_intent_config.py.
+_PROFILE_FIELDS = ("kind", "requires", "prefer", "summary")
+
+
+def _coerce_profile(name: str, raw: dict[str, Any]) -> Profile | None:
+    """One ``intents:`` stanza → a :class:`Profile`, or ``None`` if unusable.
+
+    🚨 An unusable stanza is REFUSED rather than registered, and the difference
+    matters to the caller: a profile requiring a capability nothing can declare
+    would resolve to nothing on every request, and the caller would read "no
+    endpoint satisfies requires=[...]" — a sentence about the fleet, for a fault
+    in the config file. Refused, they get "unknown intent 'x' — known intents:
+    [...]", which points at the vocabulary, where the fault actually is. Either
+    way the operator gets the notice.
+    """
+    unknown = sorted(set(raw) - set(_PROFILE_FIELDS))
+    if unknown:
+        hooks.config_notice(
+            source="models.yaml", subject=f"intents.{name}",
+            problem="unknown_key",
+            detail=(f"intent key(s) {unknown} are not read by any code and "
+                    f"have NO effect on this profile"),
+            keys=unknown, known=sorted(_PROFILE_FIELDS))
+
+    kind = str(raw.get("kind") or "chat").strip()
+    if kind not in KNOWN_KINDS:
+        hooks.config_notice(
+            source="models.yaml", subject=f"intents.{name}",
+            problem="unusable",
+            detail=(f"kind {kind!r} is not a routable kind, so this profile is "
+                    f"NOT offered — callers asking for {name!r} get an unknown-"
+                    f"intent error naming the ones that are"),
+            known=sorted(KNOWN_KINDS))
+        return None
+
+    prefer = str(raw.get("prefer") or DEFAULT_PREFERENCE).strip()
+    if prefer not in PREFERENCES:
+        hooks.config_notice(
+            source="models.yaml", subject=f"intents.{name}",
+            problem="unusable",
+            detail=(f"prefer {prefer!r} is not a known preference, so this "
+                    f"profile is NOT offered"),
+            known=sorted(PREFERENCES))
+        return None
+
+    requires = _tuple(raw, "requires")
+    bad = sorted(set(requires) - KNOWN_CAPABILITIES)
+    if bad:
+        hooks.config_notice(
+            source="models.yaml", subject=f"intents.{name}",
+            problem="unusable",
+            detail=(f"requires {bad} — no endpoint can declare a capability "
+                    f"the proxy does not know, so this profile would match "
+                    f"nothing on every request; it is NOT offered"),
+            keys=bad, known=sorted(KNOWN_CAPABILITIES))
+        return None
+
+    return Profile(
+        name=name, kind=kind, requires=frozenset(requires), prefer=prefer,
+        summary=str(raw.get("summary") or "").strip(),
+        source="models.yaml",
+    )
+
+
+def _build_intents(raw: dict[str, Any]) -> dict[str, Profile]:
+    """The built-ins with this deployment's own layered over them.
+
+    🚨 Layered, not replaced. A file that defines one profile does not delete
+    the other nine — a deployment adding ``cheap-bulk`` has said nothing about
+    ``reasoning``, and reading it as a whole-table replacement would silently
+    empty a vocabulary that `GET /rs/v1/models` publishes and callers code
+    against. Overriding by NAME is deliberate and is how a fleet whose
+    ``reasoning`` means something particular says so; it is disclosed through
+    each profile's ``source``, published beside it.
+    """
+    table = dict(BUILTIN_PROFILES)
+    for name, body in (raw.get("intents") or {}).items():
+        key = str(name).strip()
+        if not key:
+            continue
+        profile = _coerce_profile(key, dict(body or {}))
+        if profile is None:
+            # A refused stanza must not leave the BUILT-IN of the same name in
+            # force under the operator's spelling: they would be reading their
+            # own summary in the config file and getting ours on the wire.
+            table.pop(key, None)
+            continue
+        table[key] = profile
+    return table
+
+
 _cache: dict[str, Catalog] = {}
 
 
@@ -242,7 +355,8 @@ def load_catalog(path: str | os.PathLike | None = None, *, force: bool = False) 
         by_name[e.name] = e.name
 
     cat = Catalog(providers=providers, endpoints=endpoints,
-                  hosts=dict(raw.get("hosts") or {}), _by_name=by_name)
+                  hosts=dict(raw.get("hosts") or {}), _by_name=by_name,
+                  intents=_build_intents(raw))
     _cache[key] = cat
     return cat
 

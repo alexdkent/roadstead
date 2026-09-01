@@ -23,6 +23,10 @@
 #               capabilities, band behaviour, failover. Each names the provider
 #               it lives behind.
 #
+#   intents:    THE CALLER-FACING VOCABULARY. Optional, and layered over the
+#               built-in profiles rather than replacing them. See the section
+#               itself, below `hosts:`.
+#
 # A local provider hosts ONE endpoint, because a llama.cpp or vLLM server serves
 # one model. A remote provider hosts MANY, because it fronts a catalogue and the
 # base URL and credential are the same for all of them. Declaring the connection
@@ -92,6 +96,9 @@
 #   policy.*          EndpointConfig knobs — see _POLICY_PASSTHROUGH in
 #                     model_catalog.py. ⚠️ A policy key that is not in that
 #                     tuple is SILENTLY DROPPED.
+#
+# INTENT FIELDS
+#   kind, requires, prefer, summary. See the `intents:` section below.
 # ===========================================================================
 
 hosts:
@@ -101,6 +108,48 @@ hosts:
   llm-mid: 192.0.2.12
   llm-large: 192.0.2.13
   llm-util: 192.0.2.14
+
+
+# ===========================================================================
+# intents:  WHAT A CALLER MAY ASK FOR, IN WORDS THAT ARE NOT ENDPOINT NAMES
+#
+# A profile bundles a `kind`, a set of required `capabilities` and a ranking
+# `prefer` under one caller-facing name, so a request says `intent: "reasoning"`
+# and Roadstead owns which model that is. `GET /rs/v1/models` publishes this
+# table, which is where a caller should read it rather than from any document.
+#
+# 🚨 PROFILES ARE EXPRESSED IN DECLARED CAPABILITIES, NEVER ENDPOINT NAMES.
+# There is no field here that can name one, and that is the design rather than
+# an omission: a profile naming endpoints would be a SECOND ROUTING TABLE to
+# keep in step with `endpoints:` below, and it would break the moment a fleet's
+# classes are spelled differently from this example's. A caller that needs to
+# refuse one specific endpoint says so per request (`exclude`, docs/api.md
+# §1.7.1) — that is one caller's words about one call, not a table.
+#
+# LAYERED, NOT REPLACED. Nine profiles ship built in (`BUILTIN_PROFILES` in
+# intent.py). Anything here is added to them, and a stanza whose name matches a
+# built-in OVERRIDES it — which is how a fleet says its `reasoning` means
+# something particular. The override is disclosed: each profile is published
+# with a `source` of "builtin" or "models.yaml", because a caller reading our
+# documentation for a word this fleet redefined has no other way to notice.
+#
+# ⚠️ A stanza that cannot be satisfied by ANY endpoint — an unknown capability,
+# kind or preference — is REFUSED rather than offered, with a config notice
+# readable at `GET /rs/v1/admin/config`. A caller then gets "unknown intent",
+# which points at the vocabulary, instead of "no endpoint satisfies …", which
+# points at the fleet and is the wrong place to look.
+#
+# The one below is additive — it names no built-in — so this file exercises the
+# parser on every boot rather than documenting a path nothing runs.
+# ===========================================================================
+
+intents:
+  bulk:
+    kind: chat
+    # Nothing is waiting on this, so the useful question is not "which is
+    # fastest" but "which has room right now".
+    prefer: capacity
+    summary: A batch turn nobody is waiting on — take whatever has room.
 
 
 providers:

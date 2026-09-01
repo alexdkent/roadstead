@@ -275,10 +275,39 @@ should I allow — **without dispatching**), `chat` (do it, and tell me what act
   holds are checked against `docs/api.md` rather than against the server, which would agree with
   itself.
 
-**Still open in C:** the profile table is built in only — `models.yaml` has no `intents:` section
-yet, so a deployment cannot add or override a profile without editing the package. Intent resolution
-also cannot yet express a *negative* constraint ("anything but this endpoint"), which is what a
-caller working around one bad model actually wants.
+**~~Still open in C.~~ Closed 2026-09-01** — both halves, and they turned out to be one question
+(*who owns the words a caller may use*) with one line running through it.
+
+- **`models.yaml` grows an `intents:` section**, layered over the built-ins rather than replacing
+  them: a file that defines one profile has said nothing about the other nine, and reading it as a
+  whole-table swap would silently empty a vocabulary `GET /rs/v1/models` publishes and callers code
+  against. Overriding by name is how a fleet says its `reasoning` means something particular, and it
+  is **disclosed** — every published profile carries `source: builtin | models.yaml`, because a
+  caller reading our documentation for a word this fleet redefined has no other way to notice.
+- 🚨 **A profile still cannot name an endpoint, and now there is a config parser that must not learn
+  how.** There is no field for it, guarded from both ends — the allowlist and `Profile`'s own fields.
+- **An unusable stanza is refused rather than offered.** A profile requiring a capability nothing can
+  declare would match nothing on every request, and the caller would read "no endpoint satisfies
+  requires=[…]" — a sentence about the fleet, for a fault in a config file. Refused, they get
+  "unknown intent", which points at the vocabulary. A refused *override* does not leave the built-in
+  standing under the operator's spelling, which would be a declared-vs-in-force gap we created.
+- **`exclude` is the negative constraint**, and it is expressible after all — because the vocabulary
+  it needs is not the profile vocabulary. The line is between **config and request**, not between
+  positive and negative: a profile is shared, published, operator-written vocabulary and must stay in
+  capabilities; an intent is one caller's words about one call, and `pin` already names an endpoint
+  there. `exclude` says the same kind of thing in the other direction and adds no table.
+- 🚨 **An `exclude` naming an endpoint this fleet does not have is a 404, not a warning.** The
+  tempting reading — that it is satisfied trivially, since the endpoint it forbids is absent —
+  assumes the one thing the proxy cannot check. A name resolving to nothing is either "not here" or
+  "here, under a spelling you got wrong", and from inside they are the same bytes; serving the second
+  sends the request to precisely the endpoint the exclusion existed to avoid and reports success.
+  Same shape as the `finish_reason` repair that became a silencer. `model` and `exclude` naming the
+  same endpoint is a 400.
+- `tests/test_intent_config.py`. Sixteen mutations, every guard observed going red by assertion —
+  one first failed by raising an `IntentError` from `intent.py` rather than by asserting, which is
+  half a guard, and was rewritten. **Running it found the bug the suite could not**: the refusal
+  echoed the normalized name, so a caller who wrote `"tierX"` was told `'tierx'` — `pin_as_written`'s
+  reason for existing, missed in the other direction.
 
 ### D · Spill, token management and costing
 
