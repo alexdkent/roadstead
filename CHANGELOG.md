@@ -8,6 +8,35 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Changed — two cleanups on the hot path and the client boundary
+
+Landed 2026-09-01. Both were diagnosed and left open; neither changes a contract.
+
+- **`/rs/v1/chat` no longer walks the latency ladder once per endpoint per request.**
+  `EnrichedApi.facts()` runs on every request to resolve one intent, and it called
+  `timeout_model.advise` once per endpoint to fill a single field — N ladder walks, on the hot path,
+  for a number that is a median over thousands of samples and cannot meaningfully move between two
+  requests a millisecond apart. Memoised for 1s: **14,000 `advise` calls became 7** over 2,000
+  `facts()` calls, and the call itself went from 80µs to 47µs.
+  🚨 `typical_ms` is **not** dropped and **not** made optional, which is why this is a memo rather
+  than a flag: `prefer=latency` and `prefer=balanced` rank on it, and an endpoint with no samples
+  sorts as SLOW — so omitting it would silently re-rank every intent-routed request rather than lose a
+  display field. The memo is keyed by endpoint as well as time, so an endpoint that appears later is
+  priced rather than served from a map that never saw it.
+- **The client SDK is now driven over a real socket.** `tests/e2e/test_client_sdk_live.py` uses
+  `ASGITransport` and says so — it exercises request building and envelope parsing, not httpx's
+  networking — which left the SDK's own transport configuration asserted as a comparison between two
+  constants. `tests/e2e/test_client_sdk_socket.py` runs the real proxy under real uvicorn on a real
+  ephemeral socket, points a client the SDK built **itself** at it, and observes: a real round trip,
+  real SSE framing over the wire, connection reuse inside the keepalive window, and 🚨 **the idle
+  socket actually being retired** after `CLIENT_KEEPALIVE_EXPIRY_S` (4.5s) — §1.3's ordering
+  invariant watched rather than computed. It reaches into httpx's pool deliberately, and asserts the
+  internals exist rather than skipping when they do not, so an httpx upgrade fails loudly instead of
+  the guard going quietly blind.
+- Eight mutations, every guard observed going red by assertion. One first SURVIVED and was a real
+  weakness: the memo-expiry test advanced its fake clock by *the TTL*, so a mutation setting the TTL
+  to a billion seconds moved the goalposts with it.
+
 ### Fixed — the shutdown drain now has a ceiling, and it is published once
 
 Landed 2026-09-01. SIGTERM was already the correct signal and that stayed settled by experiment

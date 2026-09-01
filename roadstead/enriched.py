@@ -75,6 +75,7 @@ outcomes (``scheduler.Admission``) applies just as hard one layer up.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from starlette.requests import Request
@@ -141,11 +142,59 @@ def _error(code: str, message: str, status: int, **extra) -> JSONResponse:
 class EnrichedApi:
     """``/rs/v1`` over the shared ProxyState. A translator, not a second path."""
 
+    #: How long a memoised ``typical_ms`` stays good. Short enough that a
+    #: reader never sees a stale fleet, long enough that a burst of requests
+    #: pays for one pass rather than N.
+    _TYPICAL_MS_TTL_S = 1.0
+
     def __init__(self, state: "ProxyState", lifecycle: "Lifecycle",
                  health: "Health") -> None:
         self.state = state
         self.lifecycle = lifecycle
         self.health = health
+        #: endpoint -> learned median ms, and when the map was built.
+        #: 🚨 Memoised because ``facts()`` runs on EVERY `/rs/v1/chat` request to
+        #: resolve one intent, and it called ``timeout_model.advise`` once per
+        #: endpoint to fill this one field — N ladder walks to answer a question
+        #: about the whole fleet, on the hot path, for a number that is a median
+        #: over thousands of samples and cannot meaningfully move between two
+        #: requests a millisecond apart.
+        #:
+        #: 🚨 NOT dropped, and not made optional. `prefer=latency` and
+        #: `prefer=balanced` rank on it, and an endpoint with no samples sorts
+        #: as SLOW — so a `facts()` that omitted it would silently re-rank every
+        #: intent-routed request rather than merely losing a display field.
+        self._typical_ms: dict[str, float] = {}
+        self._typical_ms_at: float = 0.0
+
+    def _typical_ms_for(self, names: "list[str]") -> dict[str, float]:
+        """The learned median per endpoint, rebuilt at most once per TTL.
+
+        One pass over the fleet, on the loop, memoised — rather than one ladder
+        walk per endpoint per request. A rebuild that raises leaves the previous
+        map in place and falls back to 0.0 for anything missing, because a model
+        readout must never 500 a listing.
+        """
+        now = time.monotonic()
+        if (self._typical_ms
+                and now - self._typical_ms_at < self._TYPICAL_MS_TTL_S
+                and all(n in self._typical_ms for n in names)):
+            return self._typical_ms
+        fresh: dict[str, float] = {}
+        for name in names:
+            # The learned median for the endpoint as a whole — the widest cell
+            # the timeout model has, because a per-(tier, size) figure would be
+            # answering a question about a request we have not been given yet.
+            try:
+                advice = self.state.timeout_model.advise(
+                    name, int(LLMPriority.P1_TURN_SUPPORT), 0, 0)
+                fresh[name] = (float(advice.get("median_ms") or 0.0)
+                               if advice.get("sample_count") else 0.0)
+            except Exception:  # noqa: BLE001 — a readout must not 500 a listing
+                fresh[name] = 0.0
+        self._typical_ms = fresh
+        self._typical_ms_at = now
+        return fresh
 
     # ---------------------------------------------------------------- facts
 
@@ -175,6 +224,7 @@ class EnrichedApi:
         # order is kept first so the common case reads the same.
         names = list(cat.endpoints) + [
             n for n in self.state.config.endpoints if n not in cat.endpoints]
+        typical = self._typical_ms_for(names)
         out: list[ModelFacts] = []
         for name in names:
             entry = cat.endpoints.get(name)
@@ -184,17 +234,7 @@ class EnrichedApi:
                     if ep_cfg is not None else
                     {"max_slots": 0, "in_flight": 0, "queued": 0})
             price = self.state.prices.price(name)
-            # The learned median for the endpoint as a whole — the widest cell
-            # the timeout model has, because a per-(tier, size) figure would be
-            # answering a question about a request we have not been given yet.
-            typical_ms = 0.0
-            try:
-                advice = self.state.timeout_model.advise(
-                    name, int(LLMPriority.P1_TURN_SUPPORT), 0, 0)
-                if advice.get("sample_count"):
-                    typical_ms = float(advice.get("median_ms") or 0.0)
-            except Exception:  # noqa: BLE001 — a model readout must not 500 a listing
-                typical_ms = 0.0
+            typical_ms = typical.get(name, 0.0)
             # An endpoint present in the routing table is ROUTED whatever the
             # catalog says — the scheduler will dispatch to it, and reporting
             # otherwise would describe a fleet Roadstead is not running.
