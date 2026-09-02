@@ -266,7 +266,8 @@ class EndpointConfig:
     #: Monotonic timestamp of the last canary attempt (0 = never). The canary
     #: costs a real generation, so it runs on a slow cadence, not every poll.
     thinking_canary_checked_at: float = 0.0
-    # --- tier3 failover (§ 9 of the anvil2/V4-Flash plan) ------------------
+    # --- tier3 failover (§ 9 of the anvil2/V4-Flash plan) ---------------------
+
     # The endpoint CLASS this one degrades to while it is unhealthy, derived
     # from the model stanza's `fallback:` in models.yaml. Empty = no failover
     # (today's behaviour: a clean 503).

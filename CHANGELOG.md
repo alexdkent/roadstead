@@ -8,6 +8,75 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Scrub — a real host name shipped in source, and is gone from the tree (S7, half-closed)
+
+Landed 2026-09-01. `docs/corpus_and_scrub_plan.md` § S7 has the full account.
+
+S6 claimed host names were pseudonymised through the whole history. They were not. A fresh check
+found real, currently-resolving names surviving in history, and one of them — the GPU head node — was
+in **eleven tracked files, four of them shipping source** (`roadstead/health.py`, `config.py`,
+`lifecycle.py`, `correction.py`), next to a port that turned out to belong to a **live production
+inference server**. So what shipped in the wheel was a working address, not just a name.
+
+It is now spelled `anvil` (`anvil2` for its paired worker) throughout the tracked tree. The
+measurements those comments record are untouched — same rule as `models.yaml`: the measurement is
+real, the machine it names is not.
+
+🚨 **Only half of S7 is closed.** The tracked tree is clean; the **history is not**, and that still
+blocks going public. The two halves were split deliberately because their costs differ by orders of
+magnitude — the tracked half is ordinary edits and stops the name shipping *today*, while the history
+half needs a second `filter-repo` pass that changes every SHA again. Leaving them coupled is why
+neither had happened.
+
+🚨 **One entry in this file is now knowingly inaccurate.** The `ANVIL_DISPATCHER_URL` →
+`ROADSTEAD_ON_DEMAND_DISPATCHER_URL` note recorded the old variable under its real spelling, and that
+spelling carried the host name. It now reads `ANVIL_DISPATCHER_URL`, naming a variable that never
+existed. Accepted for the reason S6 rewrote commit messages: a scrub that spares the record leaks
+through the record.
+
+### Added — the wire contract, confirmed against a real vLLM for the first time
+
+Landed 2026-09-01. `tests/wire_fidelity/test_real_vllm.py`, opt-in on
+`ROADSTEAD_WIRE_FIDELITY_VLLM_URL` and deselected by default like the rest of the marker. Full
+write-up in `docs/ledger.md`.
+
+Nothing in this project had ever run against a real vLLM. Every vLLM claim in `providers/vllm.py` is
+an assertion about an **absence** — `publishes_slot_count=False`, `publishes_slot_context=False` —
+and an absence is the one thing a programmable fake can never confirm: it withholds what it was told
+to withhold and agrees with the descriptor by construction. **All seven assertions pass against a
+real engine**, so the config-seeded-concurrency decision now has evidence on both sides.
+
+🚨 **The terminal-chunk rule holds on vLLM too.** `finish_reason` rides alone on a chunk with an
+empty `delta`. That rule was established on llama.cpp and `correction.py` has applied it to *every*
+backend ever since — until now the second engine was being repaired against a rule measured on the
+first.
+
+🚨 **The near miss worth knowing:** `/metrics` publishes `vllm:cache_config_info` with a
+`kv_cache_max_concurrency` label — a plausible-looking float that is **not** the admission cap. It is
+`kv_cache_size_tokens / max_model_len`, i.e. how many *full-context* requests fit, and on a
+long-context server it reads below 2 while the engine fields many more. Seeding `max_slots` from it
+would cap a busy endpoint at one, wearing the authority of a discovered fact.
+`check_no_published_concurrency` fails loudly if `max_num_seqs` ever appears — the one development
+that would make vLLM slot discovery real, and an alarm to act on rather than route around.
+
+### Fixed — two wire-fidelity tests could only ever be aimed at their own compose file
+
+Landed 2026-09-01, found by pointing them at a production llama.cpp (build `b1-6d05498`, 6 slots,
+262144 per-slot context) rather than the 0.5B model in `compose.yaml`.
+
+`test_top_level_n_ctx_is_absent_not_an_aggregate` and
+`test_slot_count_comes_from_total_slots_not_n_parallel` compared against `COMPOSE_PARALLEL` /
+`EXPECTED_PER_SLOT` **without** the `_launched_by_compose()` gate their siblings use. Aimed at any
+other real engine they failed on the *launch config* rather than the wire shape — `262144 != 2048`
+and `6 != 4`, both correct values for that server. That defeats the purpose: this directory is meant
+to be an alarm you can aim at a production backend.
+
+Each is now split. 🚨 **The number is a property of the launch; the resolution order is a property of
+the engine** — and only the second is what these tests are about. Every b5350 finding survived the
+build gap, and `default_generation_settings.n_ctx` being **per-slot** is now corroborated
+independently by `/slots`, where each of the six entries reports the same value.
+
+
 ### Fixed — a permanent backend failure is no longer advised as retryable
 
 Landed 2026-09-01, found in live OpenRouter validation. An endpoint pinned to a model that does not

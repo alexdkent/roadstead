@@ -237,10 +237,21 @@ so it is a worked example that cannot rot. Point `ROADSTEAD_MODELS_YAML` at your
 **Comments throughout this package cite measurements taken on a real fleet under ITS names**
 (`gemma`, `creative`, `tier2-chat`, `llama-thinker`, specific model names). Those are
 records of what was measured — do not "fix" them to match the example, and do not read them as
-references to classes that exist here. 🚨 **The HOST names in those records are PSEUDONYMS as of
-S6** — `nexus`, `nasbox`, `boxa`, `beacon`, `sidekick` — rewritten through the whole history on
-2026-09-01. The measurement is real; the machine it names is not, and there is nothing to look up.
-Model and endpoint-class vocabulary was left alone, so those are still the fleet's own words.
+references to classes that exist here. 🚨 **The HOST names in the TRACKED TREE are pseudonyms**
+— `nexus`, `nasbox`, `boxa`, `beacon`, `sidekick`, and `anvil`/`anvil2` as of S7. The measurement is
+real; the machine it names is not, and there is nothing to look up. Model and endpoint-class
+vocabulary was left alone (`laguna` and `deckard` are legacy MODEL names, not hosts), so those are
+still the fleet's own words.
+
+🚨 **The same is NOT yet true of the HISTORY, and S6 was wrong to say it was.** S6 claimed
+host names were pseudonymised "through the whole history"; a fresh check on 2026-09-01 found real,
+currently-resolving host names surviving in thousands of history blobs — including the GPU head node
+now spelled `anvil`, which was also in **eleven tracked files, four of them shipping source**, beside
+a port that turned out to be a live production inference server. The tracked half is fixed. **The
+history half is open and blocks going public** — `docs/corpus_and_scrub_plan.md` § S7, which also
+records why no guard caught it (`tests/test_scrub_sweep.py` reads `git ls-files`, never history) and
+why the obvious guard cannot simply be written here (it needs the list of real names, and putting
+that list in the repo is the leak).
 
 **`providers/` is where engine differences live, and nowhere else.** A provider owns the two things
 backends genuinely disagree about: what a request must look like to be accepted
@@ -653,8 +664,9 @@ that is not the same as no personal data, and the sweep in S5 now runs both patt
 
 🚨 **What remains under fleet names is COMMENTS RECORDING MEASUREMENTS, and they stay.** Same rule as
 `models.yaml`: those are records of what was measured, not references to anything that exists here.
-🚨 **Host names within them are pseudonyms as of S6** (see Provenance above); the model and
-endpoint-class vocabulary is not.
+🚨 **Host names within them are pseudonyms in the TRACKED TREE** (see Provenance above); the
+model and endpoint-class vocabulary is not. 🚨 **In the HISTORY they are not — S7 is open and
+blocks publication.**
 
 ✅ **S6 is DONE (2026-09-01)** — `git filter-repo` ran over all 322 commits (282 of them
 extracted), rewriting blobs, commit messages *and*, in a second pass, commit metadata: author and
@@ -663,3 +675,13 @@ changed on that date**, so any SHA cited in a document, a branch, or an external
 before it is dead. The citations in this file, `CHANGELOG.md`, `docs/history.md` and
 `docs/roadmap.md` were translated through filter-repo's `commit-map` and now carry a date and
 subject as well, so the next rewrite cannot orphan them silently.
+
+🚨 **S7 is OPEN, and it is the ONLY thing still blocking publication.** S6's claim to have
+pseudonymised host names "through the whole history" did not hold: real, currently-resolving names
+survive in history, and one of them — the GPU head node, now `anvil` — was in eleven **tracked**
+files, four of them shipping source, next to a port belonging to a live production inference server.
+**The tracked-tree half is closed as of 2026-09-01**; the history half needs a second `filter-repo`
+pass that will change every SHA again and force the citations above to be re-pointed a second time.
+Full account, including the fresh sweep and why the obvious guard cannot be written in-repo, in
+`docs/corpus_and_scrub_plan.md` § S7. 🚨 **Do not read "S6 is DONE" as "the history is
+clean".**
