@@ -327,15 +327,94 @@ def _build_intents(raw: dict[str, Any]) -> dict[str, Profile]:
 _cache: dict[str, Catalog] = {}
 
 
-def load_catalog(path: str | os.PathLike | None = None, *, force: bool = False) -> Catalog:
-    """Parse ``models.yaml`` (cached per resolved path)."""
+def merge_catalog_overlay(raw: dict, overlay: dict | None) -> dict:
+    """Layer runtime catalog stanzas over the file's, BEFORE coercion.
+
+    🚨 Roadmap J2, and the whole point is *where* this happens. The overlay
+    contributes stanzas to the raw dict, so a UI-created endpoint is parsed,
+    defaulted and validated by exactly the code that parses a file-authored one
+    — `_coerce_endpoint`, the capability vocabulary, the duplicate-alias rule,
+    the `policy:` passthrough, the `intents:` layer. A second representation of
+    "an endpoint the API made" would need its own copy of every one of those,
+    and two things describing the same object that agree most of the time is
+    the shape this repo keeps paying for.
+
+    Semantics, each matching a rule that already exists elsewhere in this
+    codebase rather than being invented here:
+
+    * a stanza for a name the file also declares is a **partial, merged over**
+      it — change `slots` without restating `capabilities`;
+    * a stanza for a name the file lacks **stands alone** — that is creation;
+    * ``None`` is a **tombstone** — deletion. Applied after the file, so a
+      later statement wins, which is the rule that already puts revoke after
+      enrol in ``AdminOverlay.apply``.
+    """
+    if not overlay:
+        return raw
+    merged = dict(raw)
+    for section in ("providers", "endpoints"):
+        stanzas = overlay.get(section) or {}
+        if not stanzas:
+            continue
+        base = dict(merged.get(section) or {})
+        for name, stanza in stanzas.items():
+            if stanza is None:
+                base.pop(name, None)          # tombstone
+            elif isinstance(stanza, dict):
+                base[name] = {**(base.get(name) or {}), **stanza}
+        merged[section] = base
+    return merged
+
+
+#: The management plane's runtime catalog fragment, process-wide.
+#:
+#: 🚨 Global on purpose. Nine sites call `load_catalog()` — the enriched API,
+#: the cache stats, the management views, five class-map helpers — and threading
+#: an overlay parameter through all of them is how one gets missed. A missed one
+#: is the worst possible outcome here: that surface would describe the fleet as
+#: the FILE has it while every other surface describes the fleet as it IS, which
+#: is the two-sources-that-agree-most-of-the-time failure this whole plane
+#: exists to expose. The catalog in force is a property of the process, so it
+#: lives on the module that owns the catalog.
+_runtime_overlay: dict = {}
+
+
+def set_runtime_overlay(fragment: dict | None) -> None:
+    """Install the runtime catalog fragment and invalidate the cache.
+
+    Called from the loop thread — at startup by ``AdminOverlay.apply`` and on an
+    admin write. The cache is dropped rather than updated: it is keyed on the
+    file path, and the same path now parses to a different catalog.
+    """
+    global _runtime_overlay
+    _runtime_overlay = dict(fragment or {})
+    _cache.clear()
+
+
+def runtime_overlay() -> dict:
+    """What is layered over the file right now. For the management views."""
+    return dict(_runtime_overlay)
+
+
+def load_catalog(path: str | os.PathLike | None = None, *, force: bool = False,
+                 overlay: dict | None = None) -> Catalog:
+    """Parse ``models.yaml`` (cached per resolved path), with the runtime
+    overlay layered over it.
+
+    ``overlay`` builds a CANDIDATE catalog from a fragment that is not installed
+    — the management plane validates a write by constructing the catalog it
+    would install and refusing if that complains. It bypasses the cache both
+    ways: a candidate is never stored, and never served.
+    """
     p = Path(path or os.environ.get("ROADSTEAD_MODELS_YAML") or _DEFAULT_PATH)
     key = str(p.resolve())
-    if not force and key in _cache:
+    candidate = overlay is not None
+    if not candidate and not force and key in _cache:
         return _cache[key]
     if not p.exists():
         raise FileNotFoundError(f"model catalog not found: {p}")
-    raw = yaml.safe_load(p.read_text()) or {}
+    raw = merge_catalog_overlay(yaml.safe_load(p.read_text()) or {},
+                                overlay if candidate else _runtime_overlay)
 
     providers = {name: _coerce_provider(name, body or {})
                  for name, body in (raw.get("providers") or {}).items()}
@@ -404,7 +483,10 @@ def load_catalog(path: str | os.PathLike | None = None, *, force: bool = False) 
     cat = Catalog(providers=providers, endpoints=endpoints,
                   hosts=dict(raw.get("hosts") or {}), _by_name=by_name,
                   intents=_build_intents(raw))
-    _cache[key] = cat
+    # 🚨 A CANDIDATE is never cached — it is a catalog nobody has installed, and
+    # storing it would serve an unvalidated write to the whole process.
+    if not candidate:
+        _cache[key] = cat
     return cat
 
 

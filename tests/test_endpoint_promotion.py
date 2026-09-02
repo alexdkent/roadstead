@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 from pathlib import Path
 
 import pytest
@@ -173,6 +174,9 @@ async def test_promoting_without_the_credential_is_refused(tmp_path):
 
 @pytest.mark.asyncio
 async def test_credential_then_promote_puts_it_in_the_routing_table(tmp_path):
+    catalog_path = pathlib.Path(model_catalog.load_catalog.__module__ and
+                                model_catalog._DEFAULT_PATH)
+    catalog_before = catalog_path.read_bytes()
     svc = _svc(tmp_path)
     await svc.handle_admin_provider_credential(_Req(
         method="POST", path_params={"provider": "openrouter"},
@@ -183,10 +187,16 @@ async def test_credential_then_promote_puts_it_in_the_routing_table(tmp_path):
     assert resp.status_code == 200, resp.body
     body = json.loads(resp.body)
     assert body["routed"] is True
-    # The catalog is UNCHANGED and the response says so — an override that
-    # looked like an edit to models.yaml would be a lie about where truth lives.
+    # 🚨 The FILE is unchanged, asserted on the file rather than on the
+    # sentence. The response should also say so — an override that looked like
+    # an edit to models.yaml would be a lie about where truth lives — but a test
+    # that only reads the prose passes against a handler that writes the file
+    # and apologises.
     assert body["declared_status"] == "planned"
-    assert any("models.yaml, which is unchanged" in w for w in body["warnings"])
+    assert catalog_path.read_bytes() == catalog_before, (
+        "the write touched models.yaml — the overlay is meant to be the only "
+        "writer, which is what makes a bad save survivable")
+    assert any("models.yaml" in w and "unchanged" in w for w in body["warnings"])
     assert _REMOTE in svc._state.config.endpoints
 
 
@@ -285,7 +295,7 @@ async def test_a_promotion_survives_a_restart_and_its_credential_does_not(tmp_pa
         method="POST", path_params={"endpoint": _REMOTE},
         body={"status": "active"}))
     saved = json.loads(store.read_text())
-    assert saved["endpoints"][_REMOTE] == {"status": "active"}
+    assert saved["catalog"]["endpoints"][_REMOTE] == {"status": "active"}
     assert "sk-or-v1-test" not in store.read_text(), "the store holds a secret"
 
     # Restart WITH the variable still exported: the promotion comes back.
@@ -302,7 +312,7 @@ async def test_a_promotion_survives_a_restart_and_its_credential_does_not(tmp_pa
         "a restart put an endpoint that cannot serve back into the routing "
         "table — the exact condition the promotion refusal prevents, arriving "
         "through the back door")
-    assert third._state.admin_overlay.endpoints[_REMOTE] == {"status": "active"}
+    assert third._state.admin_overlay.catalog["endpoints"][_REMOTE] == {"status": "active"}
 
 
 def test_the_credential_gap_is_decided_in_one_place():

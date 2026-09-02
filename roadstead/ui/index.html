@@ -605,20 +605,45 @@ function feedRow(f) {
 }
 
 /* --- The gap ----------------------------------------------------------- */
-async function viewGap(root) {
+/* --- Configuration ------------------------------------------------------
+ * 🚨 Renamed from "The gap" and restructured on 2026-09-01. The old tab led
+ * with dropped config keys — an EXCEPTION that is empty on a healthy fleet —
+ * so its entire headline was usually the sentence "Nothing dropped." A
+ * permanently-visible tab that says nothing 99% of the time teaches an
+ * operator to skip it, and then it is skipped on the one day it has something
+ * to say. That is the failure it was built to prevent, one level up.
+ *
+ * So: the exception is rendered ONLY when it exists (the nav badge already
+ * carries the count), and the page leads with what is always true and always
+ * wanted — where configuration comes from, who can reach this plane, and what
+ * has been changed at runtime.
+ * --------------------------------------------------------------------- */
+async function viewConfig(root) {
   const c = state.config = await api(API.config);
   const notices = pick(c, "notices", []);
 
+  // Who am I, right now. Present in the payload since Workstream E and never
+  // rendered — an operator holding several keys has no other way to tell which
+  // one this tab is speaking for.
   root.append(el("section", {},
-    el("h2", { text: "What you wrote that is not in force" }),
-    why("Three loaders accept a fixed set of keys and drop the rest. The keys stay dropped — a typo must not stop a fleet booting — but each one is retained here, because the person who reads a boot log and the person who asks why a knob does nothing are usually not the same person, a week apart."),
-    notices.length
-      ? notices.map((n) => el("div", { class: "notice" },
-          el("div", { class: "h" }, tag(pick(n, "problem", "?"), "warn"), " ",
-            pick(n, "source", "?"), " · ", pick(n, "subject", "?")),
-          el("div", { class: "d", text: pick(n, "detail", "") })))
-      : el("div", { class: "banner ok" }, el("b", { text: "Nothing dropped." }),
-          " Every knob in the files below is read by something. This is not the same as \"no config was loaded\" — the sources are listed underneath.")));
+    el("h2", { text: "This session" }),
+    el("div", { class: "cards" },
+      card("agent", pick(c, "you.agent_id", "—")),
+      card("key", pick(c, "you.key_id", "—")),
+      card("via", pick(c, "you.source", "—")),
+      card("admin", pick(c, "you.admin") ? (pick(c, "you.may_write") ? "read + write" : "read only") : "no"))));
+
+  // 🚨 Only when there IS something. No reassuring banner: "nothing is wrong"
+  // is what the rest of the page already demonstrates by being populated.
+  if (notices.length) {
+    root.append(el("section", {},
+      el("h2", { text: notices.length + " setting" + (notices.length === 1 ? "" : "s") + " you wrote that " + (notices.length === 1 ? "is" : "are") + " not in force" }),
+      why("Three loaders accept a fixed set of keys and drop the rest. The keys stay dropped — a typo must not stop a fleet booting — but each one is retained here, because the person who reads a boot log and the person who asks why a knob does nothing are usually not the same person, a week apart."),
+      notices.map((n) => el("div", { class: "notice" },
+        el("div", { class: "h" }, tag(pick(n, "problem", "?"), "warn"), " ",
+          pick(n, "source", "?"), " · ", pick(n, "subject", "?")),
+        el("div", { class: "d", text: pick(n, "detail", "") })))));
+  }
 
   const srcRows = [
     ["catalog",       pick(c, "sources.catalog.path"),   pick(c, "sources.catalog.env_var")],
@@ -629,47 +654,65 @@ async function viewGap(root) {
     ["acl",           "", pick(c, "sources.acl.env_var")],
     ["runtime flags", pick(c, "sources.runtime_flags.path"), ""],
   ].map(([what, path, env]) => el("tr", {},
-    el("td", { text: what }), el("td", {}, el("code", { text: path || "—" })),
-    el("td", {}, el("code", { text: env || "—" }))));
-  root.append(el("section", {}, el("h2", { text: "Sources" }), table(["what", "path", "environment"], srcRows)));
-
+    el("td", { text: what }),
+    // An unset source reads as "not configured", not as an empty cell: a blank
+    // is indistinguishable from a field the page failed to render.
+    el("td", {}, path ? el("code", { text: path }) : tag("not configured", "")),
+    el("td", {}, env ? el("code", { text: env }) : "—")));
   root.append(el("section", {},
-    el("h2", { text: "Runtime overlay" }),
-    why("A runtime edit never rewrites your config file. Enrolments and quota overrides are layered on top of the files at startup, revocations last. When the overlay cannot be written the change still takes effect — it just does not survive a restart, and says so."),
-    el("div", { class: "cards" },
-      card("runtime keys", pick(c, "sources.admin_store.runtime_keys")),
-      card("revocations", pick(c, "sources.admin_store.revocations")),
-      card("caller overrides", pick(c, "sources.admin_store.caller_overrides"))),
-    el("p", { class: "lede" },
-      el("code", { text: pick(c, "sources.admin_store.path", "—") }), " ",
-      pick(c, "sources.admin_store.writable")
-        ? tag("writable", "ok")
-        : tag("read-only: " + pick(c, "sources.admin_store.reason", "unknown"), "bad"))));
+    el("h2", { text: "Where configuration comes from" }),
+    why("Every deployment-specific thing Roadstead knows arrives through one of these. The package itself ships a generic example catalog on documentation addresses; anything real is pointed at from here."),
+    table(["what", "path", "environment variable"], srcRows)));
 
   const proxies = pick(c, "sources.trusted_proxies.networks", []);
   const honoured = pick(c, "sources.trusted_proxies.forwarded_headers_honoured", false);
-  const builtinNets = pick(c, "sources.admin_nets.builtin", []);
+  const inForce = pick(c, "sources.admin_nets.in_force", []);
+  const dropped = pick(c, "sources.admin_nets.docker_default_dropped", false);
   const operatorNets = pick(c, "sources.admin_nets.operator", []);
   const readonlyNets = pick(c, "sources.admin_nets.readonly", []);
   root.append(el("section", {},
-    el("h2", { text: "Who can reach this" }),
-    why("X-Forwarded-For is a caller-supplied string and is read only from an address you trusted. Configuring one also withdraws the BUILT-IN loopback/docker admin grant from forwarded requests — \"it arrived on loopback\" stops meaning \"somebody is already on the machine\" the moment a front door exists."),
+    el("h2", { text: "Who can reach the admin plane" }),
+    why("Reach and admin are two questions and both must pass: an address may reach this plane, and no address grants it — a credential is required regardless. Loopback is always in the set and cannot be configured out, because it is where the startup-minted bootstrap key is usable. X-Forwarded-For is a caller-supplied string and is read only from an address you trusted; configuring a proxy also withdraws the built-in grant from forwarded requests, because \"it arrived on loopback\" stops meaning \"somebody is already on the machine\" the moment a front door exists."),
     table(["setting", "value"], [
-      el("tr", {}, el("td", { text: "trusted proxies" }),
-        el("td", {}, proxies.length
-          ? proxies.map((n) => [el("code", { text: n }), " "])
-          : tag("none — X-Forwarded-For is never read", "warn"))),
-      el("tr", {}, el("td", { text: "admin nets (built in)" }),
-        el("td", {}, builtinNets.map((n) => [el("code", { text: n }), " "]),
-          honoured ? [" ", tag("not applied to forwarded requests", "warn")] : null)),
-      el("tr", {}, el("td", { text: "admin nets (yours)" }),
+      // 🚨 THE reach set, from acl.reach_nets() — what an address is actually
+      // matched against. This row used to show the built-in GRANT list, which
+      // is a different question, and it went on advertising the docker default
+      // after an operator net had dropped it.
+      el("tr", {}, el("td", { text: "in force" }),
+        el("td", {}, inForce.length
+          ? inForce.map((n) => [el("code", { text: n }), " "])
+          : tag("nothing — the plane is unreachable", "bad"))),
+      el("tr", {}, el("td", { text: "docker default" }),
+        el("td", {}, dropped
+          ? [tag("dropped", "warn"), " naming any net of your own replaces it — a container reaching its own plane over the bridge needs 172.16.0.0/12 listed explicitly above"]
+          : [tag("in force", "ok"), " 172.16.0.0/12, so a containerised deployment reaches its own plane"])),
+      el("tr", {}, el("td", { text: "yours" }),
         el("td", {}, operatorNets.length
           // 🚨 A narrowed net looks exactly like a full one in a flat list, and
           // "who can CHANGE things" is the question this row is read for.
           ? operatorNets.map((n) => [el("code", { text: n }),
               readonlyNets.includes(n) ? [" ", tag("read-only", "")] : null, " "])
-          : tag("none — admin by key only, for a forwarded caller", "warn"))),
+          : tag("none — admin by credential only", ""))),
+      el("tr", {}, el("td", { text: "trusted proxies" }),
+        el("td", {}, proxies.length
+          ? [proxies.map((n) => [el("code", { text: n }), " "]),
+             honoured ? tag("built-in nets not applied to forwarded requests", "warn") : null]
+          : tag("none — X-Forwarded-For is never read", ""))),
     ])));
+
+  root.append(el("section", {},
+    el("h2", { text: "Changed at runtime" }),
+    why("A runtime edit never rewrites your config file. Enrolments and quota overrides are layered on top of the files at startup, revocations last. When the overlay cannot be written the change still takes effect — it just does not survive a restart, and says so."),
+    el("div", { class: "cards" },
+      card("runtime keys", pick(c, "sources.admin_store.runtime_keys")),
+      card("revocations", pick(c, "sources.admin_store.revocations")),
+      card("caller overrides", pick(c, "sources.admin_store.caller_overrides")),
+      card("endpoint status", pick(c, "sources.admin_store.endpoint_overrides"))),
+    el("p", { class: "lede" },
+      el("code", { text: pick(c, "sources.admin_store.path", "—") }), " ",
+      pick(c, "sources.admin_store.writable")
+        ? tag("writable — changes survive a restart", "ok")
+        : tag("read-only: " + pick(c, "sources.admin_store.reason", "unknown"), "bad"))));
 }
 
 /* --- Keys -------------------------------------------------------------- */
@@ -1240,7 +1283,7 @@ async function viewAudit(root) {
 
 const TABS = [
   { id: "fleet",     label: "Fleet",     view: viewFleet },
-  { id: "gap",       label: "The gap",   view: viewGap, badge: () => pick(state.config, "notices", []).length },
+  { id: "config",    label: "Configuration", view: viewConfig, badge: () => pick(state.config, "notices", []).length },
   { id: "keys",      label: "Keys",      view: viewKeys },
   { id: "callers",   label: "Callers",   view: viewCallers },
   { id: "providers", label: "Providers", view: viewProviders },

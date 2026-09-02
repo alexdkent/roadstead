@@ -32,6 +32,8 @@ Provides:
   - GET  /rs/v1/admin/providers — providers + endpoints: declared vs in force
   - POST /rs/v1/admin/providers/{provider}/credential — supply an api_key_env value
   - POST /rs/v1/admin/endpoints/{endpoint}/status — promote/demote (active|planned)
+  - PUT/PATCH/DELETE /rs/v1/admin/providers/{provider} — create/edit/delete (J2)
+  - PUT/PATCH/DELETE /rs/v1/admin/endpoints/{endpoint} — create/edit/delete (J2)
   - GET  /rs/v1/admin/audit     — who changed what, and when
   - GET  /rs/v1/admin/ui        — the operator UI (only when ROADSTEAD_ADMIN_UI)
   - GET  /rs/v1/admin/stream    — the SSE stream, aliased for the UI's EventSource
@@ -192,6 +194,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_admin_endpoint_status(request: Request) -> Response:
         return await svc.handle_admin_endpoint_status(request)
 
+    async def handle_admin_catalog_entry(request: Request) -> Response:
+        return await svc.handle_admin_catalog_entry(request)
+
     async def handle_admin_key_rotate(request: Request) -> Response:
         return await svc.handle_admin_key_rotate(request)
 
@@ -286,6 +291,13 @@ def make_routes(svc: "ProxyService") -> list[Route]:
               handle_admin_provider_credential, methods=["POST"]),
         Route(f"{ADMIN_PREFIX}/endpoints/{{endpoint}}/status",
               handle_admin_endpoint_status, methods=["POST"]),
+        # J2 — the catalog is writable. One handler, six methods: PUT replaces a
+        # stanza, PATCH merges into it, DELETE tombstones the name. All three
+        # validate by building the catalog they would install.
+        Route(f"{ADMIN_PREFIX}/providers/{{provider}}",
+              handle_admin_catalog_entry, methods=["PUT", "PATCH", "DELETE"]),
+        Route(f"{ADMIN_PREFIX}/endpoints/{{endpoint}}",
+              handle_admin_catalog_entry, methods=["PUT", "PATCH", "DELETE"]),
         # Every mutating admin route records here. A READ, so a read-only admin
         # scope reaches it — which is the point: the operator who cannot change
         # anything is often exactly the one auditing what changed.

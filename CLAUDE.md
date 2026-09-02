@@ -589,7 +589,24 @@ remove.
 
 ## Working here
 
-- **Python 3.11** (the production container runs 3.11.15).
+🚨 **This repo ships no deployment manifest for anybody's fleet, and that is deliberate.** Everything
+specific to a deployment — which backends exist and where, who may call, who may reach the admin
+plane, where the runtime overlay lives — is already an environment variable
+(`ROADSTEAD_MODELS_YAML`, `ROADSTEAD_API_KEYS`, `ROADSTEAD_ADMIN_NETS`, `ROADSTEAD_ADMIN_STORE`, …).
+So the catalog here is a generic example on RFC 5737 addresses, `tests/wire_fidelity/compose.yaml`
+says in its own header that it is not a deployment example, and `tests/test_scrub_sweep.py` fails the
+build if a private address appears in a tracked file.
+
+**Keep your deployment outside this tree.** A compose file, a real catalog and a deploy script belong
+in your own private infrastructure repo, pointed at this one through those variables. That is the
+supported shape, not a workaround — and it is why nothing in here can tell you where *this* project
+happens to be deployed. If you are an assistant session looking for the box: it is not in the repo,
+by design; check your own project memory.
+
+- **Python 3.11.** The `Dockerfile` pins `python:3.11-slim-bookworm`, which is a MOVING patch
+  version — it was 3.11.15 when that was written and built as **3.11.16** on 2026-09-01. Do not
+  cite a patch number as though the image pinned one; the suite passes on both and nothing here
+  depends on a patch release.
 - Dependencies are deliberately few: `httpx`, `starlette`, `uvicorn`, `PyYAML`, `jsonschema`,
   `json_repair`.
 - `pip install -e '.[dev]'` then `pytest`. No fleet, no network, no backends required — the suite

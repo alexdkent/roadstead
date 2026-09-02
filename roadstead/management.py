@@ -119,6 +119,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from pathlib import Path
@@ -242,13 +243,13 @@ class AdminOverlay:
                  environment or in a keys file, which this layer cannot edit but
                  must still be able to switch off. See :meth:`apply`.
     ``agents``   per-caller quota overrides, field by field.
-    ``endpoints`` per-endpoint ``status`` overrides — an endpoint promoted into
-                 service, or taken out of it, at runtime. 🚨 The status
-                 persists and the CREDENTIAL never does: a status is a routing
-                 decision the operator made and should find again after a
-                 restart, whereas an outbound provider key written into a JSON
-                 file is a change of posture this store has never made (it
-                 holds key *digests*, not secrets). Roadmap J1.
+``catalog``  runtime catalog stanzas — providers and endpoints created,
+                 edited or deleted through the API, layered over
+                 ``models.yaml`` (roadmap J2). 🚨 The stanzas persist and a
+                 CREDENTIAL never does: a routing decision should be findable
+                 after a restart, whereas an outbound provider key written into
+                 a JSON file is a change of posture this store has never made
+                 (it holds key *digests*, not secrets).
     ``audit``    who changed what, and when. See :meth:`record`.
 
     ``path=None`` keeps everything in memory: the changes apply, nothing
@@ -258,7 +259,7 @@ class AdminOverlay:
     #: Top-level keys the file may carry. An unknown one is REPORTED rather than
     #: dropped, for the reason this whole module exists.
     _FILE_SECTIONS = frozenset({
-        "version", "keys", "revoked", "retired", "agents", "endpoints",
+        "version", "keys", "revoked", "retired", "agents", "catalog",
         "audit"})
 
     #: How many audit records to keep. Bounded because this is an append-only
@@ -278,9 +279,12 @@ class AdminOverlay:
         #: A softer tombstone: the key still works until the instant recorded.
         self.retired: dict[str, float] = {}
         self.agents: dict[str, dict] = {}
-        #: {endpoint: {"status": "active"|"planned"}} — runtime promotions and
-        #: demotions, layered over the catalog's own ``status:``.
-        self.endpoints: dict[str, dict] = {}
+        #: The runtime catalog fragment: ``{"providers": {...}, "endpoints":
+        #: {...}}``, each stanza a PARTIAL merged over the file's (or standing
+        #: alone if the name is new), and ``None`` a tombstone. See
+        #: ``model_catalog.merge_catalog_overlay`` — this is the file's own
+        #: format, not a second one.
+        self.catalog: dict[str, dict] = {"providers": {}, "endpoints": {}}
         #: Newest LAST, matching the file. Bounded by ``_AUDIT_MAX``.
         self.audit: list[dict] = []
         #: How many records fell off the front, in this process and in every
@@ -366,10 +370,29 @@ class AdminOverlay:
         if isinstance(agents, dict):
             self.agents = {str(k): dict(v) for k, v in agents.items()
                            if isinstance(v, dict)}
-        endpoints = raw.get("endpoints", {})
-        if isinstance(endpoints, dict):
-            self.endpoints = {str(k): dict(v) for k, v in endpoints.items()
-                              if isinstance(v, dict)}
+        # 🚨 Migrate the pre-J2 shape rather than dropping it. `endpoints:` was
+        # the J1 status-override section and is exactly `catalog.endpoints` in
+        # the new file — same stanzas, one level deeper. Left unmigrated it
+        # would be reported as an unknown section (correct, and useless): an
+        # operator would upgrade and silently find every promoted endpoint out
+        # of service, which is the failure mode this store exists to prevent.
+        legacy = raw.get("endpoints")
+        if isinstance(legacy, dict) and legacy:
+            raw.setdefault("catalog", {}).setdefault("endpoints", {}).update(legacy)
+            logger.info("admin store: migrated %d endpoint override(s) from the "
+                        "pre-J2 `endpoints:` section into `catalog.endpoints`",
+                        len(legacy))
+        catalog = raw.get("catalog", {})
+        if isinstance(catalog, dict):
+            for section in ("providers", "endpoints"):
+                stanzas = catalog.get(section)
+                if not isinstance(stanzas, dict):
+                    continue
+                # 🚨 `None` survives — it is a tombstone, not a malformed entry.
+                self.catalog[section] = {
+                    str(k): (None if v is None else dict(v))
+                    for k, v in stanzas.items()
+                    if v is None or isinstance(v, dict)}
         audit = raw.get("audit", {})
         if isinstance(audit, dict):
             self.audit = [e for e in audit.get("entries", []) if isinstance(e, dict)]
@@ -379,9 +402,10 @@ class AdminOverlay:
                 self.audit_dropped = 0
         logger.info("admin overlay: %d runtime key(s), %d revocation(s), "
                     "%d retirement(s), %d caller override(s), "
-                    "%d endpoint status override(s) from %s",
+                    "%d provider + %d endpoint stanza(s) from %s",
                     len(self.keys), len(self.revoked), len(self.retired),
-                    len(self.agents), len(self.endpoints), self._path)
+                    len(self.agents), len(self.catalog.get("providers") or {}),
+                    len(self.catalog.get("endpoints") or {}), self._path)
 
     def persist(self) -> None:
         """Rewrite the store atomically. Blocking — call via ``to_thread``.
@@ -401,7 +425,7 @@ class AdminOverlay:
                     "revoked": self.revoked,
                     "retired": self.retired,
                     "agents": self.agents,
-                    "endpoints": self.endpoints,
+                    "catalog": self.catalog,
                     "audit": {"entries": self.audit,
                               "dropped": self.audit_dropped},
                 },
@@ -465,45 +489,56 @@ class AdminOverlay:
                 if name in EDITABLE_QUOTA_FIELDS:
                     setattr(cfg, name, _coerce_quota(name, value))
 
-        # 🚨 Endpoint status LAST, and through the same two functions the
-        # runtime handler uses. A promotion restored at startup must produce
-        # byte-identical config to one made by hand a minute ago, or the fleet
-        # an operator sees after a restart is not the fleet they configured.
-        for name, fields in self.endpoints.items():
-            status = str(fields.get("status") or "")
-            try:
-                if status == "active":
-                    gap = endpoint_credential_gap(name)
-                    if gap:
-                        # Not an error and not silence: the operator's promotion
-                        # stands in the overlay and will take effect the moment
-                        # the variable is set. `GET /rs/v1/admin/providers`
-                        # shows the endpoint still unrouted with the variable
-                        # named, which is the same answer in the same words.
-                        logger.warning(
-                            "admin overlay: endpoint %r was promoted at runtime "
-                            "but $%s is not set, so it stays OUT of the routing "
-                            "table — a routed endpoint that cannot serve is "
-                            "what its 'planned' status prevents. Set the "
-                            "variable and promote again, or export it.",
-                            name, gap)
-                        continue
-                    install_endpoint(config, name)
-                elif status == "planned":
-                    remove_endpoint(config, name)
-            except Exception as exc:  # noqa: BLE001 — a stale override must
-                # not stop a boot. The endpoint it names may have been deleted
-                # from models.yaml since, which is an operator's edit winning
-                # over a runtime override — the right outcome, reported not
-                # raised.
-                logger.warning("admin overlay: endpoint %r status %r could not "
-                               "be applied (%s); the catalog stands", name,
-                               status, exc)
+        # 🚨 The catalog fragment LAST, and through the same function an admin
+        # write uses. A fleet restored at startup must be byte-identical to the
+        # one configured a minute ago, or what an operator sees after a restart
+        # is not what they built.
+        try:
+            model_catalog.set_runtime_overlay(self.catalog)
+            # Only what the fragment mentions. The rest of the routing table was
+            # built from the catalog moments ago, or by whoever embedded us.
+            touched = set(self.catalog.get("endpoints") or {})
+            cat = model_catalog.load_catalog()
+            for provider in (self.catalog.get("providers") or {}):
+                touched |= {e.name for e in cat.endpoints.values()
+                            if e.provider == provider}
+            if touched:
+                reconcile_endpoints(config, cat, names=touched, rebuild=touched)
+        except Exception as exc:  # noqa: BLE001
+            # A stale or unparseable fragment must not stop a boot — the same
+            # rule as a mistyped `policy:` key. The file stands, and the
+            # management plane reports the gap.
+            logger.error("admin overlay: the runtime catalog fragment could not "
+                         "be applied (%s); models.yaml stands alone", exc)
+            model_catalog.set_runtime_overlay(None)
 
     # ---- mutation -------------------------------------------------------
 
-    def set_endpoint_status(self, endpoint: str, status: str) -> None:
-        self.endpoints[str(endpoint)] = {"status": str(status)}
+    def set_catalog_stanza(self, section: str, name: str,
+                           stanza: dict | None) -> None:
+        """Record a runtime stanza whole. ``None`` is a tombstone (deleted)."""
+        self.catalog.setdefault(section, {})[str(name)] = stanza
+
+    def patch_catalog_stanza(self, section: str, name: str,
+                             fields: dict) -> dict:
+        """Merge fields into the runtime stanza, keeping what is already there.
+
+        🚨 Merge, not replace: two edits to the same endpoint must compose. A
+        `status` change that discarded an earlier `slots` override would make
+        the second edit silently undo the first, which is the kind of loss an
+        operator finds weeks later while reading a number they thought they set.
+        A tombstone is REPLACED rather than merged into — resurrecting a deleted
+        name by editing it would be a create wearing an edit's clothes.
+        """
+        section_map = self.catalog.setdefault(section, {})
+        current = section_map.get(name)
+        merged = dict(fields) if current is None else {**current, **fields}
+        section_map[str(name)] = merged
+        return merged
+
+    def drop_catalog_stanza(self, section: str, name: str) -> None:
+        """Forget a runtime stanza entirely — back to whatever the file says."""
+        (self.catalog.get(section) or {}).pop(str(name), None)
 
     def add_key(self, record: dict) -> None:
         self.keys.append(record)
@@ -908,6 +943,24 @@ class ManagementApi:
                 },
                 "admin_nets": {
                     "env_var": "ROADSTEAD_ADMIN_NETS",
+                    # 🚨 THE REACH SET, which is the question this block is
+                    # about, and which this view did not report until
+                    # 2026-09-01. `acl.reach_nets()` was written for the
+                    # management plane — its docstring says so — and only the
+                    # STARTUP LOG was calling it. So the log told the truth and
+                    # this view did not: the two lists below are the
+                    # identity-grant nets (`_internal_nets`), a different
+                    # question, and `builtin` reported `172.16.0.0/12` as
+                    # applying even after naming an operator net had dropped it.
+                    # Advertising a grant that is not in force, on the surface
+                    # whose entire purpose is the gap between the two.
+                    "in_force": acl.reach_nets(),
+                    # 🚨 Stated rather than left to be inferred from two lists.
+                    # Naming any operator net drops the docker-internal default,
+                    # and a containerised deployment that loses its own admin
+                    # path finds out as a 403 from an address nothing in its
+                    # config mentions.
+                    "docker_default_dropped": bool(acl.operator_admin_nets()),
                     "builtin": acl.builtin_admin_nets(),
                     "operator": acl.operator_admin_nets(),
                     # 🚨 A subset of `operator`, and reported rather than left
@@ -927,6 +980,9 @@ class ManagementApi:
                     "runtime_keys": len(overlay.keys),
                     "revocations": len(overlay.revoked),
                     "caller_overrides": len(overlay.agents),
+                    # J1: endpoints promoted or taken out of service at runtime.
+                    "endpoint_overrides": len(overlay.catalog.get("endpoints") or {}),
+                    "provider_overrides": len(overlay.catalog.get("providers") or {}),
                 },
             },
             # 🚨 The gap list. Empty is the healthy state and is NOT the same as
@@ -1764,20 +1820,189 @@ class ManagementApi:
                     f"service.", 400)
             remove_endpoint(self.state.config, name)
 
-        self.state.admin_overlay.set_endpoint_status(name, status)
-        self._record(request, "endpoint.status", name, {"status": status})
+        return await self._commit_catalog(
+            request, "endpoints", name, {"status": status},
+            action="endpoint.status",
+            extra={"status": status, "declared_status": entry.status},
+            warnings=warnings)
+
+    # ---- J2: the catalog is writable ------------------------------------
+
+    async def _commit_catalog(self, request: Request, section: str, name: str,
+                              fields: dict | None, *, action: str,
+                              extra: dict | None = None,
+                              warnings: list[str] | None = None,
+                              replace: bool = False) -> Response:
+        """Validate a catalog write BY BUILDING IT, then install it.
+
+        🚨 There is no second validator. The candidate fragment is merged into
+        `models.yaml`'s raw dict and coerced by the same code that parses the
+        file — capability vocabulary, `policy:` passthrough, duplicate aliases,
+        the lot. If that reports a problem about this stanza, the write is
+        REFUSED. The file loader treats the same complaint as non-fatal on
+        purpose (a typo must not stop a fleet booting); arriving from a request
+        it is a 400, because there is an operator on the other end who can fix
+        it now. Same check, two consequences, chosen by who is asking.
+        """
+        overlay = self.state.admin_overlay
+        candidate = {sec: dict(stanzas) for sec, stanzas
+                     in (overlay.catalog or {}).items()}
+        candidate.setdefault(section, {})
+        if fields is None:
+            candidate[section][name] = None                    # tombstone
+        elif replace:
+            candidate[section][name] = dict(fields)
+        else:
+            current = candidate[section].get(name)
+            candidate[section][name] = (dict(fields) if current is None
+                                        else {**current, **fields})
+
+        subject_prefix = f"{section}.{name}"
+        before = len(hooks.config_notices())
+        try:
+            cat = model_catalog.load_catalog(overlay=candidate)
+            # 🚨 And BUILD THE KWARGS. Loading the catalog is only half of what
+            # installing does, and the other half is where several checks live —
+            # the `policy:` allowlist among them. Validating the load alone
+            # accepted a stanza with a mistyped policy key and then emitted the
+            # complaint during reconcile, AFTER the write had been agreed. If
+            # "validate by building what you would install" is the rule, it has
+            # to build all of it.
+            affected = ([name] if section == "endpoints"
+                        else [e.name for e in cat.endpoints.values()
+                              if e.provider == name])
+            entries = [cat.endpoints[n] for n in affected if n in cat.endpoints]
+            if entries:
+                model_catalog.build_endpoint_kwargs(cat, entries)
+        except Exception as exc:  # noqa: BLE001 — a bad stanza is a 400
+            return _error("invalid_request_error",
+                          f"that would not load: {exc}", 400)
+        complaints = [n for n in hooks.config_notices()[before:]
+                      if str(n.get("subject", "")).startswith(subject_prefix)]
+        if complaints:
+            return _error(
+                "invalid_request_error",
+                "; ".join(str(c.get("detail")) for c in complaints), 400)
+
+        # Install: mutate on the loop, persist off it.
+        overlay.catalog = candidate
+        model_catalog.set_runtime_overlay(candidate)
+        if fields is None and section == "endpoints":
+            # A tombstone leaves the catalog with no entry for this name, so
+            # `reconcile_endpoints` cannot tell it apart from an endpoint some
+            # host application configured in code — which it must not delete.
+            # The handler knows, so the handler does it.
+            remove_endpoint(self.state.config, name)
+        # 🚨 Name what changed, or an EDIT to an endpoint already in the table
+        # is accepted and does nothing: reconcile leaves existing entries alone
+        # so discovery's corrections survive, so nothing would rebuild it.
+        touched = ({name} if section == "endpoints"
+                   else {e.name for e in cat.endpoints.values()
+                         if e.provider == name})
+        changed = reconcile_endpoints(self.state.config, cat,
+                                      names=touched, rebuild=touched)
+
+        self._record(request, action, name, dict(fields or {}) or {"deleted": True})
         outcome = await self._persist()
         return JSONResponse({
-            "endpoint": name,
-            "status": status,
-            "routed": status == "active",
-            "declared_status": entry.status,
-            "warnings": warnings + ([
-                f"the catalog declares {name!r} as {entry.status!r}; this "
-                f"override is layered over models.yaml, which is unchanged"
-            ] if entry.status != status else []),
+            section[:-1]: name,
+            "routed": name in self.state.config.endpoints,
+            "reconciled": changed,
+            # 🚨 Said on EVERY catalog write, not just a status change. The
+            # overlay being the only writer is the doctrine that makes a bad
+            # save survivable, and an operator who believes the UI edited their
+            # file will go looking for a change that is not there.
+            "warnings": (warnings or []) + [
+                "models.yaml is unchanged — this is a runtime overlay layered "
+                "over it, and the Configuration view shows both",
+            ] + [
+                f"$" + gap + f" is not set, so {n!r} stays out of the routing "
+                f"table until it is" for n, gap in
+                [(x, endpoint_credential_gap(x, cat)) for x in changed["blocked"]]
+            ],
+            **(extra or {}),
             **outcome,
         })
+
+    async def handle_admin_catalog_entry(self, request: Request) -> Response:
+        """PUT / PATCH / DELETE one provider or endpoint stanza (roadmap J2).
+
+        PUT replaces the runtime stanza, PATCH merges into it, DELETE tombstones
+        the name so the catalog no longer has it. All three go through
+        ``_commit_catalog``, so all three are validated by building the catalog
+        they would install.
+        """
+        denied = self._gate(f"{PREFIX}/providers", request)
+        if denied is not None:
+            return denied
+        section = ("providers" if "provider" in request.path_params
+                   else "endpoints")
+        name = request.path_params.get("provider") or request.path_params["endpoint"]
+        method = request.method.upper()
+
+        if not _CATALOG_NAME.match(name):
+            return _error("invalid_request_error",
+                          f"{name!r} is not a usable name: letters, digits, "
+                          f"'-', '_' and '.', up to 64 characters", 400)
+
+        if method == "DELETE":
+            refusal = self._may_delete(section, name)
+            if refusal is not None:
+                return refusal
+            return await self._commit_catalog(
+                request, section, name, None, action=f"{section[:-1]}.delete")
+
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return _error("invalid_request_error", "body must be JSON", 400)
+        if not isinstance(body, dict):
+            return _error("invalid_request_error", "body must be an object", 400)
+        allowed = (_PROVIDER_FIELDS if section == "providers"
+                   else _ENDPOINT_FIELDS)
+        unknown = sorted(set(body) - allowed)
+        if unknown:
+            # 🚨 Never a silent drop, on the surface whose purpose is exposing
+            # them. The file loader reports and continues; a request is refused.
+            return _error("invalid_request_error",
+                          f"unknown field(s) {unknown} for a {section[:-1]}; "
+                          f"known: {sorted(allowed)}", 400)
+        if "api_key" in body or "key" in body:
+            return _error("invalid_request_error",
+                          "a catalog stanza names api_key_env — the NAME of an "
+                          "environment variable — and never a key. Set the "
+                          "value with POST .../credential.", 400)
+
+        return await self._commit_catalog(
+            request, section, name, body,
+            action=f"{section[:-1]}.{'replace' if method == 'PUT' else 'edit'}",
+            replace=(method == "PUT"))
+
+    def _may_delete(self, section: str, name: str) -> Response | None:
+        """The two refusals deletion has to make."""
+        if section == "endpoints":
+            in_flight = int((self.state.scheduler.endpoint_snapshot(name)
+                             or {}).get("in_flight") or 0)
+            if in_flight:
+                # 🚨 J1's rule. The request path reads
+                # `config.endpoints.get(...)` after dispatch, so removing an
+                # entry from under live work is a null dereference.
+                return _error("invalid_request_error",
+                              f"endpoint {name!r} has {in_flight} request(s) in "
+                              f"flight. Pause it first — that drains — then "
+                              f"delete it.", 400)
+            return None
+        # 🚨 A provider with endpoints still naming it would leave a routing
+        # table pointing at a connection that no longer exists. Named, not
+        # merely refused: "which ones" is the operator's next question.
+        cat = model_catalog.load_catalog()
+        users = sorted(e.name for e in cat.endpoints.values()
+                       if e.provider == name)
+        if users:
+            return _error("invalid_request_error",
+                          f"provider {name!r} still serves {users}. Delete or "
+                          f"repoint them first.", 400)
+        return None
 
     def _providers_view(self) -> dict:
         cat = model_catalog.load_catalog()
@@ -1886,7 +2111,8 @@ class ManagementApi:
     def _why_not_in_force(self, name: str, entry: Any, env_var: str) -> str:
         if entry is None:
             return "not in the catalog"
-        requested = self.state.admin_overlay.endpoints.get(name, {}).get("status")
+        requested = ((self.state.admin_overlay.catalog.get("endpoints") or {})
+                     .get(name) or {}).get("status")
         if requested == "active":
             if env_var and not os.environ.get(env_var):
                 return (f"promoted here, but ${env_var} is not set — a routed "
@@ -1932,8 +2158,9 @@ class ManagementApi:
             "not_in_force": {
                 "reason": self._why_not_in_force(name, entry, env_var),
                 "declared_status": entry.status if entry else None,
-                "requested_status": (self.state.admin_overlay.endpoints
-                                     .get(name, {}).get("status")),
+                "requested_status": (
+                    ((self.state.admin_overlay.catalog.get("endpoints") or {})
+                     .get(name) or {}).get("status")),
                 "credential": {
                     "env_var": env_var or None,
                     "present": bool(os.environ.get(env_var)) if env_var else None,
@@ -1958,6 +2185,25 @@ class ManagementApi:
                        "probe_healthy": None},
             "routing": {"failover_to": None, "spill_to": None},
         }
+
+
+#: What a runtime stanza may carry. 🚨 Deliberately the catalog's OWN field
+#: names — this is `models.yaml`'s format, not a second one, so an operator can
+#: read a stanza here and paste it into the file. `api_key_env` names a variable
+#: and never a key; there is no field for a secret because the store holds none.
+_PROVIDER_FIELDS = frozenset({
+    "engine", "host", "port", "base_url", "api_key_env", "notes",
+})
+_ENDPOINT_FIELDS = frozenset({
+    "provider", "kind", "status", "model", "role", "aliases", "slots",
+    "context_per_slot", "timeout_floor_s", "timeout_ceiling_s",
+    "stream_hard_cap_s", "capabilities", "failover_to", "spill_to",
+    "degrade_ok", "spill_ok", "policy", "notes",
+})
+
+#: A catalog name is used as a dict key, a URL segment, a DRR budget key and a
+#: metrics label. Bounded and boring on purpose.
+_CATALOG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 # ---------------------------------------------------------------------------
@@ -2003,6 +2249,93 @@ def endpoint_credential_gap(name: str, cat: Any = None) -> str | None:
     return None
 
 
+def reconcile_endpoints(config: "ProxyConfig", cat: Any = None, *,
+                        names: "frozenset[str] | set[str]",
+                        rebuild: "frozenset[str] | set[str]" = frozenset(),
+                        ) -> dict:
+    """Bring the NAMED endpoints into line with the catalog. What changed.
+
+    🚨 ``names`` is required, and narrow on purpose. An earlier version imposed
+    the whole catalog — every routed endpoint in, everything else out — and that
+    silently destroyed endpoints a host application had configured **in code**:
+    the shipped catalog declares `spill-chat` as `planned`, a caller had added a
+    routed one to `config.endpoints` itself, and startup deleted it. "Embed
+    Roadstead and configure it yourself" is a supported arrangement, and a
+    reconcile that treats the catalog as the only possible author of the routing
+    table breaks it without a word.
+
+    So this touches exactly what its caller says changed, and nothing else.
+
+    🚨 The ONE function that decides what is routed, used by an admin write and
+    by the startup replay alike. Two code paths that both "bring the fleet up to
+    date" is the shape that makes a restart differ from a running edit.
+
+    🚨 **The table is REPLACED, never mutated in place.** `config.endpoints` is
+    iterated by loops that `await` between items — the capacity poller probes
+    each backend — and mutating it under one of those is
+    `RuntimeError: dictionary changed size during iteration`, which is exactly
+    what happened the first time an endpoint was created at runtime. Rebinding
+    the attribute lets an in-flight iteration finish over the table it started
+    with, which is also the more honest semantics: a reconcile is one atomic
+    change of the fleet, not a sequence of adds and removes that a reader can
+    observe halfway through. It is the alternative to auditing 27 call sites for
+    an `await` and being wrong about one of them.
+
+    ``rebuild`` names endpoints whose stanza has been EDITED. An endpoint
+    already in the table is otherwise left alone, deliberately: its
+    `EndpointConfig` carries discovered state — the slot count `/props`
+    corrected, the model fingerprint — and rebuilding it wholesale would discard
+    that until the next poll. So the caller says what it changed; nothing else
+    is disturbed.
+
+    An endpoint the catalog routes but whose provider needs a credential that is
+    not set is left OUT, loudly — `models.yaml` says in its own words that a
+    deployment without the key "should not have an endpoint in its routing table
+    that cannot serve", and a restart is exactly when that rule would otherwise
+    be bypassed, because the status persists and the credential does not.
+    """
+    cat = cat or model_catalog.load_catalog()
+    routed = {e.name for e in cat.routed()}
+    table = dict(config.endpoints)
+    added, removed, rebuilt, blocked = [], [], [], []
+    for name in sorted(names):
+        gap = endpoint_credential_gap(name, cat) if name in routed else None
+        if name not in routed or gap:
+            if gap:
+                blocked.append((name, gap))
+            if table.pop(name, None) is not None:
+                removed.append(name)
+            continue
+        if name not in table:
+            table[name] = build_endpoint(name, cat)
+            added.append(name)
+        elif name in rebuild:
+            table[name] = build_endpoint(name, cat)
+            rebuilt.append(name)
+    config.endpoints = table          # one atomic swap
+    for name, gap in blocked:
+        logger.warning(
+            "endpoint %r is routed by the catalog but $%s is not set, so it "
+            "stays OUT of the routing table — a routed endpoint that cannot "
+            "serve is what a 'planned' status prevents. Set the credential.",
+            name, gap)
+    return {"added": added, "removed": removed, "rebuilt": rebuilt,
+            "blocked": [n for n, _ in blocked]}
+
+
+def build_endpoint(name: str, cat: Any = None) -> EndpointConfig:
+    """The EndpointConfig a declared endpoint gets — and nothing else.
+
+    Split out of `install_endpoint` so `reconcile_endpoints` can assemble a new
+    table without touching the live one.
+    """
+    cat = cat or model_catalog.load_catalog()
+    entry = cat.endpoints.get(name)
+    if entry is None:
+        raise KeyError(f"{name!r} is not declared in the catalog")
+    return EndpointConfig(**model_catalog.build_endpoint_kwargs(cat, [entry])[name])
+
+
 def install_endpoint(config: "ProxyConfig", name: str,
                      cat: Any = None) -> EndpointConfig:
     """Put a declared endpoint into the routing table. Idempotent.
@@ -2013,19 +2346,17 @@ def install_endpoint(config: "ProxyConfig", name: str,
     thing, and the drift would show up as an endpoint that behaves subtly
     differently depending on how it entered service.
     """
-    cat = cat or model_catalog.load_catalog()
-    entry = cat.endpoints.get(name)
-    if entry is None:
-        raise KeyError(f"{name!r} is not declared in the catalog")
-    kwargs = model_catalog.build_endpoint_kwargs(cat, [entry])[name]
-    ep = EndpointConfig(**kwargs)
-    config.endpoints[name] = ep
+    ep = build_endpoint(name, cat)
+    # Replaced, not mutated — see `reconcile_endpoints`.
+    config.endpoints = {**config.endpoints, name: ep}
     return ep
 
 
 def remove_endpoint(config: "ProxyConfig", name: str) -> None:
     """Take an endpoint out of the routing table. Idempotent."""
-    config.endpoints.pop(name, None)
+    if name in config.endpoints:
+        config.endpoints = {k: v for k, v in config.endpoints.items()
+                            if k != name}
 
 
 # ---------------------------------------------------------------------------

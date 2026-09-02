@@ -433,6 +433,27 @@ async def test_every_mutating_admin_route_records_something(tmp_path, monkeypatc
             return await svc.handle_admin_provider_credential(_Req(
                 method=method, path_params={"provider": "openrouter"},
                 body={"value": "probe-not-a-real-key"}))
+        if path.endswith("/providers/{provider}"):
+            # PUT/PATCH a provider that does not exist yet is a create; DELETE
+            # needs one nothing points at, so create it in the same breath.
+            if method == "DELETE":
+                await svc.handle_admin_catalog_entry(_Req(
+                    method="PUT", path_params={"provider": "audit-probe"},
+                    body={"engine": "llama.cpp", "host": "192.0.2.9",
+                          "port": 9099}))
+            return await svc.handle_admin_catalog_entry(_Req(
+                method=method, path_params={"provider": "audit-probe"},
+                body={"engine": "llama.cpp", "host": "192.0.2.9", "port": 9099}))
+        if path.endswith("/endpoints/{endpoint}") and not path.endswith("/status"):
+            if method == "DELETE":
+                await svc.handle_admin_catalog_entry(_Req(
+                    method="PUT", path_params={"endpoint": "audit-probe-ep"},
+                    body={"provider": "small-box", "kind": "chat",
+                          "status": "planned", "slots": 1}))
+            return await svc.handle_admin_catalog_entry(_Req(
+                method=method, path_params={"endpoint": "audit-probe-ep"},
+                body={"provider": "small-box", "kind": "chat",
+                      "status": "planned", "slots": 1}))
         if path.endswith("/endpoints/{endpoint}/status"):
             # Demote a routed endpoint: no credential needed and nothing is in
             # flight, so this exercises the write rather than a refusal.

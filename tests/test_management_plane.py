@@ -27,6 +27,8 @@ import json
 import re
 from pathlib import Path
 
+import ipaddress
+
 import pytest
 
 from roadstead import model_catalog
@@ -915,3 +917,53 @@ class _FakeSvc:
         async def handler(*args, **kwargs):  # pragma: no cover — never called
             raise AssertionError("route handler invoked in a shape test")
         return handler
+
+
+@pytest.mark.asyncio
+async def test_the_config_view_reports_the_REACH_set_not_the_grant_lists(tmp_path):
+    """🚨 The plane's own thesis, applied to the plane.
+
+    `ROADSTEAD_ADMIN_NETS` names who may REACH the admin plane, and naming any
+    net DROPS the docker-internal default. This view reported
+    `builtin: [..., "172.16.0.0/12", ...]` unconditionally — from
+    `builtin_admin_nets()`, which is the *identity-grant* net list
+    (`_internal_nets`), a different question — so after an operator named their
+    own nets it advertised a grant that was no longer in force. On the surface
+    that exists to expose exactly that gap.
+
+    `acl.reach_nets()` is the right source and its docstring says it is for the
+    management plane; only the STARTUP LOG was calling it. Two sources that
+    agree most of the time, which is where §3.5 says the expensive failures
+    live.
+
+    Asserted against `may_reach_admin` rather than against a literal list — the
+    thing that decides, not a transcription of it.
+    """
+    svc = _svc(tmp_path)
+    acl = svc._state.acl
+    acl.register_admin_net("192.0.2.0/24")   # RFC 5737, per the scrub guard
+
+    view = await _body(await svc.handle_admin_config(_Req()))
+    nets = view["sources"]["admin_nets"]
+
+    assert nets["docker_default_dropped"] is True
+    for probe, expected in (("172.18.0.2", False),   # docker: default dropped
+                            ("192.0.2.15", True),    # the operator's own net
+                            ("127.0.0.1", True)):    # loopback always survives
+        assert acl.may_reach_admin(probe) is expected, probe
+        covered = any(ipaddress.ip_address(probe) in ipaddress.ip_network(n)
+                      for n in nets["in_force"])
+        assert covered is expected, (
+            f"the view says {probe} is {'in' if covered else 'not in'} the reach "
+            f"set and may_reach_admin says {expected} — the view is describing a "
+            f"fleet this proxy is not running")
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_install_still_reports_the_docker_default_as_in_force(tmp_path):
+    """The other direction, so the fix is not just 'always say dropped'."""
+    svc = _svc(tmp_path)
+    nets = (await _body(await svc.handle_admin_config(_Req())))["sources"]["admin_nets"]
+    assert nets["docker_default_dropped"] is False
+    assert "172.16.0.0/12" in nets["in_force"]
+    assert svc._state.acl.may_reach_admin("172.18.0.2") is True

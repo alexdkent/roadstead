@@ -8,6 +8,58 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Added — the catalog is writable at runtime (roadmap J2)
+
+Landed 2026-09-01. `PUT`/`PATCH`/`DELETE` on `/rs/v1/admin/providers/{p}` and
+`/rs/v1/admin/endpoints/{e}`: create a backend that is in no file, edit any field of one that is,
+delete either. A provider and an endpoint invented through the API served a real request seconds
+later, and `models.yaml` never saw any of it.
+
+🚨 **The overlay contributes catalog STANZAS, not a second model of an endpoint.** A runtime fragment
+is merged into the file's raw dict *before coercion*, so a UI-created endpoint is parsed, defaulted
+and validated by exactly the code that parses a file-authored one. Bodies use `models.yaml`'s own
+field names because they *are* `models.yaml` stanzas. A partial merges over the file's, a new name
+stands alone, `null` is a tombstone — the same "a later statement wins" rule that puts revoke after
+enrol.
+
+🚨 **`models.yaml` is never written**, and every response says so. Comments, formatting and
+hand-authored intent survive a bad save.
+
+🚨 **Validation is by construction** — the candidate catalog *and its endpoint kwargs* are built, and
+the write is refused if either complains. Building only the catalog was not enough: the `policy:`
+allowlist check lives in `build_endpoint_kwargs`, so a mistyped policy key was accepted and the
+complaint arrived after the write had been agreed.
+
+**File format:** the overlay's `endpoints` section became `catalog.endpoints`. An existing file is
+**migrated on load**, not dropped — otherwise an upgrade silently takes every promoted endpoint out
+of service.
+
+### Fixed — three defects found by running the new writes
+
+- **`RuntimeError: dictionary changed size during iteration`** in the capacity poller. Creating an
+  endpoint mutated `config.endpoints` while the poller was iterating it and awaiting between items.
+  The routing table is now **replaced, not mutated** — an in-flight iteration finishes over the table
+  it started with, and a reconcile is one atomic change rather than a sequence a reader can observe
+  halfway through. That is also the alternative to auditing 27 call sites for an `await` and being
+  wrong about one.
+- **An edit was accepted and did nothing.** Reconcile leaves existing entries alone so discovery's
+  corrections survive, so nothing rebuilt an endpoint whose stanza had changed. Callers now name what
+  they touched.
+- 🚨 **Startup deleted endpoints configured in code.** The first reconcile imposed the whole catalog,
+  and the shipped catalog declares `spill-chat` as `planned` — so a routed one added directly to
+  `config.endpoints` by an embedding caller was removed at startup, silently. Reconcile now touches
+  only the names its caller says changed. Caught by an existing spill test going red.
+
+### Fixed — the management plane reported admin-plane reach it was not using
+
+Landed 2026-09-01. `GET /rs/v1/admin/config` reported `admin_nets.builtin` from
+`acl.builtin_admin_nets()` — the *identity-grant* net list, a different question — so after an
+operator named their own nets it went on advertising the docker-internal default that naming them had
+**dropped**. `acl.reach_nets()` is the right source and its docstring says it exists for the
+management plane; only the startup log was calling it. So the log told the truth and the view did
+not, which is the two-sources-that-agree-most-of-the-time failure this plane exists to expose. The
+view now reports `in_force` and `docker_default_dropped`.
+
 ### Added — the management plane can bring a declared endpoint into service (roadmap J1)
 
 Landed 2026-09-01. The Providers tab was the configuration surface and carried **no controls at

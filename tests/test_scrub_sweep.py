@@ -72,8 +72,48 @@ _THE_GUARD_ITSELF = "tests/test_scrub_sweep.py"
 
 
 def _tracked_files() -> list[str]:
-    out = subprocess.run(["git", "ls-files"], cwd=REPO,
-                         capture_output=True, text=True, check=True)
+    """Every tracked file, from git.
+
+    🚨 It fails rather than SKIPS when git is unavailable, and the message says
+    so. A scrub guard that skips is a scrub guard that passes — and it would
+    pass in exactly the environment where nobody is watching it: the shipping
+    image has no git, and running the suite there produced a bare
+    `FileNotFoundError: 'git'` that reads like a broken test rather than an
+    unmet requirement. The behaviour was already right (fail, not skip); only
+    the sentence was missing.
+
+    The tracked set is the right question even so — an untracked file cannot
+    leak into a published repository, and `git ls-files` is the only thing that
+    knows the difference.
+    """
+    _WHY = (
+        "It fails instead of skipping on purpose: a scrub guard that skips is "
+        "a scrub guard that passes, and this repo must not go public on a "
+        "green run that checked nothing."
+    )
+    try:
+        out = subprocess.run(["git", "ls-files"], cwd=REPO,
+                             capture_output=True, text=True, check=True)
+    except FileNotFoundError as exc:
+        raise AssertionError(
+            f"this guard enumerates tracked files with `git`, and there is "
+            f"none on PATH. {_WHY} Run the suite where git exists."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        # 🚨 The case that actually turns up: a DEPLOYED copy of the tree. The
+        # deploy rsync excludes `.git` deliberately — the history is not needed
+        # to run the code, and it still carries host names the scrub missed —
+        # so `git ls-files` there fails with "not a git repository". That is not
+        # this guard failing; it is an environment that cannot host the question
+        # the guard asks, because the question is about a REPOSITORY and a
+        # deployed tree is not one.
+        raise AssertionError(
+            f"`git ls-files` failed in {REPO}: {(exc.stderr or '').strip()!r}. "
+            f"If this is a deployed copy of the source rather than a checkout, "
+            f"that is expected — this guard is about what the REPOSITORY "
+            f"tracks, and a tree without history cannot answer it. Run it on a "
+            f"checkout. {_WHY}"
+        ) from exc
     return [line for line in out.stdout.splitlines() if line.strip()]
 
 

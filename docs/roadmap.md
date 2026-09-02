@@ -671,6 +671,59 @@ argue with the plane about it.
 
 #### J2 · Create a provider or an endpoint that is not in the file
 
+**Opened for real 2026-09-01**, on an explicit ask: the operator wants to add models and backends
+from the UI, not from a file. Three panes — Overview, Configuration, Audit — with Configuration
+owning models, providers, keys and networks. Decisions taken with the ask:
+
+- **Full create / edit / delete.** `models.yaml` becomes a seed, not the only way in.
+- **The overlay stays the ONLY writer.** `models.yaml` is never rewritten. It keeps its comments,
+  its hand-authored intent, and its property of not being destroyable by a bad UI save. The cost —
+  two sources to read before you know the truth — is paid by the Configuration pane showing
+  declared-beside-in-force, which is what that surface already exists to do.
+- **API keys, not passwords.** The no-second-credential-kind decision from G stands.
+
+🚨 **THE DESIGN DECISION: the overlay contributes catalog STANZAS, not a parallel model of an
+endpoint.** `load_catalog` reads YAML into a `raw` dict and then coerces it — `_coerce_provider`,
+`_coerce_endpoint`, alias-collision detection, capability checking, `policy:` passthrough, the
+`intents:` layer. The overlay is merged into **`raw`, before coercion**, so a UI-created endpoint is
+parsed, defaulted and validated by exactly the code that parses a file-authored one.
+
+The alternative — a second representation of "an endpoint the API made" — is the shape this repo
+keeps paying for: two things that describe the same object and agree most of the time. It would need
+its own validation, its own defaults, its own capability vocabulary and its own duplicate-alias rule,
+and each of those is a place to drift. There is one catalog format; the overlay writes it too.
+
+**Merge semantics, and they follow the doctrine already in this file:**
+
+- A stanza for a name the file also declares is a **partial, merged over** the file's — so changing
+  `slots` does not require restating `capabilities`. This subsumes J1's status override exactly:
+  `{"status": "active"}` was already a partial stanza and needs no format change.
+- A stanza for a name the file does not have **stands alone** — that is creation.
+- `null` is a **tombstone** — deletion. Applied after the file, so a later statement wins, which is
+  the same rule that puts revoke after enrol.
+
+🚨 **Validation is by CONSTRUCTION, not by a second validator: build the catalog you would install
+and refuse the write if it complains.** `hooks.config_notice` is the file loader's reporting seam and
+is deliberately non-fatal there (a typo must not stop a fleet booting) — but the same complaint
+arriving from a *request* must be a 400, because there is an operator on the other end who can fix it
+now. Same check, two consequences, chosen by who is asking.
+
+**What must still refuse:**
+
+- **Deleting an endpoint with work in flight** — J1's rule, unchanged: the request path reads
+  `config.endpoints.get(...)` after dispatch. Pause drains; pause first.
+- **Deleting a provider that endpoints still name** — refused, naming them. The alternative is a
+  routing table pointing at a connection that does not exist.
+- **Activating an endpoint whose provider needs a credential that is not set** — J1's rule.
+- **Renaming** — not supported. A rename is a delete plus a create, and the DRR budget, the spend
+  ledger and the timeout model are all keyed on the endpoint name; silently carrying that history to
+  a new name, or silently dropping it, are both wrong and the operator should choose.
+
+**What is expected to work and is not new:** discovery against a backend nobody has probed (the
+health poller re-reads `config.endpoints` every cycle), and the scheduler meeting an endpoint it has
+never seen (`_queues` is created lazily). Both were verified on a real llama.cpp in a container on
+2026-09-01 — a declared `slots: 2` was corrected to `4` by `/props`.
+
 The real hot-add, and the one E was actually pointing at. Everything J1 leans on is absent: nothing
 is parsed, nothing is validated, and a half-configured entry in the routing table is a live failure
 rather than a rejected write. It needs the catalog's validation reachable from a request, a

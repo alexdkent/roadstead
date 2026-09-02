@@ -679,6 +679,8 @@ is not an error: see §3.2.
 | `GET /rs/v1/admin/providers` | Providers and endpoints: declared vs discovered capacity, credential presence, prices, health. Includes endpoints the catalog declares that nothing is serving. |
 | `POST /rs/v1/admin/providers/{provider}/credential` | Supply the value for the provider's `api_key_env` (§3.9). Write-only, **never persisted**. |
 | `POST /rs/v1/admin/endpoints/{ep}/status` | Bring a declared endpoint into service or take it out — `active` \| `planned` (§3.9). |
+| `PUT`/`PATCH`/`DELETE /rs/v1/admin/providers/{provider}` | Create, edit or delete a provider (§3.10). |
+| `PUT`/`PATCH`/`DELETE /rs/v1/admin/endpoints/{ep}` | Create, edit or delete an endpoint (§3.10). |
 | `GET /rs/v1/admin/audit` | Who changed what, and when (§3.8). Reports its own bound and durability. |
 | `POST /rs/v1/admin/endpoints/{ep}/pause` · `POST /v1/admin/endpoints/{ep}/pause` | Drain an endpoint: background defers, interactive fast-fails, the poller stops probing. Auto-opens an annotated PLANNED maintenance window. |
 | `POST /rs/v1/admin/endpoints/{ep}/resume` · `POST /v1/admin/endpoints/{ep}/resume` | Re-probe, **re-discover capacity**, drain the deferred queue, close the window. |
@@ -910,6 +912,36 @@ request, because a provider reads the variable at call time rather than at start
   through the back door. A promotion whose variable is unset stays in the overlay, logs a warning
   naming the variable, and takes effect the moment it is set and promoted again. It is not lost and
   it is not silently in force.
+
+#### 3.10 Writing the catalog
+
+**`PUT`** replaces a runtime stanza, **`PATCH`** merges into it, **`DELETE`** removes the name.
+Bodies use `models.yaml`'s own field names, because they are `models.yaml` stanzas.
+
+🚨 **`models.yaml` is never written.** Runtime stanzas live in the admin overlay and are layered over
+the file, exactly as an endpoint status override always was. Your comments, your formatting and your
+hand-authored intent survive a bad save, and every response says the file is unchanged. The
+Configuration view shows declared beside in-force so you can see which is which.
+
+🚨 **The overlay contributes catalog STANZAS, not a second model of an endpoint.** A runtime fragment
+is merged into the file's raw dict *before coercion*, so it is parsed, defaulted and validated by
+exactly the code that parses a file-authored stanza. There is one catalog format.
+
+- A stanza for a name the file also declares is a **partial, merged over** it.
+- A stanza for a name the file lacks **stands alone** — that is creation.
+- A tombstone removes the name. Applied after the file, so a later statement wins.
+
+🚨 **Validation is by construction:** the candidate catalog is built and the write is refused if it
+complains. The file loader treats the same complaint as non-fatal (a typo must not stop a fleet
+booting); from a request it is a `400`, because there is an operator who can fix it now.
+
+**Refusals:** deleting an endpoint with work in flight (pause first — that drains); deleting a
+provider endpoints still name (they are listed); an unknown field (never a silent drop); a field
+called `api_key` (a stanza names `api_key_env`, a *variable*, and never a key).
+
+**Not supported: renaming.** A rename is a delete plus a create, and the DRR budget, the spend ledger
+and the timeout model are all keyed on the endpoint name. Carrying that history silently to a new
+name, or silently dropping it, are both wrong; the operator should choose.
 
 The same principle shapes the other two read views. `GET /rs/v1/admin/providers` reports each
 endpoint's **declared** capacity (the `models.yaml` seed) beside what is **in force** (what discovery
