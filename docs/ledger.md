@@ -301,6 +301,72 @@ must satisfy, so the next divergence fails there.
 
 ---
 
+## The vLLM half of the capacity asymmetry had never been measured
+
+**Symptom.** None, and it could not have produced one here. Every vLLM claim in the codebase was an
+*assertion about an absence* — `publishes_slot_count=False`, `publishes_slot_context=False` — and an
+absence is the one thing a programmable fake can never confirm. `roadstead.testing` publishes what it
+is told to; asked to imitate a vLLM, it withholds the fields it was told to withhold and agrees with
+the descriptor by construction. `tests/wire_fidelity/test_real_engine.py` closed this for llama.cpp
+on 2026-08-31. The other engine stayed unmeasured, so the asymmetry that decides whether an
+endpoint's concurrency is *discovered* or *config-seeded with a drift alert* rested on one side of
+evidence.
+
+**Measured 2026-09-01** against a real vLLM serving live traffic (DeepSeek-V4-Flash, `max_model_len`
+1,048,576, two-node pipeline-parallel). Read-only: `/health`, `/v1/models`, `/props`, `/slots`,
+`/metrics`. **Every descriptor claim held.**
+
+| claim | how it was confirmed |
+|---|---|
+| `publishes_slot_count=False` | `/props` **404**, `/slots` **404**, and no `max_num_seqs` on any readable surface |
+| `publishes_slot_context=False` | no per-slot figure is published at all — there is no slot to have one |
+| `publishes_context_ceiling=True` | `data[0].max_model_len` = 1048576, and it is the per-request ceiling **directly**, not an aggregate to divide |
+| `publishes_prefix_cache_metrics=True` | `vllm:prefix_cache_queries_total` / `vllm:prefix_cache_hits_total` present under exactly the names `compute_cache_stats` reads |
+| `probe_model_fingerprint` prefers `root` | `root` = a weights path, `id` = the operator's `--served-model-name`; the two differ, which is the entire reason the alias cannot detect a swap |
+
+**The finding worth having is a near miss.** `/metrics` publishes `vllm:cache_config_info`, and one
+of its labels is **`kv_cache_max_concurrency`** — a float that looks exactly like the number vLLM is
+documented not to expose. It is not. It is how many *full-context* requests the KV cache would hold
+(`kv_cache_size_tokens` / `max_model_len`), so on this long-context server it reads **1.67** while
+the engine fields far more than two concurrent requests. Seeding `max_slots` from it would cap a busy
+endpoint at one, and would do it wearing the authority of a discovered fact rather than a guess. This
+is the same shape as every other entry in this file: a field that is present, plausible, and answers
+a different question than the one being asked.
+
+**Guard.** `tests/wire_fidelity/test_real_vllm.py`, opt-in on
+`ROADSTEAD_WIRE_FIDELITY_VLLM_URL` and deselected by default like the rest of the marker.
+`conformance.py` grew the negative half of the contract (`check_endpoint_absent`,
+`check_no_published_concurrency`, `check_prefix_cache_metrics`), which fails loudly by name if
+`max_num_seqs` ever appears — the one development that would make vLLM slot discovery real and is
+therefore an alarm to act on rather than route around.
+
+🚨 **One of the five guards passed against the engine it was written to distinguish**, and was
+rewritten. `test_descriptor_declares_the_asymmetry...` asserted the descriptor booleans (source
+constants, already pinned engine-free in `tests/test_provider_interface.py`) plus the absence of
+`max_num_seqs` — which llama.cpp *also* lacks. Pointed at a real `llama-server` it went green. It now
+depends on the `models_entry` fixture, which is what establishes the target is a vLLM at all, and the
+whole file was re-run against a real llama.cpp to watch all seven go red. That check is the reason
+this entry does not record a fifth confirmation that was worth nothing — and it is the second time
+the "watch it go red, and watch *how*" discipline has caught a vacuous guard on the day it was
+written.
+
+**The inference half, run the same day with the operator's consent: 7/7.** 🚨 **The terminal-chunk
+rule holds on vLLM as well** — `finish_reason` rides alone on a chunk whose `delta` is `{}`, and the
+stream ends with its own `[DONE]`. That rule was established on llama.cpp and has been applied by
+`correction.py` to *every* backend ever since, which means until now the second engine was being
+repaired against a rule measured somewhere else. It is now measured on both. The sync shape
+(`choices[0].message.content` plus a `finish_reason`) is confirmed too.
+
+Those two assertions POST, and the only reachable vLLM serves live traffic, so they stay behind a
+second opt-in (`ROADSTEAD_WIRE_FIDELITY_VLLM_INFERENCE=1`) rather than running whenever a URL is set.
+Pointing a test at an engine is not consent to generate on it.
+
+**Still not measured on vLLM:** the `qwen3_xml` parallel-tool-call streaming defects. Those need a
+tool-calling request against an endpoint launched with that parser, which the reachable engine is
+not.
+
+---
+
 ## The extraction's own near-miss: a commit that imported files it did not contain
 
 **Symptom.** The origin repo's `main` briefly held an `ImportError` — four edited modules were

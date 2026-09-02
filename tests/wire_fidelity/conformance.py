@@ -211,3 +211,81 @@ def check_sync_completion(base_url: str, model: str) -> dict[str, Any]:
         "choices[0].finish_reason is missing — a completion with no completion "
         "signal is exactly the failure the correction layer exists to catch")
     return body
+
+
+# ---------------------------------------------------------------------------
+# vLLM — the NEGATIVE half of the capacity asymmetry
+#   (providers/vllm.py ProviderDescriptor; backend.probe_vllm_capacity)
+# ---------------------------------------------------------------------------
+#
+# Everything above states what a backend must PUBLISH. The vLLM descriptor's
+# load-bearing claims are the opposite shape — `publishes_slot_count=False` and
+# `publishes_slot_context=False` — and an absence cannot be confirmed by the
+# fake, which only ever publishes what it was told to. It has to be read off a
+# real engine, which is what these are for.
+#
+# 🚨 The asymmetry is the reason vLLM concurrency is CONFIG-SEEDED with a drift
+# alert instead of discovered. If any of these ever starts passing the other
+# way, that decision has an evidence base again and should be revisited — which
+# is the alarm, not a failure to route around.
+
+def check_endpoint_absent(base_url: str, path: str) -> int:
+    """A llama.cpp-only path must not answer on a vLLM backend.
+
+    Asserted rather than assumed because `health.apply_discovered_capacity`
+    reaches for `/props` on the llama.cpp path only: were vLLM to start serving
+    one, the engine asymmetry the descriptor declares would be stale and slot
+    discovery would have become possible without anyone noticing."""
+    r = httpx.get(f"{base_url}{path}", timeout=TIMEOUT)
+    assert r.status_code != 200, (
+        f"{path} answered 200 on a vLLM backend. The descriptor declares "
+        f"publishes_slot_count=False / publishes_slot_context=False on the "
+        f"grounds that this endpoint does not exist here; it now does, and "
+        f"capacity discovery may no longer need to be config-seeded.")
+    return r.status_code
+
+
+def check_no_published_concurrency(base_url: str) -> str:
+    """`--max-num-seqs` must remain absent from every surface we can read.
+
+    🚨 THE NEAR MISS. `/metrics` publishes `vllm:cache_config_info`, whose
+    labels include `kv_cache_max_concurrency` — a plausible-looking float that
+    is NOT the admission cap. It is how many FULL-CONTEXT requests the KV cache
+    would hold (`kv_cache_size_tokens` / `max_model_len`), so on a
+    long-context server it reads BELOW 2 while the engine happily runs many
+    more short ones. Seeding `max_slots` from it would cap a busy endpoint at
+    one or two concurrent requests and look like a discovered fact while doing
+    it. Measured on a live engine 2026-09-01: 1.67, against a served model
+    fielding far more than that.
+
+    Returns the metrics text so a caller can report what it searched."""
+    r = httpx.get(f"{base_url}/metrics", timeout=TIMEOUT)
+    assert r.status_code == 200, f"/metrics returned {r.status_code}"
+    body = r.text
+    for needle in ("max_num_seqs", "max_num_batched_tokens"):
+        assert needle not in body, (
+            f"/metrics now publishes {needle!r}. That is the launch flag vLLM "
+            f"has never exposed over the API, and it is the ONLY thing that "
+            f"would make vLLM slot discovery real. Revisit "
+            f"publishes_slot_count=False rather than ignoring this.")
+    return body
+
+
+def check_prefix_cache_metrics(base_url: str, metrics_text: str) -> tuple[float, float]:
+    """`publishes_prefix_cache_metrics=True` — health.compute_cache_stats reads
+    exactly these two counters, and a rename would silently zero the only real
+    per-endpoint cache hit rate either engine gives us."""
+    found: dict[str, float] = {}
+    for line in metrics_text.splitlines():
+        for name in ("vllm:prefix_cache_queries_total",
+                     "vllm:prefix_cache_hits_total"):
+            if line.startswith(name + "{") or line.startswith(name + " "):
+                found[name] = float(line.rsplit(" ", 1)[1])
+    missing = {"vllm:prefix_cache_queries_total",
+               "vllm:prefix_cache_hits_total"} - set(found)
+    assert not missing, (
+        f"/metrics is missing {sorted(missing)} — the descriptor claims "
+        f"publishes_prefix_cache_metrics=True and compute_cache_stats reads "
+        f"these by name, so a rename reports a 0% hit rate rather than an error.")
+    return (found["vllm:prefix_cache_queries_total"],
+            found["vllm:prefix_cache_hits_total"])

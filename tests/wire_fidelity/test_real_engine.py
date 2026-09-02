@@ -117,11 +117,24 @@ def test_top_level_n_ctx_is_absent_not_an_aggregate(base_url):
     props = wire.check_props_shape(base_url)
     gen = (props.get("default_generation_settings") or {}).get("n_ctx")
     top = props.get("n_ctx")
-    print(f"\n/props at --ctx-size {COMPOSE_CTX_SIZE} --parallel {COMPOSE_PARALLEL}:"
+    launch = (f"--ctx-size {COMPOSE_CTX_SIZE} --parallel {COMPOSE_PARALLEL}"
+              if _launched_by_compose() else "an unknown launch config")
+    print(f"\n/props at {launch}:"
           f"\n  top-level n_ctx                   = {top!r}"
           f"\n  default_generation_settings.n_ctx = {gen!r}"
           f"\n  top-level keys                    = {sorted(props)}")
-    assert gen == EXPECTED_PER_SLOT, "the per-slot field is the load-bearing one"
+    # 🚨 Compose-gated, like its sibling above. Without the gate this test could
+    # only ever be pointed at compose's engine — and pointed at any other real
+    # backend it failed on the launch config rather than on the wire shape,
+    # which defeats the point of an alarm you can aim at a production box.
+    # Measured 2026-09-01 against a 6-slot production engine: it failed here
+    # reporting `262144 != 2048`, a correct per-slot value for THAT server.
+    if _launched_by_compose():
+        assert gen == EXPECTED_PER_SLOT, "the per-slot field is the load-bearing one"
+    else:
+        assert isinstance(gen, int) and gen > 0, (
+            f"default_generation_settings.n_ctx is {gen!r}; discovery reads it "
+            f"as the per-slot context and has no other source on this build")
     assert "n_ctx" not in props, (
         f"a top-level n_ctx has reappeared ({top!r}). health.py would DIVIDE it "
         f"by {COMPOSE_PARALLEL}; if it is really an aggregate that is correct, "
@@ -144,7 +157,13 @@ def test_slot_count_comes_from_total_slots_not_n_parallel(base_url):
     assert isinstance(props.get("total_slots"), int), (
         "total_slots is gone AND n_parallel was never there — capacity "
         "discovery has no source and silently keeps the configured value")
-    assert wire.discovered_slots(props) == COMPOSE_PARALLEL
+    # Compose-gated for the same reason as above: the exact number is a
+    # property of the launch, the RESOLUTION ORDER is the property of the
+    # engine, and only the second one is what this test is about.
+    if _launched_by_compose():
+        assert wire.discovered_slots(props) == COMPOSE_PARALLEL
+    else:
+        assert wire.discovered_slots(props) >= 1
 
 
 def test_models_publishes_a_served_id(base_url):
