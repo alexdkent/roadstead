@@ -289,6 +289,9 @@ label.f { display: flex; flex-direction: column; gap: 3px; font-size: 11px; colo
 <nav id="tabs"></nav>
 <main>
   <div id="banner"></div>
+  <!-- Editors render here rather than into #banner: a form an operator is
+       filling in must not be wiped by the next status message. -->
+  <div id="editor"></div>
   <div id="view"><div class="empty">loading…</div></div>
 </main>
 
@@ -313,6 +316,8 @@ const API = {
   callers:     "/rs/v1/admin/callers",
   caller:      (id) => "/rs/v1/admin/callers/" + encodeURIComponent(id),
   providers:   "/rs/v1/admin/providers",
+  provider:    (p) => "/rs/v1/admin/providers/" + encodeURIComponent(p),
+  endpoint:    (e) => "/rs/v1/admin/endpoints/" + encodeURIComponent(e),
   credential:  (p) => "/rs/v1/admin/providers/" + encodeURIComponent(p) + "/credential",
   epStatus:    (ep) => "/rs/v1/admin/endpoints/" + encodeURIComponent(ep) + "/status",
   audit:       "/rs/v1/admin/audit",
@@ -897,12 +902,39 @@ function persisted(res) {
 }
 
 /* --- Callers ----------------------------------------------------------- */
-async function viewCallers(root) {
+/* 🚨 Callers split in two on 2026-09-01, along the line the three panes draw:
+ * what a caller is DOING right now is something you watch (Overview), what it is
+ * ALLOWED to do is something you set (Configuration). They were one table, so
+ * an operator adjusting a quota had to read past live spend to find it, and an
+ * operator watching traffic had to read past policy to see it. */
+async function viewCallersLive(root) {
+  const c = state.callers = await api(API.callers);
+  const rows = pick(c, "callers", []).map((row) => el("tr", {},
+    el("td", {}, el("code", { text: pick(row, "agent_id", "?") })),
+    el("td", {}, tag(pick(row, "spend.effective_priority", "?"))),
+    el("td", { class: "num", text: fmt.n(pick(row, "drr.total_requests")) }),
+    el("td", { class: "num", text: fmt.n(pick(row, "rate.observed_per_min")) }),
+    el("td", { class: "num", text: fmt.n(pick(row, "drr.balance_ss"), 1) }),
+    // 🚨 Never summed. One is an invoice, the other is capacity that was free.
+    el("td", { class: "num", text: fmt.usd(pick(row, "spend.spent_today_usd")) }),
+    el("td", { class: "num", text: fmt.usd(pick(row, "spend.avoided_usd")) }),
+    el("td", {}, pick(row, "drr.starving") ? tag("starving", "warn") : null,
+                 pick(row, "spend.over") ? [" ", tag("over cap", "warn")] : null,
+                 pick(row, "rate.over") ? [" ", tag("over rate", "warn")] : null)));
+  root.append(el("section", {},
+    el("h2", { text: "Callers, right now" }),
+    why("Spend and savings are never summed — one is an invoice, the other is capacity that was free. Both thresholds degrade rather than reject, and crossing both still costs one priority band, not two. A caller alone on a quiet fleet is unthrottled by design: DRR is fairness under contention."),
+    rows.length ? table(["agent_id", "band", "requests", "req/min", "drr balance",
+                         "spent today", "avoided", ""], rows)
+                : empty("no callers yet — nothing has called")));
+}
+
+async function viewCallerQuotas(root) {
   const c = state.callers = await api(API.callers);
   const rows = pick(c, "callers", []).map(callerRow);
   root.append(el("section", {},
-    el("h2", { text: "Callers" }),
-    why("Quota is shown three ways: what is in force, what the file declared, and what this API changed. An override reads as a difference rather than as a label. Spend and savings are never summed — one is an invoice, the other is capacity that was free. Both thresholds degrade and neither rejects; crossing both still costs one band, not two."),
+    el("h2", { text: "Caller quotas" }),
+    why("Quota is shown three ways: what is in force, what the file declared, and what this API changed. An override reads as a difference rather than as a label. A weight change reaches the live DRR budget and moves the replenish RATE, not the balance already run."),
     rows.length ? table(["agent_id", "identities", "weight", "band", "degrade", "spill",
                          "daily cap", "req/min", "spent today", "avoided",
                          "drr balance", ""], rows)
@@ -1009,11 +1041,12 @@ async function patchCaller(agentId) {
 /* --- Providers --------------------------------------------------------- */
 async function viewProviders(root) {
   const prov = state.providers = await api(API.providers);
+  const providerNames = pick(prov, "providers", []).map((p) => pick(p, "provider", ""));
 
   root.append(el("section", {},
     el("h2", { text: "Providers" }),
     why("Adding a provider or an endpoint is still a models.yaml edit and a restart: an endpoint is a routing-table entry that discovery, health and the fairness denominator all key on. What you can do here is supply a credential and bring an endpoint that is already written down into service, or take it out. A credential is only ever shown by the NAME of the variable it comes from and whether that resolved — setting one here writes it into this process and nowhere else, so it does not survive a restart."),
-    table(["provider", "engine", "address", "credential", "publishes", "endpoints"],
+    table(["provider", "engine", "address", "credential", "publishes", "endpoints", ""],
       pick(prov, "providers", []).map((pr) => {
         // 🚨 What this KIND of backend can tell us about itself, read off the
         // descriptor and never off the engine name. Discovery is asymmetric by
@@ -1044,8 +1077,22 @@ async function viewProviders(root) {
                }))]
             : el("span", { class: "tag", text: "none needed" })),
           el("td", {}, pubs.length ? pubs.map((x) => [tag(x), " "]) : tag("nothing — config-seeded", "warn")),
-          el("td", {}, pick(pr, "endpoints", []).map((e) => [el("code", { text: e }), " "])));
-      }))));
+          el("td", {}, pick(pr, "endpoints", []).map((e) => [el("code", { text: e }), " "])),
+          el("td", {},
+            guarded(el("button", { class: "act", id: "pv-edit-" + pick(pr, "provider", "?"),
+              text: "Edit", onclick: () => providerForm(pr) })), " ",
+            guarded(el("button", { class: "act", id: "pv-del-" + pick(pr, "provider", "?"),
+              text: "Delete", onclick: () => {
+                const n = pick(pr, "provider", "");
+                if (!confirmish("Delete provider " + n + "? Endpoints still naming it must go first."
+                    + " models.yaml is not touched — this removes the runtime stanza.")) return;
+                saveCatalog("provider", n, null, "DELETE");
+              }}))));
+      })),
+    el("div", { class: "row" },
+      guarded(el("button", { class: "act primary", id: "pv-add",
+        text: "Add a provider", onclick: () => providerForm(null) }))),
+    readonlyNote()));
 
   root.append(el("section", {},
     el("h2", { text: "Endpoints — declared vs in force" }),
@@ -1055,10 +1102,14 @@ async function viewProviders(root) {
     // right now. The berth strip answers the other one, on Fleet.
     table(["endpoint", "provider", "state", "slots", "context", "price in/out",
            "failover", "spill", ""],
-      pick(prov, "endpoints", []).map(endpointRow)),
+      pick(prov, "endpoints", []).map((e) => endpointRow(e, providerNames))),
+    el("div", { class: "row" },
+      guarded(el("button", { class: "act primary", id: "ep-add",
+        text: "Add an endpoint",
+        onclick: () => endpointForm(null, providerNames) }))),
     readonlyNote()));
 }
-function endpointRow(e) {
+function endpointRow(e, providerNames) {
   const discoverable = pick(e, "capacity.slots.discoverable");
   const inPrice = pick(e, "price.input_usd_per_mtok");
   const failover = pick(e, "routing.failover_to");
@@ -1099,17 +1150,160 @@ function endpointRow(e) {
          pick(e, "price.real") ? tag("invoice", "warn") : tag("avoided", "ok")]),
     el("td", {}, failover ? el("code", { text: failover }) : "—"),
     el("td", {}, spill ? el("code", { text: spill }) : "—"),
-    el("td", {}, pick(e, "routed") === false
-      ? guarded(el("button", {
-          class: "act", id: "promote-" + pick(e, "endpoint", "?"),
-          text: "Bring into service",
-          onclick: () => setEndpointStatus(pick(e, "endpoint", ""), "active"),
-        }))
-      : guarded(el("button", {
-          class: "act", id: "demote-" + pick(e, "endpoint", "?"),
-          text: "Take out of service",
-          onclick: () => setEndpointStatus(pick(e, "endpoint", ""), "planned"),
-        }))));
+    el("td", {},
+      pick(e, "routed") === false
+        ? guarded(el("button", {
+            class: "act", id: "promote-" + pick(e, "endpoint", "?"),
+            text: "Bring into service",
+            onclick: () => setEndpointStatus(pick(e, "endpoint", ""), "active"),
+          }))
+        : guarded(el("button", {
+            class: "act", id: "demote-" + pick(e, "endpoint", "?"),
+            text: "Take out of service",
+            onclick: () => setEndpointStatus(pick(e, "endpoint", ""), "planned"),
+          })), " ",
+      guarded(el("button", { class: "act", id: "ep-edit-" + pick(e, "endpoint", "?"),
+        text: "Edit", onclick: () => endpointForm(e, providerNames || []) })), " ",
+      guarded(el("button", { class: "act", id: "ep-del-" + pick(e, "endpoint", "?"),
+        text: "Delete", onclick: () => {
+          const n = pick(e, "endpoint", "");
+          if (!confirmish("Delete endpoint " + n + "? If work is in flight this is "
+              + "refused — pause it first, which drains. models.yaml is not touched.")) return;
+          saveCatalog("endpoint", n, null, "DELETE");
+        }}))));
+}
+
+/* ---- catalog editing (roadmap J2) -------------------------------------
+ * 🚨 The form fields are models.yaml's OWN field names, because the body IS a
+ * models.yaml stanza — the overlay contributes stanzas rather than a second
+ * model of an endpoint. An operator can read what they typed here and paste it
+ * into the file, and the server validates it with the same parser the file
+ * gets. A form with its own invented vocabulary would be a translation layer
+ * with nothing on the far side.
+ * --------------------------------------------------------------------- */
+const ENGINES = ["llama.cpp", "vllm", "openrouter", "shim"];
+const KINDS = ["chat", "embed", "rerank"];
+const STATUSES = ["active", "planned"];
+const CAPABILITIES = ["streaming", "tool_calling", "structured_output",
+                      "reasoning", "vision"];
+
+function num(id, value, width) {
+  return el("input", { id: id, type: "number", value: value ?? "",
+                       style: "width:" + (width || 90) + "px" });
+}
+
+async function saveCatalog(kind, name, body, method) {
+  const url = kind === "provider" ? API.provider(name) : API.endpoint(name);
+  try {
+    const res = await api(url, {
+      method: method, headers: { "Content-Type": "application/json" },
+      body: method === "DELETE" ? undefined : JSON.stringify(body),
+    });
+    const changed = pick(res, "reconciled", {});
+    banner("ok", el("b", { text: kind + " " + name + " saved." }), " ",
+      (changed.added || []).length ? "In service: " + changed.added.join(", ") + ". " : "",
+      (changed.removed || []).length ? "Out of service: " + changed.removed.join(", ") + ". " : "",
+      (pick(res, "warnings", []) || []).join(" "));
+    $("#editor").replaceChildren();
+    render();
+  } catch (err) { reportError(err); }
+}
+
+function providerForm(existing) {
+  const name = pick(existing, "provider", "");
+  const creating = !name;
+  const addr = pick(existing, "address", {});
+  const box = el("div", { class: "banner" },
+    el("b", { text: creating ? "Add a provider" : "Edit provider " + name }),
+    why("A provider is how to REACH a backend and how to speak to it — engine, address, credential. It is separate from an endpoint (a routable unit of capacity with policy) because one remote provider hosts many endpoints, and declaring its base URL and key once is the reason the sections are separate. Use host+port for a local engine and base_url for a remote one; base_url wins if both are set."),
+    el("div", { class: "row" },
+      field("name", el("input", { id: "pv-name", value: name,
+        disabled: !creating, placeholder: "small-box", style: "width:160px" })),
+      field("engine", select("pv-engine", ENGINES, pick(existing, "engine", "llama.cpp"))),
+      field("host", el("input", { id: "pv-host", value: pick(addr, "host", ""),
+        placeholder: "192.0.2.11", style: "width:150px" })),
+      field("port", num("pv-port", pick(addr, "port", ""))),
+      field("base_url", el("input", { id: "pv-base", value: pick(addr, "base_url", ""),
+        placeholder: "https://…/v1", style: "width:220px" })),
+      // 🚨 The NAME of a variable, never a key. The plane has no field for a
+      // secret because the store holds none; the value is set separately and
+      // never read back.
+      field("api_key_env", el("input", { id: "pv-env", style: "width:200px",
+        value: pick(existing, "credential.env_var", ""),
+        placeholder: "OPENROUTER_API_KEY" }))),
+    el("div", { class: "row" },
+      guarded(el("button", { class: "act primary", text: creating ? "Add provider" : "Save",
+        onclick: () => {
+          const n = $("#pv-name").value.trim();
+          if (!n) { banner("bad", "A provider needs a name."); return; }
+          const body = { engine: $("#pv-engine").value };
+          if ($("#pv-host").value.trim()) body.host = $("#pv-host").value.trim();
+          if ($("#pv-port").value) body.port = Number($("#pv-port").value);
+          if ($("#pv-base").value.trim()) body.base_url = $("#pv-base").value.trim();
+          if ($("#pv-env").value.trim()) body.api_key_env = $("#pv-env").value.trim();
+          saveCatalog("provider", n, body, creating ? "PUT" : "PATCH");
+        }})),
+      el("button", { class: "act", text: "Cancel",
+        onclick: () => $("#editor").replaceChildren() })));
+  $("#editor").replaceChildren(box);
+  box.scrollIntoView({ block: "nearest" });
+}
+
+function endpointForm(existing, providers) {
+  const name = pick(existing, "endpoint", "");
+  const creating = !name;
+  const caps = pick(existing, "capabilities", []);
+  const box = el("div", { class: "banner" },
+    el("b", { text: creating ? "Add an endpoint" : "Edit endpoint " + name }),
+    why("An endpoint is a routable unit of capacity with policy — slots, context, floors, capabilities, failover — naming the provider that reaches it. `slots` on a LOCAL engine is a seed that discovery corrects; on a remote one it is a policy cap on our own concurrency, because a remote provider publishes no occupancy. Capabilities are what an intent matches on: an endpoint that does not declare `reasoning` will never serve the `reasoning` intent, whatever the model can actually do."),
+    el("div", { class: "row" },
+      field("name", el("input", { id: "ep-name", value: name, disabled: !creating,
+        placeholder: "tier1", style: "width:150px" })),
+      field("provider", select("ep-provider", providers, pick(existing, "provider", providers[0]))),
+      field("kind", select("ep-kind", KINDS, pick(existing, "kind", "chat"))),
+      field("status", select("ep-status", STATUSES,
+        pick(existing, "routed") === false ? "planned" : "active")),
+      field("model", el("input", { id: "ep-model", style: "width:220px",
+        value: pick(existing, "model.pinned_model", ""),
+        placeholder: "openai/gpt-oss-120b" }))),
+    el("div", { class: "row" },
+      field("slots", num("ep-slots", pick(existing, "capacity.slots.declared", 4))),
+      field("context_per_slot", num("ep-ctx",
+        pick(existing, "capacity.context_per_slot.declared", 8192), 120)),
+      field("timeout_floor_s", num("ep-floor", "")),
+      field("failover_to", el("input", { id: "ep-failover", style: "width:130px",
+        value: pick(existing, "routing.failover_to", "") })),
+      field("spill_to", el("input", { id: "ep-spill", style: "width:130px",
+        value: pick(existing, "routing.spill_to", "") }))),
+    el("div", { class: "row" },
+      field("capabilities", el("div", { class: "row" }, CAPABILITIES.map((c) =>
+        el("label", { class: "f", style: "flex-direction:row;gap:5px;align-items:center" },
+          el("input", { id: "ep-cap-" + c, type: "checkbox",
+                        checked: caps.includes(c) }), c))))),
+    el("div", { class: "row" },
+      guarded(el("button", { class: "act primary", text: creating ? "Add endpoint" : "Save",
+        onclick: () => {
+          const n = $("#ep-name").value.trim();
+          if (!n) { banner("bad", "An endpoint needs a name."); return; }
+          const body = {
+            provider: $("#ep-provider").value,
+            kind: $("#ep-kind").value,
+            status: $("#ep-status").value,
+            slots: Number($("#ep-slots").value || 0),
+            context_per_slot: Number($("#ep-ctx").value || 0),
+            capabilities: Object.fromEntries(
+              CAPABILITIES.map((c) => [c, $("#ep-cap-" + c).checked])),
+          };
+          if ($("#ep-model").value.trim()) body.model = $("#ep-model").value.trim();
+          if ($("#ep-floor").value) body.timeout_floor_s = Number($("#ep-floor").value);
+          if ($("#ep-failover").value.trim()) body.failover_to = $("#ep-failover").value.trim();
+          if ($("#ep-spill").value.trim()) body.spill_to = $("#ep-spill").value.trim();
+          saveCatalog("endpoint", n, body, creating ? "PUT" : "PATCH");
+        }})),
+      el("button", { class: "act", text: "Cancel",
+        onclick: () => $("#editor").replaceChildren() })));
+  $("#editor").replaceChildren(box);
+  box.scrollIntoView({ block: "nearest" });
 }
 
 /* 🚨 A password field, and the value never comes back out. The plane is
@@ -1281,17 +1475,43 @@ async function viewAudit(root) {
 
 /* ---- tabs + lifecycle ------------------------------------------------- */
 
+/* ---- three panes ------------------------------------------------------
+ * 🚨 Seven tabs became three on 2026-09-01, on the operator's own framing:
+ * what is going on, how it is set up, and what happened. The old set was
+ * organised by which API endpoint fed it, which is the system's structure
+ * rather than the reader's question — and it produced a tab called "The gap"
+ * that needed a commit message to explain.
+ *
+ * The rule for where a thing lives: OVERVIEW is what you watch and the verbs
+ * you reach for while watching (pause a misbehaving backend, flip a flag).
+ * CONFIGURATION is what you set up and expect to stay set. AUDIT is what
+ * already happened. Anything that does not fit one of those three sentences
+ * probably should not be on the page.
+ * --------------------------------------------------------------------- */
 const TABS = [
-  { id: "fleet",     label: "Fleet",     view: viewFleet },
-  { id: "config",    label: "Configuration", view: viewConfig, badge: () => pick(state.config, "notices", []).length },
-  { id: "keys",      label: "Keys",      view: viewKeys },
-  { id: "callers",   label: "Callers",   view: viewCallers },
-  { id: "providers", label: "Providers", view: viewProviders },
-  { id: "control",   label: "Control",   view: viewControl },
-  { id: "audit",     label: "Audit",     view: viewAudit },
+  { id: "overview", label: "Overview", view: viewOverview },
+  { id: "config",   label: "Configuration", view: viewConfiguration,
+    badge: () => pick(state.config, "notices", []).length },
+  { id: "audit",    label: "Audit",    view: viewAudit },
 ];
-let current = (location.hash || "#fleet").slice(1);
-if (!TABS.some((t) => t.id === current)) current = "fleet";
+let current = (location.hash || "#overview").slice(1);
+if (!TABS.some((t) => t.id === current)) current = "overview";
+
+/* A pane is several of the old views in sequence. They stay separate
+ * functions: each is a coherent unit with its own guards, and gluing them
+ * into one 300-line renderer would make every future change a merge. */
+async function viewOverview(root) {
+  await viewFleet(root);
+  await viewCallersLive(root);
+  await viewControl(root);
+}
+
+async function viewConfiguration(root) {
+  await viewProviders(root);       // providers + endpoints, with CRUD
+  await viewKeys(root);            // credentials
+  await viewCallerQuotas(root);    // policy, not live state
+  await viewConfig(root);          // sources, reach, overlay, not-in-force
+}
 
 function drawTabs() {
   $("#tabs").replaceChildren(...TABS.map((t) => {

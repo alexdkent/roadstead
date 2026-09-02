@@ -312,6 +312,21 @@ async def test_every_field_the_ui_reads_exists_in_a_real_response(tmp_path, monk
         _Req(method="PATCH", body={"weight": 2.5, "spill_ok": True},
              path_params={"agent_id": "ui-sample"})))
     await sample(svc.handle_admin_callers(_Req()))
+    # 🚨 A catalog WRITE, sampled like the reads. Its response carries fields no
+    # GET does — `reconciled`, the per-write warnings — and the alternative was
+    # adding them to `unsampled`, which is the guard being talked out of its
+    # job on the newest and least-exercised part of the surface.
+    await sample(svc.handle_admin_catalog_entry(_Req(
+        method="PUT", path_params={"provider": "ui-sample-box"},
+        body={"engine": "llama.cpp", "host": "192.0.2.31", "port": 9099})))
+    await sample(svc.handle_admin_catalog_entry(_Req(
+        method="PUT", path_params={"endpoint": "ui-sample-ep"},
+        body={"provider": "ui-sample-box", "kind": "chat", "status": "planned",
+              "slots": 2, "context_per_slot": 4096,
+              "capabilities": {"streaming": True}})))
+    await sample(svc.handle_admin_providers(_Req()))   # now with a created pair
+    await sample(svc.handle_admin_catalog_entry(_Req(
+        method="DELETE", path_params={"endpoint": "ui-sample-ep"})))
     await sample(svc.handle_admin_key(
         _Req(method="DELETE", path_params={"key_id": created["key_id"]})))
     # LAST, deliberately: every mutation above records, so the audit view's rows
@@ -557,3 +572,75 @@ def test_the_asset_read_goes_off_the_loop():
     assert "read_text" in body
     assert body.index("asyncio.to_thread") < body.index("read_text"), (
         "the read must be handed to the thread, not merely near one")
+
+
+# ---------------------------------------------------------------------------
+# 8. The page has to PARSE
+# ---------------------------------------------------------------------------
+
+def _ui_script_body() -> str:
+    body = UI.read_text(encoding="utf-8")
+    return body[body.index("<script>") + len("<script>"):body.rindex("</script>")]
+
+
+def test_the_page_script_has_balanced_brackets():
+    """🚨 The whole suite went green on a page that would not parse.
+
+    Two missing `)` in a render function, and every one of 1877 tests passed:
+    they read the source as TEXT — `pick()` paths, `guarded()` calls, the
+    dependency list — and none of them asks whether a browser could run it. The
+    page rendered "loading…" and a `SyntaxError` in the console, which is the
+    DOM-level gap this file's docstring already admits to.
+
+    This is not a parser and does not pretend to be one. Unbalanced brackets is
+    the specific defect that got through, it is exactly what hand-editing nested
+    `el(...)` calls produces, and it needs no dependency — which matters,
+    because a check that needs `node` would skip on the machines that do not
+    have it, and a guard that skips is a guard that passes.
+
+    The scan strips string literals and line comments first, or every apostrophe
+    and every `:-)` in the prose would be counted as code.
+    """
+    src = _ui_script_body()
+    pairs = {")": "(", "]": "[", "}": "{"}
+    stack: list[tuple[str, int]] = []
+    line = 1
+    i = 0
+    n = len(src)
+    while i < n:
+        c = src[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            continue
+        if src.startswith("//", i):
+            i = src.find("\n", i)
+            if i < 0:
+                break
+            continue
+        if src.startswith("/*", i):
+            end = src.find("*/", i + 2)
+            line += src.count("\n", i, end if end > 0 else n)
+            i = (end + 2) if end > 0 else n
+            continue
+        if c in "\"'`":
+            quote, i = c, i + 1
+            while i < n and src[i] != quote:
+                if src[i] == "\\":
+                    i += 1
+                elif src[i] == "\n":
+                    line += 1
+                i += 1
+            i += 1
+            continue
+        if c in "([{":
+            stack.append((c, line))
+        elif c in ")]}":
+            assert stack, f"line {line}: stray {c!r} — nothing is open"
+            opener, opened = stack.pop()
+            assert opener == pairs[c], (
+                f"line {line}: {c!r} closes a {opener!r} opened on line {opened}")
+        i += 1
+    assert not stack, (
+        "the page script does not close everything it opens — a browser will "
+        f"refuse to run it: {[(c, ln) for c, ln in stack[:5]]}")

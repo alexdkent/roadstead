@@ -669,7 +669,25 @@ revocation is never refused on provenance grounds: taking capacity out of servic
 direction, and an operator who wants a remote endpoint to stop costing money should not have to
 argue with the plane about it.
 
-#### J2 · Create a provider or an endpoint that is not in the file
+#### J2 · Create a provider or an endpoint that is not in the file — **LANDED 2026-09-01**
+
+Verified through the UI on CTnnn against a real llama-server: an endpoint typed into a form served a
+request seconds later, and the catalog file never mentioned it. Three panes replaced seven tabs at
+the same time — Overview (what is going on, and the verbs you reach for while watching),
+Configuration (what you set up), Audit (what happened). The old set was organised by which API fed
+it, which is the system's structure rather than the reader's question, and it produced a tab called
+"The gap" that needed a commit message to explain.
+
+🚨 **Running it found what 1877 passing tests could not: the page did not parse.** Two missing `)`
+in a render function, and every test was green — they read the source as text (`pick()` paths,
+`guarded()` calls, the dependency list) and none asked whether a browser could run it. The page
+showed "loading…" and a `SyntaxError`. `test_the_page_script_has_balanced_brackets` now scans the
+script with string and comment literals stripped; it is not a parser and does not pretend to be one,
+but unbalanced brackets is precisely what hand-editing nested `el(...)` calls produces, and it needs
+no dependency — a check requiring `node` would skip where node is absent, and a guard that skips is
+a guard that passes.
+
+
 
 **Opened for real 2026-09-01**, on an explicit ask: the operator wants to add models and backends
 from the UI, not from a file. Three panes — Overview, Configuration, Audit — with Configuration
