@@ -298,3 +298,74 @@ async def test_startup_does_not_delete_an_endpoint_configured_in_CODE(tmp_path):
         "catalog declares that name as planned")
     assert "bespoke" in svc._state.config.endpoints, (
         "startup deleted an endpoint the catalog has never heard of")
+
+
+# --------------------------------------------------------------------------- #
+# A credential pasted into the variable-name field
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pasted", [
+    "sk-or-v1-0000000000000000000000000000000000000000000000000000000000000000",
+    "sk-ant-api03-aaaa",
+    "Bearer abc123",
+    "hf_AAAAAAAAAAAAAAAAAAAA-BBB",
+])
+async def test_a_credential_pasted_into_api_key_env_is_refused(tmp_path, pasted):
+    """🚨 It happened. An operator pasted a live OpenRouter key into the
+    variable-NAME field on 2026-09-01 — reasonably, because it was the only
+    key-shaped box on the form and the form offered nowhere else to put a key.
+
+    The plane accepted it, wrote it to the overlay on disk, recorded it in the
+    audit trail and echoed it back from `GET /rs/v1/admin/providers`. Every one
+    of those is something the "a management surface never emits a credential"
+    rule exists to prevent, and the rule was defeated by a field that merely
+    *looked* like it wanted a secret. The rule was right; nothing enforced its
+    precondition.
+
+    The precondition is checkable and is not a heuristic: `api_key_env` names an
+    environment variable, and no common credential format is a valid POSIX
+    identifier — they all carry `-`, `.` or `/`.
+    """
+    svc = _svc(tmp_path)
+    r = await _put(svc, "providers", "leaky", {
+        "engine": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": pasted})
+    assert r.status_code == 400
+
+    # 🚨 The refusal must not ECHO it. A 400 quoting what you typed puts the
+    # secret in the response body, the access log and the browser history.
+    assert pasted not in r.body.decode()
+    # …and nothing kept it.
+    blob = json.dumps(svc._state.admin_overlay.catalog) + json.dumps(
+        svc._state.admin_overlay.audit)
+    assert pasted not in blob
+    assert "leaky" not in model_catalog.load_catalog().providers
+
+
+@pytest.mark.asyncio
+async def test_the_name_check_is_necessary_and_NOT_sufficient(tmp_path):
+    """🚨 Stated as a test so nobody mistakes it for a credential detector.
+
+    `ghp_...` and `sk_live_...` are legal identifiers, so a token in one of
+    those formats passes. The check removes a large class of paste accidents and
+    that is all it does; the structural fix is the form giving the key its own
+    write-only field, which is what stops an operator reaching for the wrong box
+    in the first place.
+    """
+    svc = _svc(tmp_path)
+    r = await _put(svc, "providers", "underscored", {
+        "engine": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "ghp_looks_exactly_like_a_variable"})
+    assert r.status_code == 200, (
+        "if this now refuses, the check grew a heuristic — say so out loud "
+        "rather than leaving this test asserting the opposite")
+
+
+@pytest.mark.asyncio
+async def test_a_valid_variable_name_is_still_accepted(tmp_path):
+    svc = _svc(tmp_path)
+    r = await _put(svc, "providers", "remote", {
+        "engine": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY"})
+    assert r.status_code == 200, r.body

@@ -8,6 +8,32 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — 🚨 SECURITY: a credential pasted into `api_key_env` was stored, persisted and echoed back
+
+Landed 2026-09-01, after it happened. An operator pasted a live OpenRouter key into the provider
+form's `api_key_env` box — reasonably, because it was the only key-shaped field on the form and the
+form offered nowhere else to put a key. That field takes the **name** of an environment variable. The
+plane accepted the key as a name, wrote it to the admin overlay on disk in plaintext, recorded it in
+the audit trail, and echoed it back from `GET /rs/v1/admin/providers`.
+
+Every one of those is something §3.5's "a management surface never emits a credential" rule exists to
+prevent. **The rule was right and nothing enforced its precondition.**
+
+Two fixes, because the first is necessary and not sufficient:
+
+- **The value must be a valid POSIX identifier.** Not a heuristic: `api_key_env` names an environment
+  variable, and no common credential format is a legal identifier — they all carry `-`, `.` or `/`.
+  The refusal does **not echo** what was sent, because a 400 quoting the value puts the secret in the
+  response body, the access log and the browser history. 🚨 It does not catch `ghp_…` or `sk_live_…`,
+  which are legal identifiers, and a test asserts that out loud so nobody mistakes this for a
+  credential detector.
+- **The form gives the key its own home:** a separate write-only password field that posts to
+  `.../credential` after the provider is saved, and is cleared either way. The structural cause was a
+  form with one key-shaped box and no right answer.
+
+**If you have pasted a key into that field, treat it as compromised and rotate it** — it was written
+to disk and to the audit trail, both of which outlive the process.
+
 ### Added — the provider form asks for the fields the engine actually uses
 
 Landed 2026-09-01. Selecting `openrouter` asked for `host` and `port`, which that engine ignores

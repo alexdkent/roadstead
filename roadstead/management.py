@@ -1972,6 +1972,20 @@ class ManagementApi:
                           "a catalog stanza names api_key_env — the NAME of an "
                           "environment variable — and never a key. Set the "
                           "value with POST .../credential.", 400)
+        env_var = str(body.get("api_key_env") or "").strip()
+        if env_var and not _ENV_VAR_NAME.match(env_var):
+            # 🚨 Refused WITHOUT echoing it. The value may be the secret itself,
+            # and a 400 that quotes what you typed puts it in the response body,
+            # the access log and the browser's history.
+            return _error(
+                "invalid_request_error",
+                "api_key_env must be the NAME of an environment variable "
+                "(letters, digits and underscore, e.g. OPENROUTER_API_KEY) — "
+                "not the key. What you sent is not a valid variable name, which "
+                "usually means a credential was pasted here. It has not been "
+                "stored. Set the variable's VALUE with "
+                "POST /rs/v1/admin/providers/{provider}/credential, which is "
+                "write-only and never persisted.", 400)
         if section == "providers":
             refusal = self._provider_address_refusal(name, body, method)
             if refusal is not None:
@@ -2272,6 +2286,18 @@ _ENDPOINT_FIELDS = frozenset({
 #: A catalog name is used as a dict key, a URL segment, a DRR budget key and a
 #: metrics label. Bounded and boring on purpose.
 _CATALOG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+#: 🚨 What an environment variable is ALLOWED to be called — POSIX, and not a
+#: heuristic. `api_key_env` names a variable and never a key, and this is the
+#: constraint that makes the difference checkable rather than guessed at: no
+#: real credential format is a valid identifier, because they all carry `-`,
+#: `.` or `/`. An operator pasted a live OpenRouter key into this field on
+#: 2026-09-01 and the plane stored it, wrote it to the overlay on disk, put it
+#: in the audit trail and echoed it back from the read view — every one of which
+#: the "never emit a credential" rule was supposed to prevent, defeated by a
+#: field that merely *looked* like it wanted a secret. The rule was right and
+#: nothing enforced its precondition.
+_ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 
 
 # ---------------------------------------------------------------------------

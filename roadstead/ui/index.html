@@ -1199,13 +1199,21 @@ function num(id, value, width) {
                        style: "width:" + (width || 90) + "px" });
 }
 
-async function saveCatalog(kind, name, body, method) {
+async function saveCatalog(kind, name, body, method, secret) {
   const url = kind === "provider" ? API.provider(name) : API.endpoint(name);
   try {
     const res = await api(url, {
       method: method, headers: { "Content-Type": "application/json" },
       body: method === "DELETE" ? undefined : JSON.stringify(body),
     });
+    if (secret) {
+      // Separate request, separate route, write-only. If this fails the
+      // provider still exists and the operator is told which half went wrong.
+      await api(API.credential(name), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: secret }),
+      });
+    }
     const changed = pick(res, "reconciled", {});
     banner("ok", el("b", { text: kind + " " + name + " saved." }), " ",
       (changed.added || []).length ? "In service: " + changed.added.join(", ") + ". " : "",
@@ -1244,7 +1252,12 @@ function providerForm(existing) {
           if ($("#pv-port") && $("#pv-port").value) body.port = Number($("#pv-port").value);
           if ($("#pv-base")) body.base_url = $("#pv-base").value.trim();
           if ($("#pv-env")) body.api_key_env = $("#pv-env").value.trim();
-          saveCatalog("provider", n, body, creating ? "PUT" : "PATCH");
+          // The secret never travels with the stanza — it goes to the
+          // write-only credential route AFTER the provider exists, and the
+          // field is cleared either way.
+          const secret = $("#pv-secret") ? $("#pv-secret").value : "";
+          if ($("#pv-secret")) $("#pv-secret").value = "";
+          saveCatalog("provider", n, body, creating ? "PUT" : "PATCH", secret);
         }})),
       el("button", { class: "act", text: "Cancel",
         onclick: () => $("#editor").replaceChildren() })));
@@ -1264,12 +1277,22 @@ function providerForm(existing) {
            placeholder: "192.0.2.11", style: "width:170px" })),
          field("port", num("pv-port", pick(addr, "port", "")))];
     if (spec.requires_credential || pick(existing, "credential.env_var")) {
-      // 🚨 The NAME of a variable, never a key. The store holds no secret; the
-      // value is set separately, write-only, and never read back.
-      kids.push(field(spec.requires_credential ? "api_key_env (required)" : "api_key_env",
+      /* 🚨 TWO fields, and the second one is why. An operator pasted a live
+       * OpenRouter key into the variable-name box on 2026-09-01 — reasonably,
+       * because it was the only key-shaped field on the form and the form
+       * offered nowhere else to put a key. The plane stored it, wrote it to
+       * disk, put it in the audit trail and echoed it back from the read view.
+       * The server now refuses a value that is not a valid variable name, but
+       * that check is necessary rather than sufficient (`ghp_...` IS a legal
+       * identifier), so the real fix is here: give the key an obvious home. */
+      kids.push(field("api_key_env — the variable's NAME",
         el("input", { id: "pv-env", style: "width:230px",
           value: pick(existing, "credential.env_var", ""),
           placeholder: "OPENROUTER_API_KEY" })));
+      kids.push(field("the key itself — optional, write-only",
+        el("input", { id: "pv-secret", type: "password", autocomplete: "off",
+          spellcheck: "false", style: "width:260px",
+          placeholder: "paste it here, not on the left" })));
     }
     kids.push(el("div", { class: "lede", style: "flex-basis:100%;margin:4px 0 0" },
       remote ? "Reached at a base URL — host and port do not apply to this engine."
