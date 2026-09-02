@@ -974,6 +974,39 @@ _AGENT_CONFIG_FIELDS = frozenset({
 
 
 
+
+def env_with_legacy_prefix(name: str, default: str | None = None) -> str | None:
+    """Read ``ROADSTEAD_<name>``, falling back to pre-rename ``LLM_PROXY_<name>``.
+
+    🚨 **The entry point was left out of the rename, and it mattered more there
+    than anywhere else.** `acl.py` handled its own variable properly — reads both
+    spellings, warns on the legacy one, documents which wins — while
+    `__main__.py` kept fourteen variables under `LLM_PROXY_` only, among them
+    `DATA_DIR` and `QUEUE_DB`, which decide **where the durable event log
+    lives**. An operator setting `ROADSTEAD_QUEUE_DB` — the spelling every other
+    variable and all the documentation use — got a **silent no-op** and a queue
+    DB somewhere else entirely. Found 2026-09-02 by reaching for that name while
+    pointing the proxy at real backends and having it ignored.
+
+    Same shape as the `models.yaml` allowlist parsers dropping an unknown key:
+    the failure is silent, and it lands on whoever spelled it the documented way.
+
+    It lives HERE rather than in `__main__` so there is one implementation:
+    `config` is imported by the entry point, so the reverse direction would be a
+    cycle, and a second copy is how the two spellings drift apart again.
+    """
+    val = os.environ.get("ROADSTEAD_" + name)
+    if val is not None:
+        return val
+    legacy = os.environ.get("LLM_PROXY_" + name)
+    if legacy is not None:
+        logging.getLogger(__name__).warning(
+            "LLM_PROXY_%s is the pre-rename spelling; it is still honoured, "
+            "but rename it to ROADSTEAD_%s.", name, name)
+        return legacy
+    return default
+
+
 def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaConfig]:
     """Load per-agent DRR quota config from a YAML file.
 
@@ -996,13 +1029,13 @@ def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaCo
     because a dropped ``spill_ok`` is indistinguishable from a caller who never
     opted in — which is the whole reason this failure keeps costing something.
 
-    When ``path`` is None, looks for ``LLM_PROXY_AGENTS_CONFIG`` env
+    When ``path`` is None, looks for ``ROADSTEAD_AGENTS_CONFIG`` env
     var, else falls back to ``<package>/agents.yaml``. A missing file
     is non-fatal: returns ``{}`` and the proxy lazy-creates per-agent
     configs at default values.
     """
     if path is None:
-        path = os.environ.get("LLM_PROXY_AGENTS_CONFIG") or _DEFAULT_AGENTS_CONFIG_PATH
+        path = env_with_legacy_prefix("AGENTS_CONFIG") or _DEFAULT_AGENTS_CONFIG_PATH
     p = Path(path)
     if not p.exists():
         return {}

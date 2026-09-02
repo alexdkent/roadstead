@@ -129,7 +129,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from . import hooks, model_catalog
-from .config import AgentQuotaConfig, EndpointConfig, LLMPriority
+from .config import AgentQuotaConfig, EndpointConfig, LLMPriority, env_with_legacy_prefix
 from .enriched import _error
 from .identity import iso_time
 from .providers import known_engines, provider_for_engine
@@ -919,8 +919,13 @@ class ManagementApi:
                     "env_var": "ROADSTEAD_MODELS_YAML",
                 },
                 "agents": {
-                    "path": os.environ.get("LLM_PROXY_AGENTS_CONFIG", ""),
-                    "env_var": "LLM_PROXY_AGENTS_CONFIG",
+                    # 🚨 Reported under the CURRENT spelling, and read through
+                    # the dual-read helper. This view is where an operator comes
+                    # to learn how to point a source — so naming the pre-rename
+                    # variable here sent them to the one spelling that, until
+                    # 2026-09-02, was the only one that worked.
+                    "path": env_with_legacy_prefix("AGENTS_CONFIG", ""),
+                    "env_var": "ROADSTEAD_AGENTS_CONFIG",
                 },
                 "api_keys": {
                     "env_var": "ROADSTEAD_API_KEYS",

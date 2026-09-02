@@ -26,7 +26,7 @@ from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from .config import ProxyConfig, load_agent_configs
+from .config import ProxyConfig, env_with_legacy_prefix as _env, load_agent_configs
 from .hooks import set_degradation_sink
 from .routes import make_routes
 from .service import (
@@ -172,9 +172,9 @@ class ShutdownEnvelopeMiddleware:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Centralized LLM scheduler proxy")
-    p.add_argument("--port", type=int, default=int(os.environ.get("LLM_PROXY_PORT", "42161")))
-    p.add_argument("--host", default=os.environ.get("LLM_PROXY_HOST", "0.0.0.0"))
-    p.add_argument("--log-level", default=os.environ.get("LLM_PROXY_LOG_LEVEL", "info"))
+    p.add_argument("--port", type=int, default=int(_env("PORT", "42161")))
+    p.add_argument("--host", default=_env("HOST", "0.0.0.0"))
+    p.add_argument("--log-level", default=_env("LOG_LEVEL", "info"))
     return p.parse_args()
 
 
@@ -199,12 +199,52 @@ def warn_on_retired_env_vars() -> list[str]:
     return stale
 
 
+#: Storage that a container recreate or a reboot throws away. `/tmp` is the
+#: default root below, which is right for a dev run and wrong for the thing this
+#: process calls its DURABLE record.
+#: `/private/tmp` is macOS's real `/tmp` (the latter is a symlink to it), and it
+#: is where a developer on a Mac actually lands — so omitting it would make the
+#: warning silent on the one platform where the default is exercised most.
+_EPHEMERAL_PREFIXES = ("/tmp/", "/private/tmp/", "/var/tmp/",
+                       "/private/var/tmp/", "/dev/shm/")
+
+
+def _warn_if_durable_state_is_ephemeral(queue_db_path: str) -> bool:
+    """🚨 The durable record on storage that does not survive a restart.
+
+    Disclosed rather than moved, because the default is right for the case it
+    was written for — a developer running the module directly — and changing it
+    would relocate an existing deployment's state on upgrade, which is a worse
+    failure than the one being fixed.
+
+    What makes it worth an alarm is the gap between the care taken on one side
+    and the storage on the other: SIGTERM runs a bounded drain specifically to
+    persist DRR budgets and completion rows, the shutdown budget is computed and
+    published so a container stop-grace of 108s does not truncate that flush,
+    and `startup` replays the day's rows so a caller's spend survives a deploy.
+    All of it lands in `/tmp` by default. Measured on a real container the same
+    day: `queue.db` sat on the ephemeral writable layer while the mounted volume
+    held only the admin overlay, so every rebuild silently reset the DRR
+    balances and the day's spend that the drain had carefully written.
+    """
+    if not queue_db_path.startswith(_EPHEMERAL_PREFIXES):
+        return False
+    logging.getLogger(__name__).warning(
+        "durable state is on EPHEMERAL storage: queue.db is at %s. DRR budgets, "
+        "today's spend and endpoint drain state are written here and are LOST on "
+        "a reboot or a container recreate — which is exactly what the shutdown "
+        "drain exists to preserve. Set ROADSTEAD_DATA_DIR (or ROADSTEAD_QUEUE_DB) "
+        "to a persistent path; in a container, one that is a mounted volume.",
+        queue_db_path)
+    return True
+
+
 def build_app(config: ProxyConfig | None = None) -> Starlette:
     """Build the Starlette app.  Usable from tests without running uvicorn."""
     warn_on_retired_env_vars()
     if config is None:
-        data_dir = os.environ.get(
-            "LLM_PROXY_DATA_DIR",
+        data_dir = _env(
+            "DATA_DIR",
             os.path.join(os.environ.get("ROADSTEAD_HOT_ROOT", "/tmp"), "agents", "llmproxy"),
         )
         os.makedirs(data_dir, exist_ok=True)
@@ -212,14 +252,14 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
         os.makedirs(log_dir, exist_ok=True)
 
         config = ProxyConfig(
-            queue_db_path=os.environ.get(
-                "LLM_PROXY_QUEUE_DB",
+            queue_db_path=_env(
+                "QUEUE_DB",
                 os.path.join(data_dir, "queue.db"),
             ),
             # Runtime-mutable feature flags (flags.py) — persisted next to the
             # queue DB, flipped via POST /v1/admin/flags (no env gates).
-            runtime_flags_path=os.environ.get(
-                "LLM_PROXY_RUNTIME_FLAGS",
+            runtime_flags_path=_env(
+                "RUNTIME_FLAGS",
                 os.path.join(data_dir, "runtime_flags.json"),
             ),
             # The management plane's overlay (management.AdminOverlay) — runtime
@@ -231,31 +271,35 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
                 "ROADSTEAD_ADMIN_STORE",
                 os.path.join(data_dir, "admin_overlay.json"),
             ),
-            request_log_path=os.environ.get(
-                "LLM_PROXY_REQUEST_LOG",
+            request_log_path=_env(
+                "REQUEST_LOG",
                 os.path.join(log_dir, "llmproxy_requests.jsonl"),
             ),
             # Per-agent DRR quota overrides (weight, max_balance_ss,
             # default_priority). Reads originfleet/llmproxy/agents.yaml
-            # by default, or the path in LLM_PROXY_AGENTS_CONFIG.
+            # by default, or the path in ROADSTEAD_AGENTS_CONFIG.
             # Missing file → empty dict → proxy lazy-creates agent
             # configs at AgentQuotaConfig dataclass defaults.
             agents=load_agent_configs(),
             # queue.db maintenance knobs (persistence cleanup) — env overrides,
             # falling back to the ProxyConfig dataclass defaults.
-            payload_retention_s=float(os.environ.get(
-                "LLM_PROXY_PAYLOAD_RETENTION_S", 48 * 3600.0)),
-            completions_retention_s=float(os.environ.get(
-                "LLM_PROXY_COMPLETIONS_RETENTION_S", 30 * 86400.0)),
-            wal_checkpoint_interval_s=float(os.environ.get(
-                "LLM_PROXY_WAL_CHECKPOINT_INTERVAL_S", 300.0)),
-            incremental_vacuum_interval_s=float(os.environ.get(
-                "LLM_PROXY_INCR_VACUUM_INTERVAL_S", 600.0)),
-            incremental_vacuum_pages=int(os.environ.get(
-                "LLM_PROXY_INCR_VACUUM_PAGES", 4000)),
-            startup_vacuum_freelist_threshold_bytes=int(os.environ.get(
-                "LLM_PROXY_STARTUP_VACUUM_FREELIST_BYTES", 200 * 1024 * 1024)),
+            payload_retention_s=float(_env(
+                "PAYLOAD_RETENTION_S", 48 * 3600.0)),
+            completions_retention_s=float(_env(
+                "COMPLETIONS_RETENTION_S", 30 * 86400.0)),
+            wal_checkpoint_interval_s=float(_env(
+                "WAL_CHECKPOINT_INTERVAL_S", 300.0)),
+            incremental_vacuum_interval_s=float(_env(
+                "INCR_VACUUM_INTERVAL_S", 600.0)),
+            incremental_vacuum_pages=int(_env(
+                "INCR_VACUUM_PAGES", 4000)),
+            startup_vacuum_freelist_threshold_bytes=int(_env(
+                "STARTUP_VACUUM_FREELIST_BYTES", 200 * 1024 * 1024)),
         )
+
+    # Checked for BOTH branches — a caller that builds its own ProxyConfig can
+    # put the durable log on /tmp just as easily, and it is the same loss.
+    _warn_if_durable_state_is_ephemeral(config.queue_db_path)
 
     svc = ProxyService(config)
     routes = make_routes(svc)

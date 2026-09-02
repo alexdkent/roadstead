@@ -28,6 +28,28 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# 🚨 The durable event log, OFF the container's ephemeral writable layer.
+# Without this the default data dir is `/tmp/agents/llmproxy` — right for a
+# developer running the module directly, wrong for the artifact that ships.
+# Measured in a real container 2026-09-02: `queue.db` sat on the writable layer
+# while the mounted volume held only the admin overlay, so every rebuild
+# silently reset the DRR balances, the day's spend and the endpoint drain state
+# — the exact rows the bounded SIGTERM drain and the 108s stop-grace above exist
+# to flush. The whole shutdown budget was protecting a file the next
+# `up --build` deleted.
+#
+# Its own ENV, not appended to the block above: a comment inside a line
+# continuation is not portable across Dockerfile parsers, and this one has to
+# carry its reason.
+ENV ROADSTEAD_DATA_DIR=/var/lib/roadstead
+
+# Declared so `docker run` without `-v` still gets an anonymous volume rather
+# than the writable layer, and so `docker inspect` names the path an operator
+# has to mount. 🚨 A VOLUME is not a substitute for mounting a real one — an
+# anonymous volume survives a restart but not a `down -v`, and is orphaned by a
+# recreate. It moves the default from "certainly lost" to "not silently lost".
+VOLUME ["/var/lib/roadstead"]
+
 WORKDIR /app
 
 # Dependency layer first, so a source edit does not re-resolve the world.

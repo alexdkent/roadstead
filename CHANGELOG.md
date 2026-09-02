@@ -8,6 +8,67 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — the durable event log defaulted to `/tmp`, and in a container it was lost on every rebuild
+
+Landed 2026-09-02. Found by running the proxy against real backends for the
+first time rather than by any test.
+
+`queue.db` is the durable record: DRR budgets, the day's completion rows that
+`startup` replays so a caller's spend survives a deploy, endpoint drain state,
+timeout-model samples. Its default path is `/tmp/agents/llmproxy/queue.db`.
+Measured in the real container the same day: the file sat on the **ephemeral
+writable layer**, while the mounted volume held only the admin overlay. So every
+`docker compose up --build` silently reset all of it.
+
+🚨 **The whole shutdown apparatus was protecting a file the next rebuild
+deleted.** SIGTERM runs a bounded drain specifically to flush those rows;
+`SHUTDOWN_DEADLINE_S` and `RECOMMENDED_STOP_GRACE_S` are computed and published
+so a container stop-grace of 108s does not truncate the flush. All of that care,
+on to disk that does not survive a recreate.
+
+Two changes, deliberately different in kind:
+
+- **The image** now sets `ROADSTEAD_DATA_DIR=/var/lib/roadstead` and declares it
+  as a `VOLUME`. That is what makes it right for everyone who runs the artifact.
+  🚨 The `VOLUME` is not a substitute for mounting a real one — it moves the
+  default from *certainly lost* to *not silently lost*.
+- **The default itself is unchanged, and disclosed instead.** `/tmp` is correct
+  for a developer running the module directly, and relocating an existing
+  deployment's state on upgrade is a worse failure than the one being fixed. So
+  startup now logs a `WARNING` naming the path and what is lost with it. Same
+  doctrine as every other disclosure here: the default was defensible, its
+  silence was not.
+
+### Fixed — `ROADSTEAD_QUEUE_DB` and thirteen siblings were silently ignored
+
+Landed 2026-09-02, found while fixing the above — by setting
+`ROADSTEAD_QUEUE_DB` and watching it do nothing.
+
+The rename to the `ROADSTEAD_` prefix skipped `__main__.py`. Fourteen variables
+stayed under `LLM_PROXY_` **only** — among them `DATA_DIR`, `QUEUE_DB`, `HOST`,
+`PORT`, `LOG_LEVEL` and every retention/vacuum knob. Nothing failed, because the
+legacy spellings still worked; what broke was the **documented** spelling, which
+was a silent no-op. That is the `models.yaml` allowlist failure again: an
+unknown key dropped in silence, costing whoever spelled it the way the docs say.
+
+`acl.py` had already solved this correctly for its own variable — read both,
+warn on the legacy one, document which wins. That pattern is now shared
+(`config.env_with_legacy_prefix`) and applied everywhere. **Backward compatible:
+every `LLM_PROXY_*` spelling still works and now says it is deprecated.**
+
+🚨 The guard immediately caught one the sweep had missed: `management.py`'s
+`sources` view — the operator-facing "where does config come from" diagnostic —
+was reporting `LLM_PROXY_AGENTS_CONFIG` as the variable to set, while every
+sibling reported `ROADSTEAD_*`. It sent operators to the one spelling that did
+not work under the documented prefix.
+
+`tests/test_env_var_naming.py` is the guard: an AST sweep for any direct legacy
+read outside the helper, the helper's precedence, and the Dockerfile's data dir.
+All of it watched going red first — including a fourth `/private/tmp` case added
+after the disclosure proved silent on macOS, which is the platform where the
+`/tmp` default is exercised most.
+
+
 ### Scrub — a real host name shipped in source, and is gone from the tree (S7, half-closed)
 
 Landed 2026-09-01. `docs/corpus_and_scrub_plan.md` § S7 has the full account.
