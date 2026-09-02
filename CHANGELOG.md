@@ -8,6 +8,55 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Added — the management plane can bring a declared endpoint into service (roadmap J1)
+
+Landed 2026-09-01. The Providers tab was the configuration surface and carried **no controls at
+all**. Two writes now:
+
+- **`POST /rs/v1/admin/providers/{provider}/credential`** — supply the value for the provider's
+  `api_key_env`. 🚨 Write-only (no surface reads it back — not the value, not a prefix, not a
+  digest, not a length) and 🚨 **never persisted**, which the response says up front rather than
+  leaving it to be found at the next restart. The overlay holds key digests and has never held a
+  secret. It takes effect immediately because a provider reads the variable at call time.
+- **`POST /rs/v1/admin/endpoints/{ep}/status`** — `active` | `planned`.
+
+🚨 **Neither creates anything.** Both resolve their subject through `models.yaml` and 404 what is
+not declared there. Promoting an endpoint that is already written down changes exactly one thing —
+membership of the routing table — and is a far smaller claim than hot-adding one, which remains a
+file edit and a restart.
+
+Two refusals carry the design. **A promotion whose credential does not resolve is refused**, because
+`models.yaml` says in its own words that a deployment without the key "should not have an endpoint
+in its routing table that cannot serve". **A demotion with work in flight is refused**, because the
+request path reads the endpoint's config after dispatch; pause already drains. And 🚨 **the startup
+replay applies the same credential rule** — the status persists and the credential deliberately does
+not, so a restart would otherwise be the one moment a routed-but-unusable endpoint appears.
+
+### Fixed — a promoted endpoint was routable but reported as unrouted
+
+Landed 2026-09-01. `enriched.facts()` computed `routed` from the catalog entry while its own comment
+said "an endpoint present in the routing table is ROUTED whatever the catalog says". The branch that
+disagreed was unreachable — `config.endpoints` is built from `catalog.routed()` at startup, so the
+two could not differ — until J1 made them differ deliberately. The symptom was a promoted endpoint
+reported unrouted on `GET /rs/v1/models`, and since `intent.py` filters on that field, a pin to it
+404'd while the management plane reported it live. `config.endpoints` is the routing table.
+
+### Changed — the operator UI reads like an instrument, not a wall of text
+
+Landed 2026-09-01. Same one file, same zero dependencies, same CSP with no external reference.
+
+- **The doctrine moved behind a disclosure.** Every section printed a paragraph of reasoning as
+  permanent body copy, above the data an operator opened the page for. All 19 are now `<details>` —
+  every word kept, one click away, no JavaScript, keyboard-accessible. Alerts got the same treatment:
+  their four-line RECONCILE instructions were the largest text block on the page.
+- **Capacity is drawn as berths.** A roadstead is the anchorage where vessels wait for a berth, the
+  unit of fairness here is time spent occupying one, and the page rendered that as the string
+  `"0 / 4"`. One cell per slot, filled when occupied.
+- **A palette from the subject** — harbour water at night, chart-paper ink, and navigation lights for
+  state (starboard green serving, amber waiting, port red refused) — replacing near-black with a
+  borrowed blue accent.
+- **The 1500px cap is gone**, which was wasting a third of a wide monitor on a page of dense tables.
+
 ### Fixed — the management plane hid every endpoint that was not in force
 
 Landed 2026-09-01. `GET /rs/v1/admin/providers` reported only endpoints in the **routing table**,

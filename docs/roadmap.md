@@ -586,6 +586,33 @@ the code.
 
 ### J · A credential and an endpoint, from the operator's face
 
+**J1 LANDED 2026-09-01.** The Providers tab was the configuration surface and had zero controls on
+it; it now has two, and they are the two that turn "a dashboard" into "a way to bring a backend into
+service". Validated by clicking, not by asserting: the refusal, the credential form, the promotion,
+and discovery running against the real OpenRouter API and returning **published prices**
+(`source: "provider"`, `real: true`) — which is the proof the promoted endpoint is genuinely wired
+into discovery rather than merely recorded.
+
+🚨 **Running it found a latent bug that could not previously fire.** `enriched.facts()` computed
+`routed` from the CATALOG entry while its own comment said the opposite — "an endpoint present in
+the routing table is ROUTED whatever the catalog says". The two could never disagree, because
+`config.endpoints` is built from `cat.routed()` at startup, so the wrong branch was unreachable and
+the comment went unchallenged for the life of the file. J1 makes them disagree on purpose, and the
+result was a promoted endpoint reported unrouted on `/rs/v1/models` while the admin plane called it
+live — and `intent.py` filters on that field, so a pin to it 404'd. `config.endpoints` IS the
+routing table; there was never anything else to ask.
+
+**Known edge, not fixed:** between promotion and the first discovery pass, a remote endpoint carries
+the imputed avoided-cost price rather than its published one, so a call served in that window books
+as `avoided_usd` rather than `spent_usd`. Self-corrects on the next poll and the window is seconds,
+but it is the two-kinds-of-money inversion `spend.py` exists to prevent, and it is now reachable
+where it was not before. Workstream D territory.
+
+**Still open in J: J2**, and the design note below is unchanged by J1 — a promotion route does not
+become a creation route by adding fields.
+
+### J · A credential and an endpoint, from the operator's face
+
 **Opened 2026-09-01, with the reason E asked for.** E parked provider and endpoint writes —
 *"adding a backend is still a `models.yaml` edit and a restart, deliberately … Leave it unless there
 is a reason — and write the reason down before the code."* The reason is now on the table: the

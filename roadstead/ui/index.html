@@ -34,39 +34,73 @@
   minted, so CSRF never becomes reachable on these mutating routes.
 -->
 <style>
+/* ---------------------------------------------------------------------
+ * A roadstead is the sheltered anchorage OUTSIDE a harbour, where vessels
+ * wait for a berth to free up. The palette is that place at night, and the
+ * state colours are navigation lights — which is not decoration: port red
+ * and starboard green are a real, directional vocabulary, and this console
+ * has exactly that job. Green is alongside and serving, amber is riding at
+ * anchor, red is refused or dark.
+ *
+ * No web fonts: the CSP forbids every external reference, so the character
+ * has to come from how the system faces are SET. Instrument panel — tiny
+ * uppercase mono labels with wide tracking, large tabular mono numerals.
+ * ------------------------------------------------------------------- */
 :root {
   color-scheme: dark light;
-  --bg:        #0e1116;
-  --bg-raise:  #161b22;
-  --bg-sink:   #0a0d12;
-  --line:      #262d38;
-  --line-soft: #1c222b;
-  --ink:       #d8dee7;
-  --ink-dim:   #8b96a6;
-  --ink-faint: #5b6675;
-  --accent:    #58a6ff;
-  --ok:        #3fb950;
-  --warn:      #d29922;
-  --bad:       #f85149;
-  --gap:       #d29922;
+  --bg:        #0a1620;   /* harbour water at night — blue-green, not black */
+  --bg-raise:  #0f2130;
+  --bg-sink:   #071119;
+  --line:      #1d3a4a;
+  --line-soft: #142835;
+  --ink:       #e6dcc4;   /* chart paper, warm — never pure white */
+  --ink-dim:   #93a9b4;
+  --ink-faint: #5f7783;
+  --accent:    #56b6c2;   /* channel marker */
+  --ok:        #4fd08a;   /* starboard */
+  --warn:      #f0b429;   /* riding at anchor */
+  --bad:       #e5484d;   /* port */
+  --gap:       #f0b429;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f6f8fa; --bg-raise: #fff; --bg-sink: #eef1f5;
-    --line: #d6dce4; --line-soft: #e7ebf0;
-    --ink: #1c2431; --ink-dim: #5b6675; --ink-faint: #8b96a6;
-    --accent: #0b62d0; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --gap: #9a6700;
+    --bg: #f2ede1; --bg-raise: #fbf8f0; --bg-sink: #e8e1d0;
+    --line: #cabfa4; --line-soft: #ded5be;
+    --ink: #16303d; --ink-dim: #4d6675; --ink-faint: #7d94a0;
+    --accent: #0f6d7a; --ok: #1a7f4b; --warn: #8a5a00; --bad: #c0272d;
+    --gap: #8a5a00;
   }
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
 body {
-  background: var(--bg); color: var(--ink);
+  color: var(--ink);
   font: 13px/1.5 var(--sans);
   -webkit-font-smoothing: antialiased;
+  /* An admiralty chart's depth contours, at the threshold of visible. Two
+   * repeating gradients, no image, no request — the CSP forbids every
+   * external reference and this page has no build step to inline one with.
+   * It gives the ground a grain so the panels read as sitting ON something
+   * rather than floating in a void, which is most of what made the old
+   * near-black feel like a terminal with tables in it. */
+  background:
+    repeating-linear-gradient(
+      90deg, transparent 0 63px,
+      color-mix(in srgb, var(--accent) 5%, transparent) 63px 64px),
+    repeating-linear-gradient(
+      0deg, transparent 0 63px,
+      color-mix(in srgb, var(--accent) 5%, transparent) 63px 64px),
+    var(--bg);
+  background-attachment: fixed;
 }
+@media (prefers-reduced-motion: no-preference) {
+  main > section { animation: rise .18s ease both; }
+  main > section:nth-child(2) { animation-delay: .03s; }
+  main > section:nth-child(3) { animation-delay: .06s; }
+}
+@keyframes rise { from { opacity: 0; transform: translateY(4px); } }
 a { color: var(--accent); }
 code, .mono, td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
@@ -102,17 +136,88 @@ nav .badge {
   margin-left: 6px; font-size: 10.5px; padding: 0 5px; border-radius: 999px;
   background: var(--gap); color: #12151a; font-weight: 700;
 }
-main { padding: 18px; max-width: 1500px; }
+/* No max-width: this is a console, and a 1500px cap wasted a third of a wide
+ * monitor on a page whose whole job is dense tables. Prose is capped instead,
+ * where the measure actually matters (`.lede`, 74ch). */
+main { padding: 20px 26px 60px; }
 
 /* ---- structure ------------------------------------------------------- */
 section { margin-bottom: 26px; }
-h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase;
-     color: var(--ink-dim); margin: 0 0 4px; font-weight: 600; }
-.lede { color: var(--ink-faint); margin: 0 0 12px; max-width: 68ch; }
+/* Section headings as panel labels: mono, wide-tracked, with a rule running
+ * off to the right so a heading reads as the top of a bounded instrument
+ * rather than as a line of prose. */
+h2 {
+  font: 10px/1 var(--mono); letter-spacing: .2em; text-transform: uppercase;
+  color: var(--accent); margin: 0 0 10px; font-weight: 600;
+  display: flex; align-items: center; gap: 12px;
+}
+h2::after {
+  content: ""; flex: 1; height: 1px;
+  background: linear-gradient(90deg, var(--line), transparent);
+}
+main > section { margin-bottom: 30px; }
+.lede { color: var(--ink-faint); margin: 0 0 12px; max-width: 74ch; }
+
+/* ---- the wall of text, demoted -------------------------------------- *
+ * Every section carried a paragraph of doctrine as permanent body copy.
+ * The reasoning is the most valuable thing on the page and it was also the
+ * first thing on it, so the DATA — which is what an operator opened the
+ * page for — started below the fold of prose. `<details>` keeps every word
+ * one click away, costs no JavaScript, and is keyboard-accessible for free.
+ * --------------------------------------------------------------------- */
+details.why { margin: 0 0 14px; }
+details.why > summary {
+  cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 10px; text-transform: uppercase;
+  letter-spacing: .14em; color: var(--ink-faint); list-style: none;
+  padding: 3px 0; user-select: none;
+}
+details.why > summary::-webkit-details-marker { display: none; }
+details.why > summary::before { content: "›"; transition: transform .12s ease; }
+details.why[open] > summary::before { transform: rotate(90deg); }
+details.why > summary:hover { color: var(--accent); }
+details.why > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.why .lede { margin-top: 8px; }
 .cards { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
-.card { background: var(--bg-raise); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
-.card .k { color: var(--ink-faint); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
-.card .v { font-family: var(--mono); font-size: 21px; margin-top: 3px; }
+.card {
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--accent) 6%, var(--bg-raise)), var(--bg-raise));
+  border: 1px solid var(--line); border-radius: 6px; padding: 11px 14px 13px;
+  position: relative; overflow: hidden;
+}
+/* A hairline in the accent along the top edge — a lit channel marker. */
+.card::after {
+  content: ""; position: absolute; inset: 0 0 auto 0; height: 2px;
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+.card .k { color: var(--ink-faint); font-size: 10px; text-transform: uppercase;
+           letter-spacing: .14em; font-family: var(--mono); }
+.card .v { font-family: var(--mono); font-size: 30px; margin-top: 6px;
+           letter-spacing: -.02em; font-variant-numeric: tabular-nums;
+           color: var(--ink); line-height: 1; }
+/* The metric that is actually moving reads warm; the rest stay quiet. */
+.card[data-live="1"] .v { color: var(--accent); }
+
+/* ---- the berth strip — the signature -------------------------------- *
+ * The whole thesis of this scheduler is that capacity is a fixed number of
+ * BERTHS and the unit of fairness is time spent occupying one. The page
+ * rendered that as the string "0 / 4". One cell per slot, filled when
+ * occupied, is the same number said in the subject's own terms, and it is
+ * readable at a glance across a column of endpoints in a way two integers
+ * separated by a slash never is.
+ * --------------------------------------------------------------------- */
+.berths { display: inline-flex; gap: 3px; align-items: center; vertical-align: middle; }
+.berth {
+  width: 11px; height: 19px; border-radius: 2px;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.berth.full { background: var(--ok); border-color: var(--ok); }
+.berth.queued { background: var(--warn); border-color: var(--warn); }
+.berths .count { font-family: var(--mono); font-size: 11.5px; color: var(--ink-dim);
+                 margin-left: 8px; font-variant-numeric: tabular-nums; }
+/* An endpoint with no berths to draw — unrouted, or capacity undiscovered. */
+.berths.none { color: var(--ink-faint); font-family: var(--mono); font-size: 11px; }
 
 table { width: 100%; border-collapse: collapse; background: var(--bg-raise);
         border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
@@ -208,6 +313,8 @@ const API = {
   callers:     "/rs/v1/admin/callers",
   caller:      (id) => "/rs/v1/admin/callers/" + encodeURIComponent(id),
   providers:   "/rs/v1/admin/providers",
+  credential:  (p) => "/rs/v1/admin/providers/" + encodeURIComponent(p) + "/credential",
+  epStatus:    (ep) => "/rs/v1/admin/endpoints/" + encodeURIComponent(ep) + "/status",
   audit:       "/rs/v1/admin/audit",
   flags:       "/rs/v1/admin/flags",
   maintenance: "/rs/v1/admin/maintenance",
@@ -367,6 +474,35 @@ function pair(declared, inForce, opts) {
 }
 
 function tag(text, kind) { return el("span", { class: "tag " + (kind || ""), text: text }); }
+
+/* The doctrine, one click away rather than in front of the data. `why()`
+ * takes the same string the page used to print as a permanent paragraph. */
+function why(text, label) {
+  return el("details", { class: "why" },
+    el("summary", { text: label || "why" }),
+    el("p", { class: "lede", text: text }));
+}
+
+/* 🚨 The signature: capacity drawn as BERTHS. `max_slots` cells, `in_flight`
+ * of them filled, queued work shown as pressure beyond the wall. Reading a
+ * column of these tells an operator which endpoint is full at a glance, which
+ * "3 / 4" does not. Falls back to a dash when there is nothing to draw —
+ * an unrouted endpoint has no berths, and drawing zero of them would say the
+ * backend was asked and answered nothing (the same null-vs-zero rule the
+ * capacity columns follow). */
+function berths(inFlight, maxSlots, queued) {
+  const max = Number(maxSlots) || 0;
+  if (!max) return el("span", { class: "berths none", text: "—" });
+  const used = Math.max(0, Math.min(max, Number(inFlight) || 0));
+  const q = Math.max(0, Number(queued) || 0);
+  const cells = [];
+  for (let i = 0; i < max; i++) {
+    cells.push(el("span", { class: "berth" + (i < used ? " full" : "") }));
+  }
+  if (q) cells.push(el("span", { class: "berth queued", title: q + " queued" }));
+  return el("span", { class: "berths", title: used + " of " + max + " slots busy" },
+    ...cells, el("span", { class: "count", text: used + "/" + max }));
+}
 function empty(msg) { return el("div", { class: "empty", text: msg }); }
 function table(headers, rows) {
   const head = headers.map((h) => el("th", { text: h }));
@@ -409,10 +545,16 @@ async function viewFleet(root) {
   if (alerts.length) {
     root.append(el("section", {},
       el("h2", { text: "Alerts" }),
+      // 🚨 The detail on these runs to four lines of instructions and it was
+      // the largest block of text on the page — printed in full, always, for
+      // every alert, above the fleet an operator came to look at. The headline
+      // carries what triages it (severity, name, and the endpoint the detail
+      // names); the instructions stay one click away, complete and unedited.
       alerts.map((a) => el("div", { class: "notice" },
         el("div", { class: "h" }, tag(pick(a, "severity", "?"),
-          pick(a, "severity") === "CRITICAL" ? "bad" : "warn"), " ", pick(a, "name", "?")),
-        el("div", { class: "d", text: pick(a, "detail", "") })))));
+          pick(a, "severity") === "CRITICAL" ? "bad" : "warn"), " ",
+          el("code", { text: pick(a, "name", "?") })),
+        why(pick(a, "detail", ""), "what to do")))));
   }
 
   const rows = Object.entries(eps).sort().map(([name, e]) => {
@@ -423,7 +565,7 @@ async function viewFleet(root) {
     return el("tr", {},
       el("td", {}, el("code", { text: name })),
       el("td", {}, health, pick(e, "cooling") ? [" ", tag("cooling", "warn")] : null),
-      el("td", { class: "num", text: fmt.n(pick(e, "in_flight")) + " / " + fmt.n(pick(e, "max_slots")) }),
+      el("td", {}, berths(pick(e, "in_flight"), pick(e, "max_slots"), pick(e, "queued"))),
       el("td", { class: "num", text: fmt.n(pick(e, "queued")) }),
       el("td", { class: "num", text: fmt.ms(pick(e, "p50_wait_ms")) }),
       el("td", { class: "num", text: fmt.ms(pick(e, "p95_wait_ms")) }),
@@ -439,8 +581,8 @@ async function viewFleet(root) {
   });
   root.append(el("section", {},
     el("h2", { text: "Endpoints" }),
-    el("p", { class: "lede", text: "Slots are the unit of fairness. Pausing drains an endpoint: background work defers, interactive work fast-fails, and the restart is tagged as planned so its timeout burst does not read as an incident." }),
-    rows.length ? table(["endpoint", "state", "slots", "queued", "p50 wait", "p95 wait", "util", "timeouts 5m", ""], rows)
+    why("Slots are the unit of fairness. Pausing drains an endpoint: background work defers, interactive work fast-fails, and the restart is tagged as planned so its timeout burst does not read as an incident."),
+    rows.length ? table(["endpoint", "state", "berths", "queued", "p50 wait", "p95 wait", "util", "timeouts 5m", ""], rows)
                 : empty("no endpoints configured"),
     // Wherever a control is disabled, say why in the same section. A disabled
     // button with no explanation reads as a bug in the page.
@@ -448,7 +590,7 @@ async function viewFleet(root) {
 
   root.append(el("section", {},
     el("h2", { text: "Live" }),
-    el("p", { class: "lede", text: "Completed calls, streamed from the scheduler. Reconnects on its own; a slow reader is dropped rather than allowed to stall the hot path." }),
+    why("Completed calls, streamed from the scheduler. Reconnects on its own; a slow reader is dropped rather than allowed to stall the hot path."),
     el("div", { class: "feed", id: "feed" }, state.feed.length ? state.feed.map(feedRow) : el("div", { text: "waiting for traffic…" }))));
 }
 function card(k, v) {
@@ -469,7 +611,7 @@ async function viewGap(root) {
 
   root.append(el("section", {},
     el("h2", { text: "What you wrote that is not in force" }),
-    el("p", { class: "lede", text: "Three loaders accept a fixed set of keys and drop the rest. The keys stay dropped — a typo must not stop a fleet booting — but each one is retained here, because the person who reads a boot log and the person who asks why a knob does nothing are usually not the same person, a week apart." }),
+    why("Three loaders accept a fixed set of keys and drop the rest. The keys stay dropped — a typo must not stop a fleet booting — but each one is retained here, because the person who reads a boot log and the person who asks why a knob does nothing are usually not the same person, a week apart."),
     notices.length
       ? notices.map((n) => el("div", { class: "notice" },
           el("div", { class: "h" }, tag(pick(n, "problem", "?"), "warn"), " ",
@@ -493,7 +635,7 @@ async function viewGap(root) {
 
   root.append(el("section", {},
     el("h2", { text: "Runtime overlay" }),
-    el("p", { class: "lede", text: "A runtime edit never rewrites your config file. Enrolments and quota overrides are layered on top of the files at startup, revocations last. When the overlay cannot be written the change still takes effect — it just does not survive a restart, and says so." }),
+    why("A runtime edit never rewrites your config file. Enrolments and quota overrides are layered on top of the files at startup, revocations last. When the overlay cannot be written the change still takes effect — it just does not survive a restart, and says so."),
     el("div", { class: "cards" },
       card("runtime keys", pick(c, "sources.admin_store.runtime_keys")),
       card("revocations", pick(c, "sources.admin_store.revocations")),
@@ -511,7 +653,7 @@ async function viewGap(root) {
   const readonlyNets = pick(c, "sources.admin_nets.readonly", []);
   root.append(el("section", {},
     el("h2", { text: "Who can reach this" }),
-    el("p", { class: "lede", text: "X-Forwarded-For is a caller-supplied string and is read only from an address you trusted. Configuring one also withdraws the BUILT-IN loopback/docker admin grant from forwarded requests — \"it arrived on loopback\" stops meaning \"somebody is already on the machine\" the moment a front door exists." }),
+    why("X-Forwarded-For is a caller-supplied string and is read only from an address you trusted. Configuring one also withdraws the BUILT-IN loopback/docker admin grant from forwarded requests — \"it arrived on loopback\" stops meaning \"somebody is already on the machine\" the moment a front door exists."),
     table(["setting", "value"], [
       el("tr", {}, el("td", { text: "trusted proxies" }),
         el("td", {}, proxies.length
@@ -536,7 +678,7 @@ async function viewKeys(root) {
 
   root.append(el("section", {},
     el("h2", { text: "Keys" }),
-    el("p", { class: "lede", text: "A key is the caller's identity, and therefore the fair-share key, the quota holder and the budget holder. Keys are flat on purpose: many keys naming one agent_id give a team one budget with per-key revocation, which is what nesting would have been for." }),
+    why("A key is the caller's identity, and therefore the fair-share key, the quota holder and the budget holder. Keys are flat on purpose: many keys naming one agent_id give a team one budget with per-key revocation, which is what nesting would have been for."),
     el("div", { class: "row" },
       pick(k, "configured") ? tag("registry in play", "ok")
                             : tag("no keys — a presented key is IGNORED and the address decides", "warn"),
@@ -598,7 +740,7 @@ async function viewKeys(root) {
 
   root.append(el("section", {},
     el("h2", { text: "Enrol" }),
-    el("p", { class: "lede", text: "The secret is generated here, returned once, and never stored — only its digest is. A plaintext secret is never accepted in a request body, because a secret in a body is a secret in an access log." }),
+    why("The secret is generated here, returned once, and never stored — only its digest is. A plaintext secret is never accepted in a request body, because a secret in a body is a secret in an access log."),
     el("div", { class: "row" },
       field("agent_id", guarded(el("input", { id: "nk-agent", placeholder: "coding-assistant" }))),
       field("priority", select("nk-prio", ["P0_REALTIME", "P1_TURN_SUPPORT", "P2_POST_TURN", "P3_INGESTION", "P4_HYGIENE"], "P3_INGESTION")),
@@ -653,7 +795,7 @@ async function enrol() {
 function rotate(keyId, agentId) {
   const box = el("div", { class: "banner" },
     el("b", { text: "Rotate " + keyId + " (" + agentId + ")" }),
-    el("p", { class: "lede", text: "The successor inherits this key's agent_id, priority, deadline floor, admin scope and binding — a rotation is a new secret for the same identity. The overlap is how long the OLD key keeps working while you deploy the new one; 0 revokes it immediately, which breaks any caller still presenting it." }),
+    why("The successor inherits this key's agent_id, priority, deadline floor, admin scope and binding — a rotation is a new secret for the same identity. The overlap is how long the OLD key keeps working while you deploy the new one; 0 revokes it immediately, which breaks any caller still presenting it."),
     el("div", { class: "row" },
       field("overlap (s)", guarded(el("input", { id: "rk-overlap", type: "number", step: "1", value: "3600", style: "width:130px" }))),
       field("successor id", el("input", { id: "rk-id", placeholder: "auto" })),
@@ -717,7 +859,7 @@ async function viewCallers(root) {
   const rows = pick(c, "callers", []).map(callerRow);
   root.append(el("section", {},
     el("h2", { text: "Callers" }),
-    el("p", { class: "lede", text: "Quota is shown three ways: what is in force, what the file declared, and what this API changed. An override reads as a difference rather than as a label. Spend and savings are never summed — one is an invoice, the other is capacity that was free. Both thresholds degrade and neither rejects; crossing both still costs one band, not two." }),
+    why("Quota is shown three ways: what is in force, what the file declared, and what this API changed. An override reads as a difference rather than as a label. Spend and savings are never summed — one is an invoice, the other is capacity that was free. Both thresholds degrade and neither rejects; crossing both still costs one band, not two."),
     rows.length ? table(["agent_id", "identities", "weight", "band", "degrade", "spill",
                          "daily cap", "req/min", "spent today", "avoided",
                          "drr balance", ""], rows)
@@ -788,7 +930,7 @@ function editCaller(row) {
   const q = pick(row, "quota.in_force", {});
   const box = el("div", { class: "banner" },
     el("b", { text: "Edit " + row.agent_id }),
-    el("p", { class: "lede", text: "A weight change reaches the live DRR budget and moves the replenish RATE, not the balance already run — clearing a deficit on an edit would hand a fresh allowance to exactly the caller being reweighted for consuming too much." }),
+    why("A weight change reaches the live DRR budget and moves the replenish RATE, not the balance already run — clearing a deficit on an edit would hand a fresh allowance to exactly the caller being reweighted for consuming too much."),
     el("div", { class: "row" },
       field("weight", el("input", { id: "eq-weight", type: "number", step: "0.1", value: q.weight ?? "", style: "width:100px" })),
       field("max_balance_ss", el("input", { id: "eq-bal", type: "number", step: "1", value: q.max_balance_ss ?? "", style: "width:130px" })),
@@ -827,7 +969,7 @@ async function viewProviders(root) {
 
   root.append(el("section", {},
     el("h2", { text: "Providers" }),
-    el("p", { class: "lede", text: "Providers and endpoints are read-only: an endpoint is a routing-table entry that discovery, health and the fairness denominator all key on, so adding one is a models.yaml edit and a restart. A credential is shown by the NAME of the variable it comes from and whether that resolved — never by its value." }),
+    why("Adding a provider or an endpoint is still a models.yaml edit and a restart: an endpoint is a routing-table entry that discovery, health and the fairness denominator all key on. What you can do here is supply a credential and bring an endpoint that is already written down into service, or take it out. A credential is only ever shown by the NAME of the variable it comes from and whether that resolved — setting one here writes it into this process and nowhere else, so it does not survive a restart."),
     table(["provider", "engine", "address", "credential", "publishes", "endpoints"],
       pick(prov, "providers", []).map((pr) => {
         // 🚨 What this KIND of backend can tell us about itself, read off the
@@ -851,7 +993,12 @@ async function viewProviders(root) {
           // management surface that prints a credential is a key store.
           el("td", {}, envVar
             ? [el("code", { text: envVar }), " ",
-               pick(pr, "credential.present") ? tag("resolved", "ok") : tag("NOT SET", "bad")]
+               pick(pr, "credential.present") ? tag("resolved", "ok") : tag("NOT SET", "bad"),
+               " ", guarded(el("button", {
+                 class: "act", id: "cred-" + pick(pr, "provider", "?"),
+                 text: pick(pr, "credential.present") ? "Replace" : "Set key",
+                 onclick: () => setCredential(pick(pr, "provider", "")),
+               }))]
             : el("span", { class: "tag", text: "none needed" })),
           el("td", {}, pubs.length ? pubs.map((x) => [tag(x), " "]) : tag("nothing — config-seeded", "warn")),
           el("td", {}, pick(pr, "endpoints", []).map((e) => [el("code", { text: e }), " "])));
@@ -859,9 +1006,14 @@ async function viewProviders(root) {
 
   root.append(el("section", {},
     el("h2", { text: "Endpoints — declared vs in force" }),
-    el("p", { class: "lede", text: "Capacity discovery is asymmetric by engine, not by oversight: llama.cpp publishes real slot counts and per-slot context, vLLM publishes neither. \"Discovery agreed\" and \"discovery never ran\" look identical on a status page, so the engine's own capability is reported beside the numbers. Endpoints the catalog declares but nothing is serving are listed too, with the reason — a planned stanza is the plainest thing you wrote that is not in force, and its in-force numbers are blank rather than zero because nobody has asked the backend anything." }),
-    table(["endpoint", "provider", "state", "slots", "context", "price in/out", "failover", "spill"],
-      pick(prov, "endpoints", []).map(endpointRow))));
+    why("Capacity discovery is asymmetric by engine, not by oversight: llama.cpp publishes real slot counts and per-slot context, vLLM publishes neither. \"Discovery agreed\" and \"discovery never ran\" look identical on a status page, so the engine's own capability is reported beside the numbers. Endpoints the catalog declares but nothing is serving are listed too, with the reason — a planned stanza is the plainest thing you wrote that is not in force, and its in-force numbers are blank rather than zero because nobody has asked the backend anything."),
+    // "slots", not "berths": this column is the declared seed beside what
+    // discovery left — a question about CAPACITY, not about who is alongside
+    // right now. The berth strip answers the other one, on Fleet.
+    table(["endpoint", "provider", "state", "slots", "context", "price in/out",
+           "failover", "spill", ""],
+      pick(prov, "endpoints", []).map(endpointRow)),
+    readonlyNote()));
 }
 function endpointRow(e) {
   const discoverable = pick(e, "capacity.slots.discoverable");
@@ -903,7 +1055,73 @@ function endpointRow(e) {
       : [String(inPrice) + " / " + String(pick(e, "price.output_usd_per_mtok")) + " per Mtok ",
          pick(e, "price.real") ? tag("invoice", "warn") : tag("avoided", "ok")]),
     el("td", {}, failover ? el("code", { text: failover }) : "—"),
-    el("td", {}, spill ? el("code", { text: spill }) : "—"));
+    el("td", {}, spill ? el("code", { text: spill }) : "—"),
+    el("td", {}, pick(e, "routed") === false
+      ? guarded(el("button", {
+          class: "act", id: "promote-" + pick(e, "endpoint", "?"),
+          text: "Bring into service",
+          onclick: () => setEndpointStatus(pick(e, "endpoint", ""), "active"),
+        }))
+      : guarded(el("button", {
+          class: "act", id: "demote-" + pick(e, "endpoint", "?"),
+          text: "Take out of service",
+          onclick: () => setEndpointStatus(pick(e, "endpoint", ""), "planned"),
+        }))));
+}
+
+/* 🚨 A password field, and the value never comes back out. The plane is
+ * write-only for credentials — no prefix, no digest, no length — so the page
+ * has nothing to render afterwards except "resolved", which is exactly what
+ * it renders. Cleared immediately either way: a key sitting in a detached DOM
+ * node is a key in the page. */
+async function setCredential(provider) {
+  const input = el("input", { id: "cred-value", type: "password",
+                              autocomplete: "off", spellcheck: "false",
+                              placeholder: "paste the key",
+                              style: "width:380px;font-family:var(--mono)" });
+  const box = el("div", { class: "banner" },
+    el("b", { text: "Set the credential for " + provider }),
+    why("This sets the environment variable the provider names in models.yaml, for this process only. It takes effect on the very next request — a provider reads the variable when it calls, not when the proxy boots — and it is gone on restart. Export the variable to make it durable. Nothing here or in the audit trail ever records the value.",
+        "what this does, and what it does not"),
+    el("div", { class: "row" },
+      field("value", input),
+      el("button", { class: "act primary", text: "Set key", onclick: async () => {
+        const value = input.value;
+        input.value = "";
+        if (!value) { banner("bad", "Nothing to set — the field was empty."); return; }
+        try {
+          const res = await api(API.credential(provider), {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ value }),
+          });
+          banner("ok", el("b", { text: "$" + pick(res, "credential.env_var", "?") + " is set." }),
+                 " ", (pick(res, "warnings", []) || []).join(" "));
+          render();
+        } catch (err) { reportError(err); }
+      }}),
+      el("button", { class: "act", text: "Cancel", onclick: () => {
+        input.value = ""; banner("");
+      }})));
+  $("#banner").replaceChildren(box);
+  input.focus();
+}
+
+async function setEndpointStatus(endpoint, status) {
+  const bringing = status === "active";
+  if (!bringing && !confirmish(
+        "Take " + endpoint + " out of service? Work already in flight keeps its "
+        + "endpoint; this refuses if anything is running, so pause it first.")) return;
+  try {
+    const res = await api(API.epStatus(endpoint), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+    banner("ok",
+      el("b", { text: endpoint + (bringing ? " is in service." : " is out of service.") }),
+      " ", (pick(res, "warnings", []) || []).join(" "),
+      pick(res, "persisted") ? "" : " Not persisted: " + pick(res, "reason", ""));
+    render();
+  } catch (err) { reportError(err); }
 }
 
 /* --- Control ----------------------------------------------------------- */
@@ -912,7 +1130,7 @@ async function viewControl(root) {
   const flags = pick(f, "flags", {});
   root.append(el("section", {},
     el("h2", { text: "Runtime flags" }),
-    el("p", { class: "lede", text: "The shadow-to-enforce switches and the kill switches. A change takes effect immediately and is persisted across restarts; no process restart is needed." }),
+    why("The shadow-to-enforce switches and the kill switches. A change takes effect immediately and is persisted across restarts; no process restart is needed."),
     table(["flag", "state", ""], Object.entries(flags).sort().map(([name, on]) => el("tr", {},
       el("td", {}, el("code", { text: name })),
       el("td", {}, on ? tag("on", "ok") : tag("off", "")),
@@ -924,7 +1142,7 @@ async function viewControl(root) {
   try { windows = await api(API.maintenance); } catch (e) { /* no persistence backend is not an error here */ }
   root.append(el("section", {},
     el("h2", { text: "Maintenance windows" }),
-    el("p", { class: "lede", text: "Tag a deliberate restart so its burst of timeouts reads as planned rather than as an incident. Pause/resume records one automatically; this is for a restart taken without the drain." }),
+    why("Tag a deliberate restart so its burst of timeouts reads as planned rather than as an incident. Pause/resume records one automatically; this is for a restart taken without the drain."),
     el("div", { class: "row" },
       // 🚨 The INPUTS are guarded too, not just the submit. Found by rendering
       // the page as a read-only operator on 2026-09-01: the Record button was
@@ -986,7 +1204,7 @@ async function viewAudit(root) {
 
   root.append(el("section", {},
     el("h2", { text: "Audit" }),
-    el("p", { class: "lede", text: "Every mutating admin route records here, including the four control routes that predate this plane — a trail covering only some of them would be worse than none, because a reader assumes completeness. A record names the credential and never carries one." }),
+    why("Every mutating admin route records here, including the four control routes that predate this plane — a trail covering only some of them would be worse than none, because a reader assumes completeness. A record names the credential and never carries one."),
     el("div", { class: "row" },
       // 🚨 The limits, as data. An in-memory trail is the DEFAULT (no admin
       // store is configured by default) and the bound discards silently unless

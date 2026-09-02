@@ -676,7 +676,9 @@ is not an error: see §3.2.
 | `POST /rs/v1/admin/keys/{key_id}/rotate` | Issue a successor and retire this one, as **one** action (§3.3). Returns the new secret once. |
 | `GET /rs/v1/admin/callers` | Per caller: identities, quota (declared vs in force), DRR budget, spend, live occupancy. |
 | `PATCH /rs/v1/admin/callers/{agent_id}` | Edit one caller's quota (§3.4). Partial; absent fields untouched. |
-| `GET /rs/v1/admin/providers` | Providers and endpoints: declared vs discovered capacity, credential presence, prices, health. |
+| `GET /rs/v1/admin/providers` | Providers and endpoints: declared vs discovered capacity, credential presence, prices, health. Includes endpoints the catalog declares that nothing is serving. |
+| `POST /rs/v1/admin/providers/{provider}/credential` | Supply the value for the provider's `api_key_env` (§3.9). Write-only, **never persisted**. |
+| `POST /rs/v1/admin/endpoints/{ep}/status` | Bring a declared endpoint into service or take it out — `active` \| `planned` (§3.9). |
 | `GET /rs/v1/admin/audit` | Who changed what, and when (§3.8). Reports its own bound and durability. |
 | `POST /rs/v1/admin/endpoints/{ep}/pause` · `POST /v1/admin/endpoints/{ep}/pause` | Drain an endpoint: background defers, interactive fast-fails, the poller stops probing. Auto-opens an annotated PLANNED maintenance window. |
 | `POST /rs/v1/admin/endpoints/{ep}/resume` · `POST /v1/admin/endpoints/{ep}/resume` | Re-probe, **re-discover capacity**, drain the deferred queue, close the window. |
@@ -865,6 +867,49 @@ An empty `notices` list is the healthy state. It is not the same as "no config w
 `operator`. Which of those two an admin grant came from decides whether it survives a proxy being
 put in front (§1.5 rule 4), and an operator whose only admin path was "curl from the box" should
 read that here rather than meet it as a 403.
+
+#### 3.9 Bringing an endpoint into service
+
+Two writes, and they are deliberately the *small* pair. 🚨 **Neither creates anything.** Both resolve
+their subject through `models.yaml` and 404 what is not declared there — adding a provider or an
+endpoint that the catalog does not contain is a file edit and a restart, because an endpoint is a
+routing-table entry that discovery, health and the DRR denominator all key on. Promoting one that is
+already written down is a far smaller claim: the stanza has been parsed and validated already, and
+the only thing that changes is membership of the routing table.
+
+**`POST /rs/v1/admin/providers/{provider}/credential`** — body `{"value": "..."}`.
+
+Sets the environment variable the provider's `api_key_env` names. It takes effect on the next
+request, because a provider reads the variable at call time rather than at startup.
+
+- 🚨 **Write-only.** No surface reads it back — not the value, not a prefix, not a digest, not a
+  length. §3.5's rule is unchanged; this adds a way in, not a way out.
+- 🚨 **Never persisted, and the response says so** rather than leaving it to be discovered at the
+  next restart. The admin overlay holds key *digests* and has never held a secret; an outbound
+  provider key in a JSON file on disk is a different posture. The durable path is the environment.
+- A provider with no `api_key_env` is a 400, not an invented variable name.
+- The audit record names the **variable**, never the value.
+
+**`POST /rs/v1/admin/endpoints/{ep}/status`** — body `{"status": "active"|"planned"}`.
+
+- 🚨 **A promotion whose credential does not resolve is REFUSED.** `models.yaml` says in its own
+  words what `planned` is for: a deployment that has not set the key "should not have an endpoint in
+  its routing table that cannot serve". Promoting without it would put exactly that into the routing
+  table, from the surface whose purpose is reporting the gap. The ordering follows from the refusal
+  rather than being imposed: credential first, then promote.
+- 🚨 **A demotion with work in flight is REFUSED.** Removal is the dangerous direction — the request
+  path reads the endpoint's config after dispatch, so pulling it out from under live work is a null
+  dereference. Pause already drains, so the safe order exists; pause, then demote.
+- `on_demand` and `retired` are catalog-only. One changes how health probes, the other records that
+  a name is gone; neither is a routing decision to make from here.
+- **The status persists** (the overlay's `endpoints` section) and is re-applied at startup through
+  the same function, so a promoted endpoint comes back configured identically.
+- 🚨 **But the startup replay applies the SAME credential rule**, because the credential does not
+  persist and the status does. Without that, a restart would be the one moment a routed endpoint
+  that cannot serve appears — the exact condition the refusal above exists to prevent, arriving
+  through the back door. A promotion whose variable is unset stays in the overlay, logs a warning
+  naming the variable, and takes effect the moment it is set and promoted again. It is not lost and
+  it is not silently in force.
 
 The same principle shapes the other two read views. `GET /rs/v1/admin/providers` reports each
 endpoint's **declared** capacity (the `models.yaml` seed) beside what is **in force** (what discovery

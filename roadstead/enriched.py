@@ -251,7 +251,22 @@ class EnrichedApi:
             # An endpoint present in the routing table is ROUTED whatever the
             # catalog says — the scheduler will dispatch to it, and reporting
             # otherwise would describe a fleet Roadstead is not running.
-            routed = ep_cfg is not None if entry is None else entry.routed
+            #
+            # 🚨 That is what this line MEANT since it was written, and not what
+            # it did: it consulted `entry.routed` whenever a catalog entry
+            # existed, i.e. almost always. The two could not disagree, because
+            # `config.endpoints` is built from `cat.routed()` at startup — so
+            # the wrong branch was unreachable and the comment above went
+            # unchallenged. Roadmap J1 makes them disagree on purpose: an
+            # endpoint promoted at runtime is in the routing table while the
+            # catalog still says `planned`. Consulting the catalog then reported
+            # a promoted endpoint as unrouted on `/rs/v1/models`, and
+            # `intent.py` filters on exactly this field — so a pin to it 404'd
+            # while the management plane said it was live.
+            #
+            # `config.endpoints` IS the routing table. There is nothing else to
+            # ask.
+            routed = ep_cfg is not None
             out.append(ModelFacts(
                 endpoint=name,
                 kind=(ep_cfg.kind if ep_cfg else entry.kind if entry else "chat"),

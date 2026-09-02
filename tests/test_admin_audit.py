@@ -427,6 +427,18 @@ async def test_every_mutating_admin_route_records_something(tmp_path, monkeypatc
         if path.endswith("/maintenance"):
             return await svc.handle_maintenance(_Req(
                 method=method, body={"endpoint": "tier1", "duration_s": 5}))
+        if path.endswith("/providers/{provider}/credential"):
+            # A provider that actually declares an `api_key_env`, or the handler
+            # correctly refuses and records nothing.
+            return await svc.handle_admin_provider_credential(_Req(
+                method=method, path_params={"provider": "openrouter"},
+                body={"value": "probe-not-a-real-key"}))
+        if path.endswith("/endpoints/{endpoint}/status"):
+            # Demote a routed endpoint: no credential needed and nothing is in
+            # flight, so this exercises the write rather than a refusal.
+            return await svc.handle_admin_endpoint_status(_Req(
+                method=method, path_params={"endpoint": "tier1"},
+                body={"status": "planned"}))
         return None
 
     unrecorded = []

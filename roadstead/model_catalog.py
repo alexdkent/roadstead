@@ -458,16 +458,27 @@ _POLICY_PASSTHROUGH = (
 _POLICY_HANDLED = frozenset({"model_fingerprint", "thinking_kwargs"})
 
 
-def build_endpoint_kwargs(cat: Catalog | None = None) -> dict[str, dict[str, Any]]:
+def build_endpoint_kwargs(cat: Catalog | None = None,
+                          entries: list["EndpointEntry"] | None = None,
+                          ) -> dict[str, dict[str, Any]]:
     """Per-endpoint-class kwargs for constructing proxy ``EndpointConfig``.
 
     Keyed by endpoint class; one entry per ROUTED endpoint. ``config`` builds
     ``EndpointConfig(**kwargs)`` from this (EndpointConfig lives there, so we
     return plain kwargs to avoid a cycle).
+
+    ``entries`` overrides *which* entries are built, and exists for one caller:
+    the management plane promoting a `planned` endpoint into service
+    (roadmap J1). It needs the identical kwargs for an entry that is by
+    definition not in ``cat.routed()`` yet, and the alternative — a second
+    builder — is the "two places deciding the same thing" shape this repo keeps
+    paying for. 🚨 It changes only the SELECTION; every rule below is the same
+    code on the same catalog, so a promoted endpoint is configured exactly as a
+    restart would have configured it.
     """
     cat = cat or load_catalog()
     out: dict[str, dict[str, Any]] = {}
-    for e in cat.routed():
+    for e in (cat.routed() if entries is None else entries):
         pol = e.policy
         kw: dict[str, Any] = {
             "endpoint_class": e.name,

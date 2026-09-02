@@ -128,7 +128,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from . import hooks, model_catalog
-from .config import AgentQuotaConfig, LLMPriority
+from .config import AgentQuotaConfig, EndpointConfig, LLMPriority
 from .enriched import _error
 from .identity import iso_time
 from .providers import provider_for_engine
@@ -242,6 +242,13 @@ class AdminOverlay:
                  environment or in a keys file, which this layer cannot edit but
                  must still be able to switch off. See :meth:`apply`.
     ``agents``   per-caller quota overrides, field by field.
+    ``endpoints`` per-endpoint ``status`` overrides — an endpoint promoted into
+                 service, or taken out of it, at runtime. 🚨 The status
+                 persists and the CREDENTIAL never does: a status is a routing
+                 decision the operator made and should find again after a
+                 restart, whereas an outbound provider key written into a JSON
+                 file is a change of posture this store has never made (it
+                 holds key *digests*, not secrets). Roadmap J1.
     ``audit``    who changed what, and when. See :meth:`record`.
 
     ``path=None`` keeps everything in memory: the changes apply, nothing
@@ -251,7 +258,8 @@ class AdminOverlay:
     #: Top-level keys the file may carry. An unknown one is REPORTED rather than
     #: dropped, for the reason this whole module exists.
     _FILE_SECTIONS = frozenset({
-        "version", "keys", "revoked", "retired", "agents", "audit"})
+        "version", "keys", "revoked", "retired", "agents", "endpoints",
+        "audit"})
 
     #: How many audit records to keep. Bounded because this is an append-only
     #: list on a long-lived process and the store is rewritten whole on every
@@ -270,6 +278,9 @@ class AdminOverlay:
         #: A softer tombstone: the key still works until the instant recorded.
         self.retired: dict[str, float] = {}
         self.agents: dict[str, dict] = {}
+        #: {endpoint: {"status": "active"|"planned"}} — runtime promotions and
+        #: demotions, layered over the catalog's own ``status:``.
+        self.endpoints: dict[str, dict] = {}
         #: Newest LAST, matching the file. Bounded by ``_AUDIT_MAX``.
         self.audit: list[dict] = []
         #: How many records fell off the front, in this process and in every
@@ -355,6 +366,10 @@ class AdminOverlay:
         if isinstance(agents, dict):
             self.agents = {str(k): dict(v) for k, v in agents.items()
                            if isinstance(v, dict)}
+        endpoints = raw.get("endpoints", {})
+        if isinstance(endpoints, dict):
+            self.endpoints = {str(k): dict(v) for k, v in endpoints.items()
+                              if isinstance(v, dict)}
         audit = raw.get("audit", {})
         if isinstance(audit, dict):
             self.audit = [e for e in audit.get("entries", []) if isinstance(e, dict)]
@@ -363,9 +378,10 @@ class AdminOverlay:
             except (TypeError, ValueError):
                 self.audit_dropped = 0
         logger.info("admin overlay: %d runtime key(s), %d revocation(s), "
-                    "%d retirement(s), %d caller override(s) from %s",
+                    "%d retirement(s), %d caller override(s), "
+                    "%d endpoint status override(s) from %s",
                     len(self.keys), len(self.revoked), len(self.retired),
-                    len(self.agents), self._path)
+                    len(self.agents), len(self.endpoints), self._path)
 
     def persist(self) -> None:
         """Rewrite the store atomically. Blocking — call via ``to_thread``.
@@ -385,6 +401,7 @@ class AdminOverlay:
                     "revoked": self.revoked,
                     "retired": self.retired,
                     "agents": self.agents,
+                    "endpoints": self.endpoints,
                     "audit": {"entries": self.audit,
                               "dropped": self.audit_dropped},
                 },
@@ -448,7 +465,45 @@ class AdminOverlay:
                 if name in EDITABLE_QUOTA_FIELDS:
                     setattr(cfg, name, _coerce_quota(name, value))
 
+        # 🚨 Endpoint status LAST, and through the same two functions the
+        # runtime handler uses. A promotion restored at startup must produce
+        # byte-identical config to one made by hand a minute ago, or the fleet
+        # an operator sees after a restart is not the fleet they configured.
+        for name, fields in self.endpoints.items():
+            status = str(fields.get("status") or "")
+            try:
+                if status == "active":
+                    gap = endpoint_credential_gap(name)
+                    if gap:
+                        # Not an error and not silence: the operator's promotion
+                        # stands in the overlay and will take effect the moment
+                        # the variable is set. `GET /rs/v1/admin/providers`
+                        # shows the endpoint still unrouted with the variable
+                        # named, which is the same answer in the same words.
+                        logger.warning(
+                            "admin overlay: endpoint %r was promoted at runtime "
+                            "but $%s is not set, so it stays OUT of the routing "
+                            "table — a routed endpoint that cannot serve is "
+                            "what its 'planned' status prevents. Set the "
+                            "variable and promote again, or export it.",
+                            name, gap)
+                        continue
+                    install_endpoint(config, name)
+                elif status == "planned":
+                    remove_endpoint(config, name)
+            except Exception as exc:  # noqa: BLE001 — a stale override must
+                # not stop a boot. The endpoint it names may have been deleted
+                # from models.yaml since, which is an operator's edit winning
+                # over a runtime override — the right outcome, reported not
+                # raised.
+                logger.warning("admin overlay: endpoint %r status %r could not "
+                               "be applied (%s); the catalog stands", name,
+                               status, exc)
+
     # ---- mutation -------------------------------------------------------
+
+    def set_endpoint_status(self, endpoint: str, status: str) -> None:
+        self.endpoints[str(endpoint)] = {"status": str(status)}
 
     def add_key(self, record: dict) -> None:
         self.keys.append(record)
@@ -1559,6 +1614,171 @@ class ManagementApi:
             return denied
         return JSONResponse(self._providers_view())
 
+    # ---- J1: writes on the providers plane ------------------------------
+
+    async def handle_admin_provider_credential(self, request: Request) -> Response:
+        """POST — supply the value for a provider's ``api_key_env``.
+
+        🚨 WRITE-ONLY, and the emit doctrine does not move: this sets the
+        variable, and no surface ever reads it back. The response says the
+        variable's NAME and that it now resolves — never a prefix, never a
+        digest, never a length, because each of those narrows a search.
+
+        🚨 NOT PERSISTED, deliberately, and the response says so rather than
+        leaving an operator to discover it at the next restart. The overlay
+        holds key *digests* and has never held a secret; writing an outbound
+        provider key into a JSON file on disk is a change of posture that
+        should be argued on its own merits instead of arriving as a side effect
+        of a convenience. The durable path is unchanged and is named in the
+        response: export the variable, or put it in the unit file.
+
+        It takes effect immediately because `openrouter._api_key` reads
+        `os.environ` at CALL time rather than at startup — so there is no reload
+        to trigger and no window where the endpoint is live and unauthenticated.
+        """
+        denied = self._gate(f"{PREFIX}/providers", request)
+        if denied is not None:
+            return denied
+        provider = request.path_params["provider"]
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return _error("invalid_request_error", "body must be JSON", 400)
+        if not isinstance(body, dict):
+            return _error("invalid_request_error", "body must be an object", 400)
+        unknown = sorted(set(body) - {"value"})
+        if unknown:
+            # Never a silent drop, on the surface whose purpose is exposing them.
+            return _error("invalid_request_error",
+                          f"unknown field(s) {unknown}; the only field is "
+                          f"'value'", 400)
+        value = body.get("value")
+        if not isinstance(value, str) or not value.strip():
+            return _error("invalid_request_error",
+                          "'value' must be a non-empty string", 400)
+
+        cat = model_catalog.load_catalog()
+        entry = cat.providers.get(provider)
+        if entry is None:
+            return _error("unknown_endpoint",
+                          f"no provider {provider!r} in the catalog", 404)
+        env_var = (entry.api_key_env or "").strip()
+        if not env_var:
+            # Refused rather than invented: without `api_key_env` there is no
+            # variable to set, and choosing one here would put the name in a
+            # second place — the provider reads only what the catalog names.
+            return _error("invalid_request_error",
+                          f"provider {provider!r} declares no api_key_env, so "
+                          f"there is no variable to set; add one to models.yaml",
+                          400)
+
+        os.environ[env_var] = value.strip()
+        # 🚨 The VARIABLE, never the value. An audit record is read by more
+        # people than the plane is.
+        self._record(request, "provider.credential", provider,
+                     {"env_var": env_var})
+        return JSONResponse({
+            "provider": provider,
+            "credential": {"env_var": env_var, "present": True},
+            "persisted": False,
+            "warnings": [
+                f"${env_var} is set for this process only and will NOT survive "
+                f"a restart — export it in the environment to make it durable",
+            ],
+            # The endpoints this just unblocked, so the next step is visible
+            # rather than something to go and look for.
+            "endpoints": sorted(
+                n for n, e in cat.endpoints.items() if e.provider == provider),
+        })
+
+    async def handle_admin_endpoint_status(self, request: Request) -> Response:
+        """POST — bring a declared endpoint into service, or take it out.
+
+        See `install_endpoint` for why this is safe on a live process, and
+        roadmap J1 for why it is a much smaller claim than hot-adding one.
+        """
+        denied = self._gate(f"{PREFIX}/providers", request)
+        if denied is not None:
+            return denied
+        name = request.path_params["endpoint"]
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return _error("invalid_request_error", "body must be JSON", 400)
+        if not isinstance(body, dict):
+            return _error("invalid_request_error", "body must be an object", 400)
+        unknown = sorted(set(body) - {"status"})
+        if unknown:
+            return _error("invalid_request_error",
+                          f"unknown field(s) {unknown}; the only field is "
+                          f"'status'", 400)
+        status = body.get("status")
+        if status not in ("active", "planned"):
+            return _error("invalid_request_error",
+                          "'status' must be 'active' or 'planned'. "
+                          "'on_demand' and 'retired' are catalog-only: one "
+                          "changes how health probes, the other is a record "
+                          "that a name is gone, and neither is a routing "
+                          "decision to make from here.", 400)
+
+        cat = model_catalog.load_catalog()
+        entry = cat.endpoints.get(name)
+        if entry is None:
+            return _error("unknown_endpoint",
+                          f"no endpoint {name!r} in the catalog. Adding one "
+                          f"that is not declared is not something this plane "
+                          f"can do — it is a models.yaml edit.", 404)
+
+        warnings: list[str] = []
+        if status == "active":
+            env_var = endpoint_credential_gap(name, cat)
+            if env_var:
+                # 🚨 THE load-bearing refusal. models.yaml says in its own words
+                # what `planned` is for: "a deployment that has not set
+                # $OPENROUTER_API_KEY should not have an endpoint in its routing
+                # table that cannot serve". Promoting without the credential
+                # would put exactly that into the routing table, from the
+                # surface whose whole purpose is reporting the gap.
+                return _error(
+                    "invalid_request_error",
+                    f"endpoint {name!r} needs ${env_var}, which is not set. "
+                    f"Promoting it would put an endpoint that cannot serve into "
+                    f"the routing table — which is what its 'planned' status is "
+                    f"there to prevent. Set the credential on provider "
+                    f"{entry.provider!r} first.", 400)
+            install_endpoint(self.state.config, name, cat)
+        else:
+            in_flight = int((self.state.scheduler.endpoint_snapshot(name)
+                             or {}).get("in_flight") or 0)
+            if in_flight:
+                # 🚨 Removal is the dangerous direction: the request path reads
+                # `config.endpoints.get(...)` at several points AFTER dispatch,
+                # so pulling the entry from under work in flight turns a live
+                # request into a None dereference. Pausing already drains, so
+                # the safe order exists — this refuses rather than inventing a
+                # second drain that would duplicate it.
+                return _error(
+                    "invalid_request_error",
+                    f"endpoint {name!r} has {in_flight} request(s) in flight. "
+                    f"Pause it first — that drains — then take it out of "
+                    f"service.", 400)
+            remove_endpoint(self.state.config, name)
+
+        self.state.admin_overlay.set_endpoint_status(name, status)
+        self._record(request, "endpoint.status", name, {"status": status})
+        outcome = await self._persist()
+        return JSONResponse({
+            "endpoint": name,
+            "status": status,
+            "routed": status == "active",
+            "declared_status": entry.status,
+            "warnings": warnings + ([
+                f"the catalog declares {name!r} as {entry.status!r}; this "
+                f"override is layered over models.yaml, which is unchanged"
+            ] if entry.status != status else []),
+            **outcome,
+        })
+
     def _providers_view(self) -> dict:
         cat = model_catalog.load_catalog()
         # 🚨 Every endpoint the CATALOG declares, not only the ones in force.
@@ -1663,6 +1883,20 @@ class ManagementApi:
                         "spill_to": ep.spill_to or None},
         }
 
+    def _why_not_in_force(self, name: str, entry: Any, env_var: str) -> str:
+        if entry is None:
+            return "not in the catalog"
+        requested = self.state.admin_overlay.endpoints.get(name, {}).get("status")
+        if requested == "active":
+            if env_var and not os.environ.get(env_var):
+                return (f"promoted here, but ${env_var} is not set — a routed "
+                        f"endpoint that cannot serve is what 'planned' prevents. "
+                        f"Set the credential and promote again.")
+            return ("promoted here, but not installed — see the startup log")
+        if requested == "planned":
+            return "taken out of service here"
+        return f"the catalog declares status {entry.status!r}"
+
     def _unrouted_endpoint_view(self, name: str, entry: Any, cat: Any) -> dict:
         """An endpoint the catalog declares that nothing is serving.
 
@@ -1688,11 +1922,18 @@ class ManagementApi:
             "kind": entry.kind if entry else "chat",
             "status": entry.status if entry else "unknown",
             "routed": False,
-            # Why it is not serving, in the plane's own idiom: the declared
-            # status is the reason, and the credential is the usual blocker.
+            # Why it is not serving, in the plane's own idiom — and 🚨 the
+            # OVERRIDE outranks the catalog in this sentence. An operator who
+            # promoted this endpoint and then restarted without exporting the
+            # key is told that, not "status is 'planned'": the second is true of
+            # the file and answers a question they did not ask, and it is the
+            # difference between "I never turned this on" and "I turned it on
+            # and something is missing".
             "not_in_force": {
-                "reason": (f"status is {entry.status!r}" if entry
-                           else "not in the catalog"),
+                "reason": self._why_not_in_force(name, entry, env_var),
+                "declared_status": entry.status if entry else None,
+                "requested_status": (self.state.admin_overlay.endpoints
+                                     .get(name, {}).get("status")),
                 "credential": {
                     "env_var": env_var or None,
                     "present": bool(os.environ.get(env_var)) if env_var else None,
@@ -1717,6 +1958,74 @@ class ManagementApi:
                        "probe_healthy": None},
             "routing": {"failover_to": None, "spill_to": None},
         }
+
+
+# ---------------------------------------------------------------------------
+# Endpoint status — bringing a declared endpoint into service, and out again
+# ---------------------------------------------------------------------------
+#
+# 🚨 Roadmap J1. `planned` -> `active` is NOT hot-adding an endpoint: the stanza
+# already declares provider, model, slots, context, floors, capabilities and
+# failover, and it has already been parsed and validated by the catalog loader.
+# The only thing that changes is membership of the routing table. Inventing an
+# endpoint that is not in `models.yaml` at all is J2 and a much larger question
+# — these two functions deliberately cannot do it, because they resolve the
+# name through the catalog and refuse what is not there.
+#
+# Why this is safe to do on a live process, established by reading the code
+# rather than by hoping:
+#   * `Scheduler` creates an endpoint's queue LAZILY (`if ep not in self._queues`),
+#     so a name it has never seen needs no registration.
+#   * `health` re-reads `config.endpoints` every poll, so discovery and probing
+#     pick the endpoint up on the next cycle rather than needing a restart.
+#   * everything else reads `config.endpoints.get(name)`, which is why removal
+#     is the dangerous direction and is gated on in-flight work below.
+
+def endpoint_credential_gap(name: str, cat: Any = None) -> str | None:
+    """The env var this endpoint needs and does not have, or None.
+
+    🚨 ONE rule, consulted from both places that promote: the runtime handler
+    and the startup replay of a persisted promotion. They were written a
+    function apart and the second one is the easy one to forget — a status that
+    persists while the credential deliberately does not means a restart is
+    exactly when an endpoint would come back routed and unable to serve, which
+    is the condition `planned` exists to prevent. Same rule, same moment,
+    whichever path arrives at it.
+    """
+    cat = cat or model_catalog.load_catalog()
+    entry = cat.endpoints.get(name)
+    if entry is None:
+        return None
+    provider = cat.providers.get(entry.provider)
+    env_var = (provider.api_key_env or "").strip() if provider else ""
+    if env_var and not os.environ.get(env_var):
+        return env_var
+    return None
+
+
+def install_endpoint(config: "ProxyConfig", name: str,
+                     cat: Any = None) -> EndpointConfig:
+    """Put a declared endpoint into the routing table. Idempotent.
+
+    Built through `model_catalog.build_endpoint_kwargs`, the same function a
+    restart uses, so a promoted endpoint is configured identically to one that
+    booted active. A second builder here would be two places deciding the same
+    thing, and the drift would show up as an endpoint that behaves subtly
+    differently depending on how it entered service.
+    """
+    cat = cat or model_catalog.load_catalog()
+    entry = cat.endpoints.get(name)
+    if entry is None:
+        raise KeyError(f"{name!r} is not declared in the catalog")
+    kwargs = model_catalog.build_endpoint_kwargs(cat, [entry])[name]
+    ep = EndpointConfig(**kwargs)
+    config.endpoints[name] = ep
+    return ep
+
+
+def remove_endpoint(config: "ProxyConfig", name: str) -> None:
+    """Take an endpoint out of the routing table. Idempotent."""
+    config.endpoints.pop(name, None)
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,8 @@ Provides:
   - GET  /rs/v1/admin/callers   — per-caller identity, quota, DRR, spend
   - PATCH /rs/v1/admin/callers/{agent_id} — edit one caller's quota
   - GET  /rs/v1/admin/providers — providers + endpoints: declared vs in force
+  - POST /rs/v1/admin/providers/{provider}/credential — supply an api_key_env value
+  - POST /rs/v1/admin/endpoints/{endpoint}/status — promote/demote (active|planned)
   - GET  /rs/v1/admin/audit     — who changed what, and when
   - GET  /rs/v1/admin/ui        — the operator UI (only when ROADSTEAD_ADMIN_UI)
   - GET  /rs/v1/admin/stream    — the SSE stream, aliased for the UI's EventSource
@@ -184,6 +186,12 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_admin_providers(request: Request) -> Response:
         return await svc.handle_admin_providers(request)
 
+    async def handle_admin_provider_credential(request: Request) -> Response:
+        return await svc.handle_admin_provider_credential(request)
+
+    async def handle_admin_endpoint_status(request: Request) -> Response:
+        return await svc.handle_admin_endpoint_status(request)
+
     async def handle_admin_key_rotate(request: Request) -> Response:
         return await svc.handle_admin_key_rotate(request)
 
@@ -271,6 +279,13 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         Route(f"{ADMIN_PREFIX}/callers/{{agent_id}}", handle_admin_caller,
               methods=["PATCH"]),
         Route(f"{ADMIN_PREFIX}/providers", handle_admin_providers, methods=["GET"]),
+        # J1 — the two writes on this plane. Both mutate, so both inherit the
+        # read/write split from the HTTP METHOD in the shared gate; there is no
+        # list of write routes to fall behind.
+        Route(f"{ADMIN_PREFIX}/providers/{{provider}}/credential",
+              handle_admin_provider_credential, methods=["POST"]),
+        Route(f"{ADMIN_PREFIX}/endpoints/{{endpoint}}/status",
+              handle_admin_endpoint_status, methods=["POST"]),
         # Every mutating admin route records here. A READ, so a read-only admin
         # scope reaches it — which is the point: the operator who cannot change
         # anything is often exactly the one auditing what changed.
