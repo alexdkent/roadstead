@@ -597,6 +597,17 @@ Two consequences, both easy to get wrong:
 2. Any client library Roadstead ships should classify on `code`, not on prose — but it must keep
    emitting the legacy substrings until every existing caller has migrated.
 
+🚨 **A permanent backend failure carries `backend_status` and is NOT deferrable.** `backend_error`
+covers a transient 502 and a permanent 400 alike, so the code alone cannot say whether retrying is
+worth anything — and the proxy already knows, because it declined to retry internally
+(`is_transient_backend_error`: *"a real 4xx / other-5xx is deterministic → surface"*). Keeping that
+to itself meant the proxy gave up on a permanent failure and advised the caller to retry it.
+
+The envelope therefore carries `backend_status`, the status the **backend** returned, whenever the
+failure came from one. A `4xx` other than `408` and `429` is permanent; everything else, and an
+absent field, stays deferrable — so a client pointed at an older proxy behaves exactly as before.
+This narrows `backend_error` only, never `backpressure`.
+
 The **context-overflow marker is verbatim**:
 
 ```

@@ -232,3 +232,51 @@ def test_enrichment_from_degrades_on_a_response_that_is_not_ours():
     assert ours.present and ours.endpoint == "tier3" and ours.deadline_s == 180.0
     # A malformed header must not raise either — it is enrichment, not payload.
     assert enrichment_from({W.HEADER_DEADLINE_S: "soon"}).deadline_s == 0.0
+
+
+# ---------------------------------------------------------------------------
+# A permanent backend failure is not worth retrying
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status,deferrable,why", [
+    (400, False, "the backend rejected the request and will reject it again"),
+    (404, False, "the model does not exist and will not start existing"),
+    (422, False, "unprocessable is a statement about the request"),
+    (408, True,  "the backend timed out — later is a different answer"),
+    (429, True,  "rate limited — later is exactly the answer"),
+    (500, True,  "a server fault may not recur"),
+    (502, True,  "a bad gateway is transient by nature"),
+    (None, True, "an older proxy reports no status; behave as before"),
+])
+def test_a_permanent_backend_failure_is_not_deferrable(status, deferrable, why):
+    """🚨 The proxy already knew, and kept it to itself.
+
+    `correction.is_transient_backend_error` says in its own docstring that "a
+    real 4xx / other-5xx is deterministic" and declines to retry it. The caller
+    was then handed `backend_error`, which every client classifies as
+    retryable — so the proxy gave up on a permanent failure and simultaneously
+    advised retrying it. A caller following that advice loops forever against a
+    misconfigured endpoint while the proxy watches.
+
+    Found live on 2026-09-01: an OpenRouter endpoint pinned to a model that does
+    not exist returned `code='backend_error', deferrable=True` for a permanent
+    400.
+
+    🚨 Unknown status stays deferrable, so this narrows behaviour only where the
+    proxy has said enough to narrow it — an older proxy is unaffected.
+    """
+    body = {"code": "backend_error", "error": "backend error"}
+    if status is not None:
+        body["backend_status"] = status
+    err = RoadsteadError("backend error", code="backend_error", body=body)
+    assert err.deferrable is deferrable, why
+    assert err.backend_status == status
+
+
+def test_the_other_deferrable_codes_are_untouched_by_it():
+    """Narrowing `backend_error` must not narrow backpressure — the one whose
+    whole purpose is to say *try again shortly*."""
+    for code in ("backpressure", "circuit_open", "draining", "proxy_timeout"):
+        err = RoadsteadError("x", code=code,
+                             body={"code": code, "backend_status": 400})
+        assert err.deferrable is True, code

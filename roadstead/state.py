@@ -642,21 +642,38 @@ class ProxyState:
             pass
         return advice
 
-    def resolve_error(self, req: "QueuedRequest", error: str) -> None:
-        """Release a queued/pending request with a deferrable error, resolving
-        whichever wait primitive the caller is blocked on (sync future or
-        streaming queue)."""
+    def resolve_error(self, req: "QueuedRequest", error: str, *,
+                      backend_status: int | None = None) -> None:
+        """Release a queued/pending request with an error, resolving whichever
+        wait primitive the caller is blocked on (sync future or streaming queue).
+
+        🚨 ``backend_status`` is the status the BACKEND returned, when the
+        failure came from one. It is carried because the proxy already knows
+        whether a failure is deterministic — `is_transient_backend_error` says
+        so in its own docstring, "a real 4xx / other-5xx is deterministic" — and
+        used to keep that to itself. The caller was told `backend_error`, which
+        every client classifies as retryable, so the proxy gave up on a
+        permanent failure and simultaneously advised retrying it. One fact, two
+        readers: the retry decision here and the caller's, instead of the same
+        judgement made twice and differently.
+        """
+        payload = {
+            "request_id": req.request_id,
+            "status": "error",
+            "error": error,
+        }
+        if backend_status is not None:
+            payload["backend_status"] = int(backend_status)
         future = self.pending_futures.get(req.request_id)
         if future and not future.done():
-            future.set_result({
-                "request_id": req.request_id,
-                "status": "error",
-                "error": error,
-            })
+            future.set_result(dict(payload))
         stream_q = self.pending_streams.get(req.request_id)
         if stream_q:
+            frame = {"type": "error", "error": error}
+            if backend_status is not None:
+                frame["backend_status"] = int(backend_status)
             try:
-                stream_q.put_nowait({"type": "error", "error": error})
+                stream_q.put_nowait(frame)
             except asyncio.QueueFull:
                 pass
 

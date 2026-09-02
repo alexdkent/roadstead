@@ -54,10 +54,45 @@ class RoadsteadError(Exception):
         turn a deferrable backpressure error into a hard failure on exactly the
         deployment least able to absorb one.
         """
+        # 🚨 A permanent backend failure is NOT deferrable, whatever the code
+        # says. `backend_error` covers a transient 502 and a permanent 400
+        # alike, and the proxy already decided which it was — it declined to
+        # retry internally — so a client that retries anyway loops forever
+        # against a misconfiguration while the proxy watches. `backend_status`
+        # is the fact; absent (an older proxy) the classification is unchanged,
+        # so this narrows behaviour only where the proxy has said enough.
+        if self.code == "backend_error" and not self.backend_retryable:
+            return False
         if self.code:
             return self.code in DEFERRABLE_CODES
         low = self.message.lower()
         return any(m in low for m in DEFERRABLE_MARKERS)
+
+    @property
+    def backend_status(self) -> int | None:
+        """The status the BACKEND returned, when the failure came from one."""
+        raw = self.body.get("backend_status")
+        try:
+            return int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def backend_retryable(self) -> bool:
+        """Whether the backend's own status leaves anything worth retrying.
+
+        Unknown status → True, so a proxy that does not report one behaves as
+        it always did. A 4xx is the backend rejecting the request itself and
+        will reject it identically next time — except ``408`` (it timed out)
+        and ``429`` (it is rate limited), which are the two that say *later*
+        rather than *never*.
+        """
+        status = self.backend_status
+        if status is None:
+            return True
+        if 400 <= status < 500:
+            return status in (408, 429)
+        return True
 
     @property
     def context_overflow(self) -> bool:

@@ -994,6 +994,13 @@ class Lifecycle:
         # mean the same thing on both doors.
         body["code"] = result.get("code") or "backend_error"
         body["error"] = result.get("error", "backend error")
+        # 🚨 The BACKEND's status, when the failure came from one. `code` alone
+        # cannot say whether retrying is worth anything: `backend_error` covers
+        # a transient 502 and a permanent 400, and §2.2 asks a client to
+        # classify on the code rather than on prose — so the fact it needs has
+        # to be a field rather than something to parse out of the message.
+        if result.get("backend_status") is not None:
+            body["backend_status"] = result["backend_status"]
         return JSONResponse(body, status_code=502)
 
     async def handle_streaming_submit(
@@ -1360,7 +1367,15 @@ class Lifecycle:
                         )
                     await asyncio.sleep(_RETRY_BACKOFF_S)
                     continue
-                self.state.resolve_error(req, str(exc))
+                # 🚨 Reached only when the retry above declined — i.e. when this
+                # proxy has judged the failure DETERMINISTIC. Carrying the
+                # backend's status lets the caller reach the same conclusion,
+                # instead of being handed `backend_error` and a client-side
+                # default that says "retry", which is this proxy advising a
+                # retry it just refused to make itself.
+                self.state.resolve_error(
+                    req, str(exc),
+                    backend_status=getattr(exc, "status_code", None))
                 self.record_completion(req, decision, duration, 0, 0, "error")
                 # Step 4b: count a backend-fault (5xx/503) toward the cooldown; a
                 # 4xx caller error is classified out inside record_dispatch_failure.

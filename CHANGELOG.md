@@ -8,6 +8,28 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — a permanent backend failure is no longer advised as retryable
+
+Landed 2026-09-01, found in live OpenRouter validation. An endpoint pinned to a model that does not
+exist returned `code: backend_error, deferrable: true` for a permanent `400` — so a caller following
+the SDK's own advice would retry forever against a misconfiguration.
+
+🚨 **The proxy already knew.** `correction.is_transient_backend_error` says in its docstring that
+"a real 4xx / other-5xx is deterministic → surface", and declines to retry it internally. It then
+handed the caller a code every client classifies as retryable — the proxy giving up on a permanent
+failure and simultaneously advising a retry it had just refused to make itself. One judgement, made
+twice, differently.
+
+The error envelope now carries **`backend_status`**, the status the backend returned, whenever the
+failure came from one. `RoadsteadError.deferrable` returns `False` for `backend_error` with a
+permanent status — a `4xx` other than `408` (it timed out) and `429` (rate limited), which are the
+two that say *later* rather than *never*.
+
+**Backward compatible by construction:** an absent `backend_status` (an older proxy) classifies
+exactly as before, and only `backend_error` is narrowed — never `backpressure`, whose entire purpose
+is to say *try again shortly*. The golden behaviour baseline moved by exactly one field across
+seventeen cases.
+
 ### Fixed — 🚨 SECURITY: a credential pasted into `api_key_env` was stored, persisted and echoed back
 
 Landed 2026-09-01, after it happened. An operator pasted a live OpenRouter key into the provider

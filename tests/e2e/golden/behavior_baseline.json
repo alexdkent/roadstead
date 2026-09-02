@@ -448,6 +448,7 @@
         "substituted": false,
         "substitution": null
       },
+      "backend_status": 500,
       "code": "backend_error",
       "error": "backend error 500: {\"error\":\"internal error (injected)\"}",
       "request_id": "<rid>",
