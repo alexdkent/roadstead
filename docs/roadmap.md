@@ -584,6 +584,80 @@ entry that discovery, health and the DRR denominator all key on, and hot-adding 
 question than hot-adding a key. Leave it unless there is a reason — and write the reason down before
 the code.
 
+### J · A credential and an endpoint, from the operator's face
+
+**Opened 2026-09-01, with the reason E asked for.** E parked provider and endpoint writes —
+*"adding a backend is still a `models.yaml` edit and a restart, deliberately … Leave it unless there
+is a reason — and write the reason down before the code."* The reason is now on the table: the
+operator wants to add a remote provider's credential and bring its endpoints into service **from the
+UI**, and to add local backends the same way. This section is the writing-down; it precedes the code
+deliberately.
+
+**What exists today.** `/rs/v1/admin/providers` is **GET only** — there is no write route for a
+provider or an endpoint anywhere on the plane. The catalog states the sanctioned workflow in its own
+comment on the `openrouter` stanza: *"Its endpoints are `planned` below … Flip one to `active` once
+the key is in the environment."* Two steps, both a file-or-environment edit plus a restart.
+
+🚨 **The two asks are NOT the same size, and conflating them is how this gets built wrong.**
+
+#### J1 · Set a provider credential, and promote an endpoint that is already declared
+
+Small, and it is what unblocks live OpenRouter.
+
+**The credential is WRITE-ONLY, and the emit doctrine does not move.** `management.py` opens by
+saying a management surface never emits a credential — not the key, not the digest, never the value
+behind an `api_key_env`, only its name and whether it resolved. Accepting one is a different verb
+from emitting one, and the plane already accepts credentials when it enrols a key. What is new is
+that this is an **outbound** secret rather than an inbound identity.
+
+🚨 **The provider reads `os.environ` at CALL time, not at startup** (`openrouter._api_key`), and
+that single fact is what makes J1 small: setting the process environment takes effect on the very
+next request, with no restart and no reload path to build.
+
+**So: process environment, deliberately NOT persisted.** The overlay holds key *digests* and has
+never held a secret, and writing an outbound provider key into a JSON file on disk is a change of
+posture that deserves to be decided on its own merits rather than arriving as a side effect of a
+convenience. Not persisting is also the honest shape and the repo already has it twice: the
+bootstrap admin key is *"NOT saved and a new one is minted on every restart"*, and a control action
+that cannot be persisted still takes effect and says `persisted: false` with a reason. The response
+here says the same thing in advance — this is in force now and will not survive a restart, put it in
+the environment to make it durable. The audit record names the **variable**, never the value.
+
+**Promotion is not hot-adding.** `planned` → `active` changes one thing: membership of
+`catalog.routed()`. The stanza already declares provider, model, slots, context, floors,
+capabilities and failover — everything discovery, health and the DRR denominator key on is already
+in the file and already parsed. That is a far smaller claim than inventing a routing-table entry at
+runtime, and it is the whole of what E was protecting.
+
+🚨 **A promotion whose credential does not resolve is REFUSED.** This is the load-bearing rule.
+The catalog says exactly why `planned` exists: *"a deployment that has not set $OPENROUTER_API_KEY
+should not have an endpoint in its routing table that cannot serve."* Promoting without the key
+would place precisely that into the routing table — from the surface whose entire purpose is
+reporting the gap between what was written and what is in force. The ordering falls out of the
+refusal rather than being imposed: set the credential, then promote, and a promotion that cannot
+verify says which of the two is missing.
+
+**Demotion (`active` → `planned`) is the paired verb** and is never refused, on the same argument
+revocation is never refused on provenance grounds: taking capacity out of service is the safe
+direction, and an operator who wants a remote endpoint to stop costing money should not have to
+argue with the plane about it.
+
+#### J2 · Create a provider or an endpoint that is not in the file
+
+The real hot-add, and the one E was actually pointing at. Everything J1 leans on is absent: nothing
+is parsed, nothing is validated, and a half-configured entry in the routing table is a live failure
+rather than a rejected write. It needs the catalog's validation reachable from a request, a
+discovery pass for a backend nobody has probed, the DRR denominator and the health poller both
+picking up a member that did not exist a moment ago, and an answer for what happens to in-flight
+work if it is removed again. **Not attempted alongside J1**, and J1 does not prejudge it — a
+promotion route does not become a creation route by adding fields.
+
+**What stays true across both.** Never emit a credential. `admin_readonly` narrows and the split
+comes from the HTTP method, so these routes inherit the gate by being mutating. Every mutating admin
+route records to the audit trail, and the completeness guard is driven from `routes.py`. Mutate on
+the loop, persist off it. An allowlist parser gets the key **and** its guard **and**
+`hooks.config_notice`.
+
 ### F · Hardening — the concurrency invariant, guarded
 
 Promoted from a cross-cutting note to a named workstream on 2026-09-01, because "cross-cutting"

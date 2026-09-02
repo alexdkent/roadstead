@@ -188,14 +188,33 @@ async def test_the_providers_view_reports_a_live_endpoint_honestly(proxy):
     """The e2e half of the gap view: here discovery has actually RUN against a
     real socket, so `in_force` is a measured number rather than the seed. On a
     fake backend that publishes `/props`, declared and in-force should both be
-    present and the endpoint should read discoverable."""
+    present and the endpoint should read discoverable.
+
+    🚨 Scoped to ROUTED endpoints, which is what the paragraph above was always
+    describing. Since 2026-09-01 the view also reports endpoints the catalog
+    declares that nothing serves, and for those the same fields are `null` —
+    nobody probed them, so there is no measurement to be honest about. The
+    unrouted half is asserted below rather than skipped: `null` there is the
+    claim, and a view that started reporting `0` would be saying discovery ran
+    and found nothing.
+    """
     view = (await proxy.client.get("/rs/v1/admin/providers", headers=proxy.admin)).json()
     rows = {e["endpoint"]: e for e in view["endpoints"]}
     assert rows, "the providers view returned no endpoints"
 
-    for row in rows.values():
+    routed = [r for r in rows.values() if r["routed"]]
+    assert routed, "no routed endpoint — discovery had nothing to run against"
+    for row in routed:
         assert row["capacity"]["slots"]["in_force"] > 0
         assert isinstance(row["capacity"]["slots"]["discoverable"], bool)
-        # 🚨 Never a credential, on a live surface either.
-        for provider in view["providers"]:
-            assert "key" not in str(provider.get("credential", {}).get("present"))
+
+    for row in (r for r in rows.values() if not r["routed"]):
+        assert row["capacity"]["slots"]["in_force"] is None, row["endpoint"]
+        assert row["capacity"]["slots"]["discoverable"] is None, row["endpoint"]
+        assert row["capacity"]["slots"]["declared"], (
+            f"{row['endpoint']}: declared capacity is what an unrouted row is "
+            "FOR — without it the row says nothing")
+
+    # 🚨 Never a credential, on a live surface either.
+    for provider in view["providers"]:
+        assert "key" not in str(provider.get("credential", {}).get("present"))

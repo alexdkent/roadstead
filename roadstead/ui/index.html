@@ -859,7 +859,7 @@ async function viewProviders(root) {
 
   root.append(el("section", {},
     el("h2", { text: "Endpoints — declared vs in force" }),
-    el("p", { class: "lede", text: "Capacity discovery is asymmetric by engine, not by oversight: llama.cpp publishes real slot counts and per-slot context, vLLM publishes neither. \"Discovery agreed\" and \"discovery never ran\" look identical on a status page, so the engine's own capability is reported beside the numbers." }),
+    el("p", { class: "lede", text: "Capacity discovery is asymmetric by engine, not by oversight: llama.cpp publishes real slot counts and per-slot context, vLLM publishes neither. \"Discovery agreed\" and \"discovery never ran\" look identical on a status page, so the engine's own capability is reported beside the numbers. Endpoints the catalog declares but nothing is serving are listed too, with the reason — a planned stanza is the plainest thing you wrote that is not in force, and its in-force numbers are blank rather than zero because nobody has asked the backend anything." }),
     table(["endpoint", "provider", "state", "slots", "context", "price in/out", "failover", "spill"],
       pick(prov, "endpoints", []).map(endpointRow))));
 }
@@ -871,8 +871,20 @@ function endpointRow(e) {
   return el("tr", {},
     el("td", {}, el("code", { text: pick(e, "endpoint", "?") })),
     el("td", {}, el("code", { text: pick(e, "provider", "?") })),
-    el("td", {}, pick(e, "health.admin_paused") ? tag("paused", "warn")
-               : pick(e, "health.healthy") === false ? tag("down", "bad") : tag("up", "ok")),
+    // 🚨 An endpoint the catalog declares but nothing is serving is reported
+    // here rather than omitted. It is the purest form of this plane's one
+    // question — written down, parsed, deliberately not in force — and it was
+    // invisible until 2026-09-01 because the view iterated the ROUTING TABLE.
+    // The credential is named because for a `planned` remote endpoint it is
+    // usually the only thing between the stanza and service.
+    el("td", {}, pick(e, "routed") === false
+      ? [tag(pick(e, "status", "not in force"), "warn"), " ",
+         pick(e, "not_in_force.credential.env_var")
+           ? (pick(e, "not_in_force.credential.present")
+               ? tag("key resolved", "ok") : tag("$" + pick(e, "not_in_force.credential.env_var") + " NOT SET", "bad"))
+           : null]
+      : pick(e, "health.admin_paused") ? tag("paused", "warn")
+      : pick(e, "health.healthy") === false ? tag("down", "bad") : tag("up", "ok")),
     // 🚨 The seed beside what discovery left, plus whether the engine publishes
     // it AT ALL — because "discovery agreed" and "discovery never ran" are
     // indistinguishable from the numbers alone, and that ambiguity is what

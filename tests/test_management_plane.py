@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+from roadstead import model_catalog
+
 from roadstead import config as config_mod
 from roadstead import hooks, model_catalog
 from roadstead.agent_budget import BudgetManager
@@ -726,6 +728,42 @@ async def test_capacity_reports_the_declared_seed_beside_what_is_in_force(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_every_endpoint_the_catalog_declares_is_reported(tmp_path):
+    """🚨 The plane answers ONE question: what did you write that is not in force?
+
+    A `planned` endpoint is the plainest possible answer to it — written down,
+    parsed, validated, deliberately not serving — and until 2026-09-01 it
+    appeared in NO admin view at all. `_providers_view` iterated
+    `state.config.endpoints`, which `model_catalog` builds from `cat.routed()`,
+    so the two `planned` spill endpoints were filtered out one layer below the
+    view and nothing said so. An operator could not see that `spill-chat`
+    existed, nor that the only thing between it and service was an unset
+    environment variable.
+
+    Driven from the CATALOG rather than from a list of names: a guard naming
+    `spill-chat` would pass against a view that had learned to report exactly
+    that one endpoint, and would need editing every time the example catalog
+    changed.
+    """
+    svc = _svc(tmp_path)
+    view = await _body(await svc.handle_admin_providers(_Req()))
+    reported = {e["endpoint"] for e in view["endpoints"]}
+    declared = set(model_catalog.load_catalog().endpoints)
+    missing = sorted(declared - reported)
+    assert not missing, (
+        f"the catalog declares {missing} and the management plane reports "
+        "neither the endpoint nor the fact that it is not in force")
+
+    # And the guard is not vacuous: the example catalog must still contain an
+    # endpoint that is declared and NOT routed, or this proves only that routed
+    # endpoints are reported.
+    unrouted = sorted(e["endpoint"] for e in view["endpoints"] if not e["routed"])
+    assert unrouted, (
+        "no unrouted endpoint in the example catalog — this guard would pass "
+        "against the bug it was written for")
+
+
+@pytest.mark.asyncio
 async def test_discoverability_is_a_descriptor_property(tmp_path):
     """🚨 Branch on a capability, never on an engine name (CLAUDE.md).
 
@@ -736,11 +774,30 @@ async def test_discoverability_is_a_descriptor_property(tmp_path):
     """
     svc = _svc(tmp_path)
     view = await _body(await svc.handle_admin_providers(_Req()))
-    flags = {e["endpoint"]: e["capacity"]["slots"]["discoverable"]
-             for e in view["endpoints"]}
-    assert set(flags.values()) == {True, False}, (
-        "every endpoint reports the same discoverability, so the example fleet "
-        "no longer exercises the asymmetry this field exists to state")
+    routed = {e["endpoint"]: e["capacity"]["slots"]["discoverable"]
+              for e in view["endpoints"] if e["routed"]}
+    assert set(routed.values()) == {True, False}, (
+        "every routed endpoint reports the same discoverability, so the example "
+        "fleet no longer exercises the asymmetry this field exists to state")
+
+    # 🚨 An endpoint nothing is serving reports None, never False. False is a
+    # claim about an engine that was consulted — "this backend publishes no slot
+    # count" — and for a `planned` stanza no backend was consulted at all. The
+    # same null-not-zero rule the in-force numbers follow, and the reason this
+    # view exists: "discovery said no" and "discovery never ran" must not be
+    # indistinguishable.
+    unrouted = {e["endpoint"]: e["capacity"]["slots"]["discoverable"]
+                for e in view["endpoints"] if not e["routed"]}
+    assert unrouted, (
+        "the example catalog has no unrouted endpoint left, so nothing here "
+        "exercises an endpoint that is declared and not in force")
+    assert set(unrouted.values()) == {None}, unrouted
+    for name, e in ((e["endpoint"], e) for e in view["endpoints"]
+                    if not e["routed"]):
+        assert e["capacity"]["slots"]["in_force"] is None, name
+        assert e["price"] is None, name
+        assert e["not_in_force"]["reason"], name
+
     source = (_ROOT / "roadstead" / "management.py").read_text(encoding="utf-8")
     assert '== "vllm"' not in source and "== 'vllm'" not in source
 

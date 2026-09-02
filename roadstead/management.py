@@ -1561,8 +1561,17 @@ class ManagementApi:
 
     def _providers_view(self) -> dict:
         cat = model_catalog.load_catalog()
+        # 🚨 Every endpoint the CATALOG declares, not only the ones in force.
+        # `self.state.config.endpoints` is built from `cat.routed()`, so a
+        # `planned` or `retired` stanza was invisible here — and a `planned`
+        # endpoint is the purest example of this plane's one question: written
+        # down, parsed, validated, deliberately not serving. An operator could
+        # not see that `spill-chat` exists, or that the only thing between it
+        # and service is an unset environment variable. Reported since
+        # 2026-09-01; see roadmap J1, which cannot promote what nobody can see.
         endpoints = [self._endpoint_view(name, cat)
-                     for name in sorted(self.state.config.endpoints)]
+                     for name in sorted(set(self.state.config.endpoints)
+                                        | set(cat.endpoints))]
         by_provider: dict[str, list[str]] = {}
         for view in endpoints:
             by_provider.setdefault(view["provider"], []).append(view["endpoint"])
@@ -1598,8 +1607,10 @@ class ManagementApi:
         return {"providers": providers, "endpoints": endpoints}
 
     def _endpoint_view(self, name: str, cat: Any) -> dict:
-        ep = self.state.config.endpoints[name]
+        ep = self.state.config.endpoints.get(name)
         entry = cat.entry(name)
+        if ep is None:
+            return self._unrouted_endpoint_view(name, entry, cat)
         descriptor = provider_for_engine(ep.backend_engine).descriptor
         health = self.state.endpoint_health.get(name, {})
         paused = name in self.state.paused_endpoints
@@ -1609,6 +1620,7 @@ class ManagementApi:
             "provider": entry.provider if entry else "",
             "kind": ep.kind,
             "status": entry.status if entry else "active",
+            "routed": True,
             "role": ep.role,
             "aliases": list(entry.aliases) if entry else [],
             "capabilities": sorted(ep.capabilities),
@@ -1649,6 +1661,61 @@ class ManagementApi:
             },
             "routing": {"failover_to": ep.failover_to or None,
                         "spill_to": ep.spill_to or None},
+        }
+
+    def _unrouted_endpoint_view(self, name: str, entry: Any, cat: Any) -> dict:
+        """An endpoint the catalog declares that nothing is serving.
+
+        🚨 Every "in force" field is **null**, never zero. A `planned` endpoint
+        has not been discovered, probed or priced, and reporting `slots: 0`
+        would say the backend was asked and answered nothing — which is the one
+        confusion this whole view exists to prevent, in the same words the
+        capacity block uses: "discovery agreed" and "discovery never ran" must
+        not be indistinguishable. Null means nobody asked.
+
+        The credential IS resolved here, because for a `planned` remote endpoint
+        it is usually the only thing standing between the stanza and service,
+        and it is the field an operator has come to this view to check. Its
+        NAME and whether it resolved — never the value, on the same rule as
+        everywhere else.
+        """
+        provider = entry.provider if entry else ""
+        pentry = cat.providers.get(provider)
+        env_var = pentry.api_key_env if pentry else ""
+        return {
+            "endpoint": name,
+            "provider": provider,
+            "kind": entry.kind if entry else "chat",
+            "status": entry.status if entry else "unknown",
+            "routed": False,
+            # Why it is not serving, in the plane's own idiom: the declared
+            # status is the reason, and the credential is the usual blocker.
+            "not_in_force": {
+                "reason": (f"status is {entry.status!r}" if entry
+                           else "not in the catalog"),
+                "credential": {
+                    "env_var": env_var or None,
+                    "present": bool(os.environ.get(env_var)) if env_var else None,
+                },
+            },
+            "role": entry.role if entry else "",
+            "aliases": list(entry.aliases) if entry else [],
+            "capabilities": sorted(k for k, v in (entry.capabilities or {}).items()
+                                   if v) if entry else [],
+            "capacity": {
+                "slots": {"declared": entry.slots if entry else 0,
+                          "in_force": None, "discoverable": None},
+                "context_per_slot": {
+                    "declared": entry.context_per_slot if entry else 0,
+                    "in_force": None, "discoverable": None},
+            },
+            "model": {"declared_fingerprint": None, "serving_fingerprint": None,
+                      "served_model_id": None,
+                      "pinned_model": entry.model if entry else ""},
+            "price": None,
+            "health": {"healthy": None, "admin_paused": False,
+                       "probe_healthy": None},
+            "routing": {"failover_to": None, "spill_to": None},
         }
 
 

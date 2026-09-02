@@ -8,6 +8,24 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — the management plane hid every endpoint that was not in force
+
+Landed 2026-09-01. `GET /rs/v1/admin/providers` reported only endpoints in the **routing table**,
+because it iterated `state.config.endpoints` — which `model_catalog` builds from `catalog.routed()`.
+A `planned` or `retired` stanza was filtered out one layer below the view, and nothing said so.
+
+That is the plane's own question failing on its plainest case. `management.py` opens by saying the
+surface exists to answer *what did you write that is not in force?*, and a `planned` endpoint is
+exactly that: written down, parsed, validated, deliberately not serving. An operator could not see
+that the example catalog's `spill-chat` existed, nor that the only thing between it and service was
+an unset `$OPENROUTER_API_KEY`.
+
+Unrouted endpoints are now reported with `routed: false`, the declared capacity, a `not_in_force`
+block naming the reason and the credential variable, and 🚨 **every in-force field as `null`, never
+zero** — `slots: 0` would say the backend was asked and answered nothing, which is the one confusion
+this view exists to remove. `discoverable` is `null` for the same reason: `false` is a claim about an
+engine that was consulted. The UI's endpoint table renders the status and the missing credential.
+
 ### Fixed — the blocking client leaked connections and hung after `close()`
 
 Landed 2026-09-01. `roadstead.client.RoadsteadClient` — exported, documented, and until now never
