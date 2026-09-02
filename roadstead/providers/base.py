@@ -111,6 +111,27 @@ class ProviderDescriptor:
     #: Reports what a call actually cost in money. Nothing local does.
     publishes_token_costs: bool = False
 
+    # --- how it is REACHED ---------------------------------------------------
+    #: Reached at a ``base_url`` carrying a scheme and a base path, rather than
+    #: at ``host``/``port``. Two readers: the management plane refuses a stanza
+    #: that gives the wrong one, and the operator UI shows the field that
+    #: applies instead of all three and letting somebody fill in the wrong two.
+    #:
+    #: 🚨 Not the same question as ``kind``. "Remote" is about whose capacity it
+    #: is and who bills for it; this is about what an address looks like. They
+    #: coincide today and conflating them is how a local engine behind a
+    #: gateway becomes unconfigurable.
+    addressed_by_base_url: bool = False
+    #: Refuses to serve without a credential, so a provider stanza that names no
+    #: ``api_key_env`` is misconfigured. Declared rather than discovered at first
+    #: dispatch: without it the failure is a `ProviderMisconfigured` on the first
+    #: real request, which is the config gap surfacing as a runtime fault —
+    #: exactly what the management plane exists to catch earlier.
+    requires_credential: bool = False
+    #: The service's own address, for a form to prefill. Empty for anything
+    #: whose address is a property of the deployment rather than of the engine.
+    default_base_url: str = ""
+
     # --- what it REQUIRES of a request ---------------------------------------
     #: 404s unless the ``model`` field names what it is serving, so the proxy
     #: must overwrite the caller's alias with the discovered served id.

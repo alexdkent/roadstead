@@ -48,6 +48,7 @@ __all__ = [
     "VLLM",
     "VLLMProvider",
     "provider_for",
+    "known_engines",
     "provider_for_engine",
     "register_provider",
 ]
@@ -66,6 +67,18 @@ def register_provider(provider: Provider) -> None:
 register_provider(LLAMACPP)
 register_provider(VLLM)
 register_provider(OPENROUTER)
+
+
+def known_engines() -> dict[str, Provider]:
+    """Every registered engine, by name.
+
+    🚨 For the management plane, so the operator UI's engine list and the fields
+    it shows for each are DATA rather than a hardcoded copy. A fourth provider
+    then appears in the form, correctly configured, for free — which is the
+    whole argument for the descriptor. A list in the page would be the fifth
+    place an engine has to be added and the one nobody remembers.
+    """
+    return dict(_PROVIDERS)
 
 
 def provider_for_engine(engine: str | None) -> Provider:

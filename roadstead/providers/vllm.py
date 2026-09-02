@@ -66,6 +66,11 @@ class VLLMProvider(Provider):
         # truncation is indistinguishable from completion without parsing the
         # arguments. correction.py's structured-validity guard exists for this
         # and is gated on it.
+        # Reached at host:port on a machine you run; no credential of its own.
+        # Stated rather than defaulted — see test_provider_interface.
+        addressed_by_base_url=False,
+        requires_credential=False,
+        default_base_url="",
         mislabels_truncated_tool_calls=True,
     )
 

@@ -63,6 +63,11 @@ class LlamaCppProvider(Provider):
         # `forces_reasoning` here and the submit path reserves answer headroom.
         reasoning_is_switchable=False,
         # Labels a truncated tool call `length`, correctly.
+        # Reached at host:port on a machine you run; no credential of its own.
+        # Stated rather than defaulted — see test_provider_interface.
+        addressed_by_base_url=False,
+        requires_credential=False,
+        default_base_url="",
         mislabels_truncated_tool_calls=False,
     )
 

@@ -8,6 +8,28 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Added — the provider form asks for the fields the engine actually uses
+
+Landed 2026-09-01. Selecting `openrouter` asked for `host` and `port`, which that engine ignores
+entirely, and did not mark `api_key_env` as required, which it refuses to serve without. The form
+now follows the engine's **descriptor**, not its name:
+
+- `ProviderDescriptor` gains `addressed_by_base_url`, `requires_credential` and `default_base_url`.
+  🚨 Each has a second reader beyond the form, which is this dataclass's standing rule — the
+  management plane now **refuses** a provider stanza that gives the wrong address kind or omits a
+  credential the engine requires, instead of letting it fail as `ProviderMisconfigured` on the first
+  real request. A config gap surfacing as a runtime fault is what this plane exists to prevent.
+  🚨 `addressed_by_base_url` is deliberately not the same question as `kind`: "remote" is about whose
+  capacity it is and who bills for it, this is about what an address looks like. They coincide today,
+  and conflating them is how a local engine behind a gateway becomes unconfigurable.
+- `GET /rs/v1/admin/providers` publishes an `engines` block — every engine this build registered,
+  with its descriptor. The UI's engine list and per-engine fields are **data**, so a fourth provider
+  gets a correct form without the page being edited. A list in the page would be the fifth place an
+  engine has to be added and the one nobody remembers.
+
+Selecting `llama.cpp` shows host and port; selecting `openrouter` shows a base URL prefilled with the
+service's own address and a required `api_key_env` — the NAME of a variable, never a key.
+
 ### Added — the catalog is writable at runtime (roadmap J2)
 
 Landed 2026-09-01. `PUT`/`PATCH`/`DELETE` on `/rs/v1/admin/providers/{p}` and

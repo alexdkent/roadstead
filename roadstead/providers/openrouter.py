@@ -55,6 +55,11 @@ class OpenRouterProvider(Provider):
     descriptor = ProviderDescriptor(
         name="openrouter",
         kind="remote",
+        # Reached at a base URL with a base path, needs a key, and knows its own
+        # address. See `ProviderDescriptor` — each of these has a reader.
+        addressed_by_base_url=True,
+        requires_credential=True,
+        default_base_url="https://openrouter.ai/api/v1",
         # There is no occupancy to discover. A remote provider's concurrency
         # limit is a rate limit on OUR account, not a slot count, and it is not
         # published — so an endpoint here stays config-capped.

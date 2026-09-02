@@ -132,7 +132,7 @@ from . import hooks, model_catalog
 from .config import AgentQuotaConfig, EndpointConfig, LLMPriority
 from .enriched import _error
 from .identity import iso_time
-from .providers import provider_for_engine
+from .providers import known_engines, provider_for_engine
 from .spend import declared_price
 
 if TYPE_CHECKING:  # pragma: no cover — typing only
@@ -1972,11 +1972,72 @@ class ManagementApi:
                           "a catalog stanza names api_key_env — the NAME of an "
                           "environment variable — and never a key. Set the "
                           "value with POST .../credential.", 400)
+        if section == "providers":
+            refusal = self._provider_address_refusal(name, body, method)
+            if refusal is not None:
+                return refusal
 
         return await self._commit_catalog(
             request, section, name, body,
             action=f"{section[:-1]}.{'replace' if method == 'PUT' else 'edit'}",
             replace=(method == "PUT"))
+
+    def _provider_address_refusal(self, name: str, body: dict,
+                                  method: str) -> Response | None:
+        """Refuse a provider stanza that cannot reach anything.
+
+        🚨 Off the DESCRIPTOR, never off the engine name. "OpenRouter needs a
+        base URL and a key" is a fact about a kind of backend, and the engine
+        string is the thing this repo has an AST guard against branching on. A
+        fourth remote provider gets these refusals by declaring two booleans.
+
+        Checked here rather than left to first dispatch: without it, a provider
+        saved with the wrong address fails as `ProviderMisconfigured` on a real
+        request — a config gap surfacing as a runtime fault, which is what this
+        plane exists to catch earlier.
+        """
+        cat = model_catalog.load_catalog()
+        existing = cat.providers.get(name)
+        engine = str(body.get("engine")
+                     or (existing.engine if existing else "")).strip()
+        if not engine:
+            return _error("invalid_request_error",
+                          f"a provider needs an engine; known: "
+                          f"{sorted(known_engines())}", 400)
+        if engine.lower() not in known_engines():
+            # 🚨 A refusal here and NOT in the file loader, which resolves an
+            # unknown engine to llama.cpp so a typo degrades rather than taking
+            # an endpoint offline. A typo in a file must not stop a fleet
+            # booting; a typo in a form has an operator who can fix it now.
+            return _error("invalid_request_error",
+                          f"unknown engine {engine!r}; known: "
+                          f"{sorted(known_engines())}", 400)
+        d = provider_for_engine(engine).descriptor
+        # On a PATCH the absent fields keep their current values.
+        merged = ({} if method == "PUT" else {
+            "host": existing.host if existing else "",
+            "port": existing.port if existing else 0,
+            "base_url": existing.base_url if existing else "",
+            "api_key_env": existing.api_key_env if existing else "",
+        }) | {k: v for k, v in body.items() if k != "engine"}
+
+        if d.addressed_by_base_url and not str(merged.get("base_url") or "").strip():
+            return _error("invalid_request_error",
+                          f"{engine} is reached at a base_url, not host/port"
+                          + (f" — try {d.default_base_url}" if d.default_base_url
+                             else ""), 400)
+        if not d.addressed_by_base_url and not str(merged.get("base_url") or "").strip():
+            if not str(merged.get("host") or "").strip() or not merged.get("port"):
+                return _error("invalid_request_error",
+                              f"{engine} is reached at host and port; give both "
+                              f"(or a base_url if it sits behind a gateway)", 400)
+        if d.requires_credential and not str(merged.get("api_key_env") or "").strip():
+            return _error("invalid_request_error",
+                          f"{engine} refuses to serve without a credential, so "
+                          f"this stanza needs api_key_env — the NAME of the "
+                          f"environment variable holding the key, never the key",
+                          400)
+        return None
 
     def _may_delete(self, section: str, name: str) -> Response | None:
         """The two refusals deletion has to make."""
@@ -2049,7 +2110,14 @@ class ManagementApi:
                 "descriptor": dataclasses.asdict(descriptor),
                 "endpoints": by_provider.get(name, []),
             })
-        return {"providers": providers, "endpoints": endpoints}
+        return {"providers": providers, "endpoints": endpoints,
+                # 🚨 Every engine this build knows, with what it publishes and
+                # how it is reached. The operator UI drives its "add a provider"
+                # form off this rather than off a list of its own — so a fourth
+                # engine gets a correct form without the page being edited, and
+                # nobody has to remember that a page exists.
+                "engines": {name: dataclasses.asdict(p.descriptor)
+                            for name, p in sorted(known_engines().items())}}
 
     def _endpoint_view(self, name: str, cat: Any) -> dict:
         ep = self.state.config.endpoints.get(name)
