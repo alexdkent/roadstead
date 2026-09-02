@@ -60,6 +60,7 @@ class OpenRouterProvider(Provider):
         addressed_by_base_url=True,
         requires_credential=True,
         default_base_url="https://openrouter.ai/api/v1",
+        lists_available_models=True,
         # There is no occupancy to discover. A remote provider's concurrency
         # limit is a rate limit on OUR account, not a slot count, and it is not
         # published — so an endpoint here stays config-capped.
@@ -250,6 +251,45 @@ class OpenRouterProvider(Provider):
         if not body:
             return None
         return self.parse_capacity({"models": body, "model_id": ep_cfg.effective_model_id})
+
+    async def list_available_models(self, pool: Any,
+                                    ep_cfg: "EndpointConfig") -> list[dict]:
+        """The catalogue, flattened for a chooser.
+
+        Same fetch `discover_capacity` already makes — `/models` — so this adds
+        no new way of talking to the service, only a second reader of the answer.
+        Sorted by id so the list is stable between calls; an operator scanning
+        for a slug should not have to re-find it because the upstream reordered.
+        """
+        headers = self.request_headers(ep_cfg, "model-list")
+        return self.parse_models(await pool.probe_json(
+            ep_cfg, "/models", headers=headers))
+
+    def parse_models(self, body: Any) -> list[dict]:
+        """Flatten a ``GET /models`` body into rows to choose from.
+
+        Split from the fetch for the reason `parse_capacity` is: the shaping is
+        the part worth testing and the network is the part that makes testing it
+        awkward. Sorted by id so the list is stable between calls — an operator
+        scanning for a slug should not have to re-find it because the upstream
+        reordered.
+        """
+        data = (body or {}).get("data")
+        if not isinstance(data, list):
+            return []
+        out: list[dict] = []
+        for entry in data:
+            if not isinstance(entry, dict) or not entry.get("id"):
+                continue
+            price_in, price_out = self._parse_pricing(entry.get("pricing"))
+            out.append({
+                "id": str(entry["id"]),
+                "name": str(entry.get("name") or entry["id"]),
+                "context_length": entry.get("context_length"),
+                "input_usd_per_mtok": price_in,
+                "output_usd_per_mtok": price_out,
+            })
+        return sorted(out, key=lambda m: m["id"])
 
     def parse_capacity(self, raw: dict) -> CapacityReport | None:
         """Pick one model out of a catalogue response.

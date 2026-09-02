@@ -818,6 +818,9 @@ class ProxyService:
     async def handle_admin_catalog_entry(self, request: Request) -> Response:
         return await self._management.handle_admin_catalog_entry(request)
 
+    async def handle_admin_provider_models(self, request: Request) -> Response:
+        return await self._management.handle_admin_provider_models(request)
+
     async def handle_admin_key_rotate(self, request: Request) -> Response:
         return await self._management.handle_admin_key_rotate(request)
 

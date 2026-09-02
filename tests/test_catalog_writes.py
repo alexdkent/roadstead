@@ -369,3 +369,63 @@ async def test_a_valid_variable_name_is_still_accepted(tmp_path):
         "engine": "openrouter", "base_url": "https://openrouter.ai/api/v1",
         "api_key_env": "OPENROUTER_API_KEY"})
     assert r.status_code == 200, r.body
+
+
+# --------------------------------------------------------------------------- #
+# Choosing a model from a provider's catalogue
+# --------------------------------------------------------------------------- #
+
+def test_the_catalogue_parser_prices_what_it_lists():
+    """🚨 "Which model" and "what will it cost" are the same question when
+    somebody is picking one, so a row that cannot be priced says so rather than
+    reading as free — the distinction `spend.py` exists to protect."""
+    from roadstead.providers import provider_for_engine
+    models = provider_for_engine("openrouter").parse_models({"data": [
+        {"id": "z/last", "name": "Z", "context_length": 8192,
+         "pricing": {"prompt": "0.000002", "completion": "0.000008"}},
+        {"id": "a/first", "name": "A", "context_length": 128000,
+         "pricing": {"prompt": "0.00000015", "completion": "0.0000006"}},
+        {"id": "n/unpriced", "name": "N", "context_length": 4096},
+        {"name": "no id at all"},
+    ]})
+    assert [m["id"] for m in models] == ["a/first", "n/unpriced", "z/last"], (
+        "sorted by id, so a slug does not move because the upstream reordered")
+    assert models[0]["input_usd_per_mtok"] == 0.15      # per MILLION, converted
+    assert models[0]["output_usd_per_mtok"] == 0.6
+    assert models[1]["input_usd_per_mtok"] is None, (
+        "an unpriced row must read as unknown, never as zero — zero is a real "
+        "price and free is a real thing a model can be")
+
+
+@pytest.mark.asyncio
+async def test_an_engine_with_no_catalogue_is_refused_not_given_an_empty_list(tmp_path):
+    """🚨 Empty reads as "this provider has no models". The truth is that this
+    KIND of backend serves one model and NAMES it, so the model is discovered
+    rather than chosen — a different sentence, and the one an operator needs."""
+    svc = _svc(tmp_path)
+    r = await svc.handle_admin_provider_models(
+        _Req(path_params={"provider": "small-box"}))
+    assert r.status_code == 400
+    msg = json.loads(r.body)["error"]
+    assert "serves one model" in msg and "discovered, not chosen" in msg
+
+
+@pytest.mark.asyncio
+async def test_the_catalogue_needs_the_credential_and_says_so(tmp_path, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    svc = _svc(tmp_path)
+    await _put(svc, "providers", "remote", {
+        "engine": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY"})
+    r = await svc.handle_admin_provider_models(
+        _Req(path_params={"provider": "remote"}))
+    assert r.status_code == 400
+    assert "OPENROUTER_API_KEY" in json.loads(r.body)["error"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_provider_is_a_404(tmp_path):
+    svc = _svc(tmp_path)
+    r = await svc.handle_admin_provider_models(
+        _Req(path_params={"provider": "nope"}))
+    assert r.status_code == 404

@@ -71,6 +71,8 @@ class VLLMProvider(Provider):
         addressed_by_base_url=False,
         requires_credential=False,
         default_base_url="",
+        # Serves one model and names it; there is no catalogue to list.
+        lists_available_models=False,
         mislabels_truncated_tool_calls=True,
     )
 

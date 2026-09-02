@@ -325,6 +325,25 @@ async def test_every_field_the_ui_reads_exists_in_a_real_response(tmp_path, monk
               "slots": 2, "context_per_slot": 4096,
               "capabilities": {"streaming": True}})))
     await sample(svc.handle_admin_providers(_Req()))   # now with a created pair
+    # 🚨 The provider-catalogue response, shaped by the REAL parser from a
+    # recorded upstream body. The route itself calls OpenRouter, which this
+    # suite must not; the alternative was adding six paths to `unsampled`,
+    # which is the guard being talked out of its job on a brand-new view. The
+    # envelope below is the handler's, verbatim.
+    from roadstead.providers import provider_for_engine
+    _RECORDED_OPENROUTER_MODELS = {"data": [
+        {"id": "openai/gpt-4o-mini", "name": "OpenAI: GPT-4o-mini",
+         "context_length": 128000,
+         "pricing": {"prompt": "0.00000015", "completion": "0.0000006"}},
+        {"id": "deepseek/deepseek-r1", "name": "DeepSeek: R1",
+         "context_length": 163840,
+         "pricing": {"prompt": "0.0000008", "completion": "0.0000024"}},
+    ]}
+    _models = provider_for_engine("openrouter").parse_models(
+        _RECORDED_OPENROUTER_MODELS)
+    assert _models and _models[0]["input_usd_per_mtok"], "the parser went quiet"
+    samples.append({"provider": "openrouter", "engine": "openrouter",
+                    "models": _models, "count": len(_models)})
     await sample(svc.handle_admin_catalog_entry(_Req(
         method="DELETE", path_params={"endpoint": "ui-sample-ep"})))
     await sample(svc.handle_admin_key(

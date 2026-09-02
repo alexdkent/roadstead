@@ -131,6 +131,15 @@ class ProviderDescriptor:
     #: The service's own address, for a form to prefill. Empty for anything
     #: whose address is a property of the deployment rather than of the engine.
     default_base_url: str = ""
+    #: Fronts a CATALOGUE and will enumerate it, so "which model" is a choice an
+    #: operator makes from a list rather than a slug they have to know. Two
+    #: readers: `GET /rs/v1/admin/providers/{p}/models` refuses a provider that
+    #: cannot, and the operator UI turns its model field into a picker when it
+    #: can. 🚨 Related to `publishes_served_model_id` and not the same: that one
+    #: says the backend will name the ONE model it is serving, this one says it
+    #: will list the many it could serve. A provider that does the first cannot
+    #: do the second, which is why they are two fields and not one.
+    lists_available_models: bool = False
 
     # --- what it REQUIRES of a request ---------------------------------------
     #: 404s unless the ``model`` field names what it is serving, so the proxy
@@ -257,6 +266,21 @@ class Provider(ABC):
         ``None`` on any failure: an unreachable backend must read as "cannot
         tell", which is what leaves the configured capacity standing.
         """
+
+    async def list_available_models(self, pool: Any,
+                                    ep_cfg: "EndpointConfig") -> list[dict]:
+        """The models this provider could serve, for an operator to choose from.
+
+        Only meaningful when the descriptor says ``lists_available_models``.
+        Each entry is ``{"id", "name", "context_length", "input_usd_per_mtok",
+        "output_usd_per_mtok"}`` — enough to choose with, and priced, because
+        "which model" and "what will it cost" are the same question when
+        somebody is picking one.
+
+        Default: nothing. An engine that serves one model has no catalogue, and
+        returning its own id here would make a list of one look like a choice.
+        """
+        return []
 
     def parse_capacity(self, raw: dict) -> CapacityReport | None:
         """Pure parse of a probe body, split out from the I/O so the engine

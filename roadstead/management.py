@@ -1924,6 +1924,57 @@ class ManagementApi:
             **outcome,
         })
 
+    async def handle_admin_provider_models(self, request: Request) -> Response:
+        """GET — the models this provider could serve, for a chooser.
+
+        🚨 Built from the PROVIDER stanza, not from one of its endpoints. The
+        moment an operator most needs this list is while creating the first
+        endpoint on a new provider, when there is no endpoint to borrow a
+        connection from. So a throwaway `EndpointConfig` carries the address and
+        the credential — the same two fields `build_endpoint_kwargs` copies off
+        a provider — and nothing else.
+        """
+        denied = self._gate(f"{PREFIX}/providers", request)
+        if denied is not None:
+            return denied
+        name = request.path_params["provider"]
+        cat = model_catalog.load_catalog()
+        entry = cat.providers.get(name)
+        if entry is None:
+            return _error("unknown_endpoint",
+                          f"no provider {name!r} in the catalog", 404)
+        provider = provider_for_engine(entry.engine)
+        if not provider.descriptor.lists_available_models:
+            # Refused rather than empty: an empty list reads as "this provider
+            # has no models", and the truth is that this KIND of backend serves
+            # one model and names it rather than offering a catalogue.
+            return _error("invalid_request_error",
+                          f"{entry.engine} serves one model and names it — "
+                          f"there is no catalogue to list. The endpoint's model "
+                          f"is discovered, not chosen.", 400)
+        gap = (entry.api_key_env or "").strip()
+        if gap and not os.environ.get(gap):
+            return _error("invalid_request_error",
+                          f"${gap} is not set, so the catalogue cannot be "
+                          f"fetched. Set the credential first.", 400)
+        kwargs = {"endpoint_class": f"{name}-catalogue", "role": f"{name}-catalogue"}
+        if entry.base_url:
+            kwargs["base_url"] = entry.base_url
+        else:
+            kwargs["host"] = cat.hosts.get(entry.host, entry.host)
+            kwargs["port"] = entry.port
+        if entry.api_key_env:
+            kwargs["api_key_env"] = entry.api_key_env
+        kwargs["backend_engine"] = entry.engine
+        probe = EndpointConfig(**kwargs)
+        try:
+            models = await provider.list_available_models(self.state.backend, probe)
+        except Exception as exc:  # noqa: BLE001 — an upstream failure is a 502
+            return _error("backend_error",
+                          f"could not read the catalogue: {exc}", 502)
+        return JSONResponse({"provider": name, "engine": entry.engine,
+                             "models": models, "count": len(models)})
+
     async def handle_admin_catalog_entry(self, request: Request) -> Response:
         """PUT / PATCH / DELETE one provider or endpoint stanza (roadmap J2).
 

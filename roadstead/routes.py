@@ -32,6 +32,7 @@ Provides:
   - GET  /rs/v1/admin/providers — providers + endpoints: declared vs in force
   - POST /rs/v1/admin/providers/{provider}/credential — supply an api_key_env value
   - POST /rs/v1/admin/endpoints/{endpoint}/status — promote/demote (active|planned)
+  - GET  /rs/v1/admin/providers/{provider}/models — the catalogue, for a chooser
   - PUT/PATCH/DELETE /rs/v1/admin/providers/{provider} — create/edit/delete (J2)
   - PUT/PATCH/DELETE /rs/v1/admin/endpoints/{endpoint} — create/edit/delete (J2)
   - GET  /rs/v1/admin/audit     — who changed what, and when
@@ -197,6 +198,9 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_admin_catalog_entry(request: Request) -> Response:
         return await svc.handle_admin_catalog_entry(request)
 
+    async def handle_admin_provider_models(request: Request) -> Response:
+        return await svc.handle_admin_provider_models(request)
+
     async def handle_admin_key_rotate(request: Request) -> Response:
         return await svc.handle_admin_key_rotate(request)
 
@@ -289,6 +293,8 @@ def make_routes(svc: "ProxyService") -> list[Route]:
         # list of write routes to fall behind.
         Route(f"{ADMIN_PREFIX}/providers/{{provider}}/credential",
               handle_admin_provider_credential, methods=["POST"]),
+        Route(f"{ADMIN_PREFIX}/providers/{{provider}}/models",
+              handle_admin_provider_models, methods=["GET"]),
         Route(f"{ADMIN_PREFIX}/endpoints/{{endpoint}}/status",
               handle_admin_endpoint_status, methods=["POST"]),
         # J2 — the catalog is writable. One handler, six methods: PUT replaces a

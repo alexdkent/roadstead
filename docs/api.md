@@ -690,6 +690,7 @@ is not an error: see §3.2.
 | `GET /rs/v1/admin/providers` | Providers and endpoints: declared vs discovered capacity, credential presence, prices, health. Includes endpoints the catalog declares that nothing is serving. |
 | `POST /rs/v1/admin/providers/{provider}/credential` | Supply the value for the provider's `api_key_env` (§3.9). Write-only, **never persisted**. |
 | `POST /rs/v1/admin/endpoints/{ep}/status` | Bring a declared endpoint into service or take it out — `active` \| `planned` (§3.9). |
+| `GET /rs/v1/admin/providers/{provider}/models` | The models this provider could serve, priced — for choosing one. Refused for an engine that serves a single model and names it. |
 | `PUT`/`PATCH`/`DELETE /rs/v1/admin/providers/{provider}` | Create, edit or delete a provider (§3.10). |
 | `PUT`/`PATCH`/`DELETE /rs/v1/admin/endpoints/{ep}` | Create, edit or delete an endpoint (§3.10). |
 | `GET /rs/v1/admin/audit` | Who changed what, and when (§3.8). Reports its own bound and durability. |

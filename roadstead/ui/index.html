@@ -317,6 +317,7 @@ const API = {
   caller:      (id) => "/rs/v1/admin/callers/" + encodeURIComponent(id),
   providers:   "/rs/v1/admin/providers",
   provider:    (p) => "/rs/v1/admin/providers/" + encodeURIComponent(p),
+  providerModels: (p) => "/rs/v1/admin/providers/" + encodeURIComponent(p) + "/models",
   endpoint:    (e) => "/rs/v1/admin/endpoints/" + encodeURIComponent(e),
   credential:  (p) => "/rs/v1/admin/providers/" + encodeURIComponent(p) + "/credential",
   epStatus:    (ep) => "/rs/v1/admin/endpoints/" + encodeURIComponent(ep) + "/status",
@@ -1315,13 +1316,22 @@ function endpointForm(existing, providers) {
     el("div", { class: "row" },
       field("name", el("input", { id: "ep-name", value: name, disabled: !creating,
         placeholder: "tier1", style: "width:150px" })),
-      field("provider", select("ep-provider", providers, pick(existing, "provider", providers[0]))),
+      field("provider", select("ep-provider", providers,
+        pick(existing, "provider", providers[0]))),
       field("kind", select("ep-kind", KINDS, pick(existing, "kind", "chat"))),
       field("status", select("ep-status", STATUSES,
         pick(existing, "routed") === false ? "planned" : "active")),
-      field("model", el("input", { id: "ep-model", style: "width:220px",
-        value: pick(existing, "model.pinned_model", ""),
-        placeholder: "openai/gpt-oss-120b" }))),
+      field("model", el("div", {},
+        // 🚨 A <datalist>, not a <select>. A provider fronting a catalogue has
+        // hundreds of models, so the control has to be type-to-filter; and the
+        // field must stay free text for an engine with no catalogue at all,
+        // where "which model" is discovered rather than chosen. One control,
+        // both cases, no framework.
+        el("input", { id: "ep-model", style: "width:300px", list: "ep-model-list",
+          value: pick(existing, "model.pinned_model", ""),
+          placeholder: "openai/gpt-oss-120b" }),
+        el("datalist", { id: "ep-model-list" }),
+        el("div", { class: "lede", id: "ep-model-note", style: "margin:3px 0 0" })))),
     el("div", { class: "row" },
       field("slots", num("ep-slots", pick(existing, "capacity.slots.declared", 4))),
       field("context_per_slot", num("ep-ctx",
@@ -1360,6 +1370,43 @@ function endpointForm(existing, providers) {
         onclick: () => $("#editor").replaceChildren() })));
   $("#editor").replaceChildren(box);
   box.scrollIntoView({ block: "nearest" });
+
+  /* Fill the model list from the provider's own catalogue, when it has one.
+   * Failure is reported in the note and leaves the field usable as free text:
+   * an unreachable catalogue must not stop an operator typing a slug they
+   * already know. */
+  async function loadModels() {
+    const p = $("#ep-provider").value;
+    const list = $("#ep-model-list"), note = $("#ep-model-note");
+    if (!list || !note) return;
+    list.replaceChildren();
+    const spec = engineSpec((pick(state.providers, "providers", [])
+      .find((x) => pick(x, "provider") === p) || {}).engine);
+    if (!spec.lists_available_models) {
+      note.textContent = "This engine serves one model and names it — the model is discovered, not chosen.";
+      return;
+    }
+    note.textContent = "loading the catalogue…";
+    try {
+      const res = await api(API.providerModels(p));
+      const models = pick(res, "models", []);
+      list.replaceChildren(...models.map((m) => el("option", {
+        value: pick(m, "id", ""),
+        // The price rides in the option label, because "which model" and "what
+        // will it cost" are the same question when you are picking one.
+        label: pick(m, "name", "") + " · " +
+               (pick(m, "input_usd_per_mtok") === null ? "price unknown"
+                 : "$" + pick(m, "input_usd_per_mtok") + "/" +
+                   pick(m, "output_usd_per_mtok") + " per Mtok"),
+      })));
+      note.textContent = pick(res, "count", 0) + " models — type to filter, or paste a slug.";
+    } catch (err) {
+      note.textContent = "could not read the catalogue (" + (err.message || err)
+        + ") — type a slug instead.";
+    }
+  }
+  $("#ep-provider").addEventListener("change", loadModels);
+  loadModels();
 }
 
 /* 🚨 A password field, and the value never comes back out. The plane is
