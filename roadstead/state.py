@@ -167,7 +167,11 @@ class ProxyState:
 
         # Observability
         self.metrics = RollingMetrics(window_s=300.0)
-        self.request_logger = RequestLogger(config.request_log_path or None)
+        self.request_logger = RequestLogger(
+            config.request_log_path or None,
+            max_bytes=config.request_log_max_bytes,
+            backups=config.request_log_backups,
+        )
         self.acl = IPIdentityMap.from_env()
         # Caller identity: an API key first, ``self.acl`` as the second factor.
         # The resolver is what the request path asks — the ACL is kept as its

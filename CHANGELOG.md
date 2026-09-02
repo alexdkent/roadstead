@@ -8,6 +8,56 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — the request log grew without bound, and could fail a live request
+
+Landed 2026-09-02. `RequestLogger` opened its file in append mode and never rotated, while calling
+itself the authoritative per-request record — 10-20 MB/day at a measured ~27,700 requests/day,
+forever.
+
+🚨 **It was nearly handed to the infrastructure as a logrotate job, which would have been the wrong
+boundary twice.** The file is the application's, so bounding it is the application's job; and the
+handle is held open in append mode, so a rename-and-create rotation leaves the proxy writing to the
+unlinked inode — new file empty, disk still filling, everything looking configured. `copytruncate` is
+the only external rotation that works on it, and requiring an operator to know that is a trap.
+
+Now size-bounded in the application: `request_log_max_bytes` (64 MB) x `request_log_backups` (7),
+capping the set at ~512 MB — deliberately the same order as `completions_retention_s`, since the two
+are views of the same traffic. `max_bytes=0` opts out for a deployment driving rotation itself;
+`backups=0` truncates rather than meaning "unbounded", because that reading is already spelled
+`max_bytes=0`.
+
+🚨 **A logging failure can no longer fail a request.** `log()` runs on the scheduler loop inside
+`lifecycle`'s completion path, so an unwritable log used to raise straight into live traffic — a 500
+for a caller whose request had actually succeeded. It now fails open and discloses once, the doctrine
+`spend.py` already follows. The first version caught only `OSError` and the guard caught the hole: a
+**closed** handle raises `ValueError`, and a closed handle is exactly what a vanished mount looks
+like from inside.
+
+### Changed — the request log moved under `ROADSTEAD_DATA_DIR`
+
+**Breaking for anyone reading the old path.** It was rooted at `$ROADSTEAD_HOT_ROOT/logs`; it is now
+`<data_dir>/logs`, with `ROADSTEAD_LOG_DIR` to override.
+
+*Why:* the deployment contract asks an operator for **one** persistent path and undertakes that
+everything the application owns lives inside it. With the log rooted elsewhere, setting
+`ROADSTEAD_DATA_DIR=/var/lib/roadstead` moved the queue DB onto the mount and silently left the
+request log on the container's ephemeral layer — a half-kept promise, which is the version of this
+that gets discovered late.
+
+### Verified — the published 108s stop-grace holds under load, not just at concurrency 1
+
+`tools/sigterm_drain_probe.py` gained **S4**: 24 concurrent dispatches all outlasting the drain. Its
+three existing scenarios each parked exactly one request, and `tests/test_shutdown_budget.py` pins
+only the arithmetic — so the number an operator is told to configure had never been observed under
+the load whose failure it prevents.
+
+**78.24s at concurrency 24 against 78.21s at concurrency 1.** The drain does not scale with load: the
+cost is the two serial timeouts, not per-request work. `RECOMMENDED_STOP_GRACE_S = 108` holds with
+~30s margin. All 24 callers received the correct `draining` 503, and `proxy_completions` recorded 4
+— the number that actually reached the backend — rather than inventing rows for queued work. Full
+write-up in `docs/ledger.md`.
+
+
 ### Fixed — the durable event log defaulted to `/tmp`, and in a container it was lost on every rebuild
 
 Landed 2026-09-02. Found by running the proxy against real backends for the

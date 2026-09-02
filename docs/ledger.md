@@ -367,6 +367,49 @@ not.
 
 ---
 
+## The 108s stop-grace was derived at concurrency 1, and now it is measured at 24
+
+**Symptom.** None — and the number was probably right all along. But it is the number an operator is
+told to configure on a container that will carry the fleet's whole LLM traffic, and if it is wrong
+the failure is a SIGKILL mid-flush: the DRR budget row and the day's completion rows gone, which is
+exactly what the drain exists to prevent.
+
+**What was actually confirmed before.** `tools/sigterm_drain_probe.py` had three scenarios — idle, a
+short in-flight dispatch, and one outlasting the drain — and **every one of them parked exactly one
+request**. `tests/test_shutdown_budget.py` pins the *arithmetic* (drain 30s + straggler unwind 3s +
+lease release 5s + queue flush 10s, after uvicorn's own 48s). Arithmetic plus a single-request
+measurement is not a ceiling for a busy proxy: the two phases whose budgets were *derived* rather
+than observed are precisely the ones that scale with load — unwinding stragglers, and flushing a
+write queue with real depth.
+
+**Measured 2026-09-02**, new scenario S4: 24 concurrent dispatches, all outlasting the drain.
+
+| scenario | concurrency | SIGTERM→exit | hard-killed | callers answered |
+|---|---|---|---|---|
+| S1 idle | 1 | 0.17s | no | — |
+| S2 short in-flight | 1 | 7.14s | no | 1/1 |
+| S3 outlasts drain | 1 | **78.21s** | no | 1/1 |
+| **S4 fleet-shaped** | **24** | **78.24s** | no | **24/24** |
+
+🚨 **The drain does not scale with concurrency — 30 milliseconds separate one straggler from
+twenty-four.** The cost is dominated by the two serial timeouts (uvicorn 48s, then the app's 30s
+drain), which are wall-clock waits rather than per-request work. Unwinding 24 stragglers is a loop
+over cancellations, and the write queue drains behind them. So `RECOMMENDED_STOP_GRACE_S = 108`
+holds with about 30s of margin, and the margin is not eaten by load.
+
+Two things worth having beyond the number. **All 24 callers got the correct envelope** — 503 with
+`code: draining` and the `backpressure` marker — so `ShutdownEnvelopeMiddleware` works at scale, not
+just on the single request it was written against. And **`proxy_completions` recorded 4, not 24**,
+which is right: only 4 reached the backend (the fake serves 4 slots) and the other 20 were still
+queued, so they have no completion to record. A drain that invented rows for work never dispatched
+would be the more alarming result.
+
+**Guard.** S4 is now part of the probe rather than a one-off, so the claim can be re-measured rather
+than re-cited. It stays off the default test path for the reason the whole tool does: real processes,
+real signals, ~80 seconds for the slow scenarios.
+
+---
+
 ## The extraction's own near-miss: a commit that imported files it did not contain
 
 **Symptom.** The origin repo's `main` briefly held an `ImportError` — four edited modules were

@@ -27,6 +27,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .config import ProxyConfig, env_with_legacy_prefix as _env, load_agent_configs
+from .observability import (
+    DEFAULT_REQUEST_LOG_BACKUPS,
+    DEFAULT_REQUEST_LOG_MAX_BYTES,
+)
 from .hooks import set_degradation_sink
 from .routes import make_routes
 from .service import (
@@ -248,7 +252,15 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
             os.path.join(os.environ.get("ROADSTEAD_HOT_ROOT", "/tmp"), "agents", "llmproxy"),
         )
         os.makedirs(data_dir, exist_ok=True)
-        log_dir = os.path.join(os.environ.get("ROADSTEAD_HOT_ROOT", "/tmp"), "logs")
+        # 🚨 UNDER the data dir, not beside it in $ROADSTEAD_HOT_ROOT/logs.
+        # Changed 2026-09-02, and the reason is the deployment contract: the
+        # operator is asked to provide ONE persistent path and the application
+        # undertakes to keep everything it owns inside it. With the log rooted
+        # somewhere else, `ROADSTEAD_DATA_DIR=/var/lib/roadstead` moved the
+        # queue DB onto the mount and quietly left the request log on the
+        # container's ephemeral layer — a half-kept promise, which is the
+        # version of this that gets discovered late.
+        log_dir = _env("LOG_DIR", os.path.join(data_dir, "logs"))
         os.makedirs(log_dir, exist_ok=True)
 
         config = ProxyConfig(
@@ -275,6 +287,15 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
                 "REQUEST_LOG",
                 os.path.join(log_dir, "llmproxy_requests.jsonl"),
             ),
+            # Size bound on that log. It grew forever until 2026-09-02 while
+            # describing itself as the per-request record; rotation lives in the
+            # application because the file is the application's, and because an
+            # external rotation of a handle held open in append mode silently
+            # writes to the unlinked inode.
+            request_log_max_bytes=int(_env(
+                "REQUEST_LOG_MAX_BYTES", DEFAULT_REQUEST_LOG_MAX_BYTES)),
+            request_log_backups=int(_env(
+                "REQUEST_LOG_BACKUPS", DEFAULT_REQUEST_LOG_BACKUPS)),
             # Per-agent DRR quota overrides (weight, max_balance_ss,
             # default_priority). Reads originfleet/llmproxy/agents.yaml
             # by default, or the path in ROADSTEAD_AGENTS_CONFIG.

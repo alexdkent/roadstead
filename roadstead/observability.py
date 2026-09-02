@@ -120,24 +120,121 @@ class RequestLogRecord:
         )
 
 
-class RequestLogger:
-    """Writes JSONL request logs to a file (the authoritative per-request
-    record). Genuine failures also surface to the text log / docker logs; ok /
-    cancelled requests do not (the JSONL is the source of truth)."""
+#: Bytes per request-log file before it rolls, and how many rolled files to
+#: keep. 64 MB x 7 caps the record at ~512 MB, which at a measured ~27,700
+#: requests/day and ~500 bytes/record is roughly a month — deliberately the same
+#: order as `completions_retention_s` (30 days), because the two are views of the
+#: same traffic and a reader comparing them should not find one truncated.
+DEFAULT_REQUEST_LOG_MAX_BYTES = 64 * 1024 * 1024
+DEFAULT_REQUEST_LOG_BACKUPS = 7
 
-    def __init__(self, log_path: str | None = None) -> None:
+
+class RequestLogger:
+    """Writes JSONL request logs to a SIZE-BOUNDED file set.
+
+    The per-request record. Genuine failures also surface to the text log /
+    docker logs; ok / cancelled requests do not.
+
+    🚨 **It used to grow without limit.** `open(path, "a")` and nothing else —
+    on a fleet doing ~27,700 requests/day that is 10-20 MB/day, forever, and the
+    docstring called it authoritative while offering no way to keep it. The
+    deployment answer (logrotate) was the wrong boundary: this file is the
+    application's, so bounding it is the application's job, and handing it to
+    the infrastructure would also have handed over a trap — the handle is held
+    open in append mode, so a rename-and-create rotation leaves the proxy
+    writing to the unlinked inode while the new file stays empty and the disk
+    still fills. Rotating in here removes both the growth and the trap.
+
+    🚨 **Rotation happens ON THE SCHEDULER LOOP**, because `log()` does. So it
+    is a rename and a reopen and nothing else, and the size is tracked in memory
+    rather than stat-ed per write — a syscall per request to answer a question
+    we can count.
+
+    🚨 **A logging failure may never fail a request.** A full disk, a read-only
+    mount or a vanished directory raises from `write`, and this is called from
+    the middle of `lifecycle`'s completion path — so an unwritable log would
+    turn into 500s on live traffic. It fails open and says so ONCE, the same
+    doctrine the spend ledger follows: an accounting surface must not be able to
+    take the proxy down. The durable accounting record is `queue.db`; this is
+    the human-readable view of it.
+    """
+
+    def __init__(self, log_path: str | None = None, *,
+                 max_bytes: int = DEFAULT_REQUEST_LOG_MAX_BYTES,
+                 backups: int = DEFAULT_REQUEST_LOG_BACKUPS) -> None:
         self._file: TextIO | None = None
+        self._path: Path | None = None
+        self._max_bytes = max(0, int(max_bytes))
+        self._backups = max(0, int(backups))
+        self._size = 0
+        self._write_failed = False
         if log_path:
-            path = Path(log_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self._file = open(path, "a", buffering=1)
+            self._path = Path(log_path)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._open()
+
+    def _open(self) -> None:
+        assert self._path is not None
+        self._file = open(self._path, "a", buffering=1)
+        # Stat ONCE, here — an append re-opens onto an existing file and the
+        # in-memory counter has to start from what is already on disk, or a
+        # restart-heavy deployment would never reach the rotation threshold.
+        try:
+            self._size = self._path.stat().st_size
+        except OSError:
+            self._size = 0
+
+    def _rotate(self) -> None:
+        """`x.jsonl` -> `x.jsonl.1` -> ... -> `x.jsonl.<backups>`, oldest dropped.
+
+        🚨 `backups=0` means TRUNCATE rather than "keep everything": a bound of
+        zero files still has to be a bound, and the alternative reading — no
+        rotation — is what `max_bytes=0` already spells.
+        """
+        assert self._path is not None
+        if self._file:
+            self._file.close()
+            self._file = None
+        base = str(self._path)
+        if self._backups == 0:
+            with open(base, "w"):
+                pass
+        else:
+            oldest = f"{base}.{self._backups}"
+            if os.path.exists(oldest):
+                os.remove(oldest)
+            for i in range(self._backups - 1, 0, -1):
+                src, dst = f"{base}.{i}", f"{base}.{i + 1}"
+                if os.path.exists(src):
+                    os.replace(src, dst)
+            os.replace(base, f"{base}.1")
+        self._open()
 
     def log(self, record: RequestLogRecord) -> None:
         line = record.to_json()
         if self._file:
-            self._file.write(line + "\n")
-        # JSONL is authoritative; only surface genuine failures in the text log /
-        # docker logs (was an unconditional INFO that triplicated every request).
+            try:
+                written = self._file.write(line + "\n")
+                self._size += written if isinstance(written, int) else len(line) + 1
+                if self._max_bytes and self._size >= self._max_bytes:
+                    self._rotate()
+            # 🚨 ValueError, not just OSError. A CLOSED handle raises
+            # `ValueError: I/O operation on closed file` — which is precisely
+            # what a vanished mount looks like from in here, and what the first
+            # version of this missed: it caught the full-disk case and let the
+            # one it was actually written for through, into the request path.
+            except (OSError, ValueError) as exc:
+                # Loud once, then silent — a per-request warning on a full disk
+                # is a second way to fill it.
+                if not self._write_failed:
+                    self._write_failed = True
+                    logger.error(
+                        "request log is unwritable (%s); requests continue and "
+                        "queue.db remains the durable record. Fix the path or "
+                        "the disk: %s", self._path, exc)
+                self._file = None
+        # Only surface genuine failures in the text log / docker logs (was an
+        # unconditional INFO that triplicated every request).
         if record.status in _PROBLEM_STATUSES:
             logger.warning("req: %s", line)
 

@@ -23,6 +23,10 @@ from pathlib import Path
 from typing import Any
 
 from . import hooks, model_catalog
+from .observability import (
+    DEFAULT_REQUEST_LOG_BACKUPS,
+    DEFAULT_REQUEST_LOG_MAX_BYTES,
+)
 from .constants import _INTERACTIVE_CEILING_S
 
 logger = logging.getLogger(__name__)
@@ -884,6 +888,12 @@ class ProxyConfig:
     queue_db_path: str = ""
     stats_db_path: str = ""
     request_log_path: str = ""
+    # 🚨 Bounds on the request log, which grew without limit until 2026-09-02.
+    # `max_bytes=0` disables rotation entirely, for a deployment that would
+    # rather drive it from outside — but see RequestLogger: an external rotation
+    # must use copytruncate, because the handle is held open in append mode.
+    request_log_max_bytes: int = DEFAULT_REQUEST_LOG_MAX_BYTES
+    request_log_backups: int = DEFAULT_REQUEST_LOG_BACKUPS
     # Runtime-mutable feature flags (flags.py): persisted JSON, mutated via
     # POST /v1/admin/flags. Empty path → in-memory defaults (tests).
     runtime_flags_path: str = ""

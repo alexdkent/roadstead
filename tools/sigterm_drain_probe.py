@@ -88,10 +88,21 @@ _CHILD_SRC = textwrap.dedent('''
     )
 ''')
 
+#: (name, hold_s, note, concurrency)
+#:
+#: 🚨 S4 exists because S1-S3 all park exactly ONE dispatch, and the number this
+#: probe underwrites — the published stop-grace an operator is told to configure
+#: — is a claim about a busy proxy, not an idle one. Under load the drain has to
+#: unwind MANY stragglers and flush a write queue with real depth, and those are
+#: the two phases whose budgets (3s and 10s) were derived rather than measured.
+#: A ceiling confirmed only at concurrency 1 is a ceiling nobody has tested.
 SCENARIOS = [
-    ("S1 idle", 0.0, "no in-flight work — the container-restart common case"),
-    ("S2 short in-flight", 8.0, "one dispatch finishing INSIDE the drain budget"),
-    ("S3 outlasts drain", 120.0, "one dispatch outlasting the drain — cancelled"),
+    ("S1 idle", 0.0, "no in-flight work — the container-restart common case", 1),
+    ("S2 short in-flight", 8.0, "one dispatch finishing INSIDE the drain budget", 1),
+    ("S3 outlasts drain", 120.0, "one dispatch outlasting the drain — cancelled", 1),
+    ("S4 fleet-shaped", 120.0,
+     "MANY concurrent dispatches outlasting the drain — stragglers and a deep "
+     "write queue at once, which is what a busy proxy looks like at stop", 24),
 ]
 
 
@@ -132,7 +143,8 @@ def _persisted(db: str) -> dict:
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
-def run_scenario(name: str, hold_s: float, note: str) -> dict:
+def run_scenario(name: str, hold_s: float, note: str,
+                 concurrency: int = 1) -> dict:
     fake = FakeBackendServer(FakeBackend()).start()
     tmp = tempfile.mkdtemp(prefix="roadstead-sigterm-")
     db = os.path.join(tmp, "queue.db")
@@ -146,9 +158,10 @@ def run_scenario(name: str, hold_s: float, note: str) -> dict:
         stdout=log, stderr=subprocess.STDOUT, cwd=ROOT,
         env={**os.environ, "PYTHONPATH": ROOT},
     )
-    result: dict = {"scenario": name, "note": note, "hold_s": hold_s}
-    caller: dict = {}
-    thread: threading.Thread | None = None
+    result: dict = {"scenario": name, "note": note, "hold_s": hold_s,
+                    "concurrency": concurrency}
+    callers: list[dict] = []
+    threads: list[threading.Thread] = []
     try:
         result["startup_s"] = round(_wait_healthy(port, proc), 2)
 
@@ -158,7 +171,7 @@ def run_scenario(name: str, hold_s: float, note: str) -> dict:
             # X-Request-ID, so a header fault would never reach the backend.
             fake.controller.set_fault(FAULT_TIMEOUT, hold_s)
 
-            def _fire() -> None:
+            def _fire(slot: dict) -> None:
                 t0 = time.monotonic()
                 try:
                     r = httpx.post(
@@ -167,20 +180,27 @@ def run_scenario(name: str, hold_s: float, note: str) -> dict:
                               "messages": [{"role": "user", "content": "hold"}],
                               "max_tokens": 16, "stream": False, "timeout_s": 600},
                         timeout=600.0)
-                    caller["status"] = r.status_code
-                    caller["body"] = r.text[:160]
+                    slot["status"] = r.status_code
+                    slot["body"] = r.text[:160]
                 except Exception as exc:  # noqa: BLE001
-                    caller["status"] = "transport-error"
-                    caller["body"] = f"{type(exc).__name__}: {exc}"
-                caller["elapsed_s"] = round(time.monotonic() - t0, 2)
+                    slot["status"] = "transport-error"
+                    slot["body"] = f"{type(exc).__name__}: {exc}"
+                slot["elapsed_s"] = round(time.monotonic() - t0, 2)
 
-            thread = threading.Thread(target=_fire, daemon=True)
-            thread.start()
-            deadline = time.monotonic() + 20
+            for _ in range(concurrency):
+                slot: dict = {}
+                callers.append(slot)
+                th = threading.Thread(target=_fire, args=(slot,), daemon=True)
+                threads.append(th)
+                th.start()
+            # Wait for the backend to actually be holding work. At concurrency
+            # > 1 only the admitted ones reach it — the rest are QUEUED in the
+            # proxy, which is the point: the drain has to account for both.
+            deadline = time.monotonic() + 30
             while time.monotonic() < deadline and not fake.controller.requests:
                 time.sleep(0.1)
-            result["reached_backend"] = bool(fake.controller.requests)
-            time.sleep(0.5)
+            result["reached_backend"] = len(fake.controller.requests)
+            time.sleep(1.0)
 
         t0 = time.monotonic()
         proc.send_signal(signal.SIGTERM)
@@ -195,9 +215,14 @@ def run_scenario(name: str, hold_s: float, note: str) -> dict:
             proc.kill()
             proc.wait(timeout=10)
 
-        if thread is not None:
-            thread.join(timeout=30)
-            result["caller"] = caller
+        for th in threads:
+            th.join(timeout=30)
+        if callers:
+            answered = [c for c in callers if isinstance(c.get("status"), int)]
+            result["callers_total"] = len(callers)
+            result["callers_answered"] = len(answered)
+            result["caller_statuses"] = sorted({str(c.get("status")) for c in callers})
+            result["caller"] = callers[0]
         result["persisted"] = _persisted(db)
 
         log.flush()
@@ -221,11 +246,12 @@ def main() -> None:
     print(f"uvicorn graceful     timeout_graceful_shutdown = {graceful}s\n")
 
     results = []
-    for name, hold, note in SCENARIOS:
-        print(f">>> {name}: {note}", flush=True)
-        r = run_scenario(name, hold, note)
+    for name, hold, note, conc in SCENARIOS:
+        print(f">>> {name} (concurrency={conc}): {note}", flush=True)
+        r = run_scenario(name, hold, note, conc)
         results.append(r)
         for key in ("startup_s", "reached_backend", "exit_s", "hard_killed",
+                    "callers_total", "callers_answered", "caller_statuses",
                     "caller", "persisted"):
             if key in r:
                 print(f"    {key}: {r[key]}")
