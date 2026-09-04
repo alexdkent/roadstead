@@ -124,9 +124,20 @@ def test_a_snapshot_never_carries_the_secret_or_its_digest():
     created_at = row.pop("created_at")
     assert isinstance(created_at, float)
     assert row == {"key_id": "a-key", "agent_id": "a",
-                   "priority": "P3_INGESTION", "min_timeout_s": None,
+                   "priority": "P3_INGESTION",
+                   # 🚨 False, and the pairing matters: this key names no band,
+                   # so it DEFERS to the agent's configured default. A key that
+                   # wrote `P3_INGESTION` reports the same `priority` with this
+                   # True and pins it. Identical values, opposite meanings.
+                   "priority_declared": False,
+                   "min_timeout_s": None,
                    "admin": False, "admin_readonly": False, "may_write": False,
                    "expires_at": None, "expired": False, "bind": [],
+                   # 🚨 Published deliberately (2026-09-02). It is a list of
+                   # fair-share names rather than anything secret, and "which
+                   # callers may this credential bill" is answerable nowhere
+                   # else. Empty is the default and is what every key was.
+                   "may_assert": [],
                    "source": "file"}
 
 
@@ -185,6 +196,11 @@ def test_every_field_of_a_principal_is_reachable_from_a_keys_file(tmp_path, monk
     monkeypatch.setenv("ROADSTEAD_API_KEYS_FILE", str(f))
     assert KeyRegistry.from_env().resolve("the-secret") == Principal(
         agent_id="full-house", priority=LLMPriority.P0_REALTIME,
+        # 🚨 Set because the entry WROTE a `priority:`, not by an operator
+        # spelling this field — it is the record of that write, and it is what
+        # stops the agent's configured `default_priority` from overriding a band
+        # a credential actually asked for.
+        priority_declared=True,
         min_timeout_s=42.5, admin=True, source="api_key", key_id="everything")
 
 

@@ -74,7 +74,11 @@ async def test_a_key_enrolled_through_the_api_authenticates_a_real_call(proxy):
     callers = (await proxy.client.get("/rs/v1/admin/callers", headers=proxy.admin)).json()["callers"]
     mine = [c for c in callers if c["agent_id"] == "e2e-batch"]
     assert mine, "the enrolled identity never reached the scheduler's books"
-    assert key_id in mine[0]["identities"]["keys"]
+    # 🚨 Objects since 2026-09-02, not bare ids: a credential can name its own
+    # band, which beats the agent's configured one, so each key says what it
+    # does rather than the row carrying one number that cannot be right for all
+    # of them (docs/api.md §1.1).
+    assert key_id in [k["key_id"] for k in mine[0]["identities"]["keys"]]
 
     # 🚨 §1.5 rule 1: a presented key that does not resolve is a 401 and NEVER
     # falls back to the source address — even from loopback, which is otherwise

@@ -33,24 +33,123 @@ Routes are registered in one place: `routes.make_routes()`. There is no legacy d
 enriched Roadstead API (§1.7), with its own version because the other one is versioned by OpenAI.
 §1.1–§1.4 below describe the OpenAI door.
 
-### 1.1 Request fields beyond the OpenAI API
+### 1.1 Request fields beyond the OpenAI API — one table per DOOR 🚨
+
+**Rewritten 2026-09-02, and the rewrite is the point.** This section used to be a single table, and
+it documented the **union of two doors** as though it were one. `caller_id` and `request_id` really
+are read — on `/rs/v1/chat` (§1.7.2) — and sat here, on a door where nothing reads them, beside
+`grammar` and `thinking`, which do work here. Almost-right is worse than plainly wrong: a migrator
+sending `agent_id` to `/v1/chat/completions` got no error and no effect, and never learned that the
+field they wanted for fair-share attribution was on the other door.
+
+The **Read by** column is a pin, not a footnote: `tests/test_openai_door_fields.py` checks every row
+against what the named module actually reads, and fails when a row claims a field is read that no
+longer is — or when a handler grows a body field this table does not list.
+
+#### `POST /v1/chat/completions`
 
 A caller may send these alongside standard OpenAI fields. Each is optional.
 
-| Field | Type | Effect |
+| Field | Type | Effect | Read by |
+|---|---|---|---|
+| `model` | string | The endpoint: a class, role or alias, normalized. Validated **before** enqueue — an unknown one is a `404 model_not_found` rather than a wasted slot and a late 502. | `http_handlers.handle_openai_chat` |
+| `timeout_s` | float | Caller's own deadline. Omitted → the smart default applies (a computed recommendation, see §1.2). Popped from the body, so it never reaches the backend. | `http_handlers.handle_openai_chat` |
+| `thinking` | bool \| int | Opt into reasoning. `true` grants a flat headroom on `max_tokens`; an int gives an explicit, usually smaller, headroom — the form an interactive caller wants. | `correction.py` |
+| `grammar` | string | GBNF. Validated and repaired pre-enqueue; invalid grammar fails loud with 422. | `correction.py` |
+
+Header: **`X-Timeout-S`**, read by the same handler as an alternative to the body field.
+
+⚠️ **`X-Request-ID` is not read on the way in.** It is a header Roadstead *emits* southbound,
+carrying the request id Roadstead itself minted (§4.1) — this document used to list it here as
+"forwarded", which reads as "send one and we will carry it". Nothing consults an inbound one. The
+enriched door's `request_id` body field (§1.7.2) is the supported way to correlate a caller's own id
+with the durable record.
+
+##### What this door does NOT read 🚨
+
+Everything else in the body is **left in the payload and forwarded toward the backend**. For the
+names below that is not what a caller carrying habits from `/v1/submit` expects, so each is stated
+rather than omitted:
+
+| Field | What actually happens here |
+|---|---|
+| `agent_id` | **Ignored.** Identity is the API key, or the source address — §1.5. A body could claim any `agent_id`, including one with a better DRR weight. |
+| `priority` | **Ignored, and that is now a decision rather than a gap** (2026-09-02). The band is *configured* per caller instead — see "A static band per caller" below. A per-call body field was measured against real traffic and rejected. |
+| `call_site` | **Ignored.** Set to `<agent_id>.openai_compat`, so this door's traffic is distinguishable in attribution. |
+| `caller_id` | **Ignored.** Set to the `agent_id`. Read on `/rs/v1/chat`, which is where a caller with sub-identities should be. |
+| `session_id`, `turn_id`, `request_id` | **Ignored** — and, unlike the four above, not replaced either: they travel to the backend inside the payload, where a strict engine may reject the unknown key. Read on `/rs/v1/chat`. |
+
+🚨 **There is no caller-sendable `tier` field**, on either door — a frequent wrong assumption.
+`priority` is the tier declaration, and it is read on `/rs/v1/chat` (§1.7.2) only.
+
+##### Why this door will not grow a `priority` field 🚨
+
+Measured on a week of real traffic through the proxy this one replaces: **196k requests, 3.6% of
+them through an OpenAI-shaped door.** Every one of that 3.6% was an off-box caller reached by a
+third-party OpenAI client — a CLI, a bridge, a shell tool. Those are precisely the callers that
+*cannot* set a non-standard body field: they use an OpenAI SDK, which is why they are on this door
+at all. The other 96.4% declared `priority` explicitly, and every one of them lands on `/rs/v1/chat`
+after the migration in §1.9, where it is read.
+
+So the field would be added for a population that is empty by construction, at the cost of the one
+promise `/v1/*` makes — that a strict OpenAI validator can point here without breaking. What those
+callers actually need is a **standing** band, not a per-call one, and a key already carries one.
+
+⚠️ If a per-call band is ever genuinely wanted here, the precedent is `X-Timeout-S`: a **header**,
+like the deadline it parallels, never a body field. The body is OpenAI's; the headers are ours
+(§1.8).
+
+##### A static band per caller — where to configure it 🚨
+
+A caller that cannot send a field can still be *given* a band, in configuration, and there are two
+places to write one. **Whose default applies is one question with four steps, narrowest first:**
+
+| # | source | where |
 |---|---|---|
-| `priority` | enum | **The only tier declaration.** Drives band selection (interactive / foreground / background), DRR accounting and the timeout ceiling. |
-| `timeout_s` | float | Caller's own deadline. Omitted → the smart default applies (a computed recommendation, see §1.2). |
-| `thinking` | bool \| int | Opt into reasoning. `true` grants a flat headroom on `max_tokens`; an int gives an explicit, usually smaller, headroom — the form an interactive caller wants. |
-| `grammar` | string | GBNF. Validated and repaired pre-enqueue; invalid grammar fails loud with 422. |
-| `agent_id` | string | Caller identity — **the DRR fair-share key.** Absent → the caller is not individually accounted. |
-| `call_site` | string | Sub-identity for attribution and cache analytics. |
-| `session_id`, `turn_id`, `caller_id`, `request_id` | string | Correlation only. |
+| 1 | what this **request** declared | `priority` / `interactive` — `/rs/v1/chat` only |
+| 2 | what the **credential** declared | `ROADSTEAD_API_KEYS`, a keys file, or `ROADSTEAD_ACL`: `agent_id:P1_TURN_SUPPORT` (§1.5) |
+| 3 | what the **agent's config** declares | `agents.yaml` → `default_priority`, keyed on `agent_id` |
+| 4 | the built-in default | `P3_INGESTION` |
 
-Headers: **`X-Timeout-S`** (alternative to the body field) and **`X-Request-ID`** (forwarded).
+Step 2 sits above step 3 because a credential is the stronger statement, and an operator who scoped
+a key to a band meant it. 🚨 **A credential that names NO band falls through to step 3** rather than
+pinning the caller to the grammar's default — the two are different statements and the registry
+records which one was made.
 
-🚨 **There is no caller-sendable `tier` field.** `priority` is the only tier declaration — a
-frequent wrong assumption.
+🚨 **Step 3 did nothing at all until 2026-09-02.** `default_priority` was parsed, allowlisted,
+editable through `PATCH /rs/v1/admin/quotas` and reported by §3.4 as the caller's
+`declared_priority` — while the request path read only the credential's band. The operator-facing
+surface named the source that was not in force, and the two defaults did not even agree
+(`P1_TURN_SUPPORT` in the config, `P3_INGESTION` in the identity grammar). It was invisible because
+every door pre-filled `priority` into the internal submit body from the resolved identity, so the
+identity's own default arrived indistinguishable from a band the caller had asked for.
+
+**Which to reach for.** Step 2 when the band is a property of the *credential* — one process, one
+key, one job. Step 3 when it is a property of the *caller* — and since delegation (§1.5) one key can
+act as many `agent_id`s, a single band on that key cannot say "interactive for `chat-agent`, background for
+`forum-agent`". `agents.yaml` can, and it is already where the DRR weights that go with those bands live.
+
+#### `POST /v1/embeddings`
+
+| Field | Type | Effect | Read by |
+|---|---|---|---|
+| `input` | string \| [string] | **Required.** The text to embed. Normalized to a list. | `http_handlers.handle_openai_embeddings` |
+| `encoding_format` | string | `float` (default) or `base64`. Anything else is a `400`. | `http_handlers.handle_openai_embeddings` |
+| `model` | string | **Echoed in the response and nothing else** — it does not select an endpoint. This door routes to the `embed` class unconditionally, because OpenAI's embeddings shape gives a caller no way to express a choice the gateway would honour. | `http_handlers.handle_openai_embeddings` |
+
+🚨 **This door is LOSSY, on purpose, and must stay that way.** It is a translator in both
+directions — OpenAI `{"input": …}` in, OpenAI `{object, data, usage}` out — over a hybrid embedder
+that answers `{dense, sparse, colbert}`. OpenAI's schema has nowhere to put the sparse and colbert
+halves, so they are dropped. "Fixing" that here would put a non-OpenAI shape behind an OpenAI URL,
+which is the one thing `/v1/*` promises not to do.
+
+**The lossless path is `POST /rs/v1/chat` with `payload_type: "embedding"`** (§1.7.2), where the
+backend's body is returned whole under `response`. `roadstead.client`'s `embed()` sends exactly that.
+
+#### `POST /rs/v1/chat` and `POST /rs/v1/plan`
+
+The enriched door's fields are §1.7.1 (what you want) and §1.7.2 (how urgently, and the payload).
+`priority`, `caller_id`, `request_id`, `session_id`, `turn_id` and `call_site` are all read there.
 
 ### 1.2 Timeouts are computed, not accepted
 
@@ -149,7 +248,7 @@ and the budget holder.** It is established in one of three ways, in strict prece
 |---|---|---|
 | 1 | **API key** — `Authorization: Bearer <key>` (what an OpenAI client already sends), `Authorization: Basic <base64(anything:key)>` (what a *browser* can send — the key is the **password** half and the username is ignored), or `X-API-Key: <key>` | authenticated |
 | 2 | **Source address** — an operator registration in `ROADSTEAD_ACL` | a weak second factor: it identifies a *host*, and several callers may share one |
-| 3 | ~~**`agent_id` in the body**~~ | **Gone.** It was reachable only on `/v1/submit`, which was removed in Workstream C (§1.9). No door reads an identity from a request body; a caller cannot name its own fair-share key at all. |
+| 3 | **`agent_id` in the body** | **Only a name the credential was granted** (`may_assert`, below). It was unchecked on `/v1/submit`, which was removed in Workstream C (§1.9); it came back on `/rs/v1/*` on 2026-09-02 as a *delegation* rather than a claim. A caller still cannot name its own fair-share key — it can only pick from the ones its operator wrote down. |
 
 A key carries its own default `priority`, an optional `min_timeout_s` deadline floor, and an
 optional `admin` scope, so all four facts travel with the caller rather than with the machine it
@@ -170,11 +269,32 @@ Three rules, each of which is a decision rather than an implementation detail:
    Every OpenAI client sends an `Authorization` header whether or not anybody meant it to, so
    treating one as significant before an operator has configured any key would refuse the existing
    world over a credential nobody chose.
-3. 🚨 **A key overrides a body-declared `agent_id`; an address only fills in one the body omitted.**
-   A verified credential is a stronger statement about who is calling than anything in the body.
-   *(Kept as doctrine although row 3 is now empty: it is the rule that decides what a future body
-   field, or a third identity factor, may and may not override — and it is the reason removing the
-   body claim was safe rather than the reason it stopped mattering.)*
+3. 🚨 **A key overrides a body-declared `agent_id` unless it was granted the name; an address only
+   fills in one the body omitted.**
+   A verified credential is a stronger statement about who is calling than anything in the body, so
+   the body may never *claim* an identity. What changed on 2026-09-02 is that a credential may
+   **delegate** one: `may_assert` lists the `agent_id`s this key is permitted to act as, and a
+   declared name inside that list is honoured while one outside it is a **403** — never a quiet
+   fall-back to the credential's own identity, which would put the work on one caller's bill and
+   the record on another's with nothing anywhere to say so.
+
+   🚨 **A key with no `may_assert` ignores a declared `agent_id` exactly as before, and does not
+   refuse it.** The asymmetry is deliberate and turns on whether an operator opted in: one who wrote
+   `may_assert` asked for the field to mean something, so a bad value there earns a sentence; one
+   who wrote none has a caller sending a field carried over from `/v1/submit`, and 403-ing that
+   would break every such caller on upgrade over a claim that was already inert.
+
+   **Why the rule needed an exception at all.** It assumed the security boundary and the fairness
+   boundary are the same object, and on a real fleet they are not: callers are often sibling
+   processes in one container sharing a filesystem and a uid — *one* trust domain — while DRR
+   fair-share, quotas and spend all need to tell them apart. Issuing one key per fair-share identity
+   puts N secrets where one boundary is; issuing one and collapsing the identities destroys what the
+   weights exist for. The allowlist keeps the property that made this rule right — a caller cannot
+   claim an identity nobody gave it — while letting one credential carry many fair shares.
+
+   🚨 **Delegation moves the fair-share key and grants no policy.** The band, deadline floor, admin
+   scope and `key_id` all stay the credential's. A key that could hand itself a different policy by
+   naming another agent would be the self-asserted `agent_id` bug restored rather than fenced.
 4. 🚨 **A forwarded address is believed only from a trusted proxy, and the caller is the rightmost
    hop that is not one.** `X-Forwarded-For` is a caller-supplied string. It is read only when the
    peer is listed in **`ROADSTEAD_TRUSTED_PROXIES`** (a comma-separated list of addresses or CIDRs,
@@ -306,7 +426,7 @@ rides in response headers (§1.8); everything else lives here.
 |---|---|
 | `GET /rs/v1/models` | What can serve me, what can it do, what is it like *now*, what does it cost. |
 | `POST /rs/v1/plan` | Where would this go, how long should I allow, what would it cost — **without dispatching**. |
-| `POST /rs/v1/chat` | The enriched call. |
+| `POST /rs/v1/chat` | The enriched call — a chat completion, an embedding or a rerank, selected by `payload_type` (§1.7.2). |
 
 Every route is gated exactly like the OpenAI doors (§1.5). `/rs/v1/models` is a
 map of the fleet — slot counts, occupancy, health and prices — and an unenrolled
@@ -400,6 +520,40 @@ substitution the caller could not detect.
 | `substitution` | object | `{"degrade": bool, "spill": bool}`. See §1.7.4. |
 | `call_site`, `session_id`, `turn_id`, `caller_id`, `request_id` | string | Attribution and correlation. |
 | `payload` | object | **The model request itself** — messages, `max_tokens`, `tools`, `response_format`, `stream`. |
+| `agent_id` | string | **Act as this caller.** Honoured only when the credential's `may_assert` grants the name (§1.5 rule 3); refused `403` when it has a grant that does not, ignored when it has none. |
+| `payload_type` | string | What SHAPE `payload` is: `chat_completion` (the default) \| `embedding` \| `rerank`. It selects the route on the backend — the chat route, the embedder's `/embed`, the reranker's `/rerank`. |
+
+🚨 **One agent, two kinds of work: three different knobs, and only the third needs a grant.** A
+caller that does interactive chat *and* background summarisation is asking one of three questions,
+and reaching for `agent_id` when it wanted `priority` costs an operator a credential grant for
+nothing:
+
+| what differs | the knob | needs a grant? |
+|---|---|---|
+| **When it should run** — someone is waiting vs. nobody is | `priority`, or `interactive` | No. Per call, always available. |
+| **How it shows up in the numbers** — `chat-agent.chat` vs `chat-agent.summarise` | `call_site`, `caller_id` | No. Free-form, per call. |
+| **Whose budget it spends** — its own DRR balance, quota and spend cap | `agent_id` | **Yes** — §1.5's `may_assert`. |
+
+🚨 **The third is a real question, not a redundant spelling of the first**, and the reason is that
+the **DRR balance is one per `agent_id`, shared across bands**. Priority orders the work — a P1 turn
+is dequeued ahead of a P3 storm every time — but both spend the *same* balance. So a background
+storm can drain the balance its own interactive turns spend from, and those turns then meet DRR
+fairness empty-handed and yield to other callers in their band. If that matters for a given agent,
+split the identity (`chat-agent` and `chat-agent-summarise`, both on the key's allowlist, each with its own weight)
+and the two stop competing for one balance. If it does not, one `agent_id` and a per-call `priority`
+is the simpler and correct answer.
+
+🚨 **`payload_type` is not `kind`, and neither defaults from the other.** `kind` (§1.7.1) is a
+ROUTING declaration — what sort of endpoint may serve this — and an intent profile sets it.
+`payload_type` is a declaration about the BODY. `kind: "embed"` alone routes to an embedder and then
+posts a chat-shaped request to it; `payload_type: "embedding"` alone asks a chat model to answer an
+embedding body. Both questions are real, so both fields exist.
+
+🚨 **This is rerank's only route.** `/v1/submit` carried `payload_type` and was removed (§1.9),
+which left rerank with no door at all until the SDK learned to send this field on 2026-09-02. There
+is deliberately no `/v1/rerank`: OpenAI has no rerank shape to be compatible with, so such a route
+would be Roadstead's own API wearing somebody else's version number. `POST /rs/v1/chat` is where
+Roadstead's own API lives, and it is named for the route rather than for chat.
 
 🚨 **The split between the envelope and `payload` is the contract.** Routing
 declarations outside, the model request inside. That is what lets `deadline_s`
@@ -409,8 +563,19 @@ avoid.
 
 #### 1.7.3 The response
 
-Four blocks, plus the backend's own body **nested** under `response` so a caller
+Five blocks, plus the backend's own body **nested** under `response` so a caller
 never has to tell Roadstead's fields from the model's.
+
+🚨 **`identity` says who the call was BILLED to** — `{agent_id, declared?, honoured?}` — and the
+second half is why it exists. A credential with no delegation grant *ignores* a declared `agent_id`
+(§1.5 rule 3) rather than refusing it, which is right for upgrade compatibility and would be a
+**silencer** if it were also invisible: the caller asks to be `chat-agent`, the work is billed to the
+credential, and both outcomes are a 200 with otherwise identical bodies. `agent_id` is always
+present; `declared` and `honoured` appear only when the caller declared something, on the same rule
+that keeps `substituted` from firing on every intent-routed call and meaning nothing.
+
+It leaks no band, queue position or demotion (§1.6): the value is either the caller's own word or
+the name on the credential it presented, and neither is news to the caller.
 
 ```json
 {
@@ -549,13 +714,13 @@ replacement, and the map is mechanical:
 
 | `/v1/submit` | `/rs/v1/chat` |
 |---|---|
-| `agent_id` | **Gone.** Identity is the API key, or the source address — §1.5. A body could claim any `agent_id`, including one with a better DRR weight. |
+| `agent_id` | **A delegation, not a claim.** Identity is the API key or the source address (§1.5); the body's `agent_id` is honoured only where the key's `may_assert` grants that name, and refused otherwise. On `/v1/submit` it was unchecked — a caller could name any `agent_id`, including one with a better DRR weight — which is why that door went. A fleet migrating many callers behind one credential grants them here rather than issuing one key each. |
 | `endpoint` | `model` (a pin) — or drop it and send `intent`. |
 | `payload` | `payload`, unchanged. |
 | `timeout_s` / `X-Timeout-S` | `deadline_s` — and usually: omit it, §1.2. |
 | `priority` | `priority`, or `interactive: true`/`false`. |
 | `call_site`, `session_id`, `turn_id`, `caller_id`, `request_id` | Unchanged. |
-| `payload_type` | Unchanged (`chat_completion` \| `embedding` \| `rerank`). |
+| `payload_type` | Unchanged (`chat_completion` \| `embedding` \| `rerank`) — see §1.7.2. 🚨 The proxy has always read it here; nothing SENT it between the removal of `/v1/submit` and 2026-09-02, which is why rerank had no route for that window. |
 | response `queue_wait_ms`, `backend_latency_ms` | `timing.*` |
 | response `estimated_cost_ss` | `usage.slot_seconds` |
 | response `response`, `status`, `request_id`, `code`, `error` | Unchanged. |
@@ -774,6 +939,27 @@ with the table above, and when it falls behind, the failure is silent and in the
 `127.0.0.1=ops:admin:readonly` in `ROADSTEAD_ACL` is read-only even though loopback is a built-in
 admin net: if the widest overlapping grant won, that line would silently be a full grant, since every
 operator writing it is on loopback. A narrowing another grant can cancel is not a narrowing.
+
+🚨 **`GET /rs/v1/admin/callers` reports each key's band, not one number for the caller.** A
+credential may name its own band, which beats the agent's configured `default_priority` (§1.1), and
+many keys to one `agent_id` is a supported shape — so "the band in force for this caller" has no
+single value. `identities.keys` therefore carries an object per key: `key_id`, the `priority` it
+declares (**`null` when it declares none**, which is a different statement from declaring
+`P3_INGESTION` and resolves differently), `overrides_agent_default`, and its `may_assert` grant. The
+agent's own configured band stays reported as `declared_priority` beside its `effective_priority`.
+
+🚨 **`may_assert` is the one editable field on this plane that WIDENS.** Every other quota knob moves
+a share, a band or a cap, and none can express a rejection (§1.6's write boundary); this one names
+`agent_id`s a credential may bill. It is safe on the same argument `substitution` is: the operator
+grants, the caller can only spend inside the grant, and a name outside it is a 403 rather than a
+silent re-bill. A key listing its **own** `agent_id` is refused rather than trimmed — it reads as
+though the list is exhaustive, and an operator who believes that will later wonder why the key still
+works with the entry removed.
+
+`GET /rs/v1/admin/keys` publishes it. It is a list of fair-share names, not a credential, and "which
+callers may this key bill" is answerable nowhere else. A **rotation carries the grant to the
+successor**, unlike the expiry: the grant is a policy the operator made about this identity, and a
+rotation that silently dropped it would break every delegated caller at the moment the key changed.
 
 #### Lifecycle: expiry, rotation, binding
 
@@ -1269,6 +1455,15 @@ async with AsyncRoadsteadClient("http://proxy:42100", api_key=KEY) as rs:
 wrapper that owns a private event loop on a worker thread, so it composes with
 sync code and refuses to run inside a loop rather than deadlocking one.
 
+**All three payload types, one route.** `chat()`, `embed()` and `rerank()` differ only by the
+`payload_type` they put on the envelope (§1.7.2); `call(payload_type=…, payload=…)` sends any other
+one a newer proxy may accept, unchecked, so the SDK does not gate a deployment on a literal
+transcribed here. All four return a `CallResult` — named for the route, not for chat, since
+2026-09-02 — whose `.response` is the backend's body untouched, so a hybrid embedder's
+`{dense, sparse, colbert}` and a reranker's `{results: […]}` arrive whole. 🚨 `embed()` is
+therefore the **lossless** embedding path and `/v1/embeddings` is deliberately not (§1.1).
+`ChatResult` remains as an alias.
+
 **Three things it does that a hand-rolled `httpx.post` would not:**
 
 🚨 **It classifies errors on the `code`.** `RoadsteadError.deferrable` reads
@@ -1313,6 +1508,15 @@ headers on the OpenAI door), §1.9 (the `/v1/submit` migration map) and §7 (the
 because a caller already classifies that and a second spelling of "nothing here can serve you" would
 buy nobody anything. `POST /v1/submit` is **removed**; §1.9 is the map and `CHANGELOG.md` carries the
 reason. Read back by `tests/test_client_sdk.py` and `tests/e2e/test_enriched_api.py`.
+
+**Updated 2026-09-02:** §1.1 is now **one table per door**, because the single table it replaced
+documented the union of two of them — see `CHANGELOG.md` for the full account. `payload_type` joins
+§1.7.2, which makes `/rs/v1/chat` the route for embeddings and reranks as well as chat completions
+and gives rerank a door again for the first time since `/v1/submit` was removed. §7 records that the
+SDK speaks all three, and that `ChatResult` is now `CallResult`. Pinned by
+`tests/test_openai_door_fields.py` (each §1.1 table against what the named module reads, both
+directions) and `tests/test_enriched_envelope_coverage.py` (every field the enriched door reads is
+one the SDK can send).
 
 **Previously INCOMPLETE — both closed 2026-08-31:**
 1. ~~Nested response schemas for `/v1/fleet/*` analytics.~~ Chased to column level in §3.6 and

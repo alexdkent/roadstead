@@ -40,6 +40,36 @@ ROUTE_OPENAI_CHAT = "/v1/chat/completions"
 
 
 # ---------------------------------------------------------------------------
+# Payload types — docs/api.md §1.7.2
+# ---------------------------------------------------------------------------
+
+#: What SHAPE the ``payload`` is, and therefore which route on the backend
+#: serves it: the chat completion route, the embedder's ``/embed`` or the
+#: reranker's ``/rerank``.
+#:
+#: 🚨 **Not the same field as ``kind``, and neither defaults from the other.**
+#: ``kind`` is a ROUTING declaration — what sort of endpoint may serve this, the
+#: thing an intent profile also sets. ``payload_type`` is a declaration about the
+#: BODY. Sending ``kind: "embed"`` alone routes an embedding request to an
+#: embedder and then posts it to that backend's chat route; sending
+#: ``payload_type`` alone asks a chat model to answer an embedding body. Both are
+#: on the envelope because both questions are real.
+PAYLOAD_CHAT = "chat_completion"
+PAYLOAD_EMBEDDING = "embedding"
+PAYLOAD_RERANK = "rerank"
+
+#: The three the proxy knows today. The SDK does not enforce it — ``call()``
+#: sends whatever it is given, so a proxy newer than this SDK is usable rather
+#: than gated by a literal transcribed here (the same argument every typed view
+#: makes for keeping ``.raw``).
+PAYLOAD_TYPES: frozenset[str] = frozenset({
+    PAYLOAD_CHAT,
+    PAYLOAD_EMBEDDING,
+    PAYLOAD_RERANK,
+})
+
+
+# ---------------------------------------------------------------------------
 # Error codes — docs/api.md §2.1
 # ---------------------------------------------------------------------------
 

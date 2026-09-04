@@ -182,11 +182,18 @@ async def test_an_unsatisfiable_intent_names_the_near_misses_only(proxy):
     assert "tier2" in considered
 
 
-async def test_the_four_blocks_are_all_present_and_timing_is_real(proxy):
+async def test_the_five_blocks_are_all_present_and_timing_is_real(proxy):
     resp = await proxy.client.post("/rs/v1/chat", json=_body(intent="chat"))
     body = resp.json()
+    # 🚨 Equality, not a subset: a block added here is a deliberate decision
+    # about what the enriched envelope publishes. `identity` joined on
+    # 2026-09-02 (§1.7.3) — it is the disclosure that stops an IGNORED
+    # delegation from being invisible.
     assert set(body) == {"status", "request_id", "response",
-                         "attribution", "timing", "usage"}
+                         "attribution", "identity", "timing", "usage"}
+    # Nothing declared, so the block is the resolved identity alone — no
+    # `honoured`, which would be True on every ordinary call and mean nothing.
+    assert body["identity"] == {"agent_id": "internal"}
     timing = body["timing"]
     assert timing["deadline_source"] == "computed"   # no deadline_s supplied
     assert timing["total_ms"] >= timing["backend_latency_ms"] >= 0
@@ -329,3 +336,126 @@ async def test_v1_submit_is_gone(proxy):
     decided to keep."""
     resp = await proxy.client.post("/v1/submit", json={"payload": {}})
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Delegated identity — a key acting as another caller (2026-09-02)
+# ---------------------------------------------------------------------------
+
+def _delegating_key(proxy, *, may_assert):
+    """Enrol one key on the live registry and return its bearer header."""
+    proxy.svc._state.identity.keys.register(
+        secret="deleg-secret", agent_id="originfleet", key_id="c2",
+        may_assert=may_assert, source="runtime")
+    return {"Authorization": "Bearer deleg-secret"}
+
+
+async def test_a_granted_agent_id_becomes_the_fair_share_key(proxy):
+    """🚨 The whole point, checked on the WIRE and against the durable record
+    rather than against the handler's intent.
+
+    The `agent_id` is what DRR budgets, quota, spend and the completion row are
+    all keyed on. A delegation that reached the response but not the record
+    would look correct from outside and bill the wrong caller forever.
+    """
+    headers = _delegating_key(proxy, may_assert=["chat-agent", "knowledge_store"])
+    resp = await proxy.client.post(
+        "/rs/v1/chat", json=_body(intent="chat", agent_id="chat-agent"), headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    proxy.svc._queue_db.flush()
+    row = proxy.svc._queue_db._conn.execute(
+        "SELECT agent_id FROM proxy_completions WHERE request_id=?",
+        (body["request_id"],)).fetchone()
+    assert row is not None, "no completion row for the request just served"
+    assert row[0] == "chat-agent", (
+        f"the delegated agent_id did not reach the durable record: {row[0]!r} — "
+        f"the call was billed to the credential rather than to the caller")
+
+
+async def test_an_ungranted_agent_id_is_refused_rather_than_rebilled(proxy):
+    """🚨 403, not a silent fall-back to the credential's own identity."""
+    headers = _delegating_key(proxy, may_assert=["chat-agent"])
+    resp = await proxy.client.post(
+        "/rs/v1/chat", json=_body(intent="chat", agent_id="knowledge_store"),
+        headers=headers)
+    assert resp.status_code == 403
+    body = resp.json()
+    assert body["code"] == "access_denied"
+    assert "chat-agent" in body["error"]          # the grant is named
+
+
+async def test_a_key_without_a_grant_still_ignores_the_body(proxy):
+    """§1.5 rule 3, unchanged for every key that predates the feature."""
+    proxy.svc._state.identity.keys.register(
+        secret="plain-secret", agent_id="bridge-agent", key_id="h1", source="runtime")
+    resp = await proxy.client.post(
+        "/rs/v1/chat", json=_body(intent="chat", agent_id="chat-agent"),
+        headers={"Authorization": "Bearer plain-secret"})
+    assert resp.status_code == 200
+    proxy.svc._queue_db.flush()
+    row = proxy.svc._queue_db._conn.execute(
+        "SELECT agent_id FROM proxy_completions WHERE request_id=?",
+        (resp.json()["request_id"],)).fetchone()
+    assert row[0] == "bridge-agent", (
+        "a key with no may_assert grant took the body's word for who it is")
+
+
+async def test_plan_and_the_call_after_it_agree_about_who_is_asking(proxy):
+    """§1.7 promises a plan and the call that follows it agree. `/rs/v1/plan`
+    reports the caller's degrade/spill opt-in, which is read off the AGENT
+    config — so a plan resolved as the credential would answer for a different
+    caller than the one about to dispatch."""
+    headers = _delegating_key(proxy, may_assert=["chat-agent"])
+    resp = await proxy.client.post(
+        "/rs/v1/plan", json=_body(intent="chat", agent_id="not-granted"),
+        headers=headers)
+    assert resp.status_code == 403, (
+        "/rs/v1/plan accepted an identity /rs/v1/chat would refuse — a plan "
+        "that answers for a caller the next call cannot be is worse than none")
+
+
+async def test_an_ignored_delegation_is_visible_on_the_wire(proxy):
+    """🚨 End to end, because the door overwrites `agent_id` with the resolved
+    identity before `handle_submit` ever sees it — so the caller's own word has
+    to be carried separately, and a unit test of the block cannot prove it was.
+
+    That was a real bug in the first cut: the block reported `declared` as the
+    RESOLVED name, so `honoured` was True in exactly the case it exists to flag.
+    """
+    proxy.svc._state.identity.keys.register(
+        secret="nogrant", agent_id="bridge-agent", key_id="ng", source="runtime")
+    resp = await proxy.client.post(
+        "/rs/v1/chat", json=_body(intent="chat", agent_id="chat-agent"),
+        headers={"Authorization": "Bearer nogrant"})
+    assert resp.status_code == 200
+    identity = resp.json()["identity"]
+    assert identity == {"agent_id": "bridge-agent", "declared": "chat-agent",
+                        "honoured": False}, identity
+
+
+async def test_a_granted_delegation_reports_honoured(proxy):
+    headers = _delegating_key(proxy, may_assert=["chat-agent"])
+    resp = await proxy.client.post(
+        "/rs/v1/chat", json=_body(intent="chat", agent_id="chat-agent"), headers=headers)
+    assert resp.json()["identity"] == {
+        "agent_id": "chat-agent", "declared": "chat-agent", "honoured": True}
+
+
+async def test_the_streaming_done_frame_carries_the_same_block(proxy):
+    """One caller handling both wires must not have to handle two shapes."""
+    proxy.svc._state.identity.keys.register(
+        secret="ng2", agent_id="bridge-agent", key_id="ng2", source="runtime")
+    frames = []
+    async with proxy.client.stream(
+            "POST", "/rs/v1/chat",
+            json=_body(intent="chat", agent_id="chat-agent", payload={"stream": True}),
+            headers={"Authorization": "Bearer ng2"}) as resp:
+        async for line in resp.aiter_lines():
+            if line.startswith("data: "):
+                frames.append(json.loads(line[6:]))
+    done = [f for f in frames if f.get("type") == "done"]
+    assert done, "no done frame"
+    assert done[0]["identity"] == {"agent_id": "bridge-agent", "declared": "chat-agent",
+                                  "honoured": False}

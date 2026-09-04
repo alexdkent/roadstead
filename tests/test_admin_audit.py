@@ -111,15 +111,19 @@ def test_may_admin_write_is_the_conjunction_and_never_grants():
 
 def test_the_grammar_carries_readonly_and_warns_when_it_grants_nothing(caplog):
     """One grammar for keys and the ACL, so `:readonly` works in both."""
+    # The trailing element is `priority_declared` — whether a band was actually
+    # WRITTEN, which the band alone cannot say. Here none was, so it is False
+    # and the caller falls through to its agent's configured default.
     assert parse_identity_spec("ops:admin:readonly") == (
-        "ops", LLMPriority.P3_INGESTION, None, True, True)
-    # Order does not matter — segments are recognised by shape.
+        "ops", LLMPriority.P3_INGESTION, None, True, True, False)
+    # Order does not matter — segments are recognised by shape. This one names a
+    # band, so it is declared and nothing overrides it.
     assert parse_identity_spec("ops:readonly:P1_TURN_SUPPORT:600:admin") == (
-        "ops", LLMPriority.P1_TURN_SUPPORT, 600.0, True, True)
+        "ops", LLMPriority.P1_TURN_SUPPORT, 600.0, True, True, True)
     # 🚨 Reported, never dropped in silence: an operator who wrote it believes
     # they issued a safer credential than they did.
     with caplog.at_level("WARNING"):
-        agent, _, _, admin, readonly = parse_identity_spec("ops:readonly")
+        agent, _, _, admin, readonly, _ = parse_identity_spec("ops:readonly")
     assert (admin, readonly) == (False, True)
     assert "no effect without 'admin'" in caplog.text
 

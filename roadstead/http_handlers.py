@@ -193,7 +193,6 @@ class ProxyHttpHandlers:
             return _openai_error(denial.message, denial.openai_type,
                                  denial.status, code=denial.code)
         agent_id = resolved.principal.agent_id
-        default_priority = resolved.principal.priority
         model = body.get("model", "qwen-analyst")
         # Phase 5D: validate the model maps to a known endpoint BEFORE enqueue.
         # Otherwise an unknown model burns a scheduler slot + DRR charge and
@@ -217,12 +216,16 @@ class ProxyHttpHandlers:
         submit_body = {
             "agent_id": agent_id,
             "endpoint": model,
-            "priority": int(default_priority),
             "call_site": f"{agent_id}.openai_compat",
             "caller_id": agent_id,
             "payload_type": "chat_completion",
             "payload": body,
         }
+        # 🚨 No `priority` key. This door reads none from the caller (§1.1), and
+        # pre-filling the identity's own band here made it look to
+        # `handle_submit` like a DECLARED one — which silently shadowed the
+        # agent's configured `default_priority` and made that field dead.
+        # Omitting it lets the one precedence in `handle_submit` decide.
         if client_timeout is not None:
             submit_body["timeout_s"] = client_timeout
         return await self.lifecycle.handle_submit(submit_body, request, wire=WIRE_OPENAI)
@@ -247,7 +250,6 @@ class ProxyHttpHandlers:
             return _openai_error(denial.message, denial.openai_type,
                                  denial.status, code=denial.code)
         agent_id = resolved.principal.agent_id
-        default_priority = resolved.principal.priority
 
         texts, err = _embedding_texts(body.get("input"))
         if err:
@@ -267,7 +269,7 @@ class ProxyHttpHandlers:
             # pick a name the catalog owns rather than one deployment's model
             # name. Caller-declared intent replaces this hardcode in Workstream C.
             "endpoint": "embed",
-            "priority": int(default_priority),
+            # No `priority`, for the reason handle_openai_chat gives.
             "call_site": f"{agent_id}.openai_compat_embed",
             "payload_type": "embedding",
             # BOTH dialects, deliberately. The bge-m3 shim reads `texts` and ignores

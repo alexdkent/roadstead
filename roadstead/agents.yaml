@@ -8,9 +8,12 @@
 # Each top-level key is an `agent_id` — the caller identity, which is the DRR
 # fair-share key. Since 2026-09-01 that identity comes from an API key where one
 # is presented (`identity.py`), otherwise from an address registration
-# (`ROADSTEAD_ACL`) or, on `/v1/submit`, from the body. However it is
-# established, the name here must match it: a rename on either side silently
-# opts the caller back out of everything below, with nothing to see.
+# (`ROADSTEAD_ACL`). 🚨 It never comes from the request body: this line used to
+# say "or, on `/v1/submit`, from the body", and that door was removed with
+# Workstream C precisely because a body could claim any `agent_id` it liked,
+# including one with a better weight than its own. However it is established,
+# the name here must match it: a rename on either side silently opts the caller
+# back out of everything below, with nothing to see.
 #
 # Missing keys fall back to the AgentQuotaConfig dataclass defaults:
 #   weight: 1.0

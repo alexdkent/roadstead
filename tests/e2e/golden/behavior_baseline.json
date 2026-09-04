@@ -292,7 +292,7 @@
       "{\"data\": \"{\\\"id\\\": \\\"chatcmpl-fake\\\", \\\"object\\\": \\\"chat.completion.chunk\\\", \\\"choices\\\": [{\\\"index\\\": 0, \\\"delta\\\": {\\\"content\\\": \\\"internal \\\"}, \\\"finish_reason\\\": null}]}\", \"type\": \"chunk\"}",
       "{\"data\": \"{\\\"id\\\": \\\"chatcmpl-fake\\\", \\\"object\\\": \\\"chat.completion.chunk\\\", \\\"choices\\\": [{\\\"index\\\": 0, \\\"delta\\\": {\\\"content\\\": \\\"stream \\\"}, \\\"finish_reason\\\": null}]}\", \"type\": \"chunk\"}",
       "{\"data\": \"{\\\"id\\\": \\\"chatcmpl-fake\\\", \\\"object\\\": \\\"chat.completion.chunk\\\", \\\"choices\\\": [{\\\"index\\\": 0, \\\"delta\\\": {}, \\\"finish_reason\\\": \\\"stop\\\"}]}\", \"type\": \"chunk\"}",
-      "{\"attribution\": {\"cost\": {\"avoided_usd\": 3e-06, \"price\": {\"detail\": \"usage_rates avoided-cost for 'tier2'\", \"input_usd_per_mtok\": 0.15, \"output_usd_per_mtok\": 0.55, \"real\": false, \"source\": \"imputed\"}, \"spent_usd\": 0.0}, \"endpoint\": \"tier2\", \"engine\": \"llama.cpp\", \"model\": \"tier2\", \"provider\": \"mid-box\", \"requested\": \"chat\", \"resolved\": \"tier2\", \"substituted\": false, \"substitution\": null}, \"request_id\": \"<rid>\", \"timing\": {\"backend_latency_ms\": 0, \"deadline_s\": 180.0, \"deadline_source\": \"computed\", \"predicted_ms\": 0, \"queue_wait_ms\": 0, \"total_ms\": 0, \"ttft_ms\": 0}, \"type\": \"done\", \"usage\": {\"input_tokens\": 12, \"output_tokens\": 3, \"slot_seconds\": 0}}"
+      "{\"attribution\": {\"cost\": {\"avoided_usd\": 3e-06, \"price\": {\"detail\": \"usage_rates avoided-cost for 'tier2'\", \"input_usd_per_mtok\": 0.15, \"output_usd_per_mtok\": 0.55, \"real\": false, \"source\": \"imputed\"}, \"spent_usd\": 0.0}, \"endpoint\": \"tier2\", \"engine\": \"llama.cpp\", \"model\": \"tier2\", \"provider\": \"mid-box\", \"requested\": \"chat\", \"resolved\": \"tier2\", \"substituted\": false, \"substitution\": null}, \"identity\": {\"agent_id\": \"internal\"}, \"request_id\": \"<rid>\", \"timing\": {\"backend_latency_ms\": 0, \"deadline_s\": 180.0, \"deadline_source\": \"computed\", \"predicted_ms\": 0, \"queue_wait_ms\": 0, \"total_ms\": 0, \"ttft_ms\": 0}, \"type\": \"done\", \"usage\": {\"input_tokens\": 12, \"output_tokens\": 3, \"slot_seconds\": 0}}"
     ],
     "mode": "stream",
     "status_code": 200
@@ -319,6 +319,9 @@
         "resolved": "tier2",
         "substituted": false,
         "substitution": null
+      },
+      "identity": {
+        "agent_id": "internal"
       },
       "request_id": "<rid>",
       "response": {
@@ -383,6 +386,9 @@
         "resolved": "tier2",
         "substituted": false,
         "substitution": null
+      },
+      "identity": {
+        "agent_id": "internal"
       },
       "request_id": "<rid>",
       "response": {
@@ -451,6 +457,9 @@
       "backend_status": 500,
       "code": "backend_error",
       "error": "backend error 500: {\"error\":\"internal error (injected)\"}",
+      "identity": {
+        "agent_id": "internal"
+      },
       "request_id": "<rid>",
       "status": "error",
       "timing": {

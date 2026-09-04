@@ -86,6 +86,14 @@ CREATE TABLE IF NOT EXISTS proxy_completions (
     session_id       TEXT,
     turn_id          TEXT,
     caller_id        TEXT,
+    -- 🚨 The credential that ASSERTED `agent_id`, written ONLY when the two
+    -- differ — i.e. when a delegation grant (`may_assert`) was exercised.
+    -- NULL therefore means "the credential IS the agent_id", which was an
+    -- invariant of this table until delegation landed on 2026-09-02 and is
+    -- still true of every undelegated row. Without it, "which key ran up
+    -- chat-agent's bill?" has no answer: the admin audit trail records admin ACTIONS,
+    -- never dispatch.
+    key_id           TEXT,
     -- 'llm' for native proxy traffic (chat/embed/rerank/vision), or the
     -- non-LLM service class ('audio'/'imagegen'/'ocr'/'translate') for
     -- calls pushed in via /v1/calls/log. NULL on pre-migration rows.
@@ -272,6 +280,7 @@ class PersistentQueue:
             "finish_reason": "TEXT",
             "kind": "TEXT",
             "cached_tokens": "INTEGER",  # Phase 2a prefix-cache attribution
+            "key_id": "TEXT",            # delegation: who asserted the agent_id
         })
         # Index supporting the fleet-usage rollups (group by endpoint over a
         # recent window) now that the table holds whole-fleet call metrics.
@@ -625,6 +634,7 @@ class PersistentQueue:
         finish_reason: str | None = None,
         kind: str | None = "llm",
         cached_tokens: int | None = None,
+        key_id: str | None = None,
     ) -> None:
         if not self._conn:
             return
@@ -640,13 +650,13 @@ class PersistentQueue:
             "(request_id, agent_id, endpoint, call_site, priority, "
             " input_tokens, output_tokens, cached_tokens, duration_s, queue_wait_ms, "
             " status, completed_at, payload_json, response_json, "
-            " session_id, turn_id, caller_id, finish_reason, kind) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " session_id, turn_id, caller_id, finish_reason, kind, key_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 request_id, agent_id, endpoint, call_site, priority,
                 input_tokens, output_tokens, cached_tokens, duration_s, queue_wait_ms,
                 status, now, payload_s, response_s,
-                session_id, turn_id, caller_id, finish_reason, kind,
+                session_id, turn_id, caller_id, finish_reason, kind, key_id,
             ),
         )
 

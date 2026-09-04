@@ -193,7 +193,12 @@ async def test_success_envelope_unchanged_no_code_key():
         assert body["status"] == "ok"
         assert "code" not in body
         assert set(body) == {"status", "request_id", "response",
-                             "attribution", "timing", "usage"}
+                             "attribution", "identity", "timing", "usage"}
+        # `identity` joined 2026-09-02 (§1.7.3). It reports WHO WAS BILLED and,
+        # when a caller declared an `agent_id`, whether that was honoured — the
+        # disclosure that stops an ignored delegation from being invisible. It
+        # carries no band and no queue position, which the leak check below
+        # covers for the whole envelope.
         # 🚨 docs/api.md §1.6: a caller cannot observe its own spend demotion in
         # a response, so the enriched envelope publishes no band, no priority
         # and no queue position. Any of them would make a threshold that "never

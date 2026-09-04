@@ -351,7 +351,17 @@ class EnrichedApi:
         if not resolved_id.ok:
             d = resolved_id.denial
             return _error(d.code, d.message, d.status)
-        agent_id = resolved_id.principal.agent_id
+        # Delegated here too, and not as a courtesy: §1.7 promises a plan and
+        # the call that follows it agree, and `_substitution_policy` reads the
+        # caller's degrade/spill opt-in off the agent config. A plan resolved as
+        # the key's own identity would answer for a different caller than the
+        # one about to dispatch.
+        delegated = self.state.identity.delegate(
+            resolved_id.principal, body.get("agent_id"))
+        if not delegated.ok:
+            d = delegated.denial
+            return _error(d.code, d.message, d.status)
+        agent_id = delegated.principal.agent_id
 
         try:
             intent = parse_intent(body, normalize=normalize_endpoint,
@@ -371,7 +381,7 @@ class EnrichedApi:
         est_out = int(body.get("est_out") or 0) or (
             mt if isinstance(mt, int) and mt > 0 else 0)
         priority = LLMPriority.coerce(
-            body.get("priority"), default=resolved_id.principal.priority)
+            body.get("priority"), default=delegated.principal.priority)
 
         advice = self.state.effective_timeout_advice(
             res.endpoint, int(priority), est_in, est_out)
@@ -436,7 +446,19 @@ class EnrichedApi:
         if not resolved_id.ok:
             d = resolved_id.denial
             return _error(d.code, d.message, d.status)
-        principal = resolved_id.principal
+        # 🚨 A body-declared `agent_id` is applied ONLY where the credential's
+        # own allowlist permits it, and `identity.delegate` is the only thing
+        # that knows. This door read no identity from the body at all until
+        # 2026-09-02, and the reason it did not is unchanged — a caller must not
+        # be able to claim a better DRR weight. What changed is that a key can
+        # now GRANT the names it may wear, which is the operator making the
+        # claim rather than the caller.
+        delegated = self.state.identity.delegate(
+            resolved_id.principal, body.get("agent_id"))
+        if not delegated.ok:
+            d = delegated.denial
+            return _error(d.code, d.message, d.status)
+        principal = delegated.principal
 
         payload = body.get("payload")
         if not isinstance(payload, dict):
@@ -474,9 +496,19 @@ class EnrichedApi:
 
         submit: dict = {
             "agent_id": principal.agent_id,
+            # 🚨 The caller's own word, carried separately BECAUSE the line
+            # above has already overwritten it with the resolved identity. The
+            # two differing is the whole thing being disclosed, so the raw one
+            # cannot be reconstructed downstream — it has to travel.
+            "declared_agent_id": str(body.get("agent_id") or ""),
             "endpoint": res.endpoint,
             "requested": intent.declared,
-            "priority": int(_priority_for(body, principal)),
+            # Only what the CALLER declared. `None` when it declared nothing,
+            # in which case the key is omitted below and `handle_submit`'s one
+            # precedence resolves the band — credential, then the agent's own
+            # configured default. Pre-filling the identity's band here is what
+            # made `agents.yaml`'s `default_priority` dead.
+            "priority": _priority_for(body),
             "call_site": str(body.get("call_site")
                              or f"{principal.agent_id}.rs"),
             "caller_id": body.get("caller_id") or principal.agent_id,
@@ -491,6 +523,8 @@ class EnrichedApi:
         # `deadline_s` is the enriched spelling of `timeout_s`. Omitted entirely
         # when the caller expressed no opinion, so the computed default applies —
         # passing a null would look like a supplied deadline of nothing.
+        if submit["priority"] is None:
+            del submit["priority"]
         deadline = body.get("deadline_s", request.headers.get("X-Timeout-S"))
         if deadline is not None:
             submit["timeout_s"] = deadline
@@ -498,22 +532,29 @@ class EnrichedApi:
         return await self.lifecycle.handle_submit(submit, request, wire=WIRE_ENRICHED)
 
 
-def _priority_for(body: dict, principal) -> LLMPriority:
-    """Priority from the caller's two declarations, identity default last.
+def _priority_for(body: dict) -> LLMPriority | None:
+    """The band THIS REQUEST declared, or ``None`` if it declared none.
 
     ``interactive`` is the enriched API's first-class spelling of the thing
     ``priority`` has always encoded and never named: whether somebody is waiting.
     It is a coarse control on purpose — a caller that wants the precise band
     still sends ``priority``, which wins, because it says strictly more.
+
+    🚨 Returns ``None`` rather than the identity's band. It used to fall back to
+    ``principal.priority``, which reached ``handle_submit`` indistinguishable
+    from a band the caller had asked for — and so shadowed the agent's own
+    configured ``default_priority`` completely. Whose default applies is one
+    question with one answer, and it is answered in ``handle_submit``.
     """
     if body.get("priority") is not None:
-        return LLMPriority.coerce(body["priority"], default=principal.priority)
+        return LLMPriority.coerce(body["priority"],
+                                  default=LLMPriority.P1_TURN_SUPPORT)
     interactive = body.get("interactive")
     if interactive is True:
         return LLMPriority.P1_TURN_SUPPORT
     if interactive is False:
         return LLMPriority.P3_INGESTION
-    return principal.priority
+    return None
 
 
 def _substitution_request(body: dict) -> tuple[bool | None, bool | None]:
@@ -588,6 +629,35 @@ def _provider_name(endpoint: str) -> str:
     from .model_catalog import load_catalog
     entry = load_catalog().entry(endpoint)
     return entry.provider if entry else ""
+
+
+def identity_block(req) -> dict:
+    """Who this call was BILLED to, and whether that is who the caller asked for.
+
+    🚨 The point of it is the second half. A credential with no delegation grant
+    IGNORES a body-declared ``agent_id`` (``docs/api.md`` §1.5 rule 3) — right,
+    because refusing would break every caller carrying a ``/v1/submit`` habit
+    over a claim that was already inert, and a **silencer** if it were also
+    invisible: the caller asks to be ``chat-agent``, the work is billed to the
+    credential, and both cases return 200 with identical bodies. The same shape
+    as the ``finish_reason`` repair that had to learn to keep quiet only when it
+    could tell.
+
+    So the resolved identity is ALWAYS reported (it is a fact, and cheap), and
+    ``honoured`` appears only when the caller declared something — exactly as
+    ``substituted`` is reported only for a move that actually happened, rather
+    than firing on every intent-routed call and meaning nothing.
+
+    🚨 Nothing here leaks a band, a queue position or a demotion (§1.6). The
+    ``agent_id`` is either the caller's own word or the name on the credential
+    it presented; neither is news to the caller.
+    """
+    block: dict = {"agent_id": req.agent_id}
+    declared = getattr(req, "declared_agent_id", "") or ""
+    if declared:
+        block["declared"] = declared
+        block["honoured"] = declared == req.agent_id
+    return block
 
 
 def cost_block(state: "ProxyState", endpoint: str,

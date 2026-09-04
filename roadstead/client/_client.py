@@ -25,8 +25,10 @@ import httpx
 from ._errors import AuthError, RoadsteadError, UnroutableError
 from ._models import (
     Attribution,
+    CallResult,
     ChatResult,
     Enrichment,
+    Identity,
     ModelInfo,
     Plan,
     Timing,
@@ -39,6 +41,9 @@ from ._wire import (
     HEADER_DEADLINE_SOURCE,
     HEADER_ENDPOINT,
     HEADER_REQUEST_ID,
+    PAYLOAD_CHAT,
+    PAYLOAD_EMBEDDING,
+    PAYLOAD_RERANK,
     ROUTE_CHAT,
     ROUTE_MODELS,
     ROUTE_PLAN,
@@ -102,33 +107,46 @@ def _raise_for_envelope(resp: httpx.Response) -> dict:
     raise RoadsteadError(message, **kwargs)
 
 
-def _chat_body(
+def _envelope(
     *,
-    messages: list | None,
-    intent: str,
-    model: str,
-    requires: list[str] | tuple[str, ...] | None,
-    exclude: list[str] | tuple[str, ...] | None,
-    kind: str,
-    min_context: int,
-    prefer: str,
-    priority: str | int | None,
-    interactive: bool | None,
-    deadline_s: float | None,
-    allow_degrade: bool | None,
-    allow_spill: bool | None,
-    call_site: str,
-    session_id: str | None,
-    turn_id: str | None,
-    stream: bool,
-    payload: dict | None,
-    extra_payload: dict | None,
+    messages: list | None = None,
+    payload_type: str = "",
+    intent: str = "",
+    model: str = "",
+    requires: list[str] | tuple[str, ...] | None = None,
+    exclude: list[str] | tuple[str, ...] | None = None,
+    kind: str = "",
+    min_context: int = 0,
+    prefer: str = "",
+    priority: str | int | None = None,
+    interactive: bool | None = None,
+    deadline_s: float | None = None,
+    allow_degrade: bool | None = None,
+    allow_spill: bool | None = None,
+    call_site: str = "",
+    session_id: str | None = None,
+    turn_id: str | None = None,
+    caller_id: str | None = None,
+    request_id: str | None = None,
+    agent_id: str | None = None,
+    est_in: int = 0,
+    est_out: int = 0,
+    stream: bool = False,
+    payload: dict | None = None,
+    extra_payload: dict | None = None,
 ) -> dict:
-    """Assemble the enriched envelope.
+    """Assemble the enriched envelope. **The one place a field is put on the wire.**
 
     The split is the contract: routing declarations outside, the model request
     inside ``payload``. That is what lets ``deadline_s`` exist at all without
     being forwarded to a backend that would reject the unknown field.
+
+    🚨 Every dispatching method funnels through here rather than building its
+    own body, and ``tests/test_enriched_envelope_coverage.py`` reads this
+    function's emitted keys against the fields ``enriched.py`` actually consumes.
+    A second assembly site would be a second place for a field to go missing —
+    which is exactly how ``payload_type``, ``caller_id`` and ``request_id`` were
+    read by the server and sent by nobody for the whole of this SDK's life.
     """
     inner: dict = dict(payload or {})
     if messages is not None:
@@ -139,6 +157,14 @@ def _chat_body(
         inner["stream"] = True
 
     body: dict = {"payload": inner}
+    if payload_type:
+        # 🚨 What SHAPE the payload is — `chat_completion` | `embedding` |
+        # `rerank`. Not the same question as `kind`, which is a ROUTING
+        # declaration about the endpoint. Both are needed: `kind` picks an
+        # embedder, `payload_type` decides that the request goes to its `/embed`
+        # route rather than `/v1/chat/completions`. Omitted rather than
+        # defaulted here so `plan`, which never dispatches, sends no shape at all.
+        body["payload_type"] = payload_type
     if intent:
         body["intent"] = intent
     if model:
@@ -180,7 +206,87 @@ def _chat_body(
         body["session_id"] = session_id
     if turn_id:
         body["turn_id"] = turn_id
+    if caller_id:
+        # The sub-identity a call is attributed to, INSIDE the authenticated
+        # `agent_id` — the server defaults it to the principal. Dropping it is
+        # silent and only shows up as flat `/v1/fleet/top-callers` and
+        # `/v1/fleet/cache-attribution` readouts, which is a missing measurement
+        # rather than a missing answer, and so is never reported by anything.
+        body["caller_id"] = caller_id
+    if request_id:
+        # The CALLER's own correlation id, carried through the durable record so
+        # a caller's log line and the proxy's completion row can be joined.
+        body["request_id"] = request_id
+    if agent_id:
+        # 🚨 ACT AS this caller — a delegation, not a claim. It is honoured only
+        # where the credential's own `may_assert` grants the name, refused 403
+        # otherwise, and ignored by a key with no grant at all (docs/api.md
+        # §1.5 rule 3). Sending it never widens anything: the operator writes
+        # the list, this only picks from it.
+        #
+        # 🚨 NOT the same question as `caller_id`. This changes whose DRR
+        # balance, quota and spend cap the call spends; `caller_id` changes only
+        # how it is labelled in the analytics. Reach for this one when the two
+        # kinds of work should not drain one balance — §1.7.2's table.
+        body["agent_id"] = agent_id
+    # `/rs/v1/plan` only — it prices a call that has not been written yet, so the
+    # sizes are declared rather than measured off a payload. Assembled here
+    # rather than bolted on by `plan` afterwards so that this function really is
+    # the ONE place a field goes on the wire, which is what the coverage guard
+    # calls it to find out.
+    if est_in:
+        body["est_in"] = int(est_in)
+    if est_out:
+        body["est_out"] = int(est_out)
     return body
+
+
+#: Envelope fields ``embed``/``rerank``/``call`` will not accept through their
+#: ``**routing`` catch-all. Each is the METHOD's own business: the payload is
+#: built from the arguments those methods take, and ``payload_type`` is the whole
+#: point of having a typed method rather than a `chat(payload_type=...)` call.
+#: Refused loudly rather than dropped — a silently ignored ``stream=True`` would
+#: hand the caller a non-streaming answer and no reason.
+_METHOD_OWNED = ("payload_type", "payload", "messages", "stream",
+                 "extra_payload")
+
+#: What ``docs/api.md`` §1.7.1 requires: a request must declare at least one of
+#: these, or the server refuses it.
+_DECLARATIONS = ("intent", "model", "requires", "exclude")
+
+
+def _routing(kwargs: dict, *, method: str, default_kind: str) -> dict:
+    """Validate a typed method's ``**routing`` and supply its two defaults.
+
+    🚨 **``kind`` is defaulted always, ``intent`` only as a fallback**, and the
+    asymmetry is the point.
+
+    ``kind`` is not a preference here: ``embed()`` is *for* an embed-kind
+    endpoint, and a caller who pins one (``model="bge-m3-embed"``) with no
+    ``kind`` resolves against the default ``chat`` and gets
+    ``404 no endpoint satisfies model='…', kind='chat'`` — a sentence about the
+    fleet for a request that was perfectly clear. So the method states the kind
+    its payload type implies, and a caller who passes an explicit ``kind`` keeps
+    it.
+
+    ``intent`` is different: it is one of the four declarations §1.7.1 requires,
+    and supplying one beside a caller's own pin would be the SDK making a routing
+    declaration on their behalf. So it fills in only when the caller declared
+    nothing at all — without which ``rs.embed(texts=[…])`` would be a 400 about a
+    field the caller never mentioned.
+    """
+    owned = [k for k in _METHOD_OWNED if k in kwargs]
+    if owned:
+        raise TypeError(
+            f"{method}() builds its own payload — {', '.join(owned)} "
+            f"{'is' if len(owned) == 1 else 'are'} not accepted here; pass the "
+            f"model request through `payload=` (or use `call()` for a payload "
+            f"type this SDK has no typed method for)")
+    if not kwargs.get("kind"):
+        kwargs["kind"] = default_kind
+    if not any(kwargs.get(k) for k in _DECLARATIONS):
+        kwargs["intent"] = default_kind
+    return kwargs
 
 
 class AsyncRoadsteadClient:
@@ -237,6 +343,14 @@ class AsyncRoadsteadClient:
         if self._owns_client:
             await self._client.aclose()
 
+    async def _post(self, body: dict) -> dict:
+        """One non-streaming enriched dispatch. ONE route, for every payload
+        type — ``/rs/v1/chat`` is the enriched door, not the chat door, and
+        rerank has had no route at all since ``/v1/submit`` was removed."""
+        resp = await self._client.post(ROUTE_CHAT, json=body,
+                                       headers=self._headers())
+        return _raise_for_envelope(resp)
+
     # ---- routes ----
 
     async def models(self) -> list[ModelInfo]:
@@ -277,17 +391,13 @@ class AsyncRoadsteadClient:
         so a plan and the call that follows it agree, provided the fleet did not
         move in between.
         """
-        body = _chat_body(
-            messages=None, intent=intent, model=model, requires=requires,
-            exclude=exclude, kind=kind, min_context=min_context, prefer=prefer,
-            priority=priority, interactive=None, deadline_s=None,
-            allow_degrade=None, allow_spill=None, call_site="",
-            session_id=None, turn_id=None, stream=False, payload=payload,
-            extra_payload=None)
-        if est_in:
-            body["est_in"] = int(est_in)
-        if est_out:
-            body["est_out"] = int(est_out)
+        # No `payload_type`: this route resolves and prices, it never
+        # dispatches, so the shape of the payload is not one of its questions.
+        body = _envelope(
+            intent=intent, model=model, requires=requires, exclude=exclude,
+            kind=kind, min_context=min_context, prefer=prefer,
+            priority=priority, payload=payload,
+            est_in=est_in, est_out=est_out)
         resp = await self._client.post(ROUTE_PLAN, json=body,
                                        headers=self._headers())
         return Plan(_raise_for_envelope(resp))
@@ -311,10 +421,13 @@ class AsyncRoadsteadClient:
         call_site: str = "",
         session_id: str | None = None,
         turn_id: str | None = None,
+        caller_id: str | None = None,
+        request_id: str | None = None,
+        agent_id: str | None = None,
         payload: dict | None = None,
         **extra_payload: Any,
-    ) -> ChatResult:
-        """One enriched, non-streaming call.
+    ) -> CallResult:
+        """One enriched, non-streaming CHAT call.
 
         Declare an ``intent`` (Roadstead picks the model) or a ``model`` (a pin,
         treated as a constraint on routing). Everything a model understands —
@@ -328,16 +441,124 @@ class AsyncRoadsteadClient:
         so turns the deadline into a hard wall, where a computed one is a budget
         the streaming path may extend while tokens are still arriving.
         """
-        body = _chat_body(
-            messages=messages, intent=intent, model=model, requires=requires,
+        body = _envelope(
+            messages=messages, payload_type=PAYLOAD_CHAT, intent=intent,
+            model=model, requires=requires,
             exclude=exclude, kind=kind, min_context=min_context, prefer=prefer,
             priority=priority, interactive=interactive, deadline_s=deadline_s,
             allow_degrade=allow_degrade, allow_spill=allow_spill,
             call_site=call_site, session_id=session_id, turn_id=turn_id,
+            caller_id=caller_id, request_id=request_id, agent_id=agent_id,
             stream=False, payload=payload, extra_payload=extra_payload)
-        resp = await self._client.post(ROUTE_CHAT, json=body,
-                                       headers=self._headers())
-        return ChatResult(_raise_for_envelope(resp))
+        return CallResult(await self._post(body))
+
+    async def embed(
+        self,
+        *,
+        texts: str | list[str],
+        payload: dict | None = None,
+        **routing: Any,
+    ) -> CallResult:
+        """Embed one string or a list of them.
+
+        ::
+
+            r = await rs.embed(texts=["a chunk", "another"])
+            r.response["dense"]      # and `sparse`, and `colbert`, if the
+                                     # backend produces them
+
+        🚨 **This is the lossless embedding path, and ``/v1/embeddings`` is not.**
+        The OpenAI door must answer in OpenAI's ``{object, data, usage}``, which
+        has nowhere to put a hybrid embedder's sparse and colbert halves, so it
+        translates and drops them — deliberately, because ``/v1/*`` is
+        OpenAI-compatible and strictly so (``docs/api.md`` §1.1). Here the
+        backend's body arrives whole under :attr:`CallResult.response`.
+
+        ``**routing`` takes the same declarations :meth:`chat` does — ``model``,
+        ``requires``, ``priority``, ``deadline_s``, ``caller_id`` and the rest.
+        ``kind="embed"`` is supplied unless you pass one, and ``intent="embed"``
+        only if you declared nothing at all — see :func:`_routing`.
+        """
+        one = [texts] if isinstance(texts, str) else list(texts)
+        body = _envelope(
+            payload_type=PAYLOAD_EMBEDDING,
+            # BOTH dialects, for the reason `http_handlers.handle_openai_embeddings`
+            # gives: the hybrid shim reads `texts` and ignores unknown keys, an
+            # OpenAI-shaped embeddings server reads `input` and SIZES ITS REPLY
+            # from it. Sending only `texts` to the latter returns one vector for
+            # an N-input request — a well-formed list of the wrong length, which
+            # is worse than an error. The same normalized list goes in both, so
+            # they cannot disagree about content.
+            payload={"texts": one, "input": one, **(payload or {})},
+            **_routing(routing, method="embed", default_kind="embed"))
+        return CallResult(await self._post(body))
+
+    async def rerank(
+        self,
+        *,
+        query: str,
+        documents: list[str],
+        top_n: int | None = None,
+        payload: dict | None = None,
+        **routing: Any,
+    ) -> CallResult:
+        """Score ``documents`` against ``query`` with a cross-encoder.
+
+        ::
+
+            r = await rs.rerank(query="why is the queue deep?",
+                                documents=[c.text for c in candidates])
+            r.response["results"]    # [{"index": .., "relevance_score": ..}, ..]
+
+        🚨 **Rerank had NO route from this SDK, and none from anywhere, between
+        the removal of ``/v1/submit`` and 2026-09-02.** There is deliberately no
+        ``/v1/rerank`` door to add: OpenAI has no rerank shape to be compatible
+        with, so a new ``/v1/*`` route would be Roadstead's own API wearing
+        OpenAI's version number. This is the route.
+
+        ``**routing`` as in :meth:`embed`, with ``kind``/``intent`` defaulting
+        to ``rerank``.
+        """
+        inner: dict = {"query": query, "documents": list(documents)}
+        if top_n is not None:
+            inner["top_n"] = int(top_n)
+        inner.update(payload or {})
+        body = _envelope(
+            payload_type=PAYLOAD_RERANK, payload=inner,
+            **_routing(routing, method="rerank", default_kind="rerank"))
+        return CallResult(await self._post(body))
+
+    async def call(
+        self,
+        *,
+        payload_type: str,
+        payload: dict,
+        **routing: Any,
+    ) -> CallResult:
+        """One enriched dispatch of an arbitrary payload type. The escape hatch.
+
+        🚨 Here so that a proxy newer than this SDK is usable rather than
+        gated — the same argument every typed view makes for keeping ``.raw``.
+        ``payload_type`` is sent verbatim and is not checked against
+        :data:`PAYLOAD_TYPES`; an unknown one is the server's to refuse, with a
+        sentence, rather than this SDK's to pre-empt with a stale literal.
+
+        A declaration is required (``intent``, ``model``, ``requires`` or
+        ``exclude``): there is no sensible default intent for a payload type this
+        SDK has never heard of, and guessing one would route the call somewhere.
+
+        🚨 Pass ``kind`` too when pinning a non-chat endpoint. Unlike
+        :meth:`embed` and :meth:`rerank`, this method supplies no ``kind`` — it
+        cannot know one — and the resolver's default is ``chat``, so a pin at an
+        embedder alone is refused with ``kind='chat'`` in the message.
+        """
+        owned = [k for k in _METHOD_OWNED if k in routing]
+        if owned:
+            raise TypeError(
+                f"call() takes `payload_type` and `payload` as named arguments "
+                f"— {', '.join(owned)} cannot also be passed through routing")
+        return CallResult(await self._post(_envelope(
+            payload_type=payload_type, payload=payload, **routing)))
 
     async def stream(
         self,
@@ -358,6 +579,9 @@ class AsyncRoadsteadClient:
         call_site: str = "",
         session_id: str | None = None,
         turn_id: str | None = None,
+        caller_id: str | None = None,
+        request_id: str | None = None,
+        agent_id: str | None = None,
         payload: dict | None = None,
         **extra_payload: Any,
     ) -> AsyncIterator[dict]:
@@ -379,12 +603,14 @@ class AsyncRoadsteadClient:
         caller that trusted the opening frame would be told the endpoint we
         intended rather than the one that answered.
         """
-        body = _chat_body(
-            messages=messages, intent=intent, model=model, requires=requires,
+        body = _envelope(
+            messages=messages, payload_type=PAYLOAD_CHAT, intent=intent,
+            model=model, requires=requires,
             exclude=exclude, kind=kind, min_context=min_context, prefer=prefer,
             priority=priority, interactive=interactive, deadline_s=deadline_s,
             allow_degrade=allow_degrade, allow_spill=allow_spill,
             call_site=call_site, session_id=session_id, turn_id=turn_id,
+            caller_id=caller_id, request_id=request_id, agent_id=agent_id,
             stream=True, payload=payload, extra_payload=extra_payload)
         async with self._client.stream(
                 "POST", ROUTE_CHAT, json=body, headers=self._headers()) as resp:
@@ -540,8 +766,17 @@ class RoadsteadClient:
     def plan(self, **kwargs: Any) -> Plan:
         return self._run(self._async.plan(**kwargs))
 
-    def chat(self, **kwargs: Any) -> ChatResult:
+    def chat(self, **kwargs: Any) -> CallResult:
         return self._run(self._async.chat(**kwargs))
+
+    def embed(self, **kwargs: Any) -> CallResult:
+        return self._run(self._async.embed(**kwargs))
+
+    def rerank(self, **kwargs: Any) -> CallResult:
+        return self._run(self._async.rerank(**kwargs))
+
+    def call(self, **kwargs: Any) -> CallResult:
+        return self._run(self._async.call(**kwargs))
 
     def stream(self, **kwargs: Any) -> Iterator[dict]:
         """Blocking iteration over the enriched stream frames.
@@ -589,8 +824,10 @@ __all__ = [
     "RoadsteadClient",
     "enrichment_from",
     "Attribution",
+    "CallResult",
     "ChatResult",
     "Enrichment",
+    "Identity",
     "ModelInfo",
     "Plan",
     "Timing",

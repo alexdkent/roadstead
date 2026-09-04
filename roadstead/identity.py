@@ -65,6 +65,7 @@ from __future__ import annotations
 import base64
 import binascii
 import calendar
+import dataclasses
 import hashlib
 import ipaddress
 import logging
@@ -116,7 +117,7 @@ def parse_identity_spec(
     spec: str,
     *,
     default_priority: LLMPriority = LLMPriority.P3_INGESTION,
-) -> tuple[str, LLMPriority, float | None, bool, bool]:
+) -> tuple[str, LLMPriority, float | None, bool, bool, bool]:
     """Parse ``agent_id[:priority][:min_timeout_s][:admin][:readonly]`` in any order.
 
     ONE grammar for both registries, deliberately: an operator configuring
@@ -132,6 +133,11 @@ def parse_identity_spec(
     * ``readonly``             → NARROWS that scope to reads (see below)
     * anything numeric         → ``min_timeout_s`` (the per-identity deadline floor)
     * anything else            → a priority, by NAME
+
+    Returns a sixth element, ``priority_declared`` — whether a band was actually
+    written. 🚨 The band alone cannot say: an operator who wrote none and one who
+    wrote ``P3_INGESTION`` produce identical values, and only the first should
+    fall through to the agent's own configured band.
 
     🚨 ``readonly`` only ever NARROWS. It is meaningless without ``admin`` —
     a non-admin identity cannot reach an admin surface to read it either — and
@@ -151,6 +157,7 @@ def parse_identity_spec(
     parts = [p.strip() for p in spec.split(":")]
     agent_id = parts[0]
     priority = default_priority
+    priority_declared = False
     min_timeout_s: float | None = None
     admin = False
     readonly = False
@@ -170,6 +177,7 @@ def parse_identity_spec(
             pass
         try:
             priority = LLMPriority.coerce(segment)
+            priority_declared = True
         except ValueError:
             logger.warning(
                 "identity spec %r: ignoring unrecognised segment %r (expected a "
@@ -180,7 +188,7 @@ def parse_identity_spec(
             "identity spec %r: 'readonly' has no effect without 'admin' — it "
             "NARROWS the admin scope to reads and does not grant anything",
             spec)
-    return agent_id, priority, min_timeout_s, admin, readonly
+    return agent_id, priority, min_timeout_s, admin, readonly, priority_declared
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +207,18 @@ class Principal:
     agent_id: str
     #: Band the caller lands in when it declares no priority of its own.
     priority: LLMPriority = LLMPriority.P3_INGESTION
+    #: 🚨 Whether :attr:`priority` above was WRITTEN by an operator or is just
+    #: this dataclass's default. Nothing could tell those apart before
+    #: 2026-09-02, and the difference is load-bearing: a credential that stated
+    #: no band should fall through to the resolved agent's own configured one
+    #: (``agents.yaml``'s ``default_priority``), while one that stated a band
+    #: must keep it. Without the flag every identity looks like it declared
+    #: P3_INGESTION, so the fall-through can never fire.
+    #:
+    #: It matters more since delegation: ONE key can act as many ``agent_id``s
+    #: (``may_assert``), and a single priority on that key cannot express
+    #: "interactive for `chat-agent`, background for `forum-agent`". Per-agent config can.
+    priority_declared: bool = False
     #: Per-identity MINIMUM deadline, applied ONLY to a deadline the proxy chose
     #: (see ``lifecycle.handle_submit``). ``None`` means no floor.
     min_timeout_s: float | None = None
@@ -217,6 +237,26 @@ class Principal:
     source: str = "ip"
     #: A public label for the key that authenticated, safe to log. NEVER the key.
     key_id: str | None = None
+    #: 🚨 The ``agent_id``s this credential may ASSERT for a request, beyond its
+    #: own. Empty — the default, and what every key was before 2026-09-02 —
+    #: means it may assert none, and a body-declared ``agent_id`` is ignored
+    #: exactly as §1.5 rule 3 has always said.
+    #:
+    #: This exists because the SECURITY boundary and the FAIRNESS boundary are
+    #: not the same object. A fleet's callers are often sibling processes inside
+    #: one container, sharing a filesystem and a uid — one trust domain — while
+    #: DRR fair-share, quotas and spend all need to tell `knowledge_store` from
+    #: `chat-agent`. Issuing one key per fair-share identity puts N secrets where one
+    #: boundary is, which is labelling wearing authentication's clothes; issuing
+    #: one and collapsing the identities destroys the fairness the weights exist
+    #: for. An ALLOWLIST is the third answer: the caller still cannot claim an
+    #: identity its operator did not grant, which is the property that made
+    #: refusing a body-declared ``agent_id`` right in the first place.
+    #:
+    #: 🚨 Read it through ``IdentityResolver.delegate`` and NOWHERE else — a
+    #: second place deciding what a credential permits is the ``_remote_ip``
+    #: shape, and ``tests/test_identity_delegation.py`` fails if one appears.
+    may_assert: frozenset[str] = frozenset()
 
     @property
     def authenticated(self) -> bool:
@@ -416,11 +456,13 @@ class KeyRegistry:
         secret: str | None = None,
         key_sha256: str | None = None,
         priority: LLMPriority = LLMPriority.P3_INGESTION,
+        priority_declared: bool = False,
         min_timeout_s: float | None = None,
         admin: bool = False,
         admin_readonly: bool = False,
         expires_at: float | None = None,
         bind: "list[str] | tuple[str, ...] | None" = None,
+        may_assert: "list[str] | tuple[str, ...] | None" = None,
         key_id: str | None = None,
         source: str = "file",
         bootstrap: bool = False,
@@ -482,14 +524,26 @@ class KeyRegistry:
                 "api key %s for %r sets admin_readonly without admin — it "
                 "NARROWS the admin scope and grants nothing on its own",
                 label, agent_id)
+        assertable = frozenset(
+            n for n in (str(x).strip() for x in (may_assert or ())) if n)
+        if agent_id in assertable:
+            # Harmless, and worth saying: a key can always be itself. Listing it
+            # reads as though the entry grants something, and an operator who
+            # believes the list is exhaustive would then wonder why the key still
+            # works without it.
+            logger.warning(
+                "api key %s lists its own agent_id %r in may_assert — a key is "
+                "always itself; the entry is redundant", label, agent_id)
         self._by_digest[digest] = Principal(
             agent_id=agent_id,
             priority=priority,
+            priority_declared=priority_declared,
             min_timeout_s=min_timeout_s,
             admin=admin,
             admin_readonly=admin_readonly,
             source="api_key",
             key_id=label,
+            may_assert=assertable,
         )
         if bootstrap:
             self._bootstrap.add(digest)
@@ -603,6 +657,12 @@ class KeyRegistry:
                     "key_id": p.key_id,
                     "agent_id": p.agent_id,
                     "priority": p.priority.name,
+                    # 🚨 Whether that band was WRITTEN or is the default. The
+                    # name alone cannot say, and the management plane needs the
+                    # difference: a key that declared nothing defers to the
+                    # agent's configured band, one that declared P3_INGESTION
+                    # pins it. Identical values, opposite meanings.
+                    "priority_declared": p.priority_declared,
                     "min_timeout_s": p.min_timeout_s,
                     "admin": p.admin,
                     # Reported beside `admin` rather than folded into it: an
@@ -626,6 +686,11 @@ class KeyRegistry:
                     # The addresses it may be presented from. Empty = anywhere,
                     # which is what every key was before 2026-09-01.
                     "bind": list(self._credential.get(d, {}).get("bind", ())),
+                    # 🚨 Not a credential and safe to publish — it is a list of
+                    # fair-share names, and an operator auditing "who can bill
+                    # whom" cannot answer that from anywhere else. Sorted so two
+                    # reads of an unchanged registry are byte-identical.
+                    "may_assert": sorted(p.may_assert),
                 }
                 for d, p in self._by_digest.items()
             ),
@@ -672,10 +737,12 @@ class KeyRegistry:
                         "[:readonly])")
                 continue
             secret, spec = entry.split("=", 1)
-            agent_id, priority, floor, admin, readonly = parse_identity_spec(
+            (agent_id, priority, floor, admin, readonly,
+             priority_declared) = parse_identity_spec(
                 spec.strip())
             self.register(secret=secret.strip(), agent_id=agent_id,
-                          priority=priority, min_timeout_s=floor, admin=admin,
+                          priority=priority, priority_declared=priority_declared,
+                          min_timeout_s=floor, admin=admin,
                           admin_readonly=readonly, source="env")
 
     #: Fields a keys-file entry may set. 🚨 A key NOT in this set is reported,
@@ -685,7 +752,7 @@ class KeyRegistry:
     #: already had once each.
     _FILE_FIELDS = frozenset({
         "id", "agent_id", "key", "key_sha256", "priority", "min_timeout_s",
-        "admin", "admin_readonly", "expires_at", "bind",
+        "admin", "admin_readonly", "expires_at", "bind", "may_assert",
     })
 
     def _load_file(self, path: str | Path) -> None:
@@ -722,6 +789,7 @@ class KeyRegistry:
                     known=sorted(self._FILE_FIELDS),
                 )
             priority = LLMPriority.P3_INGESTION
+            priority_declared = entry.get("priority") is not None
             if entry.get("priority") is not None:
                 try:
                     priority = LLMPriority.coerce(entry["priority"])
@@ -736,15 +804,41 @@ class KeyRegistry:
                 secret=(str(entry["key"]) if entry.get("key") else None),
                 key_sha256=(str(entry["key_sha256"]) if entry.get("key_sha256") else None),
                 priority=priority,
+                priority_declared=priority_declared,
                 min_timeout_s=(float(floor) if floor is not None else None),
                 admin=bool(entry.get("admin", False)),
                 admin_readonly=bool(entry.get("admin_readonly", False)),
                 expires_at=_expiry_from_file(entry),
                 bind=_binding_from_file(entry),
+                may_assert=_may_assert_from_file(entry),
                 key_id=(str(entry["id"]) if entry.get("id") else None),
             ):
                 loaded += 1
         logger.info("loaded %d API key(s) from %s", loaded, p)
+
+
+def _may_assert_from_file(entry: dict) -> list[str]:
+    """``may_assert`` from a keys-file entry: a list of ``agent_id`` strings.
+
+    🚨 A scalar is accepted as a one-element list, because ``may_assert: chat-agent`` is
+    what an operator granting exactly one delegation writes, and refusing it
+    would be pedantry over a shape with one obvious reading. Anything that is
+    neither is a WARNING and NO delegation — a widening that failed open would
+    be strictly worse than one that failed closed, which is the same argument
+    ``_binding_from_file`` makes for a narrowing.
+    """
+    raw = entry.get("may_assert")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "api keys file: entry %r has may_assert %r, which is not a list of "
+            "agent_ids — the key is loaded with NO delegation rather than with "
+            "an unreadable one", entry.get("id"), raw)
+        return []
+    return [n for n in (str(x).strip() for x in raw) if n]
 
 
 def _expiry_from_file(entry: dict) -> float | None:
@@ -1227,6 +1321,7 @@ class IdentityResolver:
         return Resolution(principal=Principal(
             agent_id=agent_id,
             priority=priority,
+            priority_declared=self.acl.priority_declared(ip),
             min_timeout_s=self.acl.min_timeout_s(ip),
             # 🚨 AN ADDRESS NEVER GRANTS ADMIN. Changed 2026-09-01; this used
             # to read `self.acl.is_admin(ip, ...)` and that was the whole bug.
@@ -1250,6 +1345,57 @@ class IdentityResolver:
             admin_readonly=False,
             source="ip",
         ))
+
+    def delegate(self, principal: Principal, declared: Any) -> Resolution:
+        """Apply a request's declared ``agent_id`` to an already-resolved caller.
+
+        🚨 **The ONLY place ``Principal.may_assert`` is read.** A second site
+        deciding what a credential permits is the ``_remote_ip`` shape, and this
+        one decides who is billed; ``tests/test_identity_delegation.py`` fails
+        by AST if the field is read anywhere else.
+
+        Four cases, and the asymmetry between the last two is the design:
+
+        * **Nothing declared** → the principal, unchanged.
+        * **Declared, and permitted** → a principal wearing the declared
+          ``agent_id`` and keeping everything else. The credential's own band,
+          deadline floor, admin scope and ``key_id`` all survive: delegation
+          moves the FAIR-SHARE identity and grants no policy. A key that could
+          hand out its own admin scope by naming a different agent would be the
+          self-asserted ``agent_id`` bug restored rather than fenced.
+        * **Declared, and the key has an allowlist that does not contain it** →
+          **403**, naming the permitted set. The operator opted into delegation,
+          so an assertion outside it is a caller error worth a sentence — and
+          the alternative, quietly charging the key's own identity, is the
+          silencer shape: the work happens, the bill lands somewhere else, and
+          the DRR weights an operator tuned are silently not the ones in force.
+        * **Declared, and the key has NO allowlist** → **ignored**, exactly as
+          §1.5 rule 3 has always said, and NOT refused. 🚨 This is deliberately
+          not the case above. An operator who wrote ``may_assert`` asked for the
+          field to mean something; an operator who did not has a caller sending
+          a field it carried over from ``/v1/submit``, and 403-ing that would
+          break every such caller on upgrade for a claim that was already inert.
+          The difference is whether anybody opted in.
+
+        An address-derived principal never delegates: ``may_assert`` is empty on
+        one by construction, so it lands in the ignored case without a special
+        rule.
+        """
+        name = str(declared or "").strip()
+        if not name or name == principal.agent_id:
+            return Resolution(principal=principal)
+        if not principal.may_assert:
+            return Resolution(principal=principal)
+        if name not in principal.may_assert:
+            return Resolution(denial=Denial(
+                code="access_denied", status=403,
+                message=(f"this credential may not act as {name!r} — it is "
+                         f"permitted {sorted(principal.may_assert)}. The "
+                         f"agent_id is the fair-share key, the quota holder and "
+                         f"the budget holder, so acting as another caller is a "
+                         f"grant its operator makes, not one it takes.")))
+        return Resolution(principal=dataclasses.replace(
+            principal, agent_id=name))
 
     def _binding_denial(self, request: Any, found: "KeyLookup") -> Denial | None:
         """Whether this key may be presented from THIS address. None to proceed.

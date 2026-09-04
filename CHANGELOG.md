@@ -8,6 +8,221 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Added — the durable record names the credential behind a delegated call
+
+`proxy_completions` gains a nullable `key_id`, written **only when a delegation was exercised** —
+NULL means the credential IS the `agent_id`, which was an invariant of that table until `may_assert`
+landed and is still true of every undelegated row. So a value is always meaningful rather than a
+column populated on everything and read on nothing. "Which key ran up `chat-agent`'s bill?" had no answer
+otherwise: the admin audit trail records admin *actions*, never dispatch. Migrated through the
+existing `_add_missing_columns` path.
+
+### Changed — `GET /rs/v1/admin/callers` reports a band per KEY
+
+**Breaking for a reader of that response:** `identities.keys` was a list of key-id strings and is now
+a list of objects — `{key_id, priority, overrides_agent_default, may_assert}`. The bundled admin UI
+is updated in the same change.
+
+*Why:* `declared_priority` reports the agent's configured band, and a credential that names its own
+beats it. Many keys to one `agent_id` is a supported shape, so **the band in force for a caller has
+no single value** — and a scalar field claiming otherwise is the operator plane stating something
+untrue about itself, on the surface whose stated purpose is `declared` beside `in_force`. Measured
+before the change: agent config `P4_HYGIENE`, credential `P1_TURN_SUPPORT`, request ran
+`P1_TURN_SUPPORT`, plane reported `P4_HYGIENE`.
+
+🚨 A key that declares no band reports `priority: null`, not the grammar's default. "Declared
+`P3_INGESTION`" and "declared nothing" resolve to the same value and mean opposite things; reporting
+the value for both is how this surface would go straight back to being wrong.
+
+### Added — the enriched response says who the call was BILLED to (`identity`)
+
+A fifth block on `/rs/v1/chat`'s envelope and on the streaming `done` frame:
+`{agent_id, declared?, honoured?}` — `docs/api.md` §1.7.3.
+
+🚨 **It exists because "ignored" must not also mean "invisible".** A credential with no delegation
+grant IGNORES a body-declared `agent_id` rather than refusing it (§1.5 rule 3) — right, because
+refusing would break every caller carrying a `/v1/submit` habit over a claim that was already inert.
+But without disclosure the caller asks to be `chat-agent`, the work is billed to the credential, and both
+outcomes are a 200 with otherwise identical bodies: the `finish_reason` silencer in another costume.
+The resolved `agent_id` is always reported; `declared`/`honoured` appear only when the caller
+declared something, on the same rule that keeps `substituted` from firing on every intent-routed call
+and meaning nothing. No band, queue position or demotion (§1.6) — the value is either the caller's
+own word or the name on the credential it presented.
+
+`roadstead.client` exposes it as `CallResult.identity`. Two bugs found while building it, both by
+tests rather than by reading: the door overwrites `agent_id` with the resolved identity before
+`handle_submit` sees it, so the caller's raw word has to travel separately (`declared_agent_id`); and
+the first cut read it with `or`, which cannot tell a door that set `""` from one that set nothing —
+so `declared` echoed the resolved identity and `honoured` was `true` on every call, the field firing
+on everything and meaning nothing. The same truthiness trap the priority block is compared against
+`None` to avoid.
+
+The golden behaviour baseline was regenerated; the diff is the new block and nothing else, which is
+the check that it is additive on the wire.
+
+### Added — a key may act as callers its operator granted (`may_assert`)
+
+Landed 2026-09-02. A key entry gains `may_assert`, a list of `agent_id`s the credential is permitted
+to act as; a request declaring one of them in `agent_id` is billed to that caller, one outside a
+non-empty grant is a **403**, and a key with no grant ignores the field exactly as before.
+
+🚨 **This partially reverses §1.5 rule 3, deliberately, and the reason is measurement.** Rule 3 —
+"a key overrides a body-declared `agent_id`" — assumed the security boundary and the fairness
+boundary are the same object. On the fleet this proxy is replacing they are not: **38 distinct
+`agent_id`s across 197k requests/week, most of them sibling processes inside one container** sharing
+a filesystem and a uid. One trust domain, 38 fair shares. Forcing those to be one thing goes wrong
+in both directions — one key per `agent_id` puts 38 secrets where one boundary is, which is
+labelling wearing authentication's clothes; one key with the identities collapsed destroys what the
+DRR weights exist for, and the largest caller alone is 47% of all traffic.
+
+An allowlist is the third answer and it keeps the property that made rule 3 right: **a caller still
+cannot claim an identity nobody gave it.** The operator writes the names, the caller picks among
+them, and anything else is refused rather than quietly re-billed to the credential — which would put
+the work on one caller's bill and the record on another's, with nothing anywhere to say so.
+
+- **Delegation moves the fair-share key and grants no policy.** Band, deadline floor, admin scope
+  and `key_id` stay the credential's. A key that could hand itself a different policy by naming
+  another agent would be the self-asserted `agent_id` bug restored rather than fenced.
+- **The decision lives in `IdentityResolver.delegate` and nowhere else**, guarded by AST — a second
+  place deciding what a credential permits is the `_remote_ip` shape, and this one decides who is
+  billed. `lifecycle.handle_submit` is where the fair-share key is finally settled; it re-resolves
+  from the request rather than trusting what a door put in the body, so it stays safe on its own.
+  🚨 The first cut delegated in the door only and `lifecycle` silently undid it — caught by an
+  end-to-end test that reads the **completion row**, not the response.
+- **`may_assert` is the one editable field on the management plane that WIDENS** rather than narrows.
+  Recorded in §3.3 as the exception to §1.6's write boundary rather than left for a reader to notice.
+  A rotation carries the grant to its successor (unlike the expiry, which is an absolute instant).
+- **An unreadable grant fails CLOSED** — a widening that failed open would be strictly worse than none.
+
+`docs/api.md` §1.7.2 also gains the table this raised: **one agent doing two kinds of work has three
+knobs, and only the third needs a grant** — `priority` for when it runs, `call_site`/`caller_id` for
+how it is labelled, `agent_id` for whose budget it spends. The third is not a redundant spelling of
+the first, because the **DRR balance is one per `agent_id`, shared across bands**: priority orders
+the work, but a background storm still drains the balance its own interactive turns spend from.
+
+### Fixed — `agents.yaml`'s `default_priority` did nothing, and the dashboard said it did
+
+Landed 2026-09-02, found while answering "can a caller be given a static band in configuration?"
+The answer was yes — and the obvious place to write one was dead.
+
+`default_priority` was parsed by `load_agent_configs`, in the `agents.yaml` allowlist, editable
+through `PATCH /rs/v1/admin/quotas`, and **reported by the management plane as the caller's
+`declared_priority`** beside its `effective_priority`. The request path never read it. So an
+operator setting `default_priority: P4_HYGIENE` got nothing and was told by the dashboard that it had
+worked — a gap between two sources for one question, with the operator-facing surface naming the one
+not in force. Their defaults did not even agree: `P1_TURN_SUPPORT` in the config dataclass,
+`P3_INGESTION` in the identity grammar.
+
+🚨 **The cause was duplication, not a missing lookup.** Every door pre-filled `priority` into the
+internal submit body from `principal.priority`, so by the time `handle_submit` looked, the
+*identity's default* was indistinguishable from a band the *caller* had asked for — and nothing
+below could tell they were different. The doors now pass only what the caller declared
+(`enriched._priority_for` returns `None` for "nothing declared"; the OpenAI doors send no `priority`
+at all, which is also what §1.1 says they read), and `handle_submit` owns the one precedence:
+
+    1. the REQUEST's `priority`/`interactive`   2. the CREDENTIAL's declared band
+    3. the AGENT's configured `default_priority`   4. the built-in default
+
+Step 2 above step 3 because a credential is the stronger statement. Step 3 exists at all because
+**since delegation one key can act as many `agent_id`s**, and a single band on that key cannot say
+"interactive for `chat-agent`, background for `forum-agent`" — per-agent config can, and it is where the DRR
+weights that go with those bands already live.
+
+`Principal.priority_declared` is new and is what makes step 2-vs-3 decidable: a credential that wrote
+`P3_INGESTION` and one that wrote nothing produced identical values, so the fall-through could never
+fire. `parse_identity_spec` returns it as a sixth element and both registries carry it.
+
+Guarded by `tests/test_priority_precedence.py`, including an AST guard on the **cause** — a door that
+starts pre-filling the band again breaks the precedence silently, and the behavioural tests would
+still pass for any caller whose credential happens to agree with its config.
+
+### Changed — `/v1/chat/completions` will not grow a `priority` field
+
+Settled 2026-09-02, against a week of real traffic rather than by argument: **196k requests, 3.6%
+through an OpenAI-shaped door**, and every one of that 3.6% an off-box caller using a third-party
+OpenAI client — precisely the callers that cannot set a non-standard body field, which is why they
+are on that door. The other 96.4% declare `priority` explicitly and land on `/rs/v1/chat`, where it
+is read. The field would be added for a population that is empty by construction, at the cost of the
+one promise `/v1/*` makes. What those callers need is a **standing** band, and a key already carries
+one (`agent_id:P1_TURN_SUPPORT`). §1.1 records the reasoning, and that if a per-call band is ever
+genuinely wanted there the precedent is a **header**, like `X-Timeout-S`, never a body field.
+
+
+### Added — the SDK can express all three payload types, and rerank has a route again
+
+Landed 2026-09-02. `roadstead.client` gained `embed()`, `rerank()` and `call()` on both the async and
+blocking clients, and now sends **`payload_type`** on the enriched envelope.
+
+🚨 **The server has read `payload_type` since before this repository existed** (`enriched.py`,
+defaulting to `chat_completion`) and the SDK sent it never. So the SDK could make chat calls only,
+and — since `POST /v1/submit` was removed with Workstream C — **rerank had no route from anywhere at
+all**. Not a broken feature: an unreachable one, with nothing on either side to report it.
+
+There is deliberately **no new `/v1/rerank` door**. OpenAI has no rerank shape to be compatible with,
+so such a route would be Roadstead's own API wearing somebody else's version number. `/rs/v1/chat` is
+the enriched door, not the chat door; it is named for the route.
+
+`payload_type` is **not** `kind` and neither defaults from the other: `kind` declares what sort of
+endpoint may serve the request, `payload_type` declares what shape the body is. The typed methods
+supply the `kind` their payload type implies (an `embed()` call is *for* an embedder) but supply an
+`intent` only when the caller declared nothing — filling one in beside a caller's own pin would be
+the SDK making a routing declaration on their behalf.
+
+🚨 **`embed()` is the lossless embedding path and `/v1/embeddings` is deliberately not.** The OpenAI
+door translates a hybrid embedder's `{dense, sparse, colbert}` into OpenAI's `{object, data, usage}`,
+which has nowhere to put the sparse and colbert halves, and drops them. That stays. `CallResult.response`
+is the backend's body untouched, so the enriched path carries all three whole. Documented as a split
+in `docs/api.md` §1.1 rather than left for a caller to discover by comparing two vector counts.
+
+### Fixed — the SDK stopped dropping `caller_id` and `request_id`
+
+Both are read by `enriched.py` and neither was ever sent. Losing `caller_id` silently collapsed every
+SDK caller into one call site, so `/v1/fleet/top-callers` and `/v1/fleet/cache-attribution` went flat
+— a missing **measurement**, which reports itself to nobody. Losing `request_id` meant a caller's own
+correlation id never reached the durable record, so their log line and our completion row could not
+be joined.
+
+Guarded by `tests/test_enriched_envelope_coverage.py`, which is the test that would have caught all
+three losses on the day the SDK was written: every field the enriched door reads off the request body
+must be one `_envelope` can put on the wire. 🚨 Its SDK half **calls** the builder rather than reading
+it by AST — the AST version passed against a simulated regression that wrapped every assignment in
+`if False:`, because AST does not care whether a line can run.
+
+### Changed — `ChatResult` is now `CallResult`
+
+**Not breaking:** `ChatResult` remains as an alias and existing code needs no edit.
+
+*Why:* `/rs/v1/chat` carries chat completions, embeddings and reranks. A result class named for one
+of the three tells an embedding caller they are holding the wrong object.
+
+### Changed — `docs/api.md` §1.1 is one table per DOOR
+
+**Breaking for a reader, which is the only way this section could break.** It documented the **union
+of two doors** as though it were one: `priority`, `agent_id`, `call_site`, `session_id`, `turn_id`,
+`caller_id` and `request_id` were listed as accepted body fields on `POST /v1/chat/completions`, and
+`handle_openai_chat` reads exactly two things off that body — `model` and `timeout_s`. The identity
+fields are overwritten from the resolved principal; the rest travel to the backend inside the payload.
+
+🚨 **It was almost right, which is worse than plainly wrong.** `caller_id` and `request_id` genuinely
+are read — on `/rs/v1/chat` — and `grammar` and `thinking` genuinely do work on the OpenAI door,
+because `correction.py` reads them off the payload downstream. A migrator sending `agent_id` here got
+no error, no effect, and no hint that the field they wanted was on the other door. Rows were split
+per door and annotated with a **Read by** column, not deleted.
+
+Two smaller corrections in the same pass: `X-Request-ID` is **not** read inbound (it is a header
+Roadstead emits southbound; the section said "forwarded", which reads as an invitation to send one),
+and `/v1/embeddings`' `model` field is echoed in the response and selects nothing.
+
+`tests/test_openai_door_fields.py` pins each table against what the named module actually reads, in
+both directions — a row claiming a reader that does not read it, and a handler growing a body field
+the table does not list. Observed going red for both, and for a third: a field §1.1 sends a migrator
+to `/rs/v1/chat` for that `enriched.py` stops reading.
+
+`roadstead/agents.yaml` lost its claim that identity can arrive "on `/v1/submit`, from the body". That
+door was removed precisely because a body could claim any `agent_id`, including one with a better
+DRR weight.
+
+
 ### Fixed — the request log grew without bound, and could fail a live request
 
 Landed 2026-09-02. `RequestLogger` opened its file in append mode and never rotated, while calling

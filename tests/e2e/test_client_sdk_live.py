@@ -109,14 +109,10 @@ async def test_the_narrowing_flags_ride_the_envelope(sdk):
     response by design (declining produces the same local service), so what is
     pinned here is that the SDK builds the envelope the server reads — the
     server-side effect is `test_substitution_narrowing.py`."""
-    from roadstead.client._client import _chat_body
+    from roadstead.client._client import _envelope
 
-    body = _chat_body(
-        messages=[{"role": "user", "content": "secret"}], intent="chat",
-        model="", requires=None, exclude=None, kind="", min_context=0, prefer="",
-        priority=None, interactive=None, deadline_s=None,
-        allow_degrade=None, allow_spill=False, call_site="", session_id=None,
-        turn_id=None, stream=False, payload=None, extra_payload=None)
+    body = _envelope(messages=[{"role": "user", "content": "secret"}],
+                     intent="chat", allow_spill=False)
     assert body["substitution"] == {"spill": False}
     assert "degrade" not in body["substitution"]   # undeclared stays undeclared
     result = await sdk.chat(intent="chat", allow_spill=False,
@@ -132,14 +128,10 @@ async def test_the_sdk_can_speak_the_negative_constraint(sdk):
     refused by the server rather than dropped, so the SDK that can send one must
     also surface that refusal as `UnroutableError` rather than as a bare 404.
     """
-    from roadstead.client._client import _chat_body
+    from roadstead.client._client import _envelope
 
-    body = _chat_body(
-        messages=[{"role": "user", "content": "hi"}], intent="chat",
-        model="", requires=None, exclude=["tier1"], kind="", min_context=0,
-        prefer="", priority=None, interactive=None, deadline_s=None,
-        allow_degrade=None, allow_spill=None, call_site="", session_id=None,
-        turn_id=None, stream=False, payload=None, extra_payload=None)
+    body = _envelope(messages=[{"role": "user", "content": "hi"}],
+                     intent="chat", exclude=["tier1"])
     assert body["exclude"] == ["tier1"]
     assert "exclude" not in body["payload"]
 
@@ -156,11 +148,122 @@ async def test_unknown_response_fields_stay_reachable():
     """A proxy newer than the SDK must be usable, not lossy. A client that
     discards what it does not recognise turns every server-side addition into an
     invisible loss whose cause nobody can distinguish from it not being sent."""
-    from roadstead.client import ChatResult
+    from roadstead.client import CallResult
 
-    r = ChatResult({"status": "ok", "request_id": "req_1",
+    r = CallResult({"status": "ok", "request_id": "req_1",
                     "attribution": {"endpoint": "tier3", "future_field": 7},
                     "brand_new_block": {"x": 1}})
     assert r.attribution.endpoint == "tier3"
     assert r.attribution.raw["future_field"] == 7
     assert r.raw["brand_new_block"] == {"x": 1}
+
+
+# --------------------------------------------------------------------------- #
+# The other two payload types
+# --------------------------------------------------------------------------- #
+
+async def test_embed_reaches_the_embedder_and_the_body_comes_back_whole(sdk):
+    """🚨 The claim being checked is that `response` is UNTOUCHED.
+
+    `CallResult.response` is documented as the backend's own body, and the whole
+    argument for routing embeddings through `/rs/v1/chat` rather than
+    `/v1/embeddings` rests on it: the OpenAI door translates a hybrid reply into
+    `{object, data, usage}` and drops the sparse and colbert halves, because
+    OpenAI's schema has nowhere to put them. So this asserts the bytes, not that
+    a call succeeded — a translation that quietly happened here would look
+    identical to success.
+    """
+    r = await sdk.embed(texts=["a chunk", "another chunk"])
+    assert r.attribution.endpoint == "embed"
+    # The fake speaks the OpenAI-shaped dialect, so what proves "untouched" is
+    # that the backend's own envelope survives rather than being re-wrapped:
+    # `object`/`data`/`model`/`usage` are the FAKE's keys, not ours.
+    assert r.response["object"] == "list"
+    assert len(r.response["data"]) == 2
+    assert r.response["data"][0]["embedding"]
+    assert "usage" in r.response and "model" in r.response
+
+
+async def test_embed_sends_both_dialects_and_the_declaration_defaults(sdk):
+    """Both `texts` and `input`, for `handle_openai_embeddings`' reason: a shim
+    reads `texts` and ignores the rest, an OpenAI-shaped server reads `input` and
+    SIZES ITS REPLY from it — so sending only `texts` returns one vector for an
+    N-input request, a well-formed list of the wrong length.
+
+    And `intent` is supplied only when the caller declared nothing: §1.7.1
+    requires a declaration, but a caller who pinned must keep their pin.
+    """
+    from roadstead.client._client import _envelope, _routing
+
+    body = _envelope(
+        payload_type="embedding", payload={"texts": ["a"], "input": ["a"]},
+        **_routing({}, method="embed", default_kind="embed"))
+    assert body["payload"]["texts"] == body["payload"]["input"] == ["a"]
+    assert body["intent"] == "embed"
+    # 🚨 A pin keeps its pin and gains NO intent — but it does gain the `kind`,
+    # without which it resolves against `kind='chat'` and 404s at an embedder.
+    assert _routing({"model": "embed"}, method="embed",
+                    default_kind="embed") == {"model": "embed", "kind": "embed"}
+    # An explicit kind is never overwritten.
+    assert _routing({"kind": "chat"}, method="embed",
+                    default_kind="embed")["kind"] == "chat"
+
+    # And the pin path really resolves, which is what the unit assertions above
+    # only make plausible.
+    assert (await sdk.embed(texts=["a"], model="embed")
+            ).attribution.endpoint == "embed"
+
+
+async def test_rerank_has_a_route_again(sdk):
+    """🚨 Rerank had NO route from anywhere between the removal of `/v1/submit`
+    and the SDK learning to send `payload_type`. There is deliberately no
+    `/v1/rerank` door: OpenAI has no rerank shape to be compatible with."""
+    r = await sdk.rerank(query="why is the queue deep?",
+                         documents=["about queues", "about cheese", "about DRR"])
+    assert r.attribution.endpoint == "rerank"
+    results = r.response["results"]
+    assert len(results) == 3
+    assert all("relevance_score" in row for row in results)
+    # Descending by construction in the fake; what matters here is that the
+    # scores arrived at all, which is the thing the missing route cost.
+    assert results[0]["relevance_score"] > results[-1]["relevance_score"]
+
+
+async def test_the_raw_passthrough_sends_a_payload_type_verbatim(sdk):
+    """`call()` is the escape hatch, so it must NOT validate against this SDK's
+    transcribed literal — a proxy newer than the SDK stays usable. What it does
+    refuse is a payload type with no routing declaration."""
+    # 🚨 `kind` is explicit here: `call()` supplies none, deliberately — it
+    # cannot know one for a payload type it has never heard of — and the
+    # resolver's default is `chat`.
+    r = await sdk.call(payload_type="embedding", model="embed", kind="embed",
+                       payload={"texts": ["x"], "input": ["x"]})
+    assert r.response["object"] == "list"
+
+    with pytest.raises(TypeError, match="payload_type"):
+        await sdk.embed(texts=["x"], payload_type="rerank")
+
+
+async def test_the_correlation_fields_reach_the_durable_record(proxy, sdk):
+    """`caller_id` and `request_id` were read by the server and sent by nobody.
+    Losing `caller_id` flattens `/v1/fleet/top-callers` — a missing MEASUREMENT,
+    which reports itself to no one, so it is checked against the record."""
+    r = await sdk.chat(intent="chat", caller_id="kv4.recall",
+                       request_id="caller-own-id-1",
+                       messages=[{"role": "user", "content": "hi"}],
+                       max_tokens=8)
+    # 🚨 The caller's own id BECOMES the request id (`QueuedRequest.create`
+    # mints one only when none was sent), which is what makes a caller's log
+    # line joinable to our completion row — and is exactly what was lost while
+    # the SDK sent no `request_id` at all.
+    assert r.request_id == "caller-own-id-1"
+    # The completion row is written by the single background writer, so the
+    # flush is not a convenience — without it this reads an empty table and
+    # passes or fails on timing.
+    proxy.svc._queue_db.flush()
+    row = proxy.svc._queue_db._conn.execute(
+        "SELECT caller_id, session_id FROM proxy_completions WHERE request_id=?",
+        (r.request_id,)).fetchone()
+    assert row is not None, "no completion row for the request the SDK just made"
+    assert row[0] == "kv4.recall", (
+        f"the caller_id the SDK sent did not reach the durable record: {row[0]!r}")

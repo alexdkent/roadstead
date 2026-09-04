@@ -63,6 +63,7 @@ from .enriched import (
     attribution,
     cost_block,
     enrichment_headers,
+    identity_block,
     timing_block,
 )
 from .observability import MetricsSample, RequestLogRecord
@@ -278,6 +279,7 @@ def _enriched_done(state, req, event: dict) -> dict:
         # the one that answered — the exact silent-substitution failure this API
         # exists to close.
         "attribution": attrib,
+        "identity": identity_block(req),
         "timing": timing_block(
             req,
             queue_wait_ms=event.get("queue_wait_ms") or 0.0,
@@ -390,15 +392,64 @@ class Lifecycle:
         # it identifies a host, not a caller, and several callers legitimately
         # share one — so there it is the body that knows better, and the
         # registration only supplies what the body left out.
+        # 🚨 …unless the credential's operator GRANTED the declared name. This
+        # is the one place the fair-share key is finally decided — the doors
+        # above resolve it too, for their own `caller_id`/`call_site` defaults
+        # and for `/rs/v1/plan`, which never reaches here — and it re-resolves
+        # from the REQUEST rather than trusting what a door put in the body, so
+        # `handle_submit` stays safe on its own rather than safe by virtue of
+        # who calls it. Both sites call `IdentityResolver.delegate`, which is
+        # the single decision; delegating a name already granted is idempotent,
+        # so the two compose to the same answer.
+        # The credential's OWN identity, kept so a delegation can be recognised
+        # as one below — after `delegate` the principal wears the delegated name
+        # and the two are indistinguishable.
+        credential_agent_id = principal.agent_id
         if principal.authenticated:
+            delegated = self.state.identity.delegate(
+                principal, body.get("agent_id"))
+            if not delegated.ok:
+                denial = delegated.denial
+                if wire == WIRE_OPENAI:
+                    return _openai_error(denial.message, denial.openai_type,
+                                         denial.status, code=denial.code)
+                return JSONResponse(
+                    {"status": "error", "error": denial.message,
+                     "code": denial.code},
+                    status_code=denial.status)
+            principal = delegated.principal
             agent_id = principal.agent_id
         else:
             agent_id = str(body.get("agent_id") or principal.agent_id)
-        # Same rule for the band: a declared priority wins, the identity's
-        # default fills in. Compared against None rather than truthiness —
-        # P0_REALTIME is 0, and `or` would silently promote realtime traffic to
-        # the identity default.
+        # Same rule for the band, in four steps, narrowest first. Compared
+        # against None rather than truthiness — P0_REALTIME is 0, and `or` would
+        # silently promote realtime traffic to the identity default.
+        #
+        #   1. what this REQUEST declared            (`priority` in the body)
+        #   2. what the CREDENTIAL declared          (`agent_id:P1_TURN_SUPPORT`)
+        #   3. what the AGENT's config declares      (agents.yaml default_priority)
+        #   4. the built-in default
+        #
+        # 🚨 Step 3 did nothing at all until 2026-09-02. `agents.yaml`'s
+        # `default_priority` was parsed, editable through the admin plane and
+        # REPORTED by it as the caller's `declared_priority` — while the request
+        # path read only the credential's. Two sources for one question, the
+        # management plane naming the one that was not in force, and their
+        # defaults did not even match (P1_TURN_SUPPORT in the config dataclass,
+        # P3_INGESTION in the identity grammar).
+        #
+        # 🚨 Step 3 sits BELOW step 2 rather than above it because a credential
+        # is the stronger statement — but it has to exist, because since
+        # delegation ONE key can act as many `agent_id`s (`may_assert`), and a
+        # single band on that key cannot say "interactive for `chat-agent`, background
+        # for `forum-agent`". Per-agent config can, and it is where the weights that
+        # go with those bands already live.
         declared_priority = body.get("priority")
+        if declared_priority is None and principal.priority_declared:
+            declared_priority = principal.priority
+        if declared_priority is None:
+            agent_cfg = self.state.config.agent_config(agent_id)
+            declared_priority = getattr(agent_cfg, "default_priority", None)
         if declared_priority is None:
             declared_priority = principal.priority
         # 🚨 Recorded BEFORE the standing is taken, so a caller's own request
@@ -557,6 +608,27 @@ class Lifecycle:
             turn_id=body.get("turn_id"),
             caller_id=body.get("caller_id"),
             request_id=body.get("request_id"),
+            # As SENT, before delegation resolved it — the disclosure needs the
+            # caller's own word, not the answer, and by this point `agent_id`
+            # above IS the answer.
+            #
+            # 🚨 Set by the DOOR, with no fallback to `agent_id`. The first cut
+            # wrote `body.get("declared_agent_id") or body.get("agent_id")`, and
+            # `or` cannot tell a door that deliberately set "" (the caller
+            # declared nothing) from one that set nothing at all — so every
+            # ordinary call reported `declared` equal to its own resolved
+            # identity and `honoured: true`, which is the field firing on
+            # everything and meaning nothing. The same truthiness trap the
+            # priority block above is compared against None to avoid.
+            declared_agent_id=str(body.get("declared_agent_id") or ""),
+            # 🚨 Only when a delegation actually happened. Empty means the
+            # credential IS the `agent_id`, which is the pre-delegation
+            # invariant and still true of almost every row — so a value here is
+            # always meaningful rather than a column that is populated on
+            # everything and read on nothing.
+            asserted_by_key_id=(
+                principal.key_id or ""
+                if agent_id != credential_agent_id else ""),
             now=now,
             # Carries the caller-vs-proxy deadline distinction resolved above
             # into the streaming path, which is the ONLY consumer: a deadline we
@@ -971,6 +1043,7 @@ class Lifecycle:
             "status": "ok" if ok else "error",
             "request_id": req.request_id,
             "attribution": attrib,
+            "identity": identity_block(req),
             "timing": timing_block(
                 req,
                 queue_wait_ms=result.get("queue_wait_ms") or 0.0,
@@ -2183,6 +2256,9 @@ class Lifecycle:
             finish_reason=finish_reason,
             kind=kind,
             cached_tokens=cached_tokens,
+            # Empty -> NULL, which is the meaningful default: the credential IS
+            # the agent_id. Only a delegated call carries a value.
+            key_id=req.asserted_by_key_id or None,
         )
 
         # Log

@@ -179,8 +179,43 @@ class Usage(_Wrapped):
         return float(self.raw.get("slot_seconds") or 0.0)
 
 
-class ChatResult(_Wrapped):
-    """One completed enriched call."""
+class Identity(_Wrapped):
+    """Who the call was BILLED to, and whether that is who you asked for.
+
+    🚨 :attr:`honoured` is the reason this exists. A credential with no
+    delegation grant IGNORES a declared ``agent_id`` rather than refusing it —
+    correct, and invisible without this block: the call succeeds, the work is
+    billed to the credential, and the response is otherwise identical.
+    """
+
+    @property
+    def agent_id(self) -> str:
+        """The fair-share key this call was actually charged to."""
+        return str(self.raw.get("agent_id") or "")
+
+    @property
+    def declared(self) -> str:
+        """What the caller asked to be billed as, or ``""`` if it asked for
+        nothing."""
+        return str(self.raw.get("declared") or "")
+
+    @property
+    def honoured(self) -> bool:
+        """🚨 False when a declared ``agent_id`` was NOT applied — the
+        credential had no grant for that name. True when nothing was declared,
+        because there was nothing to ignore.
+        """
+        return bool(self.raw.get("honoured", True))
+
+
+class CallResult(_Wrapped):
+    """One completed enriched call — a chat completion, an embedding or a rerank.
+
+    🚨 Named for the ROUTE rather than for chat since 2026-09-02. ``/rs/v1/chat``
+    carries all three payload types (``payload_type`` in the envelope), so a
+    result class called ``ChatResult`` would have told an embedding caller they
+    were holding the wrong object. ``ChatResult`` remains as an alias below.
+    """
 
     @property
     def request_id(self) -> str:
@@ -188,17 +223,24 @@ class ChatResult(_Wrapped):
 
     @property
     def response(self) -> dict:
-        """The backend's own OpenAI-shaped body, untouched.
+        """The backend's own body, **untouched** — whatever shape it is.
 
         Nested rather than merged, so a caller never has to tell Roadstead's
-        fields from the model's.
+        fields from the model's. 🚨 And deliberately unparsed: an OpenAI
+        ``chat.completion``, the hybrid embedder's ``{dense, sparse, colbert}``
+        and a reranker's ``{results: [...]}`` all arrive here whole. The OpenAI
+        door cannot do that — ``/v1/embeddings`` must translate a hybrid reply
+        into ``{object, data, usage}``, which has nowhere to put the sparse and
+        colbert halves, and drops them (``docs/api.md`` §1.1). This is the path
+        that does not.
         """
         return dict(self.raw.get("response") or {})
 
     @property
     def content(self) -> str:
-        """The first choice's message content, or ``""``. A convenience — read
-        ``response`` for anything real (tool calls, multiple choices)."""
+        """The first choice's message content, or ``""``. A convenience for a
+        CHAT call — read ``response`` for anything real (tool calls, multiple
+        choices), and for every non-chat payload type."""
         try:
             return self.response["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError):
@@ -209,12 +251,24 @@ class ChatResult(_Wrapped):
         return Attribution(self.raw.get("attribution"))
 
     @property
+    def identity(self) -> Identity:
+        """Who this was billed to — and whether a declared `agent_id` applied."""
+        return Identity(self.raw.get("identity"))
+
+    @property
     def timing(self) -> Timing:
         return Timing(self.raw.get("timing"))
 
     @property
     def usage(self) -> Usage:
         return Usage(self.raw.get("usage"))
+
+
+#: The name :class:`CallResult` had until 2026-09-02, when ``/rs/v1/chat``
+#: stopped being chat-only. Kept because the SDK is public surface and an alias
+#: costs a caller who never noticed the rename nothing. ``CHANGELOG.md`` records
+#: it; new code should say ``CallResult``.
+ChatResult = CallResult
 
 
 class ModelInfo(_Wrapped):

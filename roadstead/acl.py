@@ -47,6 +47,11 @@ class _Registration:
     agent_id: str
     priority: LLMPriority
     min_timeout_s: float | None = None
+    #: Whether the operator actually WROTE a band on this entry. See
+    #: ``identity.Principal.priority_declared`` — an entry that named none falls
+    #: through to the resolved agent's own configured band rather than pinning
+    #: everyone who arrives by address to the grammar's default.
+    priority_declared: bool = False
 
 
 class IPIdentityMap:
@@ -122,8 +127,9 @@ class IPIdentityMap:
         agent_id: str,
         priority: LLMPriority = LLMPriority.P3_INGESTION,
         min_timeout_s: float | None = None,
+        priority_declared: bool = False,
     ) -> None:
-        reg = _Registration(agent_id, priority, min_timeout_s)
+        reg = _Registration(agent_id, priority, min_timeout_s, priority_declared)
         try:
             net = ipaddress.ip_network(ip_or_subnet, strict=False)
             if net.prefixlen == net.max_prefixlen:
@@ -212,6 +218,12 @@ class IPIdentityMap:
         if the IP is not registered."""
         reg = self._lookup(remote_ip)
         return None if reg is None else (reg.agent_id, reg.priority)
+
+    def priority_declared(self, remote_ip: str) -> bool:
+        """Whether this address's entry NAMED a band, as opposed to taking the
+        grammar's default. See ``identity.Principal.priority_declared``."""
+        reg = self._lookup(remote_ip)
+        return bool(reg is not None and reg.priority_declared)
 
     def min_timeout_s(self, remote_ip: str) -> float | None:
         """Per-identity MINIMUM deadline floor in seconds, or None when this
@@ -386,10 +398,12 @@ class IPIdentityMap:
                             var, entry)
                     continue
                 ip_part, spec = entry.split("=", 1)
-                agent_id, priority, floor, admin, readonly = parse_identity_spec(
+                (agent_id, priority, floor, admin, readonly,
+                 priority_declared) = parse_identity_spec(
                     spec.strip())
                 ip_part = ip_part.strip()
-                acl.register(ip_part, agent_id, priority, min_timeout_s=floor)
+                acl.register(ip_part, agent_id, priority, min_timeout_s=floor,
+                             priority_declared=priority_declared)
                 if admin:
                     acl.register_admin_net(ip_part, readonly=readonly)
 

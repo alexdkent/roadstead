@@ -20,6 +20,20 @@ carries what an OpenAI shape cannot: declare an *intent* instead of a model,
 get a recommended deadline before you call, and be told afterwards what actually
 served you, whether that differed from what you asked for, and what it cost.
 
+## Three payload types, one route
+
+``/rs/v1/chat`` is the ENRICHED door, not the chat door: ``chat``, ``embed`` and
+``rerank`` all dispatch through it and differ only by the ``payload_type`` on the
+envelope. ``call`` sends any other payload type a newer proxy may accept.
+
+🚨 **``embed`` is the LOSSLESS embedding path.** The OpenAI door,
+``/v1/embeddings``, must answer in OpenAI's ``{object, data, usage}``, which has
+nowhere to put a hybrid embedder's sparse and colbert halves — so it translates
+and drops them, deliberately and permanently, because ``/v1/*`` is
+OpenAI-compatible and strictly so. Here the backend's body arrives whole under
+``result.response``. And ``rerank`` has no OpenAI spelling at all: this is its
+only route.
+
 ## Three things it does that a hand-rolled ``httpx.post`` would not
 
 🚨 **It classifies errors on the CODE.** ``docs/api.md`` §2.2: the substrings in
@@ -70,8 +84,10 @@ from ._client import (
 from ._errors import AuthError, RoadsteadError, UnroutableError
 from ._models import (
     Attribution,
+    CallResult,
     ChatResult,
     Enrichment,
+    Identity,
     ModelInfo,
     Plan,
     Price,
@@ -82,6 +98,10 @@ from ._wire import (
     CONTEXT_OVERFLOW_MARKER,
     DEFERRABLE_CODES,
     ERROR_CODES,
+    PAYLOAD_CHAT,
+    PAYLOAD_EMBEDDING,
+    PAYLOAD_RERANK,
+    PAYLOAD_TYPES,
     PREFIX,
 )
 
@@ -96,8 +116,10 @@ __all__ = [
     "UnroutableError",
     # typed views
     "Attribution",
+    "CallResult",
     "ChatResult",
     "Enrichment",
+    "Identity",
     "ModelInfo",
     "Plan",
     "Price",
@@ -107,5 +129,9 @@ __all__ = [
     "CONTEXT_OVERFLOW_MARKER",
     "DEFERRABLE_CODES",
     "ERROR_CODES",
+    "PAYLOAD_CHAT",
+    "PAYLOAD_EMBEDDING",
+    "PAYLOAD_RERANK",
+    "PAYLOAD_TYPES",
     "PREFIX",
 ]

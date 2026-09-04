@@ -45,7 +45,20 @@ _MSG = [{"role": "user", "content": "hi"}]
 #: Keys a typed view reads that the wire is not expected to carry on every
 #: response, with the reason. 🚨 An entry here is a claim that the ABSENCE is
 #: correct, not that nobody has looked.
-_OPTIONAL: dict[str, str] = {}
+_OPTIONAL: dict[str, str] = {
+    # 🚨 Both are ABSENT BY DESIGN unless the caller declared an `agent_id`,
+    # and `identity_block` omits them deliberately: a `honoured: true` on every
+    # ordinary call is the field firing on everything and meaning nothing —
+    # the same rule that keeps `substituted` off intent-routed calls.
+    #
+    # Not reachable from this fixture either: the proxy runs in its own thread
+    # and granting a delegation means registering a key on ITS registry, which
+    # is single-loop state this repo forbids touching from another thread. The
+    # populated shape is pinned on the wire instead, in
+    # `test_enriched_api.py::test_an_ignored_delegation_is_visible_on_the_wire`.
+    "Identity.declared": "only sent when the caller declared an agent_id",
+    "Identity.honoured": "only sent when the caller declared an agent_id",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -125,6 +138,13 @@ def wire(live_proxy) -> Iterator[dict]:  # noqa: F811
         models = rs.models()
         plan = rs.plan(intent="reasoning", est_in=2000, est_out=200)
         chat = rs.chat(intent="fast-chat", messages=_MSG, max_tokens=16)
+        # 🚨 All three payload types, because `/rs/v1/chat` carries all three
+        # and there is ONE `CallResult` for them. A block the server assembles
+        # only for a chat completion would otherwise read as its default for
+        # every embedding caller, which is the same silence this file exists
+        # for one dimension over.
+        emb = rs.embed(texts=["a chunk"])
+        rr = rs.rerank(query="q", documents=["a", "b"])
         done = [f for f in rs.stream(intent="fast-chat", messages=_MSG,
                                      max_tokens=16)
                 if f.get("type") == "done"]
@@ -132,14 +152,20 @@ def wire(live_proxy) -> Iterator[dict]:  # noqa: F811
     yield {
         "ModelInfo": [m.raw for m in models],
         "Plan": [plan.raw],
-        "ChatResult": [chat.raw],
+        "CallResult": [chat.raw, emb.raw, rr.raw],
+        "Identity": [chat.raw.get("identity") or {},
+                     emb.raw.get("identity") or {},
+                     rr.raw.get("identity") or {}],
         # 🚨 Both sites, because the SDK has one `Attribution` and one `Timing`
         # for the non-streaming envelope and the `done` frame. If they ever
         # diverge, a caller reading `result.attribution.endpoint` gets it from
         # one and an empty string from the other.
-        "Attribution": [chat.attribution.raw, done[0].get("attribution") or {}],
-        "Timing": [chat.timing.raw, done[0].get("timing") or {}],
-        "Usage": [chat.usage.raw, done[0].get("usage") or {}],
+        "Attribution": [chat.attribution.raw, emb.attribution.raw,
+                        rr.attribution.raw, done[0].get("attribution") or {}],
+        "Timing": [chat.timing.raw, emb.timing.raw, rr.timing.raw,
+                   done[0].get("timing") or {}],
+        "Usage": [chat.usage.raw, emb.usage.raw, rr.usage.raw,
+                  done[0].get("usage") or {}],
         # Ditto: ONE `Price` class, two wire sites.
         "Price": [m.raw.get("price") or {} for m in models]
                  + [(chat.attribution.raw.get("cost") or {}).get("price") or {}],
@@ -152,8 +178,8 @@ def wire(live_proxy) -> Iterator[dict]:  # noqa: F811
 
 def test_the_extractor_actually_found_the_fields():
     """A reader that silently returns nothing makes every assertion below pass."""
-    assert set(PATHS) >= {"Attribution", "ChatResult", "ModelInfo", "Plan",
-                          "Price", "Timing", "Usage"}, sorted(PATHS)
+    assert set(PATHS) >= {"Attribution", "CallResult", "Identity", "ModelInfo",
+                          "Plan", "Price", "Timing", "Usage"}, sorted(PATHS)
     assert "substitution.spill.allowed" in PATHS["Plan"], (
         "the two-level read in `Plan.may_spill` was not resolved — the "
         "extractor has gone back to reading one level")
@@ -175,7 +201,10 @@ def test_every_field_the_sdk_reads_is_on_the_wire(wire):
         samples = wire.get(cls)
         assert samples, f"no real response is mapped for {cls} — map one or drop it"
         for path in sorted(PATHS[cls]):
-            if path in _OPTIONAL:
+            # Keyed `Class.path`, not bare `path`: two views can read a field of
+            # the same name, and exempting one of them must not silently exempt
+            # the other. A bare key is still honoured for the pre-existing form.
+            if f"{cls}.{path}" in _OPTIONAL or path in _OPTIONAL:
                 continue
             for i, raw in enumerate(samples):
                 if not _present(raw, path):

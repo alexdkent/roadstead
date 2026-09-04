@@ -222,7 +222,7 @@ EDITABLE_QUOTA_FIELDS = (
 #: Fields a ``POST /rs/v1/admin/keys`` accepts.
 _KEY_CREATE_FIELDS = frozenset({
     "agent_id", "priority", "min_timeout_s", "admin", "admin_readonly",
-    "expires_in_s", "bind", "id", "key_sha256",
+    "expires_in_s", "bind", "may_assert", "id", "key_sha256",
 })
 
 #: Fields a ``POST /rs/v1/admin/keys/{key_id}/rotate`` accepts.
@@ -462,6 +462,7 @@ class AdminOverlay:
                 expires_at=(None if entry.get("expires_at") is None
                             else float(entry["expires_at"])),
                 bind=entry.get("bind") or [],
+                may_assert=entry.get("may_assert") or [],
                 key_id=str(entry["id"]) if entry.get("id") else None,
                 source="runtime",
             )
@@ -732,6 +733,41 @@ def _binding(raw: Any) -> list[str]:
     return out
 
 
+def _may_assert(raw: Any, agent_id: str) -> list[str]:
+    """Coerce ``may_assert`` — the ``agent_id``s this key may act as.
+
+    🚨 This is the one editable field on this plane that WIDENS rather than
+    narrows, and it is the exception §1.6's write boundary has to state rather
+    than pretend away: every other quota knob moves a share, a band or a cap,
+    and none of them can express a rejection. This one names identities a
+    credential may bill. It is safe for the same reason `substitution` is safe:
+    the operator grants, the caller can only ever spend inside the grant, and a
+    name outside it is a 403 rather than a silent re-bill.
+
+    A string is accepted as a one-element list (`may_assert: "chat-agent"` has one
+    reading). A key listing its OWN agent_id is refused rather than trimmed —
+    it reads as though the list is exhaustive, and an operator who believes that
+    will later wonder why the key still works with the entry removed.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise Invalid("may_assert must be a list of agent_id strings")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise Invalid(f"may_assert entries must be non-empty strings, "
+                          f"got {item!r}")
+        name = item.strip()
+        if name == agent_id:
+            raise Invalid(
+                f"may_assert lists the key's own agent_id {name!r} — a key is "
+                f"always itself, and listing it suggests the grant is needed")
+        if name not in out:
+            out.append(name)
+    return out
+
+
 def validate_key_rotate(body: Any) -> dict:
     """Coerce and check a rotation body. Raises :class:`Invalid`.
 
@@ -826,6 +862,8 @@ def validate_key_create(body: Any) -> dict:
             "expires_in_s", body["expires_in_s"], allow_zero=False)
     if body.get("bind") is not None:
         out["bind"] = _binding(body["bind"])
+    if body.get("may_assert") is not None:
+        out["may_assert"] = _may_assert(body["may_assert"], out["agent_id"])
     if body.get("id") is not None:
         key_id = str(body["id"]).strip()
         if not key_id:
@@ -1034,6 +1072,7 @@ class ManagementApi:
             admin_readonly=bool(spec.get("admin_readonly", False)),
             expires_at=expires_at,
             bind=spec.get("bind"),
+            may_assert=spec.get("may_assert"),
             key_id=spec.get("id"),
             source="runtime",
         )
@@ -1057,6 +1096,13 @@ class ManagementApi:
             "admin_readonly": bool(spec.get("admin_readonly", False)),
             "expires_at": expires_at,
             "bind": spec.get("bind", []),
+            # 🚨 Load-bearing. Without it the grant lives only in memory: the
+            # key keeps working after a restart, its delegation does not, and a
+            # delegated caller is then billed to the CREDENTIAL rather than
+            # refused — because a key with no grant IGNORES a declared agent_id
+            # (§1.5 rule 3). Silent re-billing, arriving at a restart unrelated
+            # to anything anyone changed.
+            "may_assert": spec.get("may_assert", []),
             "created_at": time.time(),
         }
         self.state.admin_overlay.add_key(record)
@@ -1072,6 +1118,10 @@ class ManagementApi:
             "admin_readonly": record["admin_readonly"],
             "expires_at": record["expires_at"],
             "bind": record["bind"],
+            # The widening field belongs in the trail more than any of the
+            # others: it is the one that says which callers this credential may
+            # bill.
+            "may_assert": record["may_assert"],
             "secret_generated": secret is not None,
         })
         outcome = await self._persist()
@@ -1085,6 +1135,10 @@ class ManagementApi:
             "admin_readonly": record["admin_readonly"],
             "expires_at": record["expires_at"],
             "bind": record["bind"],
+            # Echoed because it WIDENS. An operator granting a credential the
+            # right to bill other callers should see the grant confirmed by the
+            # call that made it, not have to go and read a list.
+            "may_assert": record["may_assert"],
             **outcome,
         }
         if secret is not None:
@@ -1236,6 +1290,12 @@ class ManagementApi:
             admin_readonly=bool(row["admin_readonly"]),
             expires_at=expires_at,
             bind=row["bind"],
+            # A successor inherits the delegation grant, unlike the expiry: the
+            # grant is a POLICY the operator made about this identity, and a
+            # rotation that silently dropped it would break every delegated
+            # caller at the moment the key changed. (The expiry is an absolute
+            # instant, which is why THAT one cannot be inherited — see below.)
+            may_assert=row.get("may_assert") or [],
             key_id=successor_id,
             source="runtime",
         )
@@ -1261,6 +1321,10 @@ class ManagementApi:
             "admin_readonly": bool(row["admin_readonly"]),
             "expires_at": expires_at,
             "bind": list(row["bind"]),
+            # Inherited, unlike the expiry: the grant is a policy the operator
+            # made about this identity, and a rotation that dropped it would
+            # break every delegated caller at the moment the key changed.
+            "may_assert": list(row.get("may_assert") or ()),
             "created_at": time.time(),
             "rotated_from": key_id,
         }
@@ -1329,6 +1393,7 @@ class ManagementApi:
             "admin_readonly": landed.get("admin_readonly"),
             "expires_at": landed.get("expires_at"),
             "bind": landed.get("bind", []),
+            "may_assert": landed.get("may_assert", []),
             "predecessor": predecessor,
             **outcome,
         }
@@ -1496,10 +1561,18 @@ class ManagementApi:
     def _callers_view(self) -> list[dict]:
         budgets = {row["agent_id"]: row for row in self.state.budget_mgr.snapshot()}
         spends = {row["agent_id"]: row for row in self.state.spend.snapshot()}
-        keys_by_agent: dict[str, list[str]] = {}
-        for row in self.state.identity.keys.snapshot():
-            keys_by_agent.setdefault(str(row["agent_id"]), []).append(
-                str(row["key_id"]))
+        # 🚨 Objects, not bare ids, since 2026-09-02. `declared_priority` below
+        # reports the AGENT's configured band — step 3 of the precedence in
+        # `docs/api.md` §1.1 — and a credential that names its own band (step 2)
+        # beats it. Many keys to one `agent_id` is a documented shape, so "the
+        # band in force for this caller" HAS NO SINGLE VALUE, and a scalar field
+        # claiming otherwise is the operator surface stating something untrue on
+        # the plane whose whole purpose is `declared` beside `in_force`. So the
+        # agent's default stays where it is and every key says what it does.
+        keys_snapshot = self.state.identity.keys.snapshot()
+        keys_by_agent: dict[str, list[dict]] = {}
+        for row in keys_snapshot:
+            keys_by_agent.setdefault(str(row["agent_id"]), []).append(row)
         addresses = _acl_addresses(self.state.acl)
 
         out: list[dict] = []
@@ -1511,7 +1584,26 @@ class ManagementApi:
             out.append({
                 "agent_id": agent_id,
                 "identities": {
-                    "keys": keys_by_agent.get(agent_id, []),
+                    "keys": [
+                        {
+                            "key_id": k["key_id"],
+                            # None when the key names no band — which is not the
+                            # same statement as naming P3_INGESTION, and is
+                            # exactly what `priority_declared` exists to keep
+                            # separable. A null here means "this key defers to
+                            # the agent's configured default".
+                            "priority": (k["priority"] if k.get("priority_declared")
+                                         else None),
+                            "overrides_agent_default": bool(
+                                k.get("priority_declared")
+                                and k["priority"] != cfg.default_priority.name),
+                            # The delegation grant, beside the band, because
+                            # both answer "what can this credential do that the
+                            # agent config does not say".
+                            "may_assert": k.get("may_assert", []),
+                        }
+                        for k in keys_by_agent.get(agent_id, [])
+                    ],
                     "addresses": addresses.get(agent_id, []),
                 },
                 "quota": self._quota_view(agent_id),

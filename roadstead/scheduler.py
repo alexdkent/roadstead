@@ -54,6 +54,19 @@ class QueuedRequest:
     session_id: str | None = None
     turn_id: str | None = None
     caller_id: str | None = None
+    #: 🚨 The ``agent_id`` the CALLER asked to be billed as, as sent — kept
+    #: beside the resolved ``agent_id`` above rather than replacing it, because
+    #: the two differing is exactly what has to be disclosed. A key with no
+    #: delegation grant IGNORES a declared name (docs/api.md §1.5 rule 3), which
+    #: is right for upgrade compatibility and would be a silencer if it were
+    #: also invisible: the caller asks to be `chat-agent`, is billed as the credential,
+    #: and gets a 200 either way. Empty means the caller declared nothing.
+    declared_agent_id: str = ""
+    #: 🚨 The credential that asserted ``agent_id``, set ONLY when a delegation
+    #: grant was exercised — empty means the credential IS the ``agent_id``.
+    #: Recorded so "which key ran up this caller's bill" has an answer; before
+    #: delegation the question could not arise.
+    asserted_by_key_id: str = ""
     timeout_s: float = 180.0
     stream: bool = False
     # context_per_slot observed at ADMISSION (0 = not captured, e.g. a
@@ -160,6 +173,8 @@ class QueuedRequest:
         request_id: str | None = None,
         now: float | None = None,
         deadline_is_default: bool = False,
+        declared_agent_id: str = "",
+        asserted_by_key_id: str = "",
         requested: str = "",
         allow_degrade: bool | None = None,
         allow_spill: bool | None = None,
@@ -184,6 +199,8 @@ class QueuedRequest:
             session_id=session_id,
             turn_id=turn_id,
             caller_id=caller_id,
+            declared_agent_id=declared_agent_id,
+            asserted_by_key_id=asserted_by_key_id,
             stream=bool(payload.get("stream")),
             deadline_is_default=deadline_is_default,
             # Falls back to the endpoint the caller named, so a caller that

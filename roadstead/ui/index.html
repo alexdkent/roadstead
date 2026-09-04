@@ -978,7 +978,21 @@ function callerRow(row) {
       // billing problem from a caller in a loop — and the fix is different.
       pick(row, "rate.over") === true
         ? el("div", {}, tag("over rate — one band down, no paid spill", "warn")) : null),
-    el("td", {}, keys.map((k) => [tag(k), " "]), addresses.map((a) => [tag(a), " "]),
+    // 🚨 Each key is an OBJECT since 2026-09-02, not a bare id: a credential can
+    // name its own band, which beats the agent's configured one (docs/api.md
+    // §1.1). A key that does is marked here, because the "band" column next
+    // door reports the AGENT's default and would otherwise be the only number
+    // an operator sees — stating a band this caller does not run in.
+    el("td", {}, keys.map((k) => [
+        tag(k.key_id),
+        k.overrides_agent_default
+          ? tag("band " + k.priority, "warn")
+          : null,
+        (k.may_assert && k.may_assert.length)
+          ? tag("acts as " + k.may_assert.join(", "))
+          : null,
+        " ",
+      ]), addresses.map((a) => [tag(a), " "]),
       (!keys.length && !addresses.length) ? el("span", { class: "tag", text: "unregistered" }) : null),
     el("td", { class: "num" }, quotaCell(row, "weight")),
     // 🚨 Declared band beside effective band. This pair is the ONE place a
