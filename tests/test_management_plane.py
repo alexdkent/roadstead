@@ -73,7 +73,15 @@ class _Req:
         # about what the plane does, not about who may reach it;
         # `headers={}` still means "no credential" for the ones that
         # care. See tests/admin_key.py.
-        self.headers = dict(ADMIN_HEADERS) if headers is None else headers
+        self.headers = dict(ADMIN_HEADERS) if headers is None else dict(headers)
+        # 🚨 identity.py's CSRF gate (`admin_denial._csrf_denial`) requires
+        # `Content-Type: application/json` on every mutating admin request as
+        # of 2026-09-04. A real caller sending a JSON body already sets this;
+        # this double calls the handler directly and skips the header a real
+        # HTTP client would add for free — default it here rather than at
+        # every call site, same reasoning as `ADMIN_HEADERS` above.
+        if method not in ("GET", "HEAD", "OPTIONS"):
+            self.headers.setdefault("Content-Type", "application/json")
         self.method = method
         self.query_params: dict = {}
         self.path_params = path_params or {}
@@ -224,6 +232,20 @@ def test_the_overlay_round_trips_through_its_store(tmp_path):
     assert [k["id"] for k in reloaded.keys] == ["k1"]
     assert reloaded.agents == {"batch": {"weight": 2.0}}
     assert reloaded.revoked == ["gone"]
+
+
+def test_the_overlay_file_is_written_owner_only(tmp_path):
+    """The store holds key DIGESTS, and this module's own doctrine (its module
+    docstring, above) is that a digest is a working credential for anyone who
+    can compute one against it — `key_sha256` enrols a key BY digest directly.
+    The file on disk gets the same care the wire format does."""
+    path = tmp_path / "admin.json"
+    overlay = AdminOverlay(path)
+    overlay.add_key({"id": "k1", "agent_id": "batch", "key_sha256": "a" * 64})
+    overlay.persist()
+
+    mode = path.stat().st_mode & 0o777
+    assert mode == 0o600, f"admin overlay is {oct(mode)}, expected 0600"
 
 
 def test_a_corrupt_store_does_not_block_startup(tmp_path):

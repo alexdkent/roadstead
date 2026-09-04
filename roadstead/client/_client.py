@@ -294,7 +294,7 @@ class AsyncRoadsteadClient:
 
     ::
 
-        async with AsyncRoadsteadClient("http://proxy:42100", api_key=...) as c:
+        async with AsyncRoadsteadClient("http://proxy:42161", api_key=...) as c:
             plan = await c.plan(intent="reasoning", est_in=8_000)
             result = await c.chat(intent="reasoning",
                                   messages=[{"role": "user", "content": "hi"}])

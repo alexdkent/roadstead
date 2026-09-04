@@ -224,7 +224,10 @@ async def test_the_admin_plane_needs_BOTH_a_reachable_address_and_a_credential(m
     monkeypatch.setenv("ROADSTEAD_API_KEYS", "sk-ops=ops:admin")
     svc = _PSvc(_PCfg())
     lan, loop = "192.0.2.42", "127.0.0.1"
-    key = {"X-API-Key": "sk-ops"}
+    # 🚨 identity.py's CSRF gate requires `Content-Type: application/json` on
+    # every mutating admin request; harmless on the GET calls this dict is
+    # also reused for below.
+    key = {"X-API-Key": "sk-ops", "Content-Type": "application/json"}
 
     # Off-net, with a VALID admin key: still refused. The gate is the network.
     resp = await svc.handle_admin_endpoint_pause(

@@ -28,6 +28,10 @@ class _Req:
         self.client = _Client()
         self.method = method
         self.headers: dict = dict(ADMIN_HEADERS)
+        # 🚨 identity.py's CSRF gate (`admin_denial._csrf_denial`) requires
+        # `Content-Type: application/json` on every mutating admin request.
+        if method not in ("GET", "HEAD", "OPTIONS"):
+            self.headers.setdefault("Content-Type", "application/json")
         self._body = body
 
     async def json(self):

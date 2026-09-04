@@ -21,6 +21,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A future history guard needs commit history to look at, not just
+          # the tip — a shallow (default depth-1) checkout would make it pass
+          # by having nothing to check.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -52,5 +57,53 @@ jobs:
           fi
           echo "library core is clean"
 
+      - name: Scrub sweep
+        # Named explicitly, not left to whatever `pytest -q` happens to
+        # collect — a future addopts/deselect change that narrows the default
+        # run must not be able to silence the one guard standing between this
+        # repo and a private topology leak (docs/corpus_and_scrub_plan.md).
+        run: pytest -q --timeout=120 -v tests/test_scrub_sweep.py
+
       - name: Test
         run: pytest -q --timeout=120
+
+  package:
+    # A separate job, not a step on `test`: it proves the artifact an
+    # end user actually installs (a built wheel, in a venv that never saw
+    # this checkout's editable install) rather than the `pip install -e`
+    # environment every other step runs in. `pip install -e` cannot catch a
+    # missing package-data entry or an accidentally-excluded module — the
+    # editable install reads straight off the source tree.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          python -m build --wheel
+
+      - name: Install the wheel into a fresh venv
+        run: |
+          python -m venv /tmp/roadstead-install-check
+          /tmp/roadstead-install-check/bin/pip install --upgrade pip
+          /tmp/roadstead-install-check/bin/pip install dist/*.whl
+
+      - name: The installed package imports, runs, and carries its data files
+        run: |
+          /tmp/roadstead-install-check/bin/python -c "import roadstead, roadstead.client; print('import OK')"
+          /tmp/roadstead-install-check/bin/python -m roadstead --help
+          /tmp/roadstead-install-check/bin/python -c "
+          import pathlib, roadstead
+          root = pathlib.Path(roadstead.__file__).parent
+          for rel in ('ui/index.html', 'models.yaml', 'agents.yaml'):
+              path = root / rel
+              assert path.exists(), f'missing from the installed wheel: {rel}'
+          print('package-data OK')
+          "

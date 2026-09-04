@@ -582,6 +582,7 @@ the name on the credential it presented, and neither is news to the caller.
   "status": "ok",
   "request_id": "req_...",
   "response": { "...the backend's OpenAI-shaped body, untouched..." },
+  "corrections": [],
   "attribution": {
     "requested": "reasoning", "resolved": "tier3", "endpoint": "tier3",
     "substituted": false, "substitution": null,
@@ -617,6 +618,7 @@ the name on the credential it presented, and neither is news to the caller.
 | `timing.deadline_source` | `caller` when you supplied `deadline_s`, `computed` when Roadstead chose it. A behaviour difference, not a label: a computed deadline is a soft budget the streaming path may extend while tokens are still arriving; a supplied one is a hard wall. |
 | `timing.predicted_ms` | What the timeout model expected. `null` when the evidence is too thin. |
 | `usage.slot_seconds` | Backend occupancy — **the unit of DRR fairness**, and the number that explains scheduling in a way token counts cannot. |
+| `corrections` | The SAME token vocabulary as `X-Roadstead-Corrected` (§1.8), as a list — `[]` when nothing was rewritten. Always present, never omitted, so a caller need not distinguish "clean response" from "envelope predates the field". |
 
 🚨 **`spent_usd` and `avoided_usd` are never summed.** Both are USD and nothing
 else distinguishes them; exactly one is non-zero per call, and which one is a
@@ -692,6 +694,7 @@ The OpenAI body stays byte-identical (§1.7). What can be said in headers is:
 | `X-Roadstead-Endpoint` | The endpoint admission chose. |
 | `X-Roadstead-Deadline-S` | The deadline actually applied. |
 | `X-Roadstead-Deadline-Source` | `caller` \| `computed` — see §1.7.3. |
+| `X-Roadstead-Corrected` | Comma-separated tokens naming what the correction layer rewrote (or silently could not fix) before this response was served — `json_object_stripped`, `schema_repaired`, `schema_retried`, `schema_unrecoverable`, `degenerate_unrecovered`, `toolcall_truncated`. Absent when nothing fired. On a STREAMING response this can only ever carry `json_object_stripped` — the rest are decided after the backend has answered, past the point headers go on the wire (see the note below). |
 
 🚨 **Only what is known before the body starts.** A streaming response's headers
 are on the wire before the first token, so a later failover or spill cannot be
@@ -730,6 +733,36 @@ replacement, and the map is mechanical:
 
 `roadstead.client` (§7) speaks this API and is the shortest path across.
 
+### 1.10 Request and response size caps 🚨
+
+Two independent bounds, checked at opposite ends of a call:
+
+| | value | env | where |
+|---|---|---|---|
+| Inbound request body | **16 MiB** | `ROADSTEAD_MAX_REQUEST_BYTES` | `__main__.RequestSizeLimitMiddleware` |
+| Streamed backend response | **64 MiB** | `ROADSTEAD_MAX_RESPONSE_BYTES` | `backend.BackendClientPool.stream` |
+
+**The request cap is enforced at the ASGI layer, before anything calls `request.json()`.** Every door
+— the OpenAI-shaped doors, the enriched `/rs/v1/*` doors and the admin plane alike — parses its body
+with no code of its own bounding how large it may be. `Content-Length` is honoured when a caller
+declares it honestly; a caller that declares short and keeps streaming, or declares nothing at all
+(chunked), is caught by counting bytes as they actually arrive. Refused with `413` and `code:
+invalid_request_error` (§2.1 — no new code minted; not deferrable either way). 16 MiB is sized
+for a legitimate vision chat payload: a caller inlines its images as base64 (~1.33x the raw bytes),
+and a handful of them in one turn must clear this without the cap being wide enough to let an
+unbounded body tie up a queue slot before anything has validated it.
+
+**The response cap is a running count on the streaming loop**, checked line-by-line as
+`aiter_lines()` yields rather than after the whole response is already buffered — a wedged or
+adversarial backend that never stops talking (no `[DONE]`, no natural end) would otherwise grow the
+proxy's own memory to match it. Aborted as a `BackendError(502)`; not classified transient
+(`Correction.is_transient_backend_error` only special-cases `BackendUnavailable` and an "empty
+completion" detail), because the same request would very likely reproduce the same oversized
+response and the proxy's own defer/retry loop must not spend a slot retrying it.
+
+Neither cap touches the inference doors' Bearer-keyed admission logic, and neither is configurable
+per caller — both are fleet-wide, ASGI/transport-level bounds.
+
 
 ## 2. Error contract 🚨
 
@@ -742,6 +775,11 @@ eight):
 `proxy_timeout` · `backend_error` · `context_overflow` · `access_denied` · `invalid_api_key` ·
 `invalid_messages` · `invalid_request_error` · `vision_not_supported` · `on_demand_unavailable` ·
 `structured_invalid_json`
+
+🚨 **`invalid_request_error` now also covers `413` (§1.10's request-size cap).** No new code was
+minted for it — the same reasoning as §3's "mints no error code of its own": a caller that already
+treats this code as non-deferrable (it carries none of §2.2's markers) handles the new status for
+free, and the same body is the same size on retry either way.
 
 `access_denied` (403) and `invalid_api_key` (401) are **not interchangeable** and a client should not
 collapse them: the first says *this source is not enrolled*, the second says *this credential is
@@ -832,16 +870,41 @@ key could only ever widen access and never narrow it, which makes it worthless o
 on. Since 2026-09-01 no host confers the scope in the first place, so this holds trivially — it is
 kept stated because the property it protects is the one a future "convenience" default would break.
 
+🚨 **A resolved, admin-scoped WRITE still clears one more gate: CSRF (`IdentityResolver.admin_denial` /
+`_csrf_denial`), as of 2026-09-04.** A network gate and a credential are not enough on their own,
+because HTTP Basic — the scheme the management UI needs, §3.7 — is exactly the kind of credential a
+BROWSER attaches to a request on its own, cookie or not: a cross-site `<form enctype="text/plain">`
+POST is a CORS *simple request* (no preflight), the browser attaches the victim's cached Basic
+credential to it automatically, and a `text/plain` body can still be syntactically valid JSON. Three
+checks, on every mutating (non-GET/HEAD/OPTIONS) route on both `/rs/v1/admin/*` and the legacy
+`/v1/admin/*` spellings, in this ONE place rather than per handler:
+
+1. **`Content-Type: application/json` is required** (media type; parameters such as `charset` are
+   fine) — otherwise `415`. A cross-site form cannot send that media type without a preflight.
+2. **`Sec-Fetch-Site: cross-site` is refused** with `403`. Sent by every modern browser on a
+   cross-origin request and absent from curl/an SDK — its absence is allowed, only that one value
+   is refused.
+3. **A Basic-authenticated write additionally requires `X-Roadstead-Request: 1`.** A browser attaches
+   a cached Basic credential automatically but never adds an arbitrary header on its own initiative,
+   so this is what tells the management UI's own `fetch()` apart from a forged cross-site submission
+   riding the same credential. A Bearer/`X-API-Key` caller is never auto-attached by a browser in the
+   first place and does not need it — the SDK path is unaffected.
+
+The inference doors (`/v1/chat/completions`, `/v1/embeddings`, `/rs/v1/chat`, `/rs/v1/plan`) do **not**
+gain this gate: they take Bearer keys, never a browser-cached credential, so CSRF does not apply there
+and adding the check would risk refusing an OpenAI SDK client that sends
+`Content-Type: application/json; charset=utf-8`.
+
 **The management plane lives at `/rs/v1/admin/*`.** `/v1` is versioned by OpenAI (§1.7), and this is
 the surface most likely to need its own second version — it grows with the product rather than with
 somebody else's published standard. The four control routes that predate it keep their `/v1/admin/*`
 spelling *and* gain the new one: same handler, same gate, both paths served, so no existing consumer
 breaks and an operator has one prefix rather than two.
 
-🚨 **§3 mints no error code.** The same call as §1.6 and §1.7, for the third time. Every refusal here
-is one of §2.1's existing codes — `invalid_api_key` (401), `access_denied` (403),
-`invalid_request_error` (400/404/409). In particular a control action that could not be **persisted**
-is not an error: see §3.2.
+🚨 **§3 mints no error code of its own.** The same call as §1.6 and §1.7, for the third time. Every
+refusal here is one of §2.1's existing codes — `invalid_api_key` (401), `access_denied` (403),
+`invalid_request_error` (400/404/409/**415**, the last added for the CSRF content-type check above).
+In particular a control action that could not be **persisted** is not an error: see §3.2.
 
 | Route | Purpose |
 |---|---|
@@ -1167,11 +1230,18 @@ and an operator arriving with no credential — which is everyone, the first tim
 answer the refusal. The challenge is identical whether or not any key is configured, so it discloses
 nothing about which identity regime (§1.5) is in play.
 
-**No cookie is minted, so CSRF is never reachable on these mutating routes.** The browser attaches
-the credential; the page neither reads, stores nor forwards it. That is also why `GET /v1/stream` is
-aliased at **`/rs/v1/admin/stream`**: `EventSource` cannot set a header, so a page can reach an
-authenticated stream only through credentials the browser attaches by directory, and that is the
-directory the page was challenged in. Same handler, same gate.
+🚨 **No cookie is minted — that does NOT make CSRF unreachable, and this line used to claim it did.**
+The browser attaches the credential to any request to this origin on its own, cookie or not, which is
+what makes `GET /v1/stream`'s alias at **`/rs/v1/admin/stream`** work at all: `EventSource` cannot set
+a header, so a page reaches an authenticated stream only through credentials the browser attaches by
+directory, and that is the directory the page was challenged in. Same handler, same gate — and the
+same mechanism that makes a cross-site `<form enctype="text/plain">` POST able to carry that
+credential too, as a CORS *simple request* with no preflight and a body that can still be valid JSON.
+**The real protection is the CSRF gate described above** (`IdentityResolver.admin_denial` /
+`_csrf_denial`, applied to every mutating route on both prefixes): a strict
+`Content-Type: application/json`, a refusal on `Sec-Fetch-Site: cross-site`, and — for a
+Basic-authenticated write specifically — the `X-Roadstead-Request: 1` header this page's own
+`fetch()` sends and a forged submission cannot. Recorded in `CHANGELOG.md`.
 
 ⚠️ **`GET /v1/stream` is admin-gated as of 2026-09-01** and was not before. A frame there names the
 caller, endpoint, tokens and timing of every call the fleet serves — the live form of
@@ -1443,7 +1513,7 @@ another project installs to speak §1.7.
 ```python
 from roadstead.client import AsyncRoadsteadClient
 
-async with AsyncRoadsteadClient("http://proxy:42100", api_key=KEY) as rs:
+async with AsyncRoadsteadClient("http://proxy:42161", api_key=KEY) as rs:
     plan = await rs.plan(intent="reasoning", est_in=8_000)
     result = await rs.chat(intent="reasoning",
                            messages=[{"role": "user", "content": "..."}])

@@ -671,7 +671,7 @@ argue with the plane about it.
 
 #### J2 · Create a provider or an endpoint that is not in the file — **LANDED 2026-09-01**
 
-Verified through the UI on CTnnn against a real llama-server: an endpoint typed into a form served a
+Verified through the UI on the deployment sandbox against a real llama-server: an endpoint typed into a form served a
 request seconds later, and the catalog file never mentioned it. Three panes replaced seven tabs at
 the same time — Overview (what is going on, and the verbs you reach for while watching),
 Configuration (what you set up), Audit (what happened). The old set was organised by which API fed

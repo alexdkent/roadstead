@@ -92,8 +92,11 @@ async def test_a_key_enrolled_through_the_api_authenticates_a_real_call(proxy):
     assert wrong.status_code == 401
     assert wrong.json()["error"]["code"] == "invalid_api_key"
 
+    # 🚨 identity.py's CSRF gate requires `Content-Type: application/json` on
+    # every mutating admin request, DELETE included even with no body.
     revoked = await proxy.client.request(
-        "DELETE", f"/rs/v1/admin/keys/{key_id}", headers=proxy.admin)
+        "DELETE", f"/rs/v1/admin/keys/{key_id}",
+        headers={**proxy.admin, "Content-Type": "application/json"})
     assert revoked.status_code == 200, revoked.text
     assert revoked.json()["revoked"] == key_id
 
@@ -150,7 +153,12 @@ async def test_the_legacy_control_routes_answer_at_both_prefixes(proxy):
     """
     endpoint = next(iter(proxy.svc._config.endpoints))
 
-    paused = await proxy.client.post(f"/rs/v1/admin/endpoints/{endpoint}/pause", headers=proxy.admin)
+    # 🚨 `json={}` rather than a bare POST: identity.py's CSRF gate requires
+    # `Content-Type: application/json` on every mutating admin request, which
+    # httpx only sets when a `json=` body is given — pause/resume's own body
+    # is optional, but the content-type declaration is not.
+    paused = await proxy.client.post(
+        f"/rs/v1/admin/endpoints/{endpoint}/pause", json={}, headers=proxy.admin)
     assert paused.status_code == 200, paused.text
     status = (await proxy.client.get("/v1/status")).json()
     assert status["endpoints"][endpoint].get("admin_paused") is True
@@ -158,7 +166,8 @@ async def test_the_legacy_control_routes_answer_at_both_prefixes(proxy):
     # …and undone through the OTHER spelling, which is the pair that matters:
     # an operator who paused from a dashboard and resumes from a shell must not
     # discover that the two prefixes are different systems.
-    resumed = await proxy.client.post(f"/v1/admin/endpoints/{endpoint}/resume", headers=proxy.admin)
+    resumed = await proxy.client.post(
+        f"/v1/admin/endpoints/{endpoint}/resume", json={}, headers=proxy.admin)
     assert resumed.status_code == 200, resumed.text
     status = (await proxy.client.get("/v1/status")).json()
     assert not status["endpoints"][endpoint].get("admin_paused")

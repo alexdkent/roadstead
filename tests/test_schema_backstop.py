@@ -227,6 +227,9 @@ def test_trailing_prose_repaired_in_memory():
     assert res["response"]["choices"][0]["message"]["content"] == '{"a": 5}'
     assert st._persisted                    # corrected row re-persisted
     assert st.schema_by_call_site["knowledge.extract"]["repaired"] == 1
+    # Per-call disclosure (audit P2, 2026-09-04) — see `corrections_applied`.
+    assert res.get("_schema_repaired") is True
+    assert not res.get("_schema_retried")
 
 
 def test_schema_miss_recovered_by_retry():
@@ -248,6 +251,9 @@ def test_schema_miss_recovered_by_retry():
     assert backend.calls[0]["messages"][-1]["role"] == "user"
     assert res["response"]["choices"][0]["message"]["content"] == '{"a": 7}'
     assert st.schema_retry_inflight == 0          # released
+    # Per-call disclosure (audit P2, 2026-09-04) — see `corrections_applied`.
+    assert res.get("_schema_retried") is True
+    assert not res.get("_schema_repaired")
 
 
 def test_retry_still_invalid_fails_loud_deferrable():
@@ -428,3 +434,56 @@ def test_json_object_rooted_grammar_is_still_parse_gated():
     finally:
         _clear_flags()
     assert st.schema_detected == 1, "JSON-rooted grammar must still be parse-gated"
+
+
+# --------------------------------------------------------------------------- #
+# corrections_applied (audit P2, 2026-09-04) — the per-call disclosure that
+# reads the markers set above, plus the other correctors' existing per-request
+# flags. Pure, so tested directly against `result`/`req` shapes rather than by
+# re-running the backstop.
+# --------------------------------------------------------------------------- #
+
+def test_corrections_applied_empty_for_a_clean_response():
+    c = C(_mock_state(_backend_returning()))
+    assert c.corrections_applied(_req(), _result('{"a": 1}')) == []
+
+
+def test_corrections_applied_reports_schema_repaired():
+    c = C(_mock_state(_backend_returning()))
+    res = _result('{"a": 1}')
+    res["_schema_repaired"] = True
+    assert c.corrections_applied(_req(), res) == ["schema_repaired"]
+
+
+def test_corrections_applied_reports_schema_retried():
+    c = C(_mock_state(_backend_returning()))
+    res = _result('{"a": 1}')
+    res["_schema_retried"] = True
+    assert c.corrections_applied(_req(), res) == ["schema_retried"]
+
+
+def test_corrections_applied_reports_json_object_stripped():
+    c = C(_mock_state(_backend_returning()))
+    r = _req()
+    r.json_object_stripped = True
+    assert c.corrections_applied(r, _result('{"a": 1}')) == ["json_object_stripped"]
+
+
+def test_corrections_applied_reports_toolcall_truncated():
+    c = C(_mock_state(_backend_returning()))
+    res = _result('{"a": 1}')
+    res["code"] = "toolcall_truncated"
+    assert c.corrections_applied(_req(), res) == ["toolcall_truncated"]
+
+
+def test_corrections_applied_combines_every_marker_present():
+    """Order is stable and matches the method's own reading order — a caller
+    joining these with a comma needs a deterministic header, not a set."""
+    c = C(_mock_state(_backend_returning()))
+    r = _req()
+    r.json_object_stripped = True
+    res = _result('{"a": 1}')
+    res["_schema_retried"] = True
+    res["_degenerate_unrecovered"] = True
+    assert c.corrections_applied(r, res) == [
+        "json_object_stripped", "schema_retried", "degenerate_unrecovered"]

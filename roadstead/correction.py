@@ -623,6 +623,46 @@ class Correction:
         # never mutates `result` — see detect_structured_empty.
         self.detect_structured_empty(req, result)
 
+    def corrections_applied(self, req: "QueuedRequest", result: dict) -> list[str]:
+        """The per-request correction tokens this call's response actually
+        reflects — the caller-visible answer to "was my response rewritten,
+        and how" (audit P2, 2026-09-04). Surfaced as ``X-Roadstead-Corrected``
+        on the OpenAI door and ``corrections`` in the enriched envelope; see
+        ``enriched.enrichment_headers`` and ``Lifecycle._enriched_response``.
+
+        Reads existing per-request markers ONLY — no new tracking beyond the
+        flags each corrector already sets for itself: this method's own
+        ``result["_schema_repaired"]`` / ``result["_schema_retried"]``
+        (``maybe_repair_schema``), ``result["_schema_unrecoverable"]`` /
+        ``result["_degenerate_unrecovered"]`` (already used to gate caching,
+        above), ``result["code"]`` (``enforce_toolcall_truncation``), and
+        ``req.json_object_stripped`` (``apply_json_object_guard`` — the one
+        marker known at ADMISSION, before dispatch, which is why it is also
+        the only one a STREAMING response's headers can carry; see
+        ``enrichment_headers``).
+
+        The empty-completion rescue and the degeneration guard's RECOVERED
+        (non-degenerate) outcome are deliberately absent: both are fleet-wide
+        counters only (``state.empty_rescue_recovered``,
+        ``state.degeneration_recovered``) with no per-request flag that
+        survives to response-building time, and adding one is a separate
+        change from this disclosure, not a side effect of it.
+        """
+        tokens: list[str] = []
+        if getattr(req, "json_object_stripped", False):
+            tokens.append("json_object_stripped")
+        if result.get("_schema_repaired"):
+            tokens.append("schema_repaired")
+        if result.get("_schema_retried"):
+            tokens.append("schema_retried")
+        if result.get("_schema_unrecoverable"):
+            tokens.append("schema_unrecoverable")
+        if result.get("_degenerate_unrecovered"):
+            tokens.append("degenerate_unrecovered")
+        if result.get("code") == "toolcall_truncated":
+            tokens.append("toolcall_truncated")
+        return tokens
+
     def finalize_stream(
         self, req: "QueuedRequest", content: str, last_finish_reason: str | None,
     ) -> None:
@@ -987,6 +1027,12 @@ class Correction:
                 result["response"] = conformed
                 self.state.schema_repaired += 1
                 tally["repaired"] += 1
+                # Per-call disclosure (audit P2, 2026-09-04) — see
+                # `corrections_applied`. Never popped: unlike
+                # `_degenerate_unrecovered`/`_schema_unrecoverable` this marker
+                # does not gate caching, so it has no other reason to be read
+                # before the response is built.
+                result["_schema_repaired"] = True
                 self._persist_corrected(req, conformed)
                 logger.info(
                     "schema-backstop REPAIRED in-memory call_site=%s endpoint=%s",
@@ -1007,6 +1053,7 @@ class Correction:
                 result["response"] = retried
                 self.state.schema_retry_recovered += 1
                 tally["retried"] += 1
+                result["_schema_retried"] = True  # see `corrections_applied`
                 self._persist_corrected(req, retried)
                 logger.info(
                     "schema-backstop RECOVERED via retry call_site=%s endpoint=%s",

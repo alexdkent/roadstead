@@ -68,7 +68,13 @@ class _Req:
 
         _C.host = host
         self.client = _C()
-        self.headers = dict(ADMIN_HEADERS) if headers is None else headers
+        self.headers = dict(ADMIN_HEADERS) if headers is None else dict(headers)
+        # 🚨 identity.py's CSRF gate (`admin_denial._csrf_denial`) requires
+        # `Content-Type: application/json` on every mutating admin request as
+        # of 2026-09-04 — default it here rather than at every call site, same
+        # reasoning as `ADMIN_HEADERS` above.
+        if method not in ("GET", "HEAD", "OPTIONS"):
+            self.headers.setdefault("Content-Type", "application/json")
         self.method = method
         self.query_params: dict = {}
         self.path_params = path_params or {}

@@ -122,6 +122,13 @@ ENRICHMENT_HEADERS = {
     "endpoint": "X-Roadstead-Endpoint",
     "deadline_s": "X-Roadstead-Deadline-S",
     "deadline_source": "X-Roadstead-Deadline-Source",
+    # Audit P2, 2026-09-04. Comma-separated correction tokens (see
+    # ``Correction.corrections_applied``) — omitted entirely when empty, same
+    # rule as every other absent enrichment header. On a STREAMING response
+    # this can only ever carry ``json_object_stripped`` (known at admission);
+    # a sync response may add whatever `corrections_applied` found once the
+    # backend has actually answered.
+    "corrected": "X-Roadstead-Corrected",
 }
 
 
@@ -346,6 +353,13 @@ class EnrichedApi:
         planner that approximated the router would be a second answer to the
         question the router is about to answer differently, and a caller would
         have no way to tell which one lied.
+
+        Same discipline for the PRIORITY BAND the timing is computed at:
+        ``Lifecycle.resolve_declared_priority`` is the one place that decision
+        is made, shared with ``handle_submit`` — a plan resolved at a
+        different band than the call it precedes would predict against the
+        wrong ``timeout_model`` cell and the wrong interactive/long-form
+        ceiling.
         """
         resolved_id = self.state.identity.resolve(request)
         if not resolved_id.ok:
@@ -380,8 +394,8 @@ class EnrichedApi:
         mt = payload.get("max_tokens")
         est_out = int(body.get("est_out") or 0) or (
             mt if isinstance(mt, int) and mt > 0 else 0)
-        priority = LLMPriority.coerce(
-            body.get("priority"), default=delegated.principal.priority)
+        priority = self.lifecycle.resolve_declared_priority(
+            body, agent_id, delegated.principal)
 
         advice = self.state.effective_timeout_advice(
             res.endpoint, int(priority), est_in, est_out)
@@ -703,12 +717,23 @@ def timing_block(req, *, queue_wait_ms: float, backend_latency_ms: float,
     }
 
 
-def enrichment_headers(req) -> dict[str, str]:
-    """The ``X-Roadstead-*`` headers for the OpenAI door. See ENRICHMENT_HEADERS."""
-    return {
+def enrichment_headers(req, corrections: list[str] | None = None) -> dict[str, str]:
+    """The ``X-Roadstead-*`` headers for the OpenAI door. See ENRICHMENT_HEADERS.
+
+    ``corrections`` is the caller's own list (``Correction.corrections_applied``)
+    — passed in rather than recomputed here so a sync caller (who has a
+    completed ``result``) and a streaming caller (admission time only, no
+    ``result`` yet) each supply exactly what they know. Omitted from the
+    headers entirely when empty, the same rule every other enrichment header
+    already follows.
+    """
+    headers = {
         ENRICHMENT_HEADERS["request_id"]: req.request_id,
         ENRICHMENT_HEADERS["endpoint"]: req.endpoint,
         ENRICHMENT_HEADERS["deadline_s"]: f"{req.timeout_s:.3f}",
         ENRICHMENT_HEADERS["deadline_source"]: (
             "computed" if req.deadline_is_default else "caller"),
     }
+    if corrections:
+        headers[ENRICHMENT_HEADERS["corrected"]] = ",".join(corrections)
+    return headers

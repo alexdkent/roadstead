@@ -30,8 +30,18 @@
   Basic; the PASSWORD is an admin API key (identity.py, §1.5) and the username is
   ignored. Nothing here reads, stores or forwards the credential — the browser
   attaches it, which is also why the live stream is reached at
-  /rs/v1/admin/stream: EventSource cannot set a header at all. No cookie is ever
-  minted, so CSRF never becomes reachable on these mutating routes.
+  /rs/v1/admin/stream: EventSource cannot set a header at all.
+
+  🚨 No cookie is minted, but that does NOT make CSRF unreachable: a browser
+  attaches a cached Basic credential to ANY request to this origin on its own,
+  including a cross-site <form enctype="text/plain"> POST, which is a CORS
+  "simple request" (no preflight) whose body can still be valid JSON. The real
+  protection is server-side (identity.py: IdentityResolver.admin_denial /
+  _csrf_denial) — a strict Content-Type: application/json, a refusal on
+  Sec-Fetch-Site: cross-site, and, for a Basic-authenticated write, the
+  X-Roadstead-Request header every mutating call below sends. This page's job
+  is only to send that header and the right content-type; it is not itself
+  what stops the attack.
 -->
 <style>
 /* ---------------------------------------------------------------------
@@ -337,7 +347,6 @@ const el = (tag, attrs, ...kids) => {
   for (const [k, v] of Object.entries(attrs || {})) {
     if (v === null || v === undefined || v === false) continue;
     if (k === "text") n.textContent = String(v);
-    else if (k === "html") n.innerHTML = v;
     else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
     else n.setAttribute(k, v === true ? "" : String(v));
   }
@@ -408,7 +417,22 @@ function readonlyNote() {
 }
 
 async function api(path, opts) {
-  const res = await fetch(path, Object.assign({ headers: { "Accept": "application/json" } }, opts || {}));
+  opts = opts || {};
+  const method = (opts.method || "GET").toUpperCase();
+  const headers = Object.assign({ "Accept": "application/json" }, opts.headers || {});
+  // 🚨 CSRF hardening (identity.py: IdentityResolver.admin_denial /
+  // _csrf_denial). A browser attaches a cached Basic credential to ANY
+  // request on its own, so a mutating call has to prove it is THIS page's
+  // own fetch() rather than a forged cross-site submission riding the same
+  // credential: a strict JSON content-type a cross-site form cannot send
+  // without a preflight, and a custom header a form cannot set at all. The
+  // ONE fetch() call in this file, so this is the one place to set it —
+  // every call site below inherits it rather than repeating it.
+  if (method !== "GET" && method !== "HEAD") {
+    if (!("Content-Type" in headers)) headers["Content-Type"] = "application/json";
+    headers["X-Roadstead-Request"] = "1";
+  }
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
   let body = null;
   try { body = await res.json(); } catch (_) { /* an empty or non-JSON body is not a crash */ }
   if (!res.ok) {

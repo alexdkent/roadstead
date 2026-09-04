@@ -320,6 +320,7 @@
         "substituted": false,
         "substitution": null
       },
+      "corrections": [],
       "identity": {
         "agent_id": "internal"
       },
@@ -387,6 +388,7 @@
         "substituted": false,
         "substitution": null
       },
+      "corrections": [],
       "identity": {
         "agent_id": "internal"
       },
@@ -456,6 +458,7 @@
       },
       "backend_status": 500,
       "code": "backend_error",
+      "corrections": [],
       "error": "backend error 500: {\"error\":\"internal error (injected)\"}",
       "identity": {
         "agent_id": "internal"

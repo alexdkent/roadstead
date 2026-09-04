@@ -108,6 +108,17 @@ _BEARER_PREFIX = "bearer "
 #: buys nothing an attacker who has the key does not already have.
 _BASIC_PREFIX = "basic "
 
+#: 🚨 CSRF hardening for the mutating admin plane (`admin_denial._csrf_denial`).
+#: A browser attaches a cached ``Authorization: Basic`` credential to ANY
+#: request to this origin on its own — that is what makes Basic work for the
+#: management UI in the first place, and also what makes a cross-site
+#: ``<form>`` POST able to carry one. A browser never sets an arbitrary
+#: header on a request it did not script, so this is the one thing the UI's
+#: own ``fetch()`` can prove that a forged submission cannot. Required only
+#: when the credential arrived via Basic — a Bearer/``X-API-Key`` caller is
+#: never auto-attached by a browser and does not need it.
+_CSRF_HEADER = "X-Roadstead-Request"
+
 
 # ---------------------------------------------------------------------------
 # The identity spec grammar — shared by keys and by the address ACL
@@ -1579,6 +1590,82 @@ class IdentityResolver:
                     f"identity itself — widening it means issuing a different "
                     f"credential, not changing an address allowlist"),
             )
+        if method not in SAFE_METHODS:
+            csrf = self._csrf_denial(request)
+            if csrf is not None:
+                return csrf
+        return None
+
+    def _csrf_denial(self, request: Any) -> Denial | None:
+        """CSRF hardening for the mutating admin plane. ``None`` to proceed.
+
+        🚨 The attack this closes. A browser attaches a CACHED
+        ``Authorization: Basic`` credential to any request to this origin, on
+        its own, with no cookie and no script of ours involved — that is the
+        whole point of Basic, and §1.5 leans on it for the management UI. It
+        also means a cross-site ``<form enctype="text/plain">`` POST is a CORS
+        *simple request* (no preflight) that the victim's browser will happily
+        attach that credential to, and a `text/plain` body can still be
+        syntactically valid JSON. Every mutating handler here calls
+        ``request.json()`` with nothing upstream checking how the body was
+        declared or where the request came from — three checks close it, and
+        all three are cheap for a real caller and expensive for a forged one:
+
+        1. **Media type.** A cross-site form cannot send
+           ``Content-Type: application/json`` without a preflight, so refusing
+           anything else denies it the one content-type it can forge cheaply.
+        2. **`Sec-Fetch-Site`.** Sent by every modern browser and absent from
+           curl/an SDK, so its absence is allowed; the one value that matters
+           is ``cross-site``, which no same-origin fetch() ever sends.
+        3. **The custom header, Basic only.** A browser attaches a cached
+           Basic credential automatically but never adds an arbitrary header
+           on its own initiative, so ``X-Roadstead-Request: 1`` is what tells
+           the management UI's own ``fetch()`` apart from a forged cross-site
+           submission riding the same cookie-free credential. A Bearer/
+           ``X-API-Key`` caller is never auto-attached by a browser in the
+           first place, so it does not need this — requiring it there would
+           buy nothing and break every existing SDK integration.
+
+        Reuses §2.1's existing codes rather than minting new ones for this
+        plane (§3.2: "§3 mints no error code") — `invalid_request_error`'s
+        status range grows to include 415, and 403 already covers a resolved,
+        admin-scoped identity refused for a reason other than its scope.
+        """
+        content_type = _header(request, "Content-Type")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            return Denial(
+                code="invalid_request_error",
+                status=415,
+                message=(
+                    f"this route mutates state and requires "
+                    f"'Content-Type: application/json'; got "
+                    f"{content_type or '(none)'!r}. A cross-site form cannot "
+                    f"send that media type without a CORS preflight, which is "
+                    f"exactly what this refusal defends"),
+            )
+        if _header(request, "Sec-Fetch-Site").strip().lower() == "cross-site":
+            return Denial(
+                code="access_denied",
+                status=403,
+                message=(
+                    "this route mutates state and refuses a request the "
+                    "browser itself labelled 'Sec-Fetch-Site: cross-site'"),
+            )
+        auth = _header(request, "Authorization").strip()
+        if auth.lower().startswith(_BASIC_PREFIX):
+            if _header(request, _CSRF_HEADER).strip() != "1":
+                return Denial(
+                    code="access_denied",
+                    status=403,
+                    message=(
+                        f"a Basic-authenticated mutation requires "
+                        f"'{_CSRF_HEADER}: 1'. A browser attaches a cached "
+                        f"Basic credential to any request on its own; this "
+                        f"header is what a page's own fetch() sends and a "
+                        f"forged cross-site submission cannot. A Bearer or "
+                        f"X-API-Key credential does not need it"),
+                )
         return None
 
 

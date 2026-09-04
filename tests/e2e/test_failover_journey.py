@@ -291,8 +291,11 @@ async def test_tier3_failover_full_journey(journey, caplog):
         lambda: svc._scheduler.degraded_inflight(SRC) >= 1, timeout_s=2.0
     ), "the held request never registered as degraded in-flight"
 
+    # 🚨 `json={}` rather than a bare POST: identity.py's CSRF gate requires
+    # `Content-Type: application/json` on every mutating admin request, which
+    # httpx only sets when a `json=` body is given.
     resume = await client.post(f"/v1/admin/endpoints/{SRC}/resume",
-                               headers=dict(ADMIN_HEADERS))
+                               headers=dict(ADMIN_HEADERS), json={})
     assert resume.status_code == 200, resume.text
     assert resume.json()["paused"] is False
     assert svc._health.endpoint_healthy(SRC) is True  # health is instant; drain+dwell gate LEAVE

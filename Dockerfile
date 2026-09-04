@@ -62,5 +62,35 @@ COPY roadstead/ roadstead/
 # The default; `docker stop` sends it anyway. Stated so the image documents it.
 STOPSIGNAL SIGTERM
 
+# 🚨 STAYS ROOT — a considered trade-off, not an oversight. The only real
+# deployment of this image today bind-mounts a ZFS path (`ROADSTEAD_DATA_DIR`)
+# that is owned by root on the host, inside an unprivileged LXC — so the host
+# side of that mount cannot be re-owned to a container UID without the
+# operator's cooperation, and a bind mount's permissions come from the HOST,
+# not from anything `chown`ed at image-build time. Flipping the default user
+# here would not make the image "more non-root" for that deployment; it would
+# just make `/var/lib/roadstead` unwritable the next time the image is
+# rebuilt, silently, on a path nobody is watching for a permissions error.
+#
+# The two ways to actually get non-root without that landmine both need action
+# OUTSIDE this file: (a) `chown` the host-side data directory to a fixed
+# container UID before the next `up`, or (b) `chmod 0777` it — no sticky bit,
+# since it holds one app's data, not several tenants' — and either is a
+# decision for whoever owns that host path, not a default this image can pick
+# for them. Until one of those happens, HEALTHCHECK below is the hardening
+# that ships unconditionally; non-root is tracked as needing the deployment's
+# cooperation, not blocked on code here.
 EXPOSE 42161
+
+# Liveness, not readiness: `/health` fails OPEN on a dead BACKEND by design
+# (alert-don't-kill, see `http_handlers.handle_health`) and only 503s when the
+# scheduler loop itself has died — exactly the "is the process still alive"
+# question a container orchestrator should be asking. `/readyz` fails CLOSED
+# on backend/circuit-breaker state instead, which is right for routing and
+# wrong here: it would flap the container unhealthy over a backend blip that
+# the code is deliberately built not to restart the proxy for. Plain
+# `urllib.request` because the base image carries no `curl`.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '42161') + '/health', timeout=3)"
+
 ENTRYPOINT ["python", "-m", "roadstead"]

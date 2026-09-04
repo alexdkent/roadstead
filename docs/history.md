@@ -201,7 +201,8 @@ improvement.
    *connections*, then sends `lifespan.shutdown`, and never bounds the lifespan shutdown at all), so
    the worst case is their sum — **78.25s measured** against a 48s budget that reads as if it covered
    everything. **A container stop-grace-period must be ≥90s.** Re-runnable:
-   `tools/sigterm_drain_probe.py`; full write-up in `ledger.md`.
+   `tools/sigterm_drain_probe.py`; full write-up in `ledger.md`. *(Superseded — now 108s, see
+   `CLAUDE.md` / `tests/test_shutdown_budget.py`.)*
 
    Two things it turned up were parked as "belongs upstream" under the old authority rule and are
    now **ours to fix**: the caller of a cancelled straggler gets a raw `500 Internal Server Error`

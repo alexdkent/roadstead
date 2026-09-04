@@ -172,8 +172,8 @@ def clear_config_notices() -> None:
 # proxy's only call site passed ``store=None``, so the persistence half of the
 # framework helper was already dead here and the log line below is byte-for-byte
 # what it emitted. The event name ``llmproxy_cache_drift`` is documented in
-# ``config.py`` and ``docs/llmproxy_prefix_cache_observability.md`` — preserve
-# the shape if you touch this.
+# ``config.py`` (the origin's prefix-cache observability note is not part of
+# this repository) — preserve the shape if you touch this.
 
 def compact_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     """JSON-safe, length-capped copy of ``metadata``.

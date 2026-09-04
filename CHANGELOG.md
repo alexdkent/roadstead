@@ -8,6 +8,106 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Fixed — an on-demand endpoint's in-flight lease could never idle-release
+
+`OnDemandManager.ensure_loaded` counts a request in-flight before `handle_submit` has decided
+whether it is admitted. Three paths after it used to `return`/reroute a request without a
+matching `request_done()`: a paused-endpoint or circuit-open refusal, a load-shed `429`, and a
+failover reroute away from an on-demand SOURCE (`Failover.apply` repoints `req.endpoint` in
+place, and `record_completion` only ever releases whatever `req.endpoint` names at completion).
+All three are deferrable, so a retrying client re-incremented the count and refreshed the idle
+clock on every retry — the dispatcher GPU lease never idle-released, bounded only by the
+20-minute `_STUCK_INFLIGHT_S` force-release. Fixed by releasing at each of the three points
+(`lifecycle.py`); new `tests/test_on_demand.py`.
+
+### Fixed — `/rs/v1/plan` could predict a different priority band than `/rs/v1/chat` dispatches at
+
+`handle_rs_plan` resolved only request → credential, skipping the agent's `agents.yaml
+default_priority` step `handle_submit` already ran — so a plan's `timing` (and interactive/
+long-form ceiling) could be computed at the wrong band for a caller whose credential declares
+none. The four-step precedence is now one shared method, `Lifecycle.resolve_declared_priority`,
+called by both routes.
+
+### Added — correction-layer rewrites are now disclosed per call
+
+The schema backstop's in-memory repair/retry and `apply_json_object_guard`'s stripped
+`response_format` used to be visible only as fleet-wide `/v1/status` counters — a caller had no
+way to know its own response had been rewritten. `X-Roadstead-Corrected` (OpenAI door, §1.8) and
+`corrections` (enriched envelope, §1.7.3) now name which of `json_object_stripped`,
+`schema_repaired`, `schema_retried`, `schema_unrecoverable`, `degenerate_unrecovered` or
+`toolcall_truncated` applied to this response; absent/empty when nothing did.
+
+### Changed — CSRF hardening on the mutating admin plane 🚨 BREAKING
+
+A browser attaches a cached `Authorization: Basic` credential to any request to this origin
+on its own, cookie or not — including a cross-site `<form enctype="text/plain">` POST, a CORS
+*simple request* that skips the preflight a real cross-site JSON POST would need, whose body
+can still be syntactically valid JSON. Every mutating (non-GET/HEAD/OPTIONS) route on the admin
+plane — both `/rs/v1/admin/*` and the legacy `/v1/admin/*` spellings, the four control routes
+that predate the management plane included — now requires `Content-Type: application/json`
+(`415` otherwise) and refuses a request labelled `Sec-Fetch-Site: cross-site` (`403`); a
+Basic-authenticated write additionally requires `X-Roadstead-Request: 1` (`403` without it). One
+gate — `identity.IdentityResolver.admin_denial` / `_csrf_denial` — reached by every mutating
+admin handler already on both prefixes, so nothing had to change per handler.
+
+`docs/api.md` §3.7 previously claimed "no cookie is minted, so CSRF is never reachable on these
+mutating routes"; that was wrong, and the section (plus a new §3 paragraph) now says what the
+real protection is. `ui/index.html`'s one `fetch()` wrapper (`api()`) sends both headers on
+every mutating call automatically, and its module docstring's claim is corrected to match. A
+caller scripting the admin plane directly (curl, an ops script) needs to add
+`Content-Type: application/json` to every mutating request, and `X-Roadstead-Request: 1` if it
+authenticates with Basic. Not applied to the inference doors (`/v1/chat/completions`,
+`/v1/embeddings`, `/rs/v1/chat`, `/rs/v1/plan`): they take Bearer keys, never a browser-cached
+credential, so CSRF does not apply there and the check would risk refusing an OpenAI SDK
+client's `Content-Type: application/json; charset=utf-8`. New `code`: `invalid_request_error`
+gains status `415` (§2.1 — §3 still mints no code of its own).
+
+### Added — a request body cap and a streamed-response cap
+
+Neither door had an upper bound on how much it would read. `ROADSTEAD_MAX_REQUEST_BYTES`
+(default 16 MiB) refuses an oversized inbound request body with `413`/`invalid_request_error`
+(§2.1 — no new code minted, it just gains a status) at the ASGI layer, before `request.json()`
+ever runs on it; sized for a legitimate multi-image vision chat payload (`docs/api.md` §1.10).
+`ROADSTEAD_MAX_RESPONSE_BYTES` (default 64 MiB) is a running cap on a streamed backend
+response, checked line-by-line as `aiter_lines()` yields rather than after the whole thing is
+already buffered — a wedged or adversarial backend that never stops talking is aborted as a
+`BackendError(502)` rather than buffered without bound (`backend.BackendClientPool.stream`).
+
+### Fixed — the admin overlay was world-readable
+
+`admin_overlay.json` (runtime key digests, quota overrides) is now written mode `0600`. It
+always used an atomic temp-file-plus-`os.replace`; only the permission bit was missing.
+
+### Fixed — public-readiness pass: quick-start port, packaging, container hardening
+
+`README.md` and the `roadstead.client` docstrings pointed at port `42100`, a stale number left
+behind by the extraction — the code's default has been `42161` throughout. A guard,
+`tests/test_docs_port_consistency.py`, now reads the default from `roadstead.config.ProxyConfig`
+and fails if a tracked doc or module drifts from it again.
+
+CI now builds the wheel and installs it into a fresh venv as a separate `package` job (import,
+`--help`, and package-data presence for `ui/index.html`/`models.yaml`/`agents.yaml`), and runs the
+scrub sweep (`tests/test_scrub_sweep.py`) by name so a future `-k`/deselect change cannot quietly
+stop running it; checkout now uses `fetch-depth: 0`. `pyproject.toml` gained `build` under the `dev`
+extra for this — a build-time dependency, not a runtime one; `tests/test_admin_ui.py`'s runtime-deps
+allowlist is unchanged.
+
+`Dockerfile` gained a `HEALTHCHECK` against `/health` (liveness, not `/readyz`'s routing-oriented
+readiness — see the Dockerfile comment) using stdlib `urllib`, since the base image carries no
+`curl`. The image stays root by default: the one real deployment bind-mounts a root-owned ZFS host
+path, and flipping the default user would not make that safer, only silently unwritable at the next
+rebuild — non-root there needs the deployment's own `chown`/`chmod` cooperation, tracked rather than
+forced by this change.
+
+`roadstead.__version__` now reads the installed distribution's version via `importlib.metadata`,
+falling back to `"0.0.0+unknown"` off a bare checkout. Added `SECURITY.md` and `CONTRIBUTING.md`, and
+`Homepage`/`Issues`/`Changelog` under `[project.urls]`.
+
+A private Proxmox container id (`CTnnn`) in `docs/roadmap.md` was replaced with "the deployment
+sandbox" — `docs/corpus_and_scrub_plan.md` §S1 now flags that the human identifier-sweep half of the
+scrub (S5/S7) needs re-running over everything committed after 2026-09-01, since this finding postdates
+both passes.
+
 ### Added — the durable record names the credential behind a delegated call
 
 `proxy_completions` gains a nullable `key_id`, written **only when a delegation was exercised** —

@@ -187,7 +187,7 @@ async def test_the_minted_key_actually_works_on_the_plane(tmp_path):
 
     ok = await svc.handle_admin_flags(
         _Req(method="POST", body={"context_gate_enforce": True},
-             headers={"X-API-Key": secret}))
+             headers={"X-API-Key": secret, "Content-Type": "application/json"}))
     assert ok.status_code == 200, ok.body
     assert svc._state.flags.get("context_gate_enforce") is True
 

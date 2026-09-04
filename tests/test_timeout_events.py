@@ -41,6 +41,10 @@ class _FakeJSONRequest:
         # Authenticated by default — the admin plane needs a credential as of
         # 2026-09-01 and this file is about maintenance windows.
         self.headers = dict(ADMIN_HEADERS)
+        # 🚨 identity.py's CSRF gate (`admin_denial._csrf_denial`) requires
+        # `Content-Type: application/json` on every mutating admin request.
+        if method not in ("GET", "HEAD", "OPTIONS"):
+            self.headers.setdefault("Content-Type", "application/json")
         self.query_params = {k: str(v) for k, v in params.items()}
 
     async def json(self):

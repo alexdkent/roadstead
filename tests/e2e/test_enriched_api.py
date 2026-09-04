@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 
 
+from roadstead.config import AgentQuotaConfig, LLMPriority
 from roadstead.enriched import ENRICHMENT_HEADERS
 from roadstead.intent import BUILTIN_PROFILES
 
@@ -188,9 +189,13 @@ async def test_the_five_blocks_are_all_present_and_timing_is_real(proxy):
     # 🚨 Equality, not a subset: a block added here is a deliberate decision
     # about what the enriched envelope publishes. `identity` joined on
     # 2026-09-02 (§1.7.3) — it is the disclosure that stops an IGNORED
-    # delegation from being invisible.
+    # delegation from being invisible. `corrections` joined 2026-09-04
+    # (§1.8/audit P2) — the per-call disclosure of what, if anything, the
+    # correction layer rewrote; empty here because nothing did.
     assert set(body) == {"status", "request_id", "response",
-                         "attribution", "identity", "timing", "usage"}
+                         "attribution", "identity", "timing", "usage",
+                         "corrections"}
+    assert body["corrections"] == []
     # Nothing declared, so the block is the resolved identity alone — no
     # `honoured`, which would be True on every ordinary call and mean nothing.
     assert body["identity"] == {"agent_id": "internal"}
@@ -414,6 +419,57 @@ async def test_plan_and_the_call_after_it_agree_about_who_is_asking(proxy):
     assert resp.status_code == 403, (
         "/rs/v1/plan accepted an identity /rs/v1/chat would refuse — a plan "
         "that answers for a caller the next call cannot be is worse than none")
+
+
+async def test_plan_and_the_call_after_it_agree_about_the_band(proxy):
+    """§1.7's identity agreement above has a PRIORITY-BAND counterpart (audit
+    P1, 2026-09-04): ``/rs/v1/plan`` used to resolve only request → credential
+    (skipping the AGENT's ``agents.yaml default_priority``), while
+    ``handle_submit`` ran all four steps — so a plan's ``timing`` could be
+    computed at a different ``timeout_model`` cell (and a different
+    interactive/long-form ceiling) than the call it precedes actually
+    dispatches at.
+
+    The anonymous loopback caller (this harness's ACL identity, agent_id
+    "internal") declares no band at all (``priority_declared=False``), so
+    step 3 — the agent's configured default — is the only thing with an
+    opinion here, which is exactly the shape that used to be skipped.
+
+    Neither response surfaces the resolved band directly (``docs/api.md``
+    §1.6: no priority, no band on the wire), so this asserts on the argument
+    ``Lifecycle.resolve_declared_priority`` — the one shared resolver both
+    routes call — actually returned. (Not ``effective_timeout_advice``: that
+    is also called from ``resolve_default_timeout``'s flat-vs-smart SHADOW
+    TALLY, which deliberately resolves a raw, uncorrected priority as its
+    counterfactual baseline and would pollute this assertion with a value
+    neither route's real timing is based on.)
+    """
+    proxy.svc._state.config.agents["internal"] = AgentQuotaConfig(
+        agent_id="internal", default_priority=LLMPriority.P3_INGESTION)
+
+    seen: list[int] = []
+    orig = proxy.svc._lifecycle.resolve_declared_priority
+
+    def spy(body, agent_id, principal):
+        resolved = orig(body, agent_id, principal)
+        seen.append(int(resolved))
+        return resolved
+    proxy.svc._lifecycle.resolve_declared_priority = spy
+
+    plan_resp = await proxy.client.post("/rs/v1/plan", json=_body(intent="chat"))
+    assert plan_resp.status_code == 200
+    chat_resp = await proxy.client.post("/rs/v1/chat", json=_body(intent="chat"))
+    assert chat_resp.status_code == 200
+
+    assert len(seen) == 2, (
+        f"expected exactly one resolve per route (plan, then chat), got {seen} "
+        "— a route bypassing the shared resolver would under-count here even "
+        "if the value it used elsewhere happened to agree")
+    assert set(seen) == {int(LLMPriority.P3_INGESTION)}, (
+        f"plan and chat resolved different priority bands ({seen}) — a plan's "
+        "timing must be computed at the SAME band the call after it dispatches "
+        "at, or the recommended deadline and ceiling it reports are for a "
+        "request nobody is about to send")
 
 
 async def test_an_ignored_delegation_is_visible_on_the_wire(proxy):

@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from .config import EndpointConfig  # noqa: F401
     from .correction import Correction
     from .health import Health
+    from .identity import Principal
     from .state import ProxyState
 
 logger = logging.getLogger(__name__)
@@ -330,6 +331,53 @@ class Lifecycle:
             )
             return model_ep
         return submit_ep
+
+    def resolve_declared_priority(
+        self, body: dict, agent_id: str, principal: "Principal",
+    ) -> LLMPriority:
+        """The band THIS call runs at, in four steps, narrowest first. Compared
+        against None throughout, never truthiness — P0_REALTIME is 0, and `or`
+        would silently promote realtime traffic to the identity default.
+
+          1. what this REQUEST declared            (`priority` in the body)
+          2. what the CREDENTIAL declared          (`agent_id:P1_TURN_SUPPORT`)
+          3. what the AGENT's config declares      (agents.yaml default_priority)
+          4. the built-in default
+
+        🚨 Step 3 did nothing at all until 2026-09-02. `agents.yaml`'s
+        `default_priority` was parsed, editable through the admin plane and
+        REPORTED by it as the caller's `declared_priority` — while the request
+        path read only the credential's. Two sources for one question, the
+        management plane naming the one that was not in force, and their
+        defaults did not even match (P1_TURN_SUPPORT in the config dataclass,
+        P3_INGESTION in the identity grammar).
+
+        🚨 Step 3 sits BELOW step 2 rather than above it because a credential
+        is the stronger statement — but it has to exist, because since
+        delegation ONE key can act as many `agent_id`s (`may_assert`), and a
+        single band on that key cannot say "interactive for `chat-agent`, background
+        for `forum-agent`". Per-agent config can, and it is where the weights that
+        go with those bands already live.
+
+        🚨 THE ONE PLACE this precedence is decided — `handle_submit` and
+        `EnrichedApi.handle_rs_plan` both call it. `/rs/v1/plan` promises the
+        SAME resolve the dispatching route runs (§1.7); it used to stop at
+        step 2, which meant an agent with a configured `default_priority` and
+        no per-credential band saw `timeout_model.advise` and the interactive/
+        long-form ceiling split answer for the WRONG band in its plan, then
+        dispatch at the right one. Callers still layer spend/rate demotion
+        (`ProxyState.spend_demote`) on top of this where it applies — that is
+        dispatch-only accounting a plan does not trigger.
+        """
+        declared_priority = body.get("priority")
+        if declared_priority is None and principal.priority_declared:
+            declared_priority = principal.priority
+        if declared_priority is None:
+            agent_cfg = self.state.config.agent_config(agent_id)
+            declared_priority = getattr(agent_cfg, "default_priority", None)
+        if declared_priority is None:
+            declared_priority = principal.priority
+        return LLMPriority.coerce(declared_priority, default=LLMPriority.P1_TURN_SUPPORT)
     async def handle_submit(
         self, body: dict, request: Request, *, wire: str = WIRE_ENRICHED,
     ) -> Response:
@@ -421,37 +469,9 @@ class Lifecycle:
             agent_id = principal.agent_id
         else:
             agent_id = str(body.get("agent_id") or principal.agent_id)
-        # Same rule for the band, in four steps, narrowest first. Compared
-        # against None rather than truthiness — P0_REALTIME is 0, and `or` would
-        # silently promote realtime traffic to the identity default.
-        #
-        #   1. what this REQUEST declared            (`priority` in the body)
-        #   2. what the CREDENTIAL declared          (`agent_id:P1_TURN_SUPPORT`)
-        #   3. what the AGENT's config declares      (agents.yaml default_priority)
-        #   4. the built-in default
-        #
-        # 🚨 Step 3 did nothing at all until 2026-09-02. `agents.yaml`'s
-        # `default_priority` was parsed, editable through the admin plane and
-        # REPORTED by it as the caller's `declared_priority` — while the request
-        # path read only the credential's. Two sources for one question, the
-        # management plane naming the one that was not in force, and their
-        # defaults did not even match (P1_TURN_SUPPORT in the config dataclass,
-        # P3_INGESTION in the identity grammar).
-        #
-        # 🚨 Step 3 sits BELOW step 2 rather than above it because a credential
-        # is the stronger statement — but it has to exist, because since
-        # delegation ONE key can act as many `agent_id`s (`may_assert`), and a
-        # single band on that key cannot say "interactive for `chat-agent`, background
-        # for `forum-agent`". Per-agent config can, and it is where the weights that
-        # go with those bands already live.
-        declared_priority = body.get("priority")
-        if declared_priority is None and principal.priority_declared:
-            declared_priority = principal.priority
-        if declared_priority is None:
-            agent_cfg = self.state.config.agent_config(agent_id)
-            declared_priority = getattr(agent_cfg, "default_priority", None)
-        if declared_priority is None:
-            declared_priority = principal.priority
+        # Same rule for the band — see `resolve_declared_priority` for the
+        # four steps and why step 3 sits below step 2.
+        declared_priority = self.resolve_declared_priority(body, agent_id, principal)
         # 🚨 Recorded BEFORE the standing is taken, so a caller's own request
         # counts toward the rate it is judged on. The alternative — record after
         # — lets a caller sit exactly one request under its threshold forever.
@@ -464,9 +484,7 @@ class Lifecycle:
         # PLACE IN THE QUEUE and never its access to local capacity. There is
         # deliberately no branch below this line that can turn an over-threshold
         # caller into an error.
-        declared_priority = self.state.spend_demote(
-            agent_id, LLMPriority.coerce(declared_priority,
-                                         default=LLMPriority.P1_TURN_SUPPORT))
+        declared_priority = self.state.spend_demote(agent_id, declared_priority)
 
         now = time.monotonic()
 
@@ -810,6 +828,14 @@ class Lifecycle:
             self.state.failover.refresh()
             fplan = self.state.failover.plan(req)
             if fplan.rerouted:
+                # `apply()` mutates `req.endpoint` in place, and
+                # `record_completion` releases whatever `req.endpoint` names AT
+                # COMPLETION (the failover target). If the SOURCE is itself
+                # on-demand, its `ensure_loaded()` above already incremented
+                # its in-flight count — release it now, before the repoint,
+                # or that increment is orphaned forever (the target can never
+                # be on-demand itself: `Failover.pairs()` excludes it).
+                self.state.on_demand.request_done(req.endpoint)
                 self.state.failover.apply(req, fplan.target)
             elif req.band != PriorityBand.BACKGROUND:
                 # Phase 5F: distinguish an operator drain (planned) from an
@@ -851,6 +877,11 @@ class Lifecycle:
                         status_code=503,
                     )
                 resp.headers["Retry-After"] = str(retry_after)
+                # Refusing here — `ensure_loaded()` above (if this endpoint is
+                # on-demand) already counted this request in-flight and it will
+                # never reach `record_completion`. Release it or a retried
+                # (deferrable) 503 pins the lease until `_STUCK_INFLIGHT_S`.
+                self.state.on_demand.request_done(req.endpoint)
                 return resp
 
         # Load-shed / backpressure (Phase 2.4): under sustained saturation, shed
@@ -871,6 +902,10 @@ class Lifecycle:
                          "code": "backpressure"},
                         status_code=429)
                 resp.headers["Retry-After"] = str(retry_after)
+                # Same reasoning as the circuit-breaker refusal above: shed
+                # before this endpoint's on-demand in-flight (if any) is ever
+                # released by `record_completion`.
+                self.state.on_demand.request_done(req.endpoint)
                 return resp
 
         # Forced-reasoning endpoints (e.g. creative/Trinity-Mini, capabilities.reasoning
@@ -963,6 +998,12 @@ class Lifecycle:
         # Correction.apply.
         await self.correction.apply(req, result)
 
+        # The caller-visible disclosure of what just happened to this
+        # response (audit P2, 2026-09-04) — read BEFORE the internal markers
+        # below are popped, and reused for both the OpenAI door's header and
+        # the enriched envelope's `corrections` field.
+        corrections = self.correction.corrections_applied(req, result)
+
         # Cache if deterministic — but NEVER cache an unrecovered degenerate
         # response (don't serve the same garbage for the cache TTL). Both internal
         # markers are POPPED here so they never leak into the returned JSON; the
@@ -970,6 +1011,8 @@ class Lifecycle:
         # cache anyway), but we pop it for symmetry + response hygiene.
         degen_unrecovered = result.pop("_degenerate_unrecovered", False)
         schema_unrecovered = result.pop("_schema_unrecoverable", False)
+        result.pop("_schema_repaired", None)
+        result.pop("_schema_retried", None)
         # …and NEVER cache a truncated (finish_reason=length) body (operator
         # mandate 2026-07-11): a temperature=0 free-text truncation passes as
         # status=ok, and caching it would re-serve the cut-off text for the
@@ -997,12 +1040,12 @@ class Lifecycle:
         if wire == WIRE_OPENAI:
             if result.get("status") == "ok":
                 return JSONResponse(result.get("response", {}),
-                                    headers=enrichment_headers(req))
+                                    headers=enrichment_headers(req, corrections))
             return _openai_error(
                 result.get("error", "backend error"), "backend_error", 502,
                 code="backend_error",
             )
-        return self._enriched_response(req, result)
+        return self._enriched_response(req, result, corrections)
     def _predicted_ms(self, req: QueuedRequest) -> float | None:
         """What the timeout model would recommend for this call, in ms.
 
@@ -1022,13 +1065,19 @@ class Lifecycle:
             logger.debug("predicted_ms unavailable", exc_info=True)
             return None
 
-    def _enriched_response(self, req: QueuedRequest, result: dict) -> Response:
+    def _enriched_response(
+        self, req: QueuedRequest, result: dict, corrections: list[str] | None = None,
+    ) -> Response:
         """Serialize one finished non-streaming request onto the enriched wire.
 
         Four blocks and nothing else: ``attribution`` (who served, and whether
         that is who was asked for), ``timing`` (both sides of the deadline),
         ``usage`` (tokens and the slot-seconds this call actually occupied), and
-        the backend's own ``response``.
+        the backend's own ``response``. Plus ``corrections`` (audit P2,
+        2026-09-04) — the disclosure list from
+        ``Correction.corrections_applied``, always present (empty for a clean
+        response) so a caller never has to distinguish "nothing was corrected"
+        from "this envelope predates the field".
 
         🚨 No priority, no band, no queue position. ``docs/api.md`` §1.6: a
         caller cannot observe its own spend demotion in a response, and every
@@ -1044,6 +1093,7 @@ class Lifecycle:
             "request_id": req.request_id,
             "attribution": attrib,
             "identity": identity_block(req),
+            "corrections": corrections or [],
             "timing": timing_block(
                 req,
                 queue_wait_ms=result.get("queue_wait_ms") or 0.0,
@@ -1206,9 +1256,14 @@ class Lifecycle:
             # so they carry only what admission already settled — request id,
             # the endpoint chosen, the deadline and who chose it. A later
             # failover or spill cannot be reflected here, which is exactly why
-            # the enriched stream repeats attribution on its `done` frame.
+            # the enriched stream repeats attribution on its `done` frame. Same
+            # reasoning bounds `X-Roadstead-Corrected` here to
+            # `json_object_stripped` — the one correction decided at admission,
+            # before dispatch; the schema backstop and degeneration guard only
+            # ever run on the SYNC path and have nothing to report yet.
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
-                     **enrichment_headers(req)},
+                     **enrichment_headers(
+                         req, self.correction.corrections_applied(req, {}))},
         )
     async def scheduler_loop(self) -> None:
         """Main scheduling loop — runs dispatch on every event or interval.

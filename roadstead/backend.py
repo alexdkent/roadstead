@@ -23,7 +23,7 @@ from typing import Any, AsyncIterator
 
 import httpx
 
-from .config import EndpointConfig
+from .config import EndpointConfig, max_response_bytes_from_env
 from .providers import DEFAULT_PROVIDER, ProviderError, provider_for
 
 logger = logging.getLogger(__name__)
@@ -412,7 +412,29 @@ class BackendClientPool:
                     body = await response.aread()
                     raise BackendError(response.status_code, body.decode("utf-8", errors="replace")[:500])
 
+                # 🚨 A running cap on the streamed response, checked BEFORE
+                # each line is buffered rather than after. `aiter_lines()`
+                # already holds the whole line in memory before yielding it,
+                # so a wedged or adversarial backend that never stops talking
+                # (no `[DONE]`, no chunk boundary) can otherwise grow the
+                # proxy's own memory without bound — the streaming counterpart
+                # to the request-body cap in `__main__.RequestSizeLimitMiddleware`.
+                # Not classified transient (`Correction.is_transient_backend_error`
+                # only special-cases `BackendUnavailable` and an "empty
+                # completion" detail): the same request would very likely
+                # reproduce the same oversized response, so the proxy's own
+                # defer/retry loop must not spend a slot retrying it.
+                max_response_bytes = max_response_bytes_from_env()
+                seen_bytes = 0
                 async for line in response.aiter_lines():
+                    seen_bytes += len(line.encode("utf-8", errors="ignore")) + 1
+                    if seen_bytes > max_response_bytes:
+                        raise BackendError(
+                            502,
+                            f"backend {ep_cfg.role} streamed response exceeded "
+                            f"the {max_response_bytes}-byte cap "
+                            f"(ROADSTEAD_MAX_RESPONSE_BYTES) — aborted rather "
+                            f"than buffered without bound")
                     line = line.strip()
                     if not line:
                         continue

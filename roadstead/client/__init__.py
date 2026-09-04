@@ -2,7 +2,7 @@
 
     from roadstead.client import AsyncRoadsteadClient
 
-    async with AsyncRoadsteadClient("http://proxy:42100", api_key=KEY) as rs:
+    async with AsyncRoadsteadClient("http://proxy:42161", api_key=KEY) as rs:
         result = await rs.chat(
             intent="reasoning",
             messages=[{"role": "user", "content": "why is the queue deep?"}],

@@ -98,7 +98,7 @@ The suite needs **no fleet, no network and no inference backend** — it runs ag
 **OpenAI-compatible**, for anything that already speaks it:
 
 ```sh
-curl localhost:42100/v1/chat/completions -H 'Authorization: Bearer $KEY' \
+curl localhost:42161/v1/chat/completions -H 'Authorization: Bearer $KEY' \
   -d '{"model": "tier2", "messages": [{"role": "user", "content": "hi"}]}'
 ```
 
@@ -108,7 +108,7 @@ rather than which box, and be told what actually served you:
 ```python
 from roadstead.client import AsyncRoadsteadClient
 
-async with AsyncRoadsteadClient("http://localhost:42100", api_key=KEY) as rs:
+async with AsyncRoadsteadClient("http://localhost:42161", api_key=KEY) as rs:
     plan = await rs.plan(intent="reasoning", est_in=8_000)
     print(plan.endpoint, plan.recommended_deadline_s, plan.estimated_usd)
 
@@ -197,15 +197,15 @@ a file and restarting a proxy that is serving traffic.
 
 ```sh
 # enrol a caller. The secret comes back ONCE and is never stored — only its digest is.
-curl -sX POST localhost:42100/rs/v1/admin/keys \
+curl -sX POST localhost:42161/rs/v1/admin/keys \
      -d '{"agent_id": "coding-assistant", "priority": "P1_TURN_SUPPORT"}'
 
 # adjust its share of the fleet, and cap what it may spend off-machine
-curl -sX PATCH localhost:42100/rs/v1/admin/callers/coding-assistant \
+curl -sX PATCH localhost:42161/rs/v1/admin/callers/coding-assistant \
      -d '{"weight": 3.0, "spill_ok": true, "daily_spend_usd": 5.0}'
 
 # revoke, immediately, whatever declared it
-curl -sX DELETE localhost:42100/rs/v1/admin/keys/coding-assistant-laptop
+curl -sX DELETE localhost:42161/rs/v1/admin/keys/coding-assistant-laptop
 ```
 
 ### The UI
@@ -232,9 +232,9 @@ wrote stays separable from what the API changed.
 The read side answers the question a config file cannot: **what did I write that is not in force?**
 
 ```sh
-curl -s localhost:42100/rs/v1/admin/config     # sources, and every knob nothing reads
-curl -s localhost:42100/rs/v1/admin/providers  # declared capacity vs what discovery found
-curl -s localhost:42100/rs/v1/admin/callers    # quota in force, declared, and overridden
+curl -s localhost:42161/rs/v1/admin/config     # sources, and every knob nothing reads
+curl -s localhost:42161/rs/v1/admin/providers  # declared capacity vs what discovery found
+curl -s localhost:42161/rs/v1/admin/callers    # quota in force, declared, and overridden
 ```
 
 A dropped `policy:` key looks exactly like a knob that was never load-bearing, and a slot count that

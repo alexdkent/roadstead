@@ -26,7 +26,12 @@ from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from .config import ProxyConfig, env_with_legacy_prefix as _env, load_agent_configs
+from .config import (
+    ProxyConfig,
+    env_with_legacy_prefix as _env,
+    load_agent_configs,
+    max_request_bytes_from_env,
+)
 from .observability import (
     DEFAULT_REQUEST_LOG_BACKUPS,
     DEFAULT_REQUEST_LOG_MAX_BYTES,
@@ -172,6 +177,98 @@ class ShutdownEnvelopeMiddleware:
         # waiting on a response that will never continue.
         await send({"type": "http.response.body", "body": b"",
                     "more_body": False})
+
+
+#: The error envelope a caller sees when a request body exceeds
+#: `ROADSTEAD_MAX_REQUEST_BYTES` (`config.max_request_bytes_from_env`).
+#: `code` is `invalid_request_error` — §2.1 mints no new code for this (the
+#: existing one is already classified non-deferrable, and the same body is
+#: the same size on retry either way), it just gains a new status, `413`.
+def _request_too_large_body(max_bytes: int) -> bytes:
+    return json.dumps({
+        "status": "error",
+        "error": (f"request body exceeds the {max_bytes}-byte cap "
+                  f"(ROADSTEAD_MAX_REQUEST_BYTES) — refused before it was "
+                  f"parsed"),
+        "code": "invalid_request_error",
+    }).encode()
+
+
+class RequestSizeLimitMiddleware:
+    """Refuse an oversized request body BEFORE any handler calls
+    ``request.json()`` — the ASGI layer, so nothing downstream even sees the
+    bytes.
+
+    🚨 **The gap this closes.** Every door on this proxy — the OpenAI-shaped
+    doors, the enriched `/rs/v1/*` doors and the admin plane alike — calls
+    ``await request.json()`` with nothing upstream bounding how large that
+    body may be. `Content-Length` is honoured when a caller declares it
+    honestly; a caller that lies short and then keeps streaming is caught by
+    counting bytes as they actually arrive, which is also what covers a
+    chunked-encoding body that declares no length at all.
+
+    Sized at :data:`config.DEFAULT_MAX_REQUEST_BYTES` (16 MiB): a vision chat
+    payload inlines its images as base64, and a caller sending a handful of
+    them in one turn is the legitimate case this has to clear.
+
+    Modelled on :class:`ShutdownEnvelopeMiddleware` just above: wrap ``send``
+    so the refusal can be delivered exactly once even though the decision is
+    made partway through the app's own read of the body, and swallow
+    whatever the app tries to send afterwards rather than risk a second
+    ``http.response.start`` on the same connection.
+    """
+
+    def __init__(self, app, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        declared: int | None = None
+        for key, value in scope.get("headers") or ():
+            if key == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = None
+                break
+        if declared is not None and declared > self.max_bytes:
+            await self._refuse(send)
+            return
+
+        refused = False
+
+        async def _send(message) -> None:
+            if refused:
+                return  # the refusal already went out; nothing else may follow
+            await send(message)
+
+        seen = 0
+
+        async def _receive():
+            nonlocal seen, refused
+            message = await receive()
+            if message.get("type") == "http.request":
+                seen += len(message.get("body") or b"")
+                if seen > self.max_bytes and not refused:
+                    refused = True
+                    await self._refuse(send)
+                    return {"type": "http.request", "body": b"", "more_body": False}
+            return message
+
+        await self.app(scope, _receive, _send)
+
+    async def _refuse(self, send) -> None:
+        body = _request_too_large_body(self.max_bytes)
+        await send({
+            "type": "http.response.start", "status": 413,
+            "headers": [(b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode())],
+        })
+        await send({"type": "http.response.body", "body": body})
 
 
 def _parse_args() -> argparse.Namespace:
@@ -356,7 +453,16 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
         lifespan=lifespan,
         # 🚨 Outside the router, inside `ServerErrorMiddleware` — the only place
         # a `BaseException` from a route is still catchable. See the class.
-        middleware=[Middleware(ShutdownEnvelopeMiddleware)],
+        # Outermost first: an oversized body is refused before anything else
+        # runs, including the shutdown-envelope rewrite below (which only
+        # ever engages on a cancellation, so the ordering is not otherwise
+        # load-bearing — this is just where "refuse before you do more work"
+        # belongs).
+        middleware=[
+            Middleware(RequestSizeLimitMiddleware,
+                      max_bytes=max_request_bytes_from_env()),
+            Middleware(ShutdownEnvelopeMiddleware),
+        ],
         # Robustness backstop: malformed JSON → 400; any other uncaught route
         # exception → logged clean 500 (never a raw ASGI 500). Per-field
         # coercions (priority/timeout_s/query-params) are handled at the source;

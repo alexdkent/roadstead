@@ -44,7 +44,13 @@ class _Req:
             pass
         _C.host = host
         self.client = _C()
-        self.headers = headers or {}
+        self.headers = dict(headers) if headers else {}
+        # 🚨 identity.py's CSRF gate (`admin_denial._csrf_denial`) requires
+        # `Content-Type: application/json` on every mutating admin request —
+        # this double always reports POST (below), even for the GET-only
+        # routes some of these tests exercise, so it must carry the header
+        # unconditionally rather than only when a test remembers to.
+        self.headers.setdefault("Content-Type", "application/json")
         self.method = "POST"
         self.query_params: dict = {}
 
@@ -159,6 +165,15 @@ async def test_no_door_pre_fills_the_band_into_the_submit_body():
     and the agent config unreachable. A door that starts doing it again breaks
     the precedence silently — the tests above would still pass for any caller
     whose credential happens to agree with its config.
+
+    Widened 2026-09-04 (§1.7): the same shape reappeared one level down, not as
+    a dict literal but as `LLMPriority.coerce(..., default=<identity band>)` —
+    `/rs/v1/plan` resolved only steps 1-2 that way, so an agent with a
+    configured `default_priority` and no per-credential band got a plan priced
+    at the wrong band and dispatched at the right one. The fix is
+    `Lifecycle.resolve_declared_priority`, the one place all four steps are
+    decided; a door calling `LLMPriority.coerce` itself with an
+    identity-derived default is resolving the precedence AGAIN, badly.
     """
     import ast
     import pathlib
@@ -168,19 +183,35 @@ async def test_no_door_pre_fills_the_band_into_the_submit_body():
     for name in ("http_handlers.py", "enriched.py"):
         tree = ast.parse((root / name).read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Dict):
-                continue
-            for key, value in zip(node.keys, node.values):
-                if not (isinstance(key, ast.Constant) and key.value == "priority"):
-                    continue
-                src = ast.dump(value)
-                if "principal" in src or "default_priority" in src:
-                    offenders.append(f"{name}:{key.lineno}")
+            if isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values):
+                    if not (isinstance(key, ast.Constant) and key.value == "priority"):
+                        continue
+                    src = ast.dump(value)
+                    if "principal" in src or "default_priority" in src:
+                        offenders.append(f"{name}:{key.lineno}")
+            # A door calling `LLMPriority.coerce(...)` directly with a
+            # `default=` derived from the identity/principal — the precedence
+            # belongs to `resolve_declared_priority` alone; a second caller
+            # computing "the identity's band" as a fallback is the same bug in
+            # a call argument instead of a dict literal.
+            elif (isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Attribute)
+                  and node.func.attr == "coerce"
+                  and isinstance(node.func.value, ast.Name)
+                  and node.func.value.id == "LLMPriority"):
+                for kw in node.keywords:
+                    if kw.arg != "default":
+                        continue
+                    src = ast.dump(kw.value)
+                    if "principal" in src or "default_priority" in src:
+                        offenders.append(f"{name}:{node.lineno}")
     assert not offenders, (
-        "a door is pre-filling the submit body's `priority` from the identity: "
-        f"{offenders} — pass only what the CALLER declared and let "
-        "`handle_submit` resolve the rest, or agents.yaml's default_priority "
-        "goes dead again")
+        "a door is resolving the priority band's identity fallback itself "
+        f"instead of going through Lifecycle.resolve_declared_priority: "
+        f"{offenders} — pass only what the CALLER declared and let the shared "
+        "resolver apply the credential/agents.yaml/default steps, or a plan "
+        "and the call it precedes can disagree about the band again")
 
 
 # --------------------------------------------------------------------------- #

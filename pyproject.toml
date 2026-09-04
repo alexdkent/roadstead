@@ -39,13 +39,17 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "pytest-timeout>=2.3",
+  "build>=1.2",
 ]
 
 [project.scripts]
 roadstead = "roadstead.__main__:main"
 
 [project.urls]
+Homepage = "https://github.com/alexdkent/roadstead"
 Repository = "https://github.com/alexdkent/roadstead"
+Issues = "https://github.com/alexdkent/roadstead/issues"
+Changelog = "https://github.com/alexdkent/roadstead/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["roadstead*"]

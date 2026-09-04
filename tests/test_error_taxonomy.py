@@ -193,7 +193,8 @@ async def test_success_envelope_unchanged_no_code_key():
         assert body["status"] == "ok"
         assert "code" not in body
         assert set(body) == {"status", "request_id", "response",
-                             "attribution", "identity", "timing", "usage"}
+                             "attribution", "identity", "timing", "usage",
+                             "corrections"}
         # `identity` joined 2026-09-02 (§1.7.3). It reports WHO WAS BILLED and,
         # when a caller declared an `agent_id`, whether that was honoured — the
         # disclosure that stops an ignored delegation from being invisible. It

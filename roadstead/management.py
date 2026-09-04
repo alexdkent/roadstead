@@ -431,6 +431,13 @@ class AdminOverlay:
                 },
                 indent=1, sort_keys=True,
             ))
+            # 🚨 Owner-only. This file holds key DIGESTS, never a secret, but a
+            # digest is still a working credential for anyone who can compute
+            # one against it (§ the same reasoning `management.py`'s module
+            # docstring gives for never emitting one over the wire) — the file
+            # on disk deserves the same care. Set on the TEMP file, before the
+            # rename, so the final path is never briefly world-readable.
+            os.chmod(tmp, 0o600)
             os.replace(tmp, self._path)
         except Exception as exc:  # noqa: BLE001
             logger.error("admin store persist failed at %s: %s", self._path, exc)

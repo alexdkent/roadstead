@@ -864,6 +864,40 @@ def _inflight_stream_interval_s() -> float:
         return 1.5
 
 
+#: 16 MiB. A vision chat payload inlines its images as base64 (~1.33x the raw
+#: bytes), and a caller sending several of them in one turn is the legitimate
+#: case this has to clear; it is not wide enough to let an unbounded body tie
+#: up a queue slot before anything has validated it. See docs/api.md §1.10.
+DEFAULT_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+
+#: 64 MiB. A running cap on a streamed backend response — see
+#: ``backend.BackendClientPool.stream``.
+DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
+
+def max_request_bytes_from_env() -> int:
+    """Cap on an inbound request body, enforced at the ASGI layer BEFORE
+    anything calls ``request.json()`` (`__main__.RequestSizeLimitMiddleware`).
+    Env ``ROADSTEAD_MAX_REQUEST_BYTES``, default :data:`DEFAULT_MAX_REQUEST_BYTES`."""
+    try:
+        return max(1, int(os.environ.get(
+            "ROADSTEAD_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES)))
+    except ValueError:
+        return DEFAULT_MAX_REQUEST_BYTES
+
+
+def max_response_bytes_from_env() -> int:
+    """Running cap on a streamed backend response body, checked chunk-by-chunk
+    so a wedged or adversarial backend cannot grow the proxy's own memory
+    without bound. Env ``ROADSTEAD_MAX_RESPONSE_BYTES``, default
+    :data:`DEFAULT_MAX_RESPONSE_BYTES`."""
+    try:
+        return max(1, int(os.environ.get(
+            "ROADSTEAD_MAX_RESPONSE_BYTES", DEFAULT_MAX_RESPONSE_BYTES)))
+    except ValueError:
+        return DEFAULT_MAX_RESPONSE_BYTES
+
+
 @dataclass
 class ProxyConfig:
     """Top-level proxy configuration."""
