@@ -99,10 +99,19 @@ jobs:
         run: |
           /tmp/roadstead-install-check/bin/python -c "import roadstead, roadstead.client; print('import OK')"
           /tmp/roadstead-install-check/bin/python -m roadstead --help
+          # The CONSOLE SCRIPT, not just the module. `[project.scripts]` has
+          # declared `roadstead` since the first commit and nothing ever ran
+          # it: a broken entry-point path installs cleanly and only fails for
+          # the user, who is the one person who invokes it this way.
+          /tmp/roadstead-install-check/bin/roadstead --help
           /tmp/roadstead-install-check/bin/python -c "
           import pathlib, roadstead
           root = pathlib.Path(roadstead.__file__).parent
-          for rel in ('ui/index.html', 'models.yaml', 'agents.yaml'):
+          # py.typed is the PEP 561 marker: EMPTY, so only its presence says
+          # anything. Nothing imports it and no test would notice it missing —
+          # this assertion is the only thing standing between a package-data
+          # edit and every downstream type checker silently seeing Any.
+          for rel in ('ui/index.html', 'models.yaml', 'agents.yaml', 'py.typed'):
               path = root / rel
               assert path.exists(), f'missing from the installed wheel: {rel}'
           print('package-data OK')

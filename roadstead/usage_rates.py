@@ -3,8 +3,22 @@
 Every fleet endpoint maps to a REALISTIC cloud-rental price — the published cost
 of renting the SAME (or closest hostable) open model on a real provider — so the
 "savings" figure reflects what we'd actually pay to rent instead of self-host,
-NOT a frontier-model (Opus/Sonnet/Haiku) fantasy. Rates researched 2026-07-12;
-full sourcing + methodology in `originfleet/docs/fleet_cost_model.md`.
+NOT a frontier-model (Opus/Sonnet/Haiku) fantasy.
+
+METHODOLOGY, so the numbers can be re-derived rather than trusted. Each rate is
+the MID-OF-MARKET published price, on 2026-07-12, for renting the closest
+hostable OPEN model to the one an endpoint actually serves — surveyed across
+DeepInfra, OpenRouter, Together, Groq and Fireworks, taking the middle rather
+than the cheapest so a single provider's loss-leader cannot inflate the saving.
+Anchoring on the CLASS (parameter count and architecture) rather than on a named
+model is deliberate: swapping the model behind an endpoint for another of the
+same size must not silently reprice history. The exact anchor for each class is
+in the comment beside it below.
+
+🚨 These are STALE-BY-DESIGN and nothing recomputes them. Inference prices fall;
+a rate left alone for a year overstates the saving. Re-survey before quoting the
+figure anywhere it matters, and treat every number here as an order-of-magnitude
+claim rather than an accounting one.
 
 Two cost regimes:
 
@@ -13,15 +27,18 @@ Two cost regimes:
      gemma / embed / rerank); every legacy role/alias resolves to one of
      those via `_ENDPOINT_CLASS`.
 
-  2. PER-UNIT capabilities (speech / audio) — the producer packs its NATIVE
-     billable unit into the token columns (a documented CONTRACT with the
-     wrappers), decoded here:
+  2. PER-UNIT capabilities (speech / audio) — Roadstead does not serve these; a
+     deployment's own wrapper pushes them through `/v1/calls/log`, and packs its
+     NATIVE billable unit into the token columns. That packing is a CONTRACT
+     between the producer and this table, not an accident of the schema, and it
+     is decoded here:
        * STT / diarize / stem / lyrics:  input_tokens = audio_seconds * 100
-         (nexus_stream/telemetry.py, wrappers/lyrics_service.py,
-          wrappers/diarize_gpu_server.py — verified)
        * TTS:                            input_tokens = characters
-         (orpheus_tts_server.py, wrappers/sesame_tts_server.py — verified)
-     so cost is computed from audio-hours / characters, not a token rate.
+     so cost is computed from audio-hours / characters, not a token rate. 🚨 A
+     wrapper that pushes real token counts for one of these units will be priced
+     as though its tokens were seconds — the unit name in `_ENDPOINT_CLASS`
+     below is what selects the decoder, so a new audio capability must be added
+     there and taught the packing, in that order.
 
   3. MEDIA generation (imagegen / video / musicgen) is per-image / per-second /
      per-generation and is NOT yet metered — those jobs don't push a
@@ -43,7 +60,8 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 # 1. Token-native LLM classes — (input, output) USD per 1M tokens.
 #    Anchor = closest hostable open model, mid-of-market (DeepInfra / OpenRouter
-#    / Together / Groq / Fireworks). See docs/fleet_cost_model.md for the table.
+#    / Together / Groq / Fireworks), surveyed 2026-07-12. See the module
+#    docstring for how the anchor is chosen and why it is a class, not a model.
 # ---------------------------------------------------------------------------
 _RATES_BY_CLASS: dict[str, tuple[float, float]] = {
     # Anchored to the class of model an endpoint serves, not to a specific one:

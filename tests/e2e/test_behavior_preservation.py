@@ -42,7 +42,7 @@ timestamp/uuid fields, are redacted so the baseline is stable):
   preserved verbatim.
 
 TWO MODES:
-  * CAPTURE  (``LLMPROXY_GOLDEN_CAPTURE=1``): drive every declared case through a
+  * CAPTURE  (``ROADSTEAD_GOLDEN_CAPTURE=1``): drive every declared case through a
     fresh proxy and (re)write ``golden/behavior_baseline.json`` (pretty, sorted).
     Prints the case count. Run this ONLY to regenerate the baseline on purpose.
   * ASSERT   (default): parametrized over the frozen baseline; drives each case
@@ -77,7 +77,7 @@ from tests.corpus.schemas import _CHAT_CASE_D
 
 
 _BASELINE_PATH = Path(__file__).parent / "golden" / "behavior_baseline.json"
-_CAPTURE = os.environ.get("LLMPROXY_GOLDEN_CAPTURE", "").strip() in ("1", "true", "yes", "on")
+_CAPTURE = os.environ.get("ROADSTEAD_GOLDEN_CAPTURE", "").strip() in ("1", "true", "yes", "on")
 _INTERNAL_CLIENT = ("127.0.0.1", 41999)
 
 
@@ -366,7 +366,7 @@ async def _capture_all() -> Dict[str, Any]:
     return out
 
 
-@pytest.mark.skipif(not _CAPTURE, reason="capture mode: set LLMPROXY_GOLDEN_CAPTURE=1")
+@pytest.mark.skipif(not _CAPTURE, reason="capture mode: set ROADSTEAD_GOLDEN_CAPTURE=1")
 async def test_capture_baseline():
     """Regenerate golden/behavior_baseline.json from the live proxy."""
     records = await _capture_all()
@@ -385,7 +385,7 @@ def _load_baseline() -> Dict[str, Any]:
     if not _BASELINE_PATH.exists():
         raise AssertionError(
             f"baseline missing: {_BASELINE_PATH} — run with "
-            f"LLMPROXY_GOLDEN_CAPTURE=1 to generate it")
+            f"ROADSTEAD_GOLDEN_CAPTURE=1 to generate it")
     return json.loads(_BASELINE_PATH.read_text(encoding="utf-8"))
 
 
@@ -453,7 +453,7 @@ def test_baseline_covers_every_declared_case():
     assert frozen == declared, (
         f"baseline drift: missing={sorted(declared - frozen)} "
         f"extra={sorted(frozen - declared)} — regenerate with "
-        f"LLMPROXY_GOLDEN_CAPTURE=1")
+        f"ROADSTEAD_GOLDEN_CAPTURE=1")
 
 
 @pytest.mark.skipif(_CAPTURE, reason="capture mode active")
