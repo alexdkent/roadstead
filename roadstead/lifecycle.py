@@ -1743,7 +1743,7 @@ class Lifecycle:
                 return  # stream already finished and left the context
             self.state.stream_progress_extensions += 1
             logger.info(
-                "LLMPROXY_STREAM_PROGRESS_EXTEND endpoint=%s caller=%s "
+                "ROADSTEAD_STREAM_PROGRESS_EXTEND endpoint=%s caller=%s "
                 "request_id=%s extension=%d/%d gap_s=%.0f prompt=%d generation=%d",
                 req.endpoint, req.agent_id, req.request_id, extensions,
                 _STREAM_GAP_MAX_EXTENSIONS, gap_s,
@@ -2129,7 +2129,7 @@ class Lifecycle:
                 }),
             })
             logger.warning(
-                "LLMPROXY_STREAM_FINISH_REPAIRED endpoint=%s caller=%s "
+                "ROADSTEAD_STREAM_FINISH_REPAIRED endpoint=%s caller=%s "
                 "request_id=%s chunks=%d out_tokens=%d — backend sent [DONE] "
                 "with no finish_reason chunk; synthesized finish_reason=stop. "
                 "Without this the client sees text with no finish_reason and "
@@ -2141,7 +2141,7 @@ class Lifecycle:
             # Genuinely unterminated: no [DONE], no finish_reason. Say so —
             # this is the case where the client's drop handling is RIGHT.
             logger.warning(
-                "LLMPROXY_STREAM_UNTERMINATED endpoint=%s caller=%s "
+                "ROADSTEAD_STREAM_UNTERMINATED endpoint=%s caller=%s "
                 "request_id=%s chunks=%d out_tokens=%d — backend stream ended "
                 "with NEITHER [DONE] nor a finish_reason; relaying as-is (a "
                 "real truncation, not repaired).",
@@ -2155,7 +2155,7 @@ class Lifecycle:
         # unconditional on purpose: a stream that only logs when something
         # already went wrong cannot tell you what "normal" looked like.
         logger.info(
-            "LLMPROXY_STREAM_DONE endpoint=%s caller=%s request_id=%s "
+            "ROADSTEAD_STREAM_DONE endpoint=%s caller=%s request_id=%s "
             "chunks=%d ttft_ms=%.0f duration_ms=%.0f finish_reason=%s "
             "backend_done=%s splits=%d in_tokens=%d out_tokens=%d",
             req.endpoint, req.agent_id, req.request_id, chunks_relayed,
@@ -2183,7 +2183,7 @@ class Lifecycle:
         # Phase 1.1: record truncation of a structured stream so the storm is
         # visible in metrics (kept independent of the guard kill-switch — with
         # the guard off the caller still got the legacy 'done', but the
-        # completion row + LLMPROXY_TRUNCATION log stay loud).
+        # completion row + ROADSTEAD_TRUNCATION log stay loud).
         status = stream_guard_status
         if (status == "ok" and last_finish_reason == "length"
                 and self.correction.request_is_structured(req)):

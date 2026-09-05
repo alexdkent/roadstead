@@ -340,7 +340,7 @@ def test_event_carries_the_greppable_marker_and_caller_identity(caplog):
         m.detect_structured_empty(_req(BARE_STRIPPED_PAYLOAD, stripped=True),
                                   _result("{}"))
     line = "\n".join(r.getMessage() for r in caplog.records)
-    assert "LLMPROXY_STRUCTURED_EMPTY" in line
+    assert "ROADSTEAD_STRUCTURED_EMPTY" in line
     assert "agent=sidekick" in line
     assert "call_site=auto_approve.critic" in line
     assert "model=tier3" in line

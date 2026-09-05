@@ -187,7 +187,7 @@ def clear_config_notices() -> None:
 # the logs, so the field order and the ``key=value`` spelling are the shape to
 # preserve: ``<event_type> severity= provider= msg= source= action= blocked=
 # reason= metadata=``, with ``metadata`` a sort-keyed JSON object.
-# ``llmproxy_cache_drift`` (``health.py``, when a call_site's
+# ``roadstead_cache_drift`` (``health.py``, when a call_site's
 # front-loaded-prefix share collapses against its own trailing
 # baseline) is the only ``event_type`` in the package today, and a second one
 # means adding a NAME, never a column.

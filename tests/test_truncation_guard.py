@@ -7,14 +7,14 @@ Pins (both response modes, internal door):
 
   * TRUNCATION VISIBILITY (always on, observability-only): every
     finish_reason=length completion — structured or free-text, sync or stream —
-    emits the stable, grep-able ``LLMPROXY_TRUNCATION`` ERROR marker carrying
+    emits the stable, grep-able ``ROADSTEAD_TRUNCATION`` ERROR marker carrying
     model / agent / call_site / priority / max_tokens / output_tokens /
     structured, and bumps the per-(model, caller) tally on /v1/status.
   * SYNC STRUCTURED TRUNCATION → the pre-existing 502 ("truncated structured
     output", Phase 1.1) still fires — the guard extends it, never duplicates.
   * SYNC STRUCTURED PARSE FAILURE → a 200 whose content fails json.loads on a
     JSON-implying structured request flips to the established 502 error shape
-    (code ``structured_invalid_json``) + ``LLMPROXY_STRUCTURED_INVALID`` marker.
+    (code ``structured_invalid_json``) + ``ROADSTEAD_STRUCTURED_INVALID`` marker.
   * STREAMING: a structured stream that truncated or whose reassembled content
     fails json.loads terminates with the established error frame, never a clean
     'done'. Free-text streaming truncation still gets its 'done' (log + counter
@@ -176,7 +176,7 @@ async def test_sync_structured_truncation_502_and_marker(caplog):
         resp, result = await _drive_sync(svc, _payload(structured=True))
     assert resp.status_code == 502
     assert "truncated structured output" in result["error"]  # pre-existing shape
-    marker = [r for r in caplog.records if "LLMPROXY_TRUNCATION" in r.getMessage()]
+    marker = [r for r in caplog.records if "ROADSTEAD_TRUNCATION" in r.getMessage()]
     assert len(marker) == 1 and marker[0].levelno == logging.ERROR
     msg = marker[0].getMessage()
     assert ("model=tier3" in msg and "agent=kv4" in msg
@@ -197,7 +197,7 @@ async def test_sync_freetext_truncation_served_but_loud(caplog):
     assert result["response"]["choices"][0]["message"]["content"] == "a long capped reply"
     # …but never silently: marker + freetext tally.
     msg = next(r.getMessage() for r in caplog.records
-               if "LLMPROXY_TRUNCATION" in r.getMessage())
+               if "ROADSTEAD_TRUNCATION" in r.getMessage())
     assert "structured=False" in msg
     assert _tally(svc) == {"count": 1, "structured": 0, "freetext": 1}
 
@@ -215,7 +215,7 @@ async def test_sync_freetext_warmer_probe_exempt_from_marker(caplog):
     # Response still delivered (freetext truncation is never a hard failure)…
     assert resp.status_code == 200 and result["status"] == "ok"
     # …but the marker + tally are suppressed for the tiny probe.
-    markers = [r for r in caplog.records if "LLMPROXY_TRUNCATION" in r.getMessage()]
+    markers = [r for r in caplog.records if "ROADSTEAD_TRUNCATION" in r.getMessage()]
     assert markers == []
     assert _tally(svc) is None
     assert svc._correction.state.truncation_total == 0
@@ -228,7 +228,7 @@ async def test_sync_freetext_16token_probe_exempt(caplog):
     with caplog.at_level(logging.ERROR):
         resp, result = await _drive_sync(svc, _payload(max_tokens=16))
     assert resp.status_code == 200 and result["status"] == "ok"
-    assert [r for r in caplog.records if "LLMPROXY_TRUNCATION" in r.getMessage()] == []
+    assert [r for r in caplog.records if "ROADSTEAD_TRUNCATION" in r.getMessage()] == []
     assert svc._correction.state.truncation_total == 0
 
 
@@ -283,7 +283,7 @@ def _svc_toolcall(args):
 async def test_sync_vllm_truncated_toolcall_args_fail_loud(caplog):
     """vLLM mislabels a mid-tool-call truncation as finish_reason="tool_calls":
     cut-off arguments on a vLLM sync 200 = truncation → the pinned deferrable
-    502, LLMPROXY_TRUNCATION marker + tally — never a json-repaired
+    502, ROADSTEAD_TRUNCATION marker + tally — never a json-repaired
     valid-but-fabricated argument. (tier3 is the vLLM endpoint.)"""
     svc = _svc_toolcall('{"cmd": "rm -rf /tmp/x')  # cut mid-string
     with caplog.at_level(logging.ERROR):
@@ -294,7 +294,7 @@ async def test_sync_vllm_truncated_toolcall_args_fail_loud(caplog):
     assert "truncated structured output" in result["error"]  # pinned marker
     assert result["code"] == "toolcall_truncated"
     assert "response" not in result
-    assert any("LLMPROXY_TRUNCATION" in r.getMessage() for r in caplog.records)
+    assert any("ROADSTEAD_TRUNCATION" in r.getMessage() for r in caplog.records)
     assert _tally(svc)["count"] == 1
 
 
@@ -352,7 +352,7 @@ async def test_sync_structured_parse_failure_502_and_marker(caplog):
     assert "invalid JSON for a structured request" in result["error"]
     assert "response" not in result  # never a body alongside the error
     marker = [r for r in caplog.records
-              if "LLMPROXY_STRUCTURED_INVALID" in r.getMessage()]
+              if "ROADSTEAD_STRUCTURED_INVALID" in r.getMessage()]
     assert len(marker) == 1 and marker[0].levelno == logging.ERROR
     assert "model=tier3" in marker[0].getMessage()
     assert svc._correction.state.structured_parse_failure_total == 1
@@ -404,7 +404,7 @@ async def test_stream_structured_truncation_error_frame(caplog):
     assert "done" not in kinds, "a truncated structured stream must not end clean"
     err = next(e for e in events if e.get("type") == "error")
     assert "truncated structured output" in err["error"]
-    assert any("LLMPROXY_TRUNCATION" in r.getMessage() for r in caplog.records)
+    assert any("ROADSTEAD_TRUNCATION" in r.getMessage() for r in caplog.records)
     assert _tally(svc)["structured"] == 1
 
 
@@ -417,7 +417,7 @@ async def test_stream_structured_parse_failure_error_frame(caplog):
     assert "done" not in kinds
     err = next(e for e in events if e.get("type") == "error")
     assert "invalid JSON for a structured request" in err["error"]
-    assert any("LLMPROXY_STRUCTURED_INVALID" in r.getMessage()
+    assert any("ROADSTEAD_STRUCTURED_INVALID" in r.getMessage()
                for r in caplog.records)
     assert svc._correction.state.structured_parse_failures_by_model_caller == {
         "tier3|kv4": 1}
@@ -433,7 +433,7 @@ async def test_stream_freetext_truncation_done_delivered(caplog):
     assert not any(e.get("type") == "error" for e in events)
     # …but the truncation is loud.
     msg = next(r.getMessage() for r in caplog.records
-               if "LLMPROXY_TRUNCATION" in r.getMessage())
+               if "ROADSTEAD_TRUNCATION" in r.getMessage())
     assert "structured=False" in msg and "stream=True" in msg
     assert _tally(svc) == {"count": 1, "structured": 0, "freetext": 1}
 

@@ -588,9 +588,9 @@ class ProxyService:
                 self._config.startup_vacuum_freelist_threshold_bytes)
             if reclaimed:
                 logger.info(
-                    "llmproxy startup VACUUM reclaimed %.0f MB", reclaimed / 1e6)
+                    "roadstead startup VACUUM reclaimed %.0f MB", reclaimed / 1e6)
         except Exception as exc:  # noqa: BLE001 — never block startup on maintenance
-            logger.warning("llmproxy startup VACUUM skipped: %s", exc)
+            logger.warning("roadstead startup VACUUM skipped: %s", exc)
 
         # Phase 2.2: all startup recovery + bootstrap reads/writes are done
         # synchronously above while single-threaded; from here, route DB writes
@@ -619,7 +619,7 @@ class ProxyService:
         await self._on_demand.start()
 
         logger.info(
-            "llmproxy started: %d endpoints, %d total slots",
+            "roadstead started: %d endpoints, %d total slots",
             len(self._config.endpoints), self._config.total_fleet_slots,
         )
         # 🚨 Said at STARTUP, once, because the number is needed by whoever

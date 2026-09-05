@@ -254,7 +254,7 @@ class ProxyState:
         # each time the fail-loud gate in backend.call() trips — the
         # reliability signature for "this endpoint returned an empty
         # completion". Loop-thread-only writes (single-writer invariant), emitted
-        # on /metrics as ``llmproxy_empty_completion_total{endpoint}``.
+        # on /metrics as ``roadstead_empty_completion_total{endpoint}``.
         self.empty_completion_by_endpoint: dict[str, int] = {}
         # Truncation / structured-validity guard tallies (operator mandate
         # 2026-07-11 — truncation must never pass silently; structured responses
@@ -375,7 +375,7 @@ class ProxyState:
         self.cache_drift_alerted: dict = {}
         # Currently-drifting call_sites from the last drift evaluation (audit
         # 2026-07-02): evaluate_alerts turns these into standing AlertConditions
-        # so drift reaches /v1/status.alerts + the llmproxy_alerts_active gauge
+        # so drift reaches /v1/status.alerts + the roadstead_alerts_active gauge
         # (the one-shot CACHE_DRIFT_ALERT log line + store-less security event
         # were unreachable by any automated consumer).
         self.cache_drift_current: list[dict] = []

@@ -346,7 +346,7 @@ class PersistentQueue:
 
     def _spawn_writer_thread(self) -> None:
         self._writer = threading.Thread(
-            target=self._writer_loop, name="llmproxy-dbwriter", daemon=True)
+            target=self._writer_loop, name="roadstead-dbwriter", daemon=True)
         self._writer.start()
 
     def _writer_loop(self) -> None:
@@ -364,7 +364,7 @@ class PersistentQueue:
                     sql, params = item
                     self._conn.execute(sql, params)
             except Exception as exc:  # noqa: BLE001 — never let a bad write kill the writer
-                logger.warning("llmproxy db write failed: %s", exc)
+                logger.warning("roadstead db write failed: %s", exc)
             finally:
                 self._write_q.task_done()
 
@@ -389,7 +389,7 @@ class PersistentQueue:
                 self._write_q_dropped += 1
                 if self._write_q_dropped % 100 == 1:
                     logger.error(
-                        "llmproxy write queue full (maxsize=%d) — dropped %d "
+                        "roadstead write queue full (maxsize=%d) — dropped %d "
                         "best-effort write(s); recovery/telemetry rows lost, "
                         "live serving unaffected",
                         self._write_q_maxsize, self._write_q_dropped,
@@ -401,14 +401,14 @@ class PersistentQueue:
             return
         # Writer was started and DIED — try to self-heal once.
         logger.critical(
-            "llmproxy db writer thread is DEAD — attempting restart (restarts=%d)",
+            "roadstead db writer thread is DEAD — attempting restart (restarts=%d)",
             self._writer_restarts,
         )
         self._writer_restarts += 1
         try:
             self._spawn_writer_thread()
         except Exception as exc:  # noqa: BLE001
-            logger.critical("llmproxy db writer restart FAILED: %s", exc)
+            logger.critical("roadstead db writer restart FAILED: %s", exc)
         if self._writer is not None and self._writer.is_alive():
             try:
                 self._write_q.put_nowait((sql, params))
@@ -419,11 +419,11 @@ class PersistentQueue:
         # Restart failed — degraded sync fallback (loud). Better than losing the
         # write entirely; the CRITICAL above pages the operator via log_scan.
         logger.critical(
-            "llmproxy db writer unavailable — degraded SYNC write on loop thread")
+            "roadstead db writer unavailable — degraded SYNC write on loop thread")
         try:
             self._conn.execute(sql, params)
         except Exception as exc:  # noqa: BLE001
-            logger.error("llmproxy degraded sync write failed: %s", exc)
+            logger.error("roadstead degraded sync write failed: %s", exc)
 
     def _submit_writer_call(self, fn) -> None:
         """Run ``fn(conn)`` on the writer thread (or synchronously pre-writer).
@@ -447,11 +447,11 @@ class PersistentQueue:
         # Writer started and DIED — best-effort maintenance runs synchronously
         # and loudly (rare; _w's self-heal path covers normal writes).
         logger.critical(
-            "llmproxy db writer dead — running maintenance op synchronously")
+            "roadstead db writer dead — running maintenance op synchronously")
         try:
             fn(self._conn)
         except Exception as exc:  # noqa: BLE001
-            logger.error("llmproxy maintenance op failed: %s", exc)
+            logger.error("roadstead maintenance op failed: %s", exc)
 
     def writer_alive(self) -> bool:
         """True if the async writer thread is running (or not yet started)."""

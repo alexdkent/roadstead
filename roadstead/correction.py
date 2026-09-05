@@ -1563,7 +1563,7 @@ class Correction:
         ANY caller). Called from the single completion choke point
         (``Lifecycle.record_completion``, finish_reason=="length" for BOTH
         response modes) and from the sync tool-call truncation rule (vLLM
-        mislabels that finish as "tool_calls"). The ``LLMPROXY_TRUNCATION``
+        mislabels that finish as "tool_calls"). The ``ROADSTEAD_TRUNCATION``
         marker is stable — log_scan / health-verifier grep for it. Synchronous +
         allocation-light (one small dict row per (model, caller))."""
         p = req.payload if isinstance(req.payload, dict) else {}
@@ -1584,7 +1584,7 @@ class Correction:
         tally["structured" if structured else "freetext"] += 1
         self.state.truncation_total += 1
         logger.error(
-            "LLMPROXY_TRUNCATION model=%s agent=%s call_site=%s priority=%s "
+            "ROADSTEAD_TRUNCATION model=%s agent=%s call_site=%s priority=%s "
             "max_tokens=%s output_tokens=%d structured=%s stream=%s status=%s",
             req.endpoint, req.agent_id, req.call_site, req.priority.name,
             max_tokens, output_tokens, structured, stream, status)
@@ -1649,7 +1649,7 @@ class Correction:
         ``json.loads`` (operator mandate 2026-07-11). Shared by the sync guard
         (:meth:`enforce_structured_validity`) and the streaming end-of-stream
         guard in ``Lifecycle.execute_streaming`` so both doors count + log
-        identically. The ``LLMPROXY_STRUCTURED_INVALID`` marker is stable —
+        identically. The ``ROADSTEAD_STRUCTURED_INVALID`` marker is stable —
         log_scan / health-verifier grep for it."""
         key = f"{req.endpoint}|{req.agent_id}"
         st = self.state
@@ -1658,7 +1658,7 @@ class Correction:
             st.structured_parse_failures_by_model_caller.get(key, 0) + 1)
         p = req.payload if isinstance(req.payload, dict) else {}
         logger.error(
-            "LLMPROXY_STRUCTURED_INVALID model=%s agent=%s call_site=%s "
+            "ROADSTEAD_STRUCTURED_INVALID model=%s agent=%s call_site=%s "
             "priority=%s max_tokens=%s output_tokens=%d stream=%s — structured "
             "response content is not valid JSON",
             req.endpoint, req.agent_id, req.call_site, req.priority.name,
@@ -1738,7 +1738,7 @@ class Correction:
         failure: the condition is a backend launch flag, so every retry
         re-earns the same ``{}`` at full cost. The operator surfaces are:
 
-          * the greppable WARNING marker ``LLMPROXY_STRUCTURED_EMPTY``;
+          * the greppable WARNING marker ``ROADSTEAD_STRUCTURED_EMPTY``;
           * ``framework.observability.degradation`` (component=``llmproxy``,
             reason=``structured_empty``) — the same seam the comment critic
             uses, so it also lands on the fleet-wide counter;
@@ -1799,7 +1799,7 @@ class Correction:
                 empty=True, call_site=cs, now=time.monotonic())
             n_keys = len(obj) if isinstance(obj, dict) else 0
             logger.warning(
-                "LLMPROXY_STRUCTURED_EMPTY model=%s agent=%s call_site=%s "
+                "ROADSTEAD_STRUCTURED_EMPTY model=%s agent=%s call_site=%s "
                 "request_id=%s stream=%s declared_schema=%s required=%s "
                 "keys=%d content=%r — a STRUCTURED request returned a "
                 "well-formed JSON object with no answer in it. This is what a "

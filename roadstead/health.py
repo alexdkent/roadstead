@@ -114,7 +114,7 @@ class Health:
             return  # shutdown path
         exc = task.exception()
         logger.critical(
-            "llmproxy %s loop EXITED unexpectedly%s — proxy degraded until restart",
+            "roadstead %s loop EXITED unexpectedly%s — proxy degraded until restart",
             name, f": {exc!r}" if exc else " (clean return — should be impossible)",
         )
     def endpoint_healthy(self, endpoint: str) -> bool:
@@ -373,14 +373,14 @@ class Health:
         # truncation / degeneration check passed it. A per-endpoint rate is the
         # only thing that separates "one caller answered nothing" from "this
         # endpoint stopped answering", and putting it on the alerts channel is
-        # what makes it reach /v1/status.alerts + the llmproxy_alerts_active
+        # what makes it reach /v1/status.alerts + the roadstead_alerts_active
         # gauge + the health-verifier chip instead of dying as a log line nobody greps.
-        # Window / threshold / sample-floor rationale: llmproxy/observability.py.
+        # Window / threshold / sample-floor rationale: roadstead/observability.py.
         alerts.extend(structured_empty_alerts(
             self.state.structured_empty_window, now))
         # Standing cache-drift conditions (audit 2026-07-02): mirror the current
         # drift set into the alerts channel so it reaches /v1/status.alerts +
-        # the llmproxy_alerts_active gauge + the health-verifier chip — the CACHE_DRIFT
+        # the roadstead_alerts_active gauge + the health-verifier chip — the CACHE_DRIFT
         # log line alone had no automated consumer. Bucketed detail (10-pt) so
         # a jittering LCP% doesn't re-log every tick via the dedup key.
         for d in (self.state.cache_drift_current or []):
@@ -742,7 +742,7 @@ class Health:
     async def _evaluate_cache_drift(self, now: float) -> None:
         """Read the recent cache snapshots, detect call_sites whose front-loaded
         prefix collapsed vs baseline, and raise a ``CACHE_DRIFT_ALERT`` log marker
-        + a store-less ``llmproxy_cache_drift`` security event for each NEW drift
+        + a store-less ``roadstead_cache_drift`` security event for each NEW drift
         (dedup'd via ``state.cache_drift_alerted``). The heavy snapshot read +
         median math run off the event loop."""
         snaps = await asyncio.to_thread(
@@ -772,7 +772,7 @@ class Health:
                 d["call_site"], d["endpoint"], d["from"], d["to"])
             record_security_event(
                 logger,
-                event_type="llmproxy_cache_drift", severity="warning",
+                event_type="roadstead_cache_drift", severity="warning",
                 source=d["endpoint"], action=d["call_site"],
                 reason=f"prefix LCP% {d['from']}->{d['to']}",
                 metadata={"call_site": d["call_site"], "endpoint": d["endpoint"],
