@@ -3,8 +3,14 @@
 > A **roadstead** is the sheltered anchorage outside a harbour where vessels wait for a berth to
 > free up.
 
-**A local-first LLM scheduler.** It stands between many kinds of caller and many kinds of model, and
-absorbs the mismatch so that neither side has to model the other.
+**An LLM proxy and scheduler for backends you run yourself** — llama.cpp and vLLM on your own
+hardware, with OpenRouter and other remote providers as explicit overflow. Callers reach it through
+an OpenAI-compatible door; it decides what runs where and when, using priority bands, fair-share
+between callers, and timeouts computed from latency it measured rather than a number the caller
+guessed.
+
+It stands between many kinds of caller and many kinds of model, and absorbs the mismatch so that
+neither side has to model the other.
 
 Callers differ in *urgency*, not just in what they ask for — an interactive turn and an overnight
 summarizer may want the same model and cannot wait the same amount of time. Backends differ in
@@ -53,7 +59,7 @@ Roadstead answers that question by measuring rather than assuming:
 A survey of ~25 open-source gateways (`docs/evaluation.md`) found none that does all of this
 outside Kubernetes, and none at all that does the last two.
 
-That survey was of a proxy for one private fleet. Roadstead generalises it: the same question, asked
+That survey was of a proxy for one operator's own fleet. Roadstead generalises it: the same question, asked
 across local *and* remote capacity, for callers who declare what they need rather than which model
 to use. See `docs/roadmap.md`.
 
@@ -86,6 +92,15 @@ plan on 2026-08-31**: a parity gate on a deliberate superset fails on every impr
 ## Quick start
 
 ```sh
+pip install git+https://github.com/alexdkent/roadstead
+```
+
+**Not on PyPI yet** — `pip install roadstead` is coming, and until it does the git URL above is the
+install. Python 3.11 or newer.
+
+To work on it instead, take the source and its dev extras:
+
+```sh
 python3.11 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest
 ```
@@ -93,12 +108,54 @@ python3.11 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 The suite needs **no fleet, no network and no inference backend** — it runs against
 `roadstead.testing`, described below.
 
+### Run it
+
+The install puts a `roadstead` console script on your path; `python -m roadstead` is the same entry
+point for anyone who would rather not rely on one.
+
+```sh
+ROADSTEAD_DATA_DIR=/var/lib/roadstead roadstead --port 42161
+ROADSTEAD_DATA_DIR=/var/lib/roadstead python -m roadstead --port 42161
+```
+
+🚨 **Set `ROADSTEAD_DATA_DIR` or you will lose state you were told was durable.** It defaults to
+`/tmp/agents/llmproxy`, which is right for a developer running the module for ten minutes and wrong
+for anything else: DRR balances, the day's spend and endpoint drain state live under it, and those
+are exactly the rows the shutdown drain exists to flush. The process says so on startup when the
+path looks ephemeral.
+
+With no configuration at all it boots against the example catalog that ships in the package
+(`roadstead/models.yaml` — invented backends on RFC 5737 addresses), mints a one-off bootstrap admin
+key, and answers:
+
+```sh
+curl localhost:42161/readyz     # {"ready":true, ..., "scheduler_alive":true, "reason":"ok"}
+curl localhost:42161/v1/models  # tier1, tier2, tier3, embed, rerank — from the catalog
+```
+
+Point `ROADSTEAD_MODELS_YAML` at your own catalog to route to backends that exist.
+
+**In a container, the stop-grace period is load-bearing:**
+
+```sh
+docker run --stop-timeout 108 -p 42161:42161 -v roadstead-data:/var/lib/roadstead roadstead
+```
+
+SIGTERM starts a bounded drain that persists DRR budgets and completion rows. Uvicorn's
+connection budget and the app's drain budget run in series rather than nested — 48s, then 48s, plus
+a margin — so 108 is a ceiling rather than a measurement. `docker stop` hard-kills after **10s** by
+default, which truncates that flush in every non-idle case and loses the state silently; the default
+works fine while the proxy is quiet, which is why it first fails under load. Compose spells the same
+thing `stop_grace_period: 108s`. The number is computed in one place
+(`service.RECOMMENDED_STOP_GRACE_S`), the image carries it as a label, and the process prints it on
+startup.
+
 ### Two doors
 
 **OpenAI-compatible**, for anything that already speaks it:
 
 ```sh
-curl localhost:42161/v1/chat/completions -H 'Authorization: Bearer $KEY' \
+curl localhost:42161/v1/chat/completions -H "Authorization: Bearer $KEY" \
   -d '{"model": "tier2", "messages": [{"role": "user", "content": "hi"}]}'
 ```
 
@@ -316,11 +373,31 @@ SSE frames, TTFT and inter-token stalls, mid-stream resets, and capacity desync.
 
 It is also the executable form of §4 of `docs/api.md` — what Roadstead requires *of a backend*.
 
+## Known limitations
+
+Three things worth knowing before you deploy it, each written up where it is being worked on:
+
+- **Intent routing never explores, so a fleet converges on one endpoint.** Found by running it:
+  2,566 calls across three intents all went to `tier3`, and the rivals ended with no latency
+  samples at all — an unmeasured endpoint ranks `inf`, so the first winner is the only one that
+  ever accumulates the evidence that could unseat it. A concrete pin still routes exactly where you
+  said. [`docs/roadmap.md`](docs/roadmap.md)
+- **Pre-1.0: breaking changes are allowed.** They are deliberate and recorded — the wire contract in
+  `docs/api.md` is the stable surface, everything else may move, and none of it promises a
+  deprecation *period*. Read the policy before you pin a version.
+  [`docs/compatibility.md`](docs/compatibility.md)
+- **The legacy `/v1/submit` door is a compatibility shim, off by default.** It exists so a fleet
+  already speaking the old envelope can cross one caller at a time; `ROADSTEAD_LEGACY_SUBMIT` opens
+  it, and unset means the route does not exist. It also restores an unchecked body `agent_id` for
+  internal-net callers, which is the one place Roadstead departs from its own identity rules. Its
+  removal is gated on the inventory being empty, not on a date.
+  [`docs/api.md`](docs/api.md) §1.9.1
+
 ## Documentation
 
 | | |
 |---|---|
-| `CLAUDE.md` | Orientation, the concurrency invariant, and the engine-behaviour findings that explain why the code is shaped the way it is. **Read before changing anything.** |
+| `docs/internals.md` | Orientation, the concurrency invariant, and the engine-behaviour findings that explain why the code is shaped the way it is. **Read before changing anything.** |
 | `docs/api.md` | The API surfaces: both north faces, the error contract, the admin/control plane, what Roadstead requires *of a backend*, and the client SDK. |
 | `docs/roadmap.md` | **What is being built and why.** Start here for direction. |
 | `docs/compatibility.md` | What is stable, what is not, and how to break something on purpose. |

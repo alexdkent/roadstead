@@ -1,0 +1,96 @@
+name: Bug report
+description: Something Roadstead does that it should not, or does not do that it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. The fields below are the ones that usually decide whether a
+        report can be reproduced or only sympathised with — a scheduler's behaviour depends on what
+        capacity it thinks it has and who it thinks is asking, and neither is guessable from a
+        stack trace.
+
+        🚨 **Redact before you paste.** Everything here becomes public. Replace real host names and
+        addresses with RFC 5737 documentation addresses (`192.0.2.0/24`), and strip API keys — a
+        catalog stanza and a `/v1/status` body can both carry credentials and topology.
+
+        For a **security** problem, do not open an issue at all: use the private advisory route in
+        [`SECURITY.md`](https://github.com/alexdkent/roadstead/blob/main/SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: Roadstead version
+      description: |
+        `python -c "import roadstead; print(roadstead.__version__)"`, or the commit SHA if you are
+        running from a checkout. (`roadstead --help` does not print it.)
+      placeholder: "0.1.0.dev0, or a commit SHA"
+    validations:
+      required: true
+
+  - type: input
+    id: engine
+    attributes:
+      label: Backend engine and version
+      description: |
+        Which engine sits behind the endpoint that misbehaved, and what version — `llama.cpp
+        b1234`, `vLLM 0.6.3`, `openrouter`. If several were involved, name them all. Engine
+        behaviour differs in ways Roadstead has to model, so "a llama.cpp server" without a build
+        is often not enough to reproduce.
+      placeholder: "llama.cpp b4123 / vLLM 0.6.3 / openrouter"
+    validations:
+      required: true
+
+  - type: textarea
+    id: catalog
+    attributes:
+      label: The catalog stanza (redacted)
+      description: |
+        The `providers:` and `endpoints:` entries from your `models.yaml` for the endpoint
+        involved — slots, per-slot context, timeouts, capabilities, failover and spill. This is the
+        single most useful thing in the report: admission decisions are made against these numbers.
+        Replace addresses and credentials.
+      render: yaml
+      placeholder: |
+        providers:
+          my-backend:
+            engine: llama.cpp
+            base_url: http://192.0.2.10:8080
+        endpoints:
+          tier2:
+            provider: my-backend
+            slots: 4
+            context_per_slot: 32768
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: "`GET /v1/status` excerpt"
+      description: |
+        `curl -s localhost:42161/v1/status` around the time it happened — the endpoint's health,
+        pause and breaker state, in-flight and utilisation, queue waits. Trim it to the endpoint in
+        question if the whole body is large.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What should have happened, and what made you expect it — a line in `docs/api.md` if there is one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened
+      description: |
+        The observed behaviour, with the request that produced it and the response you got back
+        (status, `code`, and the error message — the marker substrings in it are contract). Logs
+        around the event help; so does whether it reproduces.
+    validations:
+      required: true
