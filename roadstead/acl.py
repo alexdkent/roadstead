@@ -6,7 +6,7 @@ one; an address now fills in an identity that no credential established.
 
 🚨 **It ships no addresses.** Until 2026-09-01 this file carried a private
 fleet's LAN registrations — ten hosts by address, role and purpose, compiled
-into the package (scrub item S1, ``docs/corpus_and_scrub_plan.md``). They are
+into the package (the scrub rule in ``CONTRIBUTING.md``). They are
 gone, and the environment is now the ONLY way to register one. Two spellings for
 one registration is how they come to disagree, and a shipped default that
 happens to match somebody's LAN is worse than no default at all: it hands an

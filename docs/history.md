@@ -129,8 +129,8 @@ rather than moved:**
 | `test_inference_placement_doctrine.py` | The host/vehicle placement charter — which machine runs what. Roadstead has no opinion. |
 | `test_tier2_analyst_naming_doctrine.py` | The `creative` retired-name coupling as it appears in the *real* fleet's catalog. |
 
-The last three also **interact with the scrub** (`corpus_and_scrub_plan.md` S2): they assert facts
-about the real `models.yaml`, so keeping them here would have blocked turning it into an example.
+The last three also **interact with the scrub**: they assert facts about the real
+`models.yaml`, so keeping them here would have blocked turning it into an example.
 The `creative` naming invariant itself is still recorded in `CLAUDE.md` and in "Things that will
 mislead you" below — only the fleet-specific assertion left.
 
@@ -181,8 +181,9 @@ improvement.
 
 - **Comments referencing `ship.sh`, `cexec`, skills, agents or fleet hosts** are extraction
   leftovers. The reference is dead; **the reasoning usually is not.** Don't delete the reasoning.
-- **`models.yaml` is real fleet data**, not an example. See `corpus_and_scrub_plan.md` — it must
-  become an example before this goes public.
+- **`models.yaml` WAS real fleet data**, and is an example now (2026-08-31). The schema is
+  Roadstead's contract; the fleet in the shipped file is invented, on RFC 5737 addresses. A comment
+  or a test that reads as though the catalog described somebody's real machines predates that.
 - **`creative` is a retired endpoint name kept deliberately** in three load-bearing places
   (persisted rows, the pre-discovery wire id, and a routable alias). Renaming it is a data
   migration, not a rename.
@@ -223,8 +224,8 @@ improvement.
    build-time coupling to the monorepo's copy during the dual-track period, and with the dual track
    gone the two are simply separate files in separate projects. The open question is no longer
    *where the catalog lives* but **what ships**: the schema is Roadstead's contract, the data is a
-   private fleet's. `corpus_and_scrub_plan.md` S2 (ship `models.yaml.example`) is the answer, and it
-   is now on the critical path rather than deferred.
+   private fleet's. Shipping an example catalog is the answer, and it landed 2026-08-31 —
+   `roadstead/models.yaml` is that example, and the suite runs against it.
 
 4. **The `n_parallel` preference order** — new 2026-08-31, and newly actionable. `health.py` prefers
    `default_generation_settings.n_parallel` over `total_slots`, but a current llama.cpp publishes

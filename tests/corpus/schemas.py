@@ -13,7 +13,7 @@ invented fixture only ever exercises the failures its author already thought of.
 What survived the extraction is the PROPERTY each one pins (a closed enum
 vocabulary, an open one, an array root, a negative constraint); the vocabulary
 around it — agent names, source paths, people, places, brands — was one private
-deployment's and is gone (scrub item S4, `docs/corpus_and_scrub_plan.md`). Every
+deployment's and is gone (the scrub rule in `CONTRIBUTING.md`). Every
 name, address and business below is fictional, and the prompts are synthesized.
 Do not read any of it as a record of anything.
 

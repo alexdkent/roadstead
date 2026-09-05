@@ -162,8 +162,8 @@ def test_the_published_floor_and_ceilings_match_the_code():
 def test_the_per_class_floors_are_deliberately_not_published():
     """§1.4 says the per-class floors are deployment data and tells clients to
     ask for them. Pin that commitment, so nobody 'helpfully' pastes a fleet's
-    real floor table into a document headed for publication — the working tree
-    half of `docs/corpus_and_scrub_plan.md`.
+    real floor table into a document headed for publication — the scrub rule in
+    `CONTRIBUTING.md`.
 
     Checks for a table ROW binding a class to a number, not for the class name:
     §1.4 legitimately names `tier3` and `tier3` while explaining

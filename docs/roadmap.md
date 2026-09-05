@@ -905,7 +905,8 @@ was written, surfaced in two views, and read for no decision.
 
 ### Cross-cutting · The scrub
 
-`corpus_and_scrub_plan.md`. Gates the open-source goal. **S2 is done** (2026-08-31), together with
+Tracked privately in the origin monorepo; the half a contributor needs is the scrub rule in
+`CONTRIBUTING.md`. Gates the open-source goal. **S2 is done** (2026-08-31), together with
 the catalog redesign it shared its work with — and it turned up a second inventory nobody had listed,
 `usage_rates.py`, which is now anchored to model classes rather than to one fleet's models.
 

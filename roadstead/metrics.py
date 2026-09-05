@@ -1,14 +1,14 @@
 """Tiny Prometheus text-exposition EMITTER for the proxy's ``GET /metrics``.
 
-Vendored from ``originfleet/framework/metrics.py`` (2026-08-31) so this package
-depends on nothing outside itself — see ``hooks.py`` for the rationale. The two
-copies are independent by design: this one serves the proxy, the framework one
-serves the agents. Keep them behaviourally identical if you touch the rendering
-rules, but they are not required to stay byte-identical.
+Vendored from the origin monorepo's framework emitter (2026-08-31) so this
+package depends on nothing outside itself — see ``hooks.py`` for the rationale.
+The two copies are independent by design: this one serves the proxy, the one
+left behind serves that fleet's agents. Nothing keeps them in step, and nothing
+needs to.
 
-The repo deliberately avoids the ``prometheus_client`` dependency:
-``infra/common/telemetry_core/prom_parse.py`` hand-rolls the read side for vLLM
-telemetry, and this module hand-rolls the write side.
+The ``prometheus_client`` dependency is deliberately not taken. The write side
+is small enough to hand-roll — this module is the whole of it — and the read
+side was already hand-rolled where the origin fleet parses vLLM telemetry.
 
 Scope note: this emits the subset of Prometheus text exposition the fleet needs
 — ``gauge`` and ``counter`` samples with ``name{labels} value`` lines and the

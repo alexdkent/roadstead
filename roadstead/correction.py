@@ -125,7 +125,7 @@ def _chat_completion_text(body: dict) -> str:
 # --- Phase 3 schema-repair backstop — pure helpers --------------------------
 # All are total (never raise) so the guard can stay fail-open; the orchestration
 # (flags / state / persist / retry) lives on Correction.maybe_repair_schema. See
-# docs/llmproxy_phase3_schema_backstop_contract.md.
+# the origin project's phase-3 schema-backstop contract (not in this repo).
 
 def _response_tool_calls(body: dict) -> list:
     """The assistant message's tool_calls list (or [])."""
@@ -978,7 +978,8 @@ class Correction:
         FAIL-OPEN: any error leaves ``result`` byte-identical. Flag-gated
         (``ROADSTEAD_PROXY_SCHEMA_BACKSTOP``, default OFF); shadow
         (``…_SHADOW``) = detect + repair-in-memory + count + log, return original
-        untouched. See docs/llmproxy_phase3_schema_backstop_contract.md."""
+        untouched. The behaviour is the phase-3 schema-backstop contract; what
+        the caller sees of it is docs/api.md §2.1 (`schema_invalid`)."""
         try:
             if not schema_backstop_enabled():
                 return
@@ -1062,9 +1063,11 @@ class Correction:
 
             # (3) Fail loud — never hand malformed structured output to the caller.
             # Same in-band shape as thinking-fallback: status=error + drop the body
-            # → handle_sync_submit returns 502 (deferrable via the client's
-            # "llm proxy error 50" marker); never cached (_schema_unrecoverable,
-            # honored at lifecycle alongside _degenerate_unrecovered).
+            # → handle_sync_submit returns 502 with code `schema_invalid`, which
+            # docs/api.md §2.1 publishes as NON-deferrable: repair and one retry
+            # with the error fed back have already failed, so a third identical
+            # attempt buys nothing. Never cached (_schema_unrecoverable, honored
+            # at lifecycle alongside _degenerate_unrecovered).
             self.state.schema_unrecoverable += 1
             tally["unrecoverable"] += 1
             result["status"] = "error"
