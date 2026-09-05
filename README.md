@@ -24,7 +24,7 @@ leaves the machine unless someone opts into spilling it.
 > ⚠️ **Pre-release, and private.** Extracted from a production monorepo on 2026-08-31 and still
 > stabilising. It is an independent project rather than a replacement for its origin — expect it to
 > become a superset, and expect occasional deliberate breaks (`docs/compatibility.md`). This
-> repository must not be made public until the scrub in `docs/corpus_and_scrub_plan.md` is complete.
+> repository must not be made public until the git-history rewrite (S7) is complete.
 
 ## Why it exists
 
@@ -403,7 +403,6 @@ Three things worth knowing before you deploy it, each written up where it is bei
 | `docs/compatibility.md` | What is stable, what is not, and how to break something on purpose. |
 | `docs/history.md` | Closed record of the extraction — where the code came from and what that cost. |
 | `docs/evaluation.md` | Why this exists rather than adopting something else — the field survey and decision record. |
-| `docs/corpus_and_scrub_plan.md` | What must be scrubbed before this can go public, and why the working tree is not enough. |
 | `docs/ledger.md` | Defects that came back, with the guard that now prevents each. |
 
 ## Licence

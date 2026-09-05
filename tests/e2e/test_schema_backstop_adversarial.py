@@ -14,7 +14,9 @@ tool-call args) or the two controller knobs added by this track
 (``structured_content`` / ``structured_tool_args``) — no new named fault, so the
 ALL_FAULTS meta-coverage stays intact.
 
-See docs/llmproxy_phase3_schema_backstop_contract.md §5.
+The behaviour it pins is `correction.py`'s, documented there and in
+docs/api.md §2.1; the origin project's phase-3 contract document is not part of
+this repository.
 """
 from __future__ import annotations
 
@@ -121,7 +123,8 @@ def ok_tool_args(resp, door):
 
 
 def is_fail_loud(resp, door):
-    """A schema-backstop deferrable fail-loud (502, typed), NOT a 500/other."""
+    """A schema-backstop fail-loud (502, typed `schema_invalid` — non-deferrable,
+    docs/api.md §2.1), NOT a 500/other."""
     if resp.status_code != 502:
         return False
     j = resp.json()
@@ -271,7 +274,8 @@ async def test_bare_grammar_no_schema_repaired_parse_only(proxy, monkeypatch):
 @pytest.mark.parametrize("door", DOORS)
 async def test_schema_invalid_persistent_fail_loud(proxy, monkeypatch, door):
     """schema-INVALID, repair insufficient, retry ALSO invalid → fail-loud
-    deferrable (502, typed), never a malformed 200, never a 500."""
+    (502, typed `schema_invalid` — NON-deferrable per docs/api.md §2.1), never a
+    malformed 200, never a 500."""
     monkeypatch.setenv(FLAG, "1")
     proxy.controller.set_fault(FAULT_SCHEMA_VALID_WRONG)  # persistent
     st = proxy.svc._correction.state

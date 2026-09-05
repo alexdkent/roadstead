@@ -20,15 +20,27 @@ ghosts. Both directions matter, and for different reasons —
   an omission: it is confidently wrong. An operator sets it, sees no error, and
   concludes the setting took effect.
 
-**Read as TEXT, comments included, and deliberately.** A variable named only in
-a comment (`ROADSTEAD_TIMEOUT_ADVICE_CAP_S`) or emitted only in a log line
-(`ROADSTEAD_SPILL`) is still a `ROADSTEAD_`-shaped string a reader will grep and
-have to adjudicate. The document has a section for exactly those, so they are
-covered rather than exempted — an exemption list is the thing that quietly
-grows.
+🚨 **The two directions read the tree differently, and they have to.**
+
+* code → doc asks *what does this process READ from the environment*, and that
+  is answered from the CALL — `os.environ[...]`, `os.getenv`, and the
+  prefix-building helper — never from a `ROADSTEAD_`-shaped literal. Written the
+  other way it demanded a configuration row for the ten renamed LOG MARKERS
+  (`ROADSTEAD_STREAM_DONE`, `ROADSTEAD_FAILOVER_ENTER`, …, 2026-09-05), which
+  are grep handles inside `logger` calls and configure nothing. A reference that
+  lists things nobody can set is the same defect as one that omits things they
+  can, arriving from the other side.
+* doc → code stays a TEXT scan, comments included: a name the document utters
+  and the tree does not is a ghost whether the tree would have *read* it or not,
+  and a name that appears only in a comment (`ROADSTEAD_TIMEOUT_ADVICE_CAP_S`)
+  or a log line (`ROADSTEAD_SPILL`) is still something a reader will grep and
+  have to adjudicate. The document has a section for exactly those, so they are
+  covered rather than exempted — an exemption list is the thing that quietly
+  grows.
 """
 from __future__ import annotations
 
+import ast
 import pathlib
 import re
 
@@ -88,8 +100,112 @@ def _source_files() -> list[pathlib.Path]:
     )
 
 
-def _names_the_code_names() -> dict[str, str]:
-    """Every variable name in the package → the first file that names it."""
+#: 🚨 The three shapes that actually READ the environment. `os.environ.setdefault`
+#: is deliberately absent: it PUBLISHES a name for somebody else's benefit, and
+#: the one place that did it named `ROADSTEAD_AGENT_NAME`, which no module in
+#: this package ever consulted (deleted 2026-09-05). A name this process exports
+#: and never reads is not a knob, and a reference row for it would promise a
+#: setting that does nothing.
+_ENV_READERS = frozenset({
+    ("os", "environ", "get"),
+    ("os", "getenv"),
+})
+
+#: The two helpers that prepend the prefix, as they appear at a CALL. `_env` is
+#: `__main__`'s import alias for the second; both are call sites of one function.
+_HELPER_NAMES = frozenset({"_env", "env_with_legacy_prefix"})
+
+
+def _dotted(node: ast.AST) -> tuple[str, ...] | None:
+    """`os.environ.get` → `("os", "environ", "get")`; anything else → None."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return tuple(reversed(parts))
+    return None
+
+
+def _string_constants(tree: ast.AST) -> dict[str, set[str]]:
+    """Module-level names bound to string literals, INCLUDING loop variables.
+
+    🚨 Not a nicety — three variables are read through one of these and would
+    otherwise vanish from the scan. `legacy.py` reads `ENV`, `management.py`
+    reads `_UI_ENV`, and `acl.py` reads its name out of a `for var in (…)` over
+    the legacy spelling and the current one. A resolver that only understood a
+    literal argument would report all three as unread while the doc rows for
+    them looked like ghosts.
+    """
+    consts: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    consts.setdefault(target.id, set()).add(node.value.value)
+        elif isinstance(node, ast.For) and isinstance(node.target, ast.Name) \
+                and isinstance(node.iter, (ast.Tuple, ast.List)):
+            for elt in node.iter.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    consts.setdefault(node.target.id, set()).add(elt.value)
+    return consts
+
+
+def _env_reads_in(source: str) -> set[str]:
+    """Every variable name this source READS from the environment.
+
+    Dynamic reads — `os.environ.get(entry.api_key_env)` for a provider
+    credential the catalog names — resolve to nothing and are skipped on
+    purpose: the name is a runtime value, so no reference can list it. What must
+    never be skipped is a name that IS static, which is what the recovery tests
+    below pin.
+    """
+    tree = ast.parse(source)
+    consts = _string_constants(tree)
+
+    def resolve(node: ast.AST) -> set[str]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return {node.value}
+        if isinstance(node, ast.Name):
+            return set(consts.get(node.id, ()))
+        return set()
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and node.args:
+            if _dotted(node.func) in _ENV_READERS:
+                names |= resolve(node.args[0])
+            elif isinstance(node.func, ast.Name) and node.func.id in _HELPER_NAMES:
+                names |= {_BARE_PREFIX + s for s in resolve(node.args[0])}
+        elif isinstance(node, ast.Subscript) and _dotted(node.value) == ("os", "environ"):
+            # `os.environ["ROADSTEAD_DATA_DIR"] = …` is a write, and it is here
+            # anyway: the flag is published into the environment precisely so the
+            # four paths derived from it read it back, so it is a variable of
+            # this process either way.
+            names |= resolve(node.slice)
+    return {n for n in names if n.startswith(_BARE_PREFIX) and n != _BARE_PREFIX}
+
+
+def _names_the_code_reads() -> dict[str, str]:
+    """Every variable the package reads → the first file that reads it."""
+    found: dict[str, str] = {}
+    for path in _source_files():
+        if path.suffix != ".py":
+            continue
+        rel = str(path.relative_to(REPO))
+        for name in sorted(_env_reads_in(path.read_text(encoding="utf-8"))):
+            found.setdefault(name, rel)
+    return found
+
+
+def _names_the_code_mentions() -> dict[str, str]:
+    """Every `ROADSTEAD_`-shaped name the package UTTERS → the first file.
+
+    Comments, docstrings, log markers and YAML alike — the doc→code direction's
+    net, and deliberately the wider one.
+    """
     found: dict[str, str] = {}
     for path in _source_files():
         text = path.read_text(encoding="utf-8")
@@ -115,20 +231,18 @@ def _names_the_doc_mentions() -> set[str]:
 
 
 def test_every_variable_the_code_reads_is_in_the_reference():
-    code = _names_the_code_names()
+    code = _names_the_code_reads()
     missing = sorted(set(code) - _names_the_doc_lists())
     assert not missing, (
         "these names appear in roadstead/ and not in docs/configuration.md:\n  "
         + "\n  ".join(f"{n}  ({code[n]})" for n in missing)
-        + "\n\nAdd a row — group, type, default, and what it does. If it is not "
-          "actually an environment variable (a log marker, a name this process "
-          "exports rather than reads), it goes in the document's 'Names that "
-          "look like configuration and are not' table, which is there so the "
-          "answer is written down instead of re-derived.")
+        + "\n\nAdd a row — group, type, default, and what it does. Every name "
+          "here was recovered from an actual environment READ, so it is a knob "
+          "somebody can set and cannot find.")
 
 
 def test_every_variable_the_reference_names_exists_in_the_code():
-    code = set(_names_the_code_names())
+    code = set(_names_the_code_mentions())
     ghosts = sorted(_names_the_doc_mentions() - code)
     assert not ghosts, (
         "docs/configuration.md names variables that nothing in roadstead/ "
@@ -147,12 +261,62 @@ def test_the_helper_built_names_are_actually_recovered():
     pattern misses), both tests above would keep passing while going blind to
     fourteen variables. This is what makes that failure loud.
     """
-    recovered = {n for n, _ in _names_the_code_names().items()}
+    recovered = set(_names_the_code_reads())
     for name in ("ROADSTEAD_QUEUE_DB", "ROADSTEAD_LOG_DIR", "ROADSTEAD_PORT",
                  "ROADSTEAD_REQUEST_LOG_BACKUPS"):
         assert name in recovered, (
             f"{name} was not recovered from a helper call site — the scan has "
             f"gone blind to every variable built as ROADSTEAD_ + <suffix>")
+
+
+def test_a_log_marker_is_not_read_as_a_variable():
+    """🚨 The defect this scan was rewritten for, pinned from both ends.
+
+    The `ROADSTEAD_*` log markers are grep handles inside `logger` calls — they
+    configure nothing, and there is nothing an operator could set. Written as a
+    literal scan, this file demanded a configuration row for all ten of them the
+    day they were renamed off the origin project's prefix (2026-09-05), which
+    would have been answered by documenting ten settings that do not exist.
+    """
+    synthetic = _env_reads_in(
+        'import os, logging\n'
+        'logger = logging.getLogger(__name__)\n'
+        'def f(x):\n'
+        '    logger.info("ROADSTEAD_STREAM_DONE request_id=%s", x)\n'
+        '    logger.warning("ROADSTEAD_MADE_UP_MARKER %s", x)\n'
+        '    return os.environ.get("ROADSTEAD_REAL_KNOB", "")\n'
+    )
+    assert synthetic == {"ROADSTEAD_REAL_KNOB"}, synthetic
+
+    # And on the real tree: the markers are uttered, and read by nothing.
+    reads = set(_names_the_code_reads())
+    mentions = set(_names_the_code_mentions())
+    for marker in ("ROADSTEAD_STREAM_DONE", "ROADSTEAD_FAILOVER_ENTER",
+                   "ROADSTEAD_TRUNCATION", "ROADSTEAD_STRUCTURED_EMPTY",
+                   "ROADSTEAD_SPILL"):
+        assert marker in mentions, (
+            f"{marker} is not in the source at all — this test is pinning a "
+            f"marker that has been renamed or removed")
+        assert marker not in reads, (
+            f"{marker} is a log marker and the scan is treating it as a "
+            f"variable; the code→doc direction is back to matching literals")
+
+
+def test_the_indirectly_named_reads_are_actually_recovered():
+    """The three variables whose name reaches `os.environ` through a NAME.
+
+    `ROADSTEAD_LEGACY_SUBMIT` is read as `os.environ.get(ENV)`,
+    `ROADSTEAD_ADMIN_UI` as `os.environ.get(_UI_ENV)`, and `ROADSTEAD_ACL` out
+    of a `for var in (…)` that walks the legacy spelling and the current one.
+    All three are real knobs an operator sets, and a resolver that only
+    understood a literal argument would drop them from the reference silently —
+    the exact failure `_HELPER_CALL` exists to prevent for the other shape.
+    """
+    reads = set(_names_the_code_reads())
+    for name in ("ROADSTEAD_LEGACY_SUBMIT", "ROADSTEAD_ADMIN_UI", "ROADSTEAD_ACL"):
+        assert name in reads, (
+            f"{name} is read through a module constant or a loop variable and "
+            f"the scan no longer resolves it")
 
 
 def test_no_variable_name_is_built_from_an_fstring_template():
@@ -177,10 +341,18 @@ def test_the_scan_is_not_vacuous():
     code→doc test fail loudly, but an empty CODE side would make BOTH tests
     pass on a document full of ghosts.
     """
-    code = _names_the_code_names()
+    reads = _names_the_code_reads()
+    mentions = _names_the_code_mentions()
     rows = _names_the_doc_lists()
-    assert len(code) > 40, f"only {len(code)} names found in roadstead/"
+    assert len(reads) > 40, f"only {len(reads)} variables READ in roadstead/"
     assert len(rows) > 40, f"only {len(rows)} rows found in {DOC.name}"
+    # The read scan is a strict subset of the text scan by construction; if the
+    # two ever coincide, the AST walk has silently fallen back to matching
+    # everything and the marker exclusion has stopped meaning anything.
+    assert set(reads) < set(mentions), (
+        "the environment-read scan no longer narrows the text scan — one of the "
+        "two has drifted and the code→doc direction is back to demanding a row "
+        "for every ROADSTEAD_-shaped string")
     assert _names_the_doc_mentions() >= rows, (
         "the wider mention pattern no longer covers the row pattern — one of "
         "the two has drifted and the doc→code direction has gone partly blind")
@@ -203,9 +375,13 @@ def test_the_stable_column_is_exactly_what_the_contract_document_names():
     variable, that variable just became part of the wire contract and this
     reference has to say so. If it lost one, the guarantee was withdrawn and
     needs a `CHANGELOG` entry under `### Breaking` before the marker moves.
+
+    Narrowed to names the code actually READS, because `docs/api.md` names the
+    log markers too — and says in the same breath that markers are NOT contract
+    (§3.1). A marker is not a variable, so it cannot be a stable one.
     """
-    contract = set(_TOKEN.findall((REPO / "docs" / "api.md").read_text(
-        encoding="utf-8"))) - {_BARE_PREFIX}
+    contract = (set(_TOKEN.findall((REPO / "docs" / "api.md").read_text(
+        encoding="utf-8"))) - {_BARE_PREFIX}) & set(_names_the_code_reads())
     marked = {name: mark for name, mark in
               _DOC_ROW_WITH_MARK.findall(DOC.read_text(encoding="utf-8"))}
 

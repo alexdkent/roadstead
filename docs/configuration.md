@@ -2,7 +2,8 @@
 
 Every knob Roadstead has is an **environment variable**. There is no config file for behaviour —
 `models.yaml` describes the fleet and `agents.yaml` describes the callers, and both are *data*,
-pointed at by variables listed here. The command line carries four flags and nothing else.
+pointed at by variables listed here. The command line carries five flags and one subcommand,
+and nothing else.
 
 This document is the complete list, generated against the source and **pinned by
 `tests/test_configuration_doc.py`**, which walks `roadstead/` in both directions: a variable the
@@ -46,7 +47,8 @@ in the shipped image is `/app` and in a systemd unit is whatever the unit says. 
 ## The command line
 
 ```
-roadstead [--host HOST] [--port PORT] [--log-level LEVEL] [--data-dir DIR]
+roadstead [--host HOST] [--port PORT] [--log-level LEVEL] [--data-dir DIR] [--version]
+roadstead test {sim,replay,ab} …
 ```
 
 | flag | environment equivalent | notes |
@@ -55,6 +57,7 @@ roadstead [--host HOST] [--port PORT] [--log-level LEVEL] [--data-dir DIR]
 | `--port` | `ROADSTEAD_PORT` | listening port |
 | `--log-level` | `ROADSTEAD_LOG_LEVEL` | root logger level; `httpx` is pinned to WARNING regardless |
 | `--data-dir` | `ROADSTEAD_DATA_DIR` | root for all durable state |
+| `--version` | — | prints `roadstead <version>` and exits; the version of the *installed distribution*, which is what a bug report should quote |
 
 **A flag beats its variable, which beats the default.** `--data-dir` is published back into the
 environment before the app is built, so the four paths derived from the data dir (`ROADSTEAD_QUEUE_DB`,
@@ -64,8 +67,18 @@ those can still be set individually to override the flag for its own file.
 🚨 **There is no bare `PORT`, `HOST` or `LOG_LEVEL`.** Every variable answers to the `ROADSTEAD_`
 prefix, including these three. A PaaS that injects a bare `PORT` is not configuring this process.
 
-🚨 **`roadstead test …` is reachable only as `python -m roadstead test …`.** The `test` subcommand
-tree is dispatched from the module's `__main__` guard, which the console script does not run.
+### `roadstead test` — the harness
+
+`roadstead test {sim,replay,ab}` drives the scheduler without a fleet in front of it, and runs from
+the console script and `python -m roadstead` alike. **`sim`** runs a named built-in scenario, or
+`all`, as a discrete-event simulation — no backends, no sockets, and a PASS/FAIL against the
+scenario's own thresholds. **`replay`** reads real traffic back out of `queue.db` (`--hours`,
+optionally filtered by `--endpoint`/`--call-site`, shaped by `--compress`/`--multiply`) and puts it
+through a running proxy at `--proxy-url`. **`ab`** replays that same traffic against the live proxy
+and a shadow backend (`--shadow-host`, `--shadow-port`, `--concurrency`) and reports the two side by
+side. The database is `--db`, defaulting to `queue.db` under the data directory resolved exactly as
+the server resolves it — so a deployment that moved its data dir does not have to tell the harness
+twice.
 
 ### The default data directory
 
@@ -159,7 +172,7 @@ guard off is the guard's own variable.
 | `ROADSTEAD_PROXY_THINKING_BUDGET` | 🔓 | int tokens; `8000`, clamped ≥ 0 | Reasoning headroom **added** to a thinking request's `max_tokens`. Reasoning is generated output and counts against the cap, so too small a budget truncates mid-thought (`finish=length`). Generous by directive: prefer slowness to cutoff, then tune **down** while watching the truncation metric. |
 | `ROADSTEAD_PROXY_THINKING_CANARY` | 🔓 | ⚠️ `!= "0"`; **on** | The startup capability probe for the reasoning path. 🚨 The only variable here that is not one of the two boolean families: **only the literal `0` turns it off** — `false`, `no` and `off` all leave it ON. Set it to `0` for a backend that must not receive a probe request. |
 | `ROADSTEAD_PROXY_FORCED_REASONING_BUDGET` | 🔓 | int tokens; `1536`, clamped ≥ 0 | The same headroom for an endpoint whose model **always** emits a reasoning trace (`capabilities.reasoning: true`), which the caller cannot switch off. Deliberately much smaller than the budget above: those turns reason a few hundred tokens, and inflating a small `max_tokens` into a large one is its own failure. |
-| `ROADSTEAD_PROXY_STRUCTURED_VALIDITY` | 🔓 | kill-switch; **on** | Validate a structured response against the schema the request declared, and fail it loudly (`structured_invalid_json`, marker `LLMPROXY_STRUCTURED_INVALID`) rather than returning something that parses but does not conform. |
+| `ROADSTEAD_PROXY_STRUCTURED_VALIDITY` | 🔓 | kill-switch; **on** | Validate a structured response against the schema the request declared, and fail it loudly (`structured_invalid_json`, marker `ROADSTEAD_STRUCTURED_INVALID`) rather than returning something that parses but does not conform. |
 | `ROADSTEAD_PROXY_SCHEMA_BACKSTOP` | 🔓 | opt-in; **off** | Repair a response that missed its schema, instead of only reporting it. |
 | `ROADSTEAD_PROXY_SCHEMA_BACKSTOP_SHADOW` | 🔓 | opt-in; **off** | Run that backstop in detect-only mode — count what it *would* have repaired. Only meaningful with the backstop enabled. |
 | `ROADSTEAD_PROXY_DEGENERATION_GUARD` | 🔓 | kill-switch; **on** | Catch a degenerate response — one long n-gram repeated many times — and re-dispatch with an anti-repetition penalty. A 200-with-garbage is invisible to both the transient-error and the grammar checks; this is the layer that sees it. |
@@ -188,7 +201,7 @@ guard off is the guard's own variable.
 
 | variable | 🔒 | type / default | what it does |
 |---|---|---|---|
-| `ROADSTEAD_PROXY_CACHE_DRIFT_ALARM` | 🔓 | kill-switch; **on** | Each cache-stats cycle, flag call_sites whose front-loaded-prefix share collapsed against their own trailing baseline — the signature of a prompt edit that broke a cacheable leading block. Raises a `CACHE_DRIFT_ALERT` log marker and an `llmproxy_cache_drift` security event, deduplicated. Never changes routing, admission or output. |
+| `ROADSTEAD_PROXY_CACHE_DRIFT_ALARM` | 🔓 | kill-switch; **on** | Each cache-stats cycle, flag call_sites whose front-loaded-prefix share collapsed against their own trailing baseline — the signature of a prompt edit that broke a cacheable leading block. Raises a `CACHE_DRIFT_ALERT` log marker and a `roadstead_cache_drift` security event, deduplicated. Never changes routing, admission or output. |
 | `ROADSTEAD_PROXY_INFLIGHT_INTERVAL_S` | 🔓 | float seconds; `1.5`, clamped ≥ 0.25 | Cadence of the SSE `inflight` reconcile frame behind the live board. The instant dispatch/complete events do the real work; this refreshes elapsed/queue/occupancy and recovers a missed event. Gated on connected clients — free when nobody is watching. |
 
 ---
@@ -222,7 +235,7 @@ not happen.
 
 ## Names that look like configuration and are not
 
-Three `ROADSTEAD_`-prefixed strings appear in the source and are **not** environment variables the
+Two `ROADSTEAD_`-prefixed strings appear in the source and are **not** environment variables the
 proxy reads. They are listed so a reader who greps the tree is not left guessing, and so the
 bidirectional test above has somewhere honest to put them.
 
@@ -230,4 +243,3 @@ bidirectional test above has somewhere honest to put them.
 |---|---|
 | `ROADSTEAD_SPILL` | A **log marker**. `service.py` emits it on the line recording one request moved to remote capacity because local was full. Grep for it; do not set it. |
 | `ROADSTEAD_TIMEOUT_ADVICE_CAP_S` | A **client-side** variable, named in a `constants.py` comment only, to record that the server's smart-default deadline cap (1800s) is deliberately the same number the client uses. Nothing in this package reads it. |
-| `ROADSTEAD_AGENT_NAME` | **Exported, never read.** The entry point sets it (`setdefault`, to `llmproxy`) for the benefit of a surrounding process tree. No module in this package consults it, so setting it changes nothing here. |

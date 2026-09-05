@@ -5,7 +5,7 @@
      that exists, and the forward pointer in §1 now names documents that exist in THIS repo (the
      origin's execution plan does not). Nothing in the body, and no figure or verdict, was touched. -->
 
-<!-- FRESHNESS: 2026-08-31 — original evaluation. Landscape figures pulled from the GitHub API on 2026-08-31; re-verify project activity before relying on the dismissal list after ~2026-11. The llmproxy capability inventory is code-truth as of a72e2c3a7 + live runtime-flag state. -->
+<!-- FRESHNESS: 2026-08-31 — original evaluation. Landscape figures pulled from the GitHub API on 2026-08-31; re-verify project activity before relying on the dismissal list after ~2026-11. The capability inventory is code-truth as of the origin snapshot, 2026-08-31, + live runtime-flag state. -->
 
 # Roadstead vs the open-source field — 2026-08-31
 

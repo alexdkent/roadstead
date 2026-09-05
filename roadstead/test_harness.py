@@ -5,10 +5,11 @@ Three modes:
   2. **replay** — recorded-replay through the real proxy scheduler
   3. **ab** — A/B backend comparison using recorded corpus
 
-Usage:
-    python -m roadstead test sim all_agents_burst
-    python -m roadstead test replay --hours 4 --compress 8 --endpoint tier3
-    python -m roadstead test ab --hours 4 --endpoint tier3 --shadow-host 192.0.2.10 --shadow-port 9084
+Usage (either entry point — the console script and ``python -m`` reach the same
+dispatch; see ``__main__.main``):
+    roadstead test sim all_agents_burst
+    roadstead test replay --hours 4 --compress 8 --endpoint tier3
+    roadstead test ab --hours 4 --endpoint tier3 --shadow-host 192.0.2.10 --shadow-port 9084
 """
 
 from __future__ import annotations

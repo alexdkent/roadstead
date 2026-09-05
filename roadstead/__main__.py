@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -16,16 +17,13 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-os.environ.setdefault("ROADSTEAD_AGENT_NAME", "llmproxy")
-
-import json
-
 import uvicorn
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from . import __version__
 from .config import (
     ProxyConfig,
     env_with_legacy_prefix as _env,
@@ -270,7 +268,7 @@ class RequestSizeLimitMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         # `prog` is pinned because there are two ways in — the console script
         # and `python -m roadstead` — and argparse would otherwise derive
@@ -283,7 +281,7 @@ def _parse_args() -> argparse.Namespace:
         # deployment's role, not the project.
         description="Capacity-aware admission control for self-hosted LLM "
                     "inference fleets (llama.cpp + vLLM), without Kubernetes.",
-        epilog="These four flags are the whole command line; everything else "
+        epilog="These five flags are the whole command line; everything else "
                "this proxy does is configured by environment variable. The "
                "full reference — every ROADSTEAD_* variable, its default, and "
                "whether it is contract or internal — is docs/configuration.md: "
@@ -298,7 +296,12 @@ def _parse_args() -> argparse.Namespace:
         help="Directory for durable state — queue.db, runtime flags, the admin "
              "overlay and the request log all live under it. Overrides "
              f"ROADSTEAD_DATA_DIR; default {default_data_dir()}.")
-    return p.parse_args()
+    # The installed distribution's version, resolved the same way `roadstead`
+    # itself resolves it — a bug report that quotes this is quoting what is
+    # actually running, not what the checkout says (.github/ISSUE_TEMPLATE).
+    p.add_argument(
+        "--version", action="version", version=f"roadstead {__version__}")
+    return p.parse_args(argv)
 
 
 #: Variables that were REMOVED rather than renamed, and what to do instead.
@@ -586,8 +589,20 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
     return app
 
 
-def main() -> None:
-    args = _parse_args()
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # 🚨 The `test` subcommand tree is dispatched HERE, not from the module's
+    # `__main__` guard, because the console script never runs that guard: it
+    # calls `main()` directly. With the dispatch below, `python -m roadstead
+    # test sim all` worked and `roadstead test sim all` died in the server
+    # parser with "unrecognized arguments: sim all" — the same command, two
+    # answers, depending on how the process was started.
+    if argv and argv[0] == "test":
+        _test_cli(argv[1:])
+        return
+
+    args = _parse_args(argv)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
@@ -631,8 +646,12 @@ def main() -> None:
     )
 
 
-def _test_cli() -> None:
-    """Entry point for `python -m roadstead test ...`."""
+def _test_cli(argv: list[str] | None = None) -> None:
+    """`roadstead test ...` — the simulation/replay/A-B harness.
+
+    Takes its arguments rather than reading ``sys.argv`` so that both entry
+    points hand it the same list, and so a test can drive it.
+    """
     p = argparse.ArgumentParser(prog="roadstead test")
     sub = p.add_subparsers(dest="mode", required=True)
 
@@ -658,7 +677,7 @@ def _test_cli() -> None:
     ab_p.add_argument("--proxy-url", default="http://127.0.0.1:42161")
     ab_p.add_argument("--db", default=None, help="Path to proxy queue.db")
 
-    args = p.parse_args(sys.argv[2:])
+    args = p.parse_args(sys.argv[2:] if argv is None else argv)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -724,7 +743,4 @@ def _test_cli() -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
-        _test_cli()
-    else:
-        main()
+    main()

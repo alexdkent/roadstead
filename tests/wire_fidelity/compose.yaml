@@ -1,5 +1,5 @@
 # One small real llama-server, purely so `test_real_engine.py` has an engine to
-# interrogate. Not a deployment example — see docs/corpus_and_scrub_plan.md; the
+# interrogate. Not a deployment example — see the scrub rule in CONTRIBUTING.md; the
 # real fleet's topology is not described here and should not be added.
 #
 #   docker compose -f tests/wire_fidelity/compose.yaml up -d

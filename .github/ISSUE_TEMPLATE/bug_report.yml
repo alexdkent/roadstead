@@ -22,8 +22,8 @@ body:
     attributes:
       label: Roadstead version
       description: |
-        `python -c "import roadstead; print(roadstead.__version__)"`, or the commit SHA if you are
-        running from a checkout. (`roadstead --help` does not print it.)
+        `roadstead --version`, or the commit SHA if you are running from a checkout. It prints the
+        version of the distribution actually installed, which is the one that misbehaved.
       placeholder: "0.1.0.dev0, or a commit SHA"
     validations:
       required: true

@@ -61,7 +61,7 @@ jobs:
         # Named explicitly, not left to whatever `pytest -q` happens to
         # collect — a future addopts/deselect change that narrows the default
         # run must not be able to silence the one guard standing between this
-        # repo and a private topology leak (docs/corpus_and_scrub_plan.md).
+        # repo and a private topology leak (the scrub rule in CONTRIBUTING.md).
         run: pytest -q --timeout=120 -v tests/test_scrub_sweep.py
 
       - name: Test

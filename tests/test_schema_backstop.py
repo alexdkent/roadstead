@@ -1,11 +1,11 @@
 """Builder happy-path + parity tests for the Phase 3 schema-repair backstop
 (`Correction.maybe_repair_schema` + the pure `_conform_body`/helpers).
 
-Contract: docs/llmproxy_phase3_schema_backstop_contract.md. On a structured/tool
+Contract: `roadstead/correction.py` and docs/api.md §2.1. On a structured/tool
 SYNC response whose JSON is wrong (trailing prose / fenced / malformed /
 schema-invalid / bad tool_calls.arguments) the backstop runs
 json-repair → schema-validate → one bounded retry (error fed back) → fail-loud
-deferrable. Default OFF == byte-identical.
+`schema_invalid` (non-deferrable, docs/api.md §2.1). Default OFF == byte-identical.
 
 Invariants pinned here (builder scope — happy path + parity; the independent
 adversarial track owns the hostile both-seam fake-backend matrix + guard-bite):

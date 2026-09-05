@@ -345,8 +345,8 @@ class EndpointConfig:
 
     # --- Name of the environment variable holding this backend's API key, for
     # a provider that needs one. THE NAME, NEVER THE KEY: a key in a config file
-    # is a key in a git history, and this repo is heading for public
-    # (`docs/corpus_and_scrub_plan.md`). Empty for every local backend — they
+    # is a key in a git history, and this repo is heading for public (the scrub
+    # rule in `CONTRIBUTING.md`). Empty for every local backend — they
     # take no auth, which is itself a reason local capacity is the design
     # centre. Resolved at request time by the provider, so rotating the secret
     # does not need a restart. ---
@@ -711,8 +711,9 @@ def cache_drift_alarm_enabled() -> bool:
     most every ``CACHE_DRIFT_REALERT_S``). OBSERVABILITY ONLY — it never changes
     routing/admission/output (zero caller-visible effect, like the max_slots
     reconciler + shadow-egress detector), so default ON. Env kill-switch
-    ``ROADSTEAD_PROXY_CACHE_DRIFT_ALARM``. See
-    ``docs/llmproxy_prefix_cache_observability.md`` (Tier-2 step 3)."""
+    ``ROADSTEAD_PROXY_CACHE_DRIFT_ALARM``. Designed as step 3 of the origin
+    project's prefix-cache observability tier; that plan stayed behind and only
+    the behaviour came across, which is what this docstring is for."""
     return os.environ.get("ROADSTEAD_PROXY_CACHE_DRIFT_ALARM", "1").strip().lower() not in (
         "0", "false", "no", "off", "",
     )
@@ -767,7 +768,8 @@ def schema_backstop_enabled() -> bool:
     / truncated / thinking-noise are rescued). Default OFF == byte-identical (the
     guard early-returns before any observable effect). Env
     ``ROADSTEAD_PROXY_SCHEMA_BACKSTOP``. See
-    ``docs/llmproxy_phase3_schema_backstop_contract.md``."""
+    the origin project's phase-3 schema-backstop contract, which stayed behind
+    when this package was extracted."""
     return os.environ.get("ROADSTEAD_PROXY_SCHEMA_BACKSTOP", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )

@@ -862,6 +862,13 @@ The OpenAI body stays byte-identical (§1.7). What can be said in headers is:
 | `X-Roadstead-Deadline-Source` | `caller` \| `computed` — see §1.7.3. |
 | `X-Roadstead-Corrected` | Comma-separated tokens naming what the correction layer rewrote (or silently could not fix) before this response was served — `json_object_stripped`, `schema_repaired`, `schema_retried`, `schema_unrecoverable`, `degenerate_unrecovered`, `toolcall_truncated`. Absent when nothing fired. On a STREAMING response this can only ever carry `json_object_stripped` — the rest are decided after the backend has answered, past the point headers go on the wire (see the note below). |
 
+🚨 **`toolcall_truncated` is also an envelope `code` (§2.1).** It is the one token
+above that names a call which FAILED: the rule that detects it sets
+`code = toolcall_truncated` on the envelope and the header token is derived from
+that code, so the two always appear together. The other five annotate a response
+that was still served. A client classifying on `error.code` therefore sees this
+one whether or not it reads headers.
+
 🚨 **Only what is known before the body starts.** A streaming response's headers
 are on the wire before the first token, so a later failover or spill cannot be
 reflected in them. That is a real limit of the header channel and it is why the
@@ -1273,8 +1280,11 @@ In particular a control action that could not be **persisted** is not an error: 
 
 Open surfaces: `GET /v1/status` (per-endpoint health, capacity, reliability counters),
 `GET /v1/timeouts` and `GET /v1/timeout-advice/shadow-report` (§1.4), `GET /v1/recent` (§3.11),
-`GET /metrics` (Prometheus), `GET /health`, `GET /readyz` (fails closed on readiness-critical
-endpoints), and the `/v1/fleet/*` analytics family (§3.6, and `/v1/fleet/cache-stats` in §3.11).
+`GET /v1/inflight`, `GET /v1/history`, `GET /v1/series`, `GET /v1/metrics/cost-model` and
+`GET /v1/timeouts/stalls` (§3.12), `GET /metrics` (Prometheus), `GET /health`, `GET /readyz` (fails
+closed on readiness-critical endpoints), and the `/v1/fleet/*` analytics family together with
+`GET /v1/usage` (§3.6; `/v1/fleet/top-callers` and `/v1/fleet/cache-attribution` are in §3.12,
+`/v1/fleet/cache-stats` in §3.11).
 
 The three `/rs/v1` inference routes are **not** open — they are gated like the inference doors
 (§1.7). `GET /rs/v1/models` in particular is a map of the fleet: slot counts, live occupancy, health

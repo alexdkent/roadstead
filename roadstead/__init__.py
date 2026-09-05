@@ -1,8 +1,12 @@
-"""Centralized LLM scheduler proxy.
+"""Capacity-aware admission control for self-hosted LLM inference fleets.
 
-All LLM traffic in the Collective routes through this service.  It
-implements deficit-round-robin scheduling with priority bands,
-duration-weighted cost accounting, and concurrency-aware admission.
+Every call a deployment makes goes through this service: deficit-round-robin
+scheduling with priority bands, duration-weighted cost accounting, and
+concurrency-aware admission against the capacity a backend actually has.
+
+The previous summary described the origin deployment's role — "all LLM traffic
+in <that fleet> routes through this service" — which is a fact about one
+installation rather than about the package.
 """
 from __future__ import annotations
 

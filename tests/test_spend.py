@@ -650,7 +650,7 @@ def _service(monkeypatch, agents_yaml: str, tmp_path):
 
     f = tmp_path / "agents.yaml"
     f.write_text(agents_yaml)
-    monkeypatch.setenv("LLM_PROXY_AGENTS_CONFIG", str(f))
+    monkeypatch.setenv("ROADSTEAD_AGENTS_CONFIG", str(f))
     monkeypatch.delenv("ROADSTEAD_ACL", raising=False)
     svc = ProxyService(ProxyConfig(agents=load_agent_configs(f)))
 
