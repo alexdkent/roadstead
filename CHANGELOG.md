@@ -8,6 +8,14 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Documented — 21 things the code shipped and `docs/api.md` did not
+
+No behaviour change. `GET /v1/timeouts` and `GET /v1/timeout-advice/shadow-report` (§1.4),
+`GET /v1/recent`, `POST /v1/calls/log` and `GET /v1/fleet/cache-stats` (new §3.11) get sections with
+their query params and every response field; §2.2 gains the `truncated structured output` and
+`returned empty completion` deferral markers; §1.1 states that `X-Agent-Id` and `X-Call-Site` are
+ignored on the OpenAI doors.
+
 ### Added — the legacy `/v1/submit` door, flag-gated
 
 `POST /v1/submit` was removed in Workstream C, deliberately and recorded. That decision stands and

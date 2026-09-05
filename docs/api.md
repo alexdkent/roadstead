@@ -79,6 +79,17 @@ rather than omitted:
 | `caller_id` | **Ignored.** Set to the `agent_id`. Read on `/rs/v1/chat`, which is where a caller with sub-identities should be. |
 | `session_id`, `turn_id`, `request_id` | **Ignored** — and, unlike the four above, not replaced either: they travel to the backend inside the payload, where a strict engine may reject the unknown key. Read on `/rs/v1/chat`. |
 
+**The header spellings are ignored too**, and they are listed because a fleet arriving from a proxy
+that read identity out of headers will try them before it reads this table:
+
+| Header | What actually happens here |
+|---|---|
+| `X-Agent-Id` | **Ignored.** Nothing reads it — not this handler, and nothing downstream. Identity is the API key or the source address (§1.5), exactly as for the body field above. |
+| `X-Call-Site` | **Ignored.** `call_site` is set to `<agent_id>.openai_compat` here and `<agent_id>.openai_compat_embed` on `/v1/embeddings`, whatever you send. |
+
+`X-Timeout-S` is the only request header either OpenAI door reads. The `X-Roadstead-*` names in §1.8
+are ones Roadstead *emits*.
+
 🚨 **There is no caller-sendable `tier` field**, on either door — a frequent wrong assumption.
 `priority` is the tier declaration, and it is read on `/rs/v1/chat` (§1.7.2) only.
 
@@ -236,6 +247,115 @@ The resolved ceiling is always lifted to at least the class floor, so a ceiling 
 call below the deadline the model already guarantees.
 
 `tests/test_timeout_floor_contract.py` pins this side of it.
+
+#### `GET /v1/timeouts` → `timeouts_report(hours)`
+
+**Which calls gave up instead of finishing, and at which bound.** Open (§3 lists it among the open
+surfaces): it names endpoints, tiers and callers, never a payload. Its companion
+`/v1/timeout-advice/shadow-report` below asks the other half of the question — not *who gave up*, but
+*would the recommendation above have made it worse*. Transcribed from the producers 2026-09-04.
+
+Query: `hours` (default 24, clamped to **0.1–168**).
+
+| field | type | meaning |
+|---|---|---|
+| `hours` | float | Echo of the resolved, clamped window. |
+| `total` | int | Timeout events in the window, every layer. |
+| `premature` | int | Of those, the ones that fired **below** the deadline the timeout model recommended — someone's deadline severing a call the model always expected to take longer. |
+| `premature_unplanned` | int | `premature` minus the events that fell inside an operator maintenance window. |
+| `premature_foreground_unplanned` | int | …and of those, the P0–P2 subset. Background work (P3/P4) defers and retries silently by design, so this is the number that answers "is the fleet under pressure a user can feel?". |
+| `planned` | int | Events inside a maintenance window. 🚨 `premature` and `planned` are **independent flags that overlap** — a drained backend can also sever a call below its recommendation, and that event is counted in both. Do not subtract one from the other. |
+| `by_abort_reason` | object | `{reason: count}` fleet-wide, over the `stream` layer's four reasons. |
+| `rows` | list | One entry per `(endpoint, priority, layer)` cell, descending by `count`. |
+| `stream_extensions` | object | Process-lifetime counters read straight off the loop — **not** windowed, and reset by a restart. |
+| `maintenance_windows` | list | The windows `planned` was computed against: `{id, endpoint, started_at, ended_at, reason, operator, source}`. `ended_at` is `null` while a window is still open; `endpoint` is `*` for one covering every class. |
+
+`rows[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `endpoint` | string | Endpoint class as persisted. |
+| `priority` | int | The band, numeric. |
+| `layer` | string | Where the call gave up — the vocabulary below. |
+| `count` | int | Events in the cell. |
+| `premature` | int | Of those, below the recommendation. |
+| `planned` | int | Of those, inside a maintenance window. |
+| `elapsed_s_p50` | float | Seconds waited before giving up, 2dp. |
+| `elapsed_s_p95` | float | 2dp, same basis. |
+| `avg_in_flight` | float | Mean in-flight count on the endpoint at the moment each event fired, 1dp — the load context, and the reason a timeout report is readable at all. |
+| `avg_queued` | float | Mean queue depth at the same moments, 1dp. |
+| `recommended_ms_p50` | float | Median recommendation for the cell, 1dp — the number `premature` is measured against. |
+| `avg_context_used_pct` | float \| null | Mean context occupancy, 1dp. `null` when no event in the cell recorded one. |
+| `top_callers` | object | `{caller_id: count}`, the three largest. |
+| `abort_reasons` | object | `{reason: count}` for this cell alone. |
+
+`stream_extensions`:
+
+| field | type | meaning |
+|---|---|---|
+| `count` | int | Streams whose deadline was extended because the backend was still emitting tokens. |
+| `total_s` | float | Slot-seconds spent on those extensions, 1dp. Without it a progress-governed deadline is an invisible capacity sink — you would see the kills it prevents and never what they cost. |
+| `hard_cap_aborts` | int | Streams cut at the hard cap regardless of progress. |
+| `progress_extensions` | int | Gap deadlines extended on proven backend progress. Read it beside `by_abort_reason.stall`: this rising while stalls fall is the mechanism working, both rising is a backend genuinely in trouble. |
+
+**The `layer` vocabulary is four values**, and they name failures with different owners:
+
+| `layer` | the call gave up |
+|---|---|
+| `admission` | waiting to be admitted — it never reached a backend. Capacity. |
+| `client_wait` | admitted, then out of time on the deadline in force for it. |
+| `backend` | the backend failed or its transport deadline fired. |
+| `stream` | mid-stream, and `by_abort_reason` says which bound: `ttft` (accepted, never emitted a first token), `stall` (was emitting, then stopped), `hard_cap` (still healthy, cut for capacity) or `caller_deadline`. The first two are the substrate dying under a caller that did nothing wrong; the last two are Roadstead deciding to stop. |
+
+⚠️ **With no DB the envelope is narrower**, the same trap §3.6 documents for the fleet analytics: the
+producer early-outs to `{total, premature, rows}`, so the response is `hours`, those three and
+`stream_extensions` — **no `by_abort_reason`, no `planned`, no `premature_unplanned`, no
+`premature_foreground_unplanned`, no `maintenance_windows`**.
+
+#### `GET /v1/timeout-advice/shadow-report` → `timeout_shadow_report(hours)`
+
+**Would the recommendation have held?** For every completed call the proxy logs what §1.4 would have
+advised and whether that number would have fired. This summarises the log per `(endpoint, priority)`,
+so the headroom a data-driven deadline reclaims can be read *before* anything is switched onto it.
+
+Query: `hours` (default 24, clamped to **0.1–168**).
+
+| field | type | meaning |
+|---|---|---|
+| `hours` | float | Echo of the resolved, clamped window. |
+| `report` | list | One row per `(endpoint, priority)`, ascending by both. `[]` with no DB. |
+
+`report[]` — these seven are always present:
+
+| field | type | meaning |
+|---|---|---|
+| `endpoint` | string | Endpoint class as persisted. |
+| `priority` | int | The band, numeric. |
+| `samples` | int | Shadow rows behind the cell. 🚨 Completions **only** — see the survivorship note below. |
+| `actual_timeouts` | int | Calls in the same cell and window that really did time out. |
+| `would_timeout` | int | Of `samples`, how many the recommendation would have severed. |
+| `would_timeout_rate` | float | `would_timeout / samples`, 4dp. `0.0` when `samples` is 0. |
+| `observed_timeout_rate` | float | `actual_timeouts / (samples + actual_timeouts)`, 4dp — the real rate, with the censored samples in the denominator. |
+
+🚨 **`would_timeout_rate` is computed over survivors and reads ≈0 while calls are actually timing
+out.** The shadow log records `status == ok` completions, so a call that really timed out is never in
+`samples` — it is in `actual_timeouts`. The two censored-sample fields are the 2026-06-06 correction
+for exactly this; quoting `would_timeout_rate` on its own as "the timeout rate" is the mistake they
+exist to prevent.
+
+**The remaining seven fields are conditional** — present only when the cell has at least one shadow
+row. A cell holding nothing but real timeouts arrives with the counts above and none of these, so
+read them with a `.get()`:
+
+| field | type | meaning |
+|---|---|---|
+| `recommended_ms_p50` | float | Median recommendation for the cell, 1dp. |
+| `recommended_ms_p95` | float | 1dp, same basis. |
+| `actual_total_ms_p50` | float | What the calls really took end to end, 1dp. |
+| `actual_total_ms_p95` | float | 1dp. Compare against `recommended_ms_p95`: a recommendation below it is one that would sever the tail. |
+| `headroom_vs_applied_ms_p50` | float | `applied_timeout_ms - recommended_ms`, 1dp — the wall-clock the recommendation hands back versus the deadline in force today. **Negative means the recommendation is longer**, not that headroom was lost. |
+| `headroom_vs_applied_ms_p95` | float | 1dp, same basis. |
+| `sources` | object | `{source: count}` over §1.4's fallback levels, so a cell whose advice came from the `floor` is visible as one rather than reading like measured evidence. |
 
 ---
 
@@ -927,6 +1047,17 @@ always emitted.
 matching **substrings of the error message** — historically in the host's
 `framework/nexus_errors.py`. Matched markers include **`circuit open`** and **`backpressure`**.
 
+Two more are emitted and matched, and both mean *retry* rather than *give up* — a client that treats
+either as terminal throws away a call the next attempt would have completed:
+
+| marker | emitted when | what the client must do |
+|---|---|---|
+| `truncated structured output` | A structured request (a grammar, a `response_format` schema, structured outputs) came back with `finish_reason=length`, so the body is almost certainly unparseable JSON — `lifecycle.py` fails it loud with a deferrable error rather than record garbage, and never caches it. `correction.py` emits the same marker for the other spelling of the same fault: a tool call whose `arguments` were cut mid-JSON while `finish_reason` claimed `tool_calls`. That variant additionally reports `toolcall_truncated` in `X-Roadstead-Corrected` (§1.8). | **Raise the output budget and retry** — a larger `max_tokens`, or re-chunk the input so the answer fits under the one in force. Retrying the identical request unchanged truncates identically. |
+| `returned empty completion` | A backend answered `200` with no content at all (`backend.py`). The proxy retries this itself first, and arms a `min_tokens` re-dispatch to break a position-0-EOS degeneration — it matches this very substring to decide to do so, which makes the marker load-bearing *inside* the proxy as well as at the caller. A caller only sees it once those attempts have been spent. | **Retry.** It surfaces as a `502` carrying `backend_status: 502`, so the rule below keeps it deferrable — but a caller matching prose must not read "empty" as "the model had nothing to say". |
+
+Free-form truncation is *not* in this set: a `finish_reason=length` on an unstructured request is a
+short answer, not a broken one, and it is returned normally.
+
 Two consequences, both easy to get wrong:
 
 1. **Rewording an error message is a breaking API change**, even when the `code` is untouched.
@@ -1010,7 +1141,9 @@ BROWSER attaches to a request on its own, cookie or not: a cross-site `<form enc
 POST is a CORS *simple request* (no preflight), the browser attaches the victim's cached Basic
 credential to it automatically, and a `text/plain` body can still be syntactically valid JSON. Three
 checks, on every mutating (non-GET/HEAD/OPTIONS) route on both `/rs/v1/admin/*` and the legacy
-`/v1/admin/*` spellings, in this ONE place rather than per handler:
+`/v1/admin/*` spellings, in this ONE place rather than per handler — and, because the decision is
+taken on the METHOD rather than from a route list, on every other surface that funnels through the
+same gate too, `POST /v1/calls/log` (§3.11) being the one that is not an `admin/` path:
 
 1. **`Content-Type: application/json` is required** (media type; parameters such as `charset` are
    fine) — otherwise `415`. A cross-site form cannot send that media type without a preflight.
@@ -1061,10 +1194,12 @@ In particular a control action that could not be **persisted** is not an error: 
 | `GET`/`POST /rs/v1/admin/maintenance` · `GET`/`POST /v1/admin/maintenance` | List, or backdate a closed window for a restart done without draining. |
 | `GET /rs/v1/admin/ui` | The operator UI (§3.7). **Only when `ROADSTEAD_ADMIN_UI` is set** — otherwise the route does not exist. Refuses with 401 + `WWW-Authenticate: Basic`. |
 | `GET /rs/v1/admin/stream` · `GET /v1/stream` | Live `call.completed` + `metrics` SSE. Admin-gated since 2026-09-01. The alias exists because `EventSource` cannot set a header (§3.7). |
+| `POST /v1/calls/log` | Ingest a call the proxy did not schedule — audio, imagegen, OCR (§3.11). Admin-gated by the same gate, on a path that is not an `admin/` one; refuses anything the proxy records natively. |
 
 Open surfaces: `GET /v1/status` (per-endpoint health, capacity, reliability counters),
-`GET /v1/timeouts`, `GET /metrics` (Prometheus), `GET /health`, `GET /readyz` (fails closed on
-readiness-critical endpoints), and the `/v1/fleet/*` analytics family.
+`GET /v1/timeouts` and `GET /v1/timeout-advice/shadow-report` (§1.4), `GET /v1/recent` (§3.11),
+`GET /metrics` (Prometheus), `GET /health`, `GET /readyz` (fails closed on readiness-critical
+endpoints), and the `/v1/fleet/*` analytics family (§3.6, and `/v1/fleet/cache-stats` in §3.11).
 
 The three `/rs/v1` inference routes are **not** open — they are gated like the inference doors
 (§1.7). `GET /rs/v1/models` in particular is a map of the fleet: slot counts, live occupancy, health
@@ -1418,10 +1553,11 @@ cannot change anything is often exactly the one auditing what changed.
 
 ### 3.6 `/v1/fleet/*` analytics — response schemas
 
-Chased to column level 2026-08-31. Every field below is pinned by
+Chased to column level 2026-08-31. Every field in the three schemas below is pinned by
 `tests/test_fleet_analytics_schema.py`, which drives the real producers against a seeded
 `queue.db` and reads **this section** back — so an added, renamed or dropped field fails the suite
-rather than silently breaking a dashboard.
+rather than silently breaking a dashboard. §3.11 documents the three call-metrics routes that ship
+beside these and are **not** pinned that way.
 
 All three run **off the event loop** via `asyncio.to_thread` (§5c): a heavy `GROUP BY` over the
 whole-fleet completions table must never stall scheduling under a hot dashboard.
@@ -1528,6 +1664,134 @@ With no DB connection each producer returns an early-out that is **not** the ful
 
 A consumer that assumes `now` or `today_start` is always present will `KeyError` rather than degrade.
 Documented because it is easy to hit in a test double and never in production.
+
+### 3.11 The rest of the call-metrics plane — `/v1/recent`, `/v1/calls/log`, `/v1/fleet/cache-stats`
+
+Three routes that ship beside the family above and were never written down: the completion feed, the
+non-LLM ingest, and the prefix-cache observability read. Transcribed from the producers 2026-09-04.
+
+⚠️ **Unlike §3.6, nothing reads this section back.** `tests/test_fleet_analytics_schema.py` pins the
+three schemas above in both directions; these three are a hand transcription, so the date is a
+freshness marker rather than a guarantee.
+
+#### `GET /v1/recent` → `recent_requests(limit)`
+
+The completion feed — the most recent calls the proxy scheduled, newest first. Open, like the rest of
+the analytics family; it names callers and endpoints, never a payload.
+
+Query: `limit` (default 50, **capped at 200**; anything unparseable falls back to the default rather
+than erroring).
+
+| field | type | meaning |
+|---|---|---|
+| `requests` | list | Descending by `completed_at`. `[]` with no DB — the only degraded shape here. |
+
+`requests[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `request_id` | string | The id Roadstead minted (§4.1), the one `X-Roadstead-Request-Id` carries. |
+| `agent_id` | string | The resolved caller identity (§1.5), not anything a body claimed. |
+| `endpoint` | string | Endpoint class as persisted. |
+| `call_site` | string | The finer-grained attribution key — `<agent_id>.openai_compat` for OpenAI-door traffic (§1.1). |
+| `priority` | int | The band, numeric. |
+| `input_tokens` | int | |
+| `output_tokens` | int | |
+| `duration_s` | float | Backend time, 2dp. Excludes queue wait. |
+| `queue_wait_ms` | float | Time spent waiting for a slot, 1dp. |
+| `status` | string | `ok`, `error`, `truncated`, … as persisted — not an HTTP status. |
+| `completed_at` | string \| null | **ISO-8601 UTC**, not the epoch float the other analytics rows carry. `null` when the row has no completion time. |
+
+🚨 **`completed_at` is the one timestamp in this document that is a string.** Every other analytics
+route returns epoch seconds. A consumer that pools rows across §3.6 and this route has to convert one
+of them.
+
+#### `POST /v1/calls/log` → `persist_external_call(...)`
+
+**Ingest for a call the proxy did not schedule** — audio, image generation, OCR, translation. It
+exists so one store answers "what did the fleet spend?", rather than the proxy's own traffic living
+here and everything else living somewhere a dashboard has to join against.
+
+🚨 **Admin-gated**, and it is the one admin-gated route that is not an `admin/` path: the gate is
+`deny_non_admin`, so the network gate, the `admin` scope and — because this is a mutation — the three
+CSRF checks of §3 all apply. In practice a pusher must send `Content-Type: application/json` (else
+`415`) and, if it authenticates with HTTP Basic, `X-Roadstead-Request: 1`.
+
+Body — every field optional except the endpoint, which may arrive under any of three names:
+
+| field | type | meaning |
+|---|---|---|
+| `endpoint` \| `provider` \| `unit` | string | **Required**, first non-empty of the three wins. Absent or blank → `400`. |
+| `kind` | string | What sort of call this was; default `external`. Refused when it names proxy-native LLM work — see below. |
+| `agent` \| `agent_id` | string | The caller to attribute it to; default `unknown`. |
+| `call_site` | string | Finer-grained attribution; defaults to `kind`. |
+| `caller_id` | string | Sub-identity, recorded as given. |
+| `request_id` | string | Default `ext-<uuid4 hex>`, which is also what the response echoes. |
+| `input_tokens`, `output_tokens` | int | Default 0. Malformed values fall back to 0 rather than erroring. |
+| `latency_ms` | float | Default 0. |
+| `duration_s` | float | Default `latency_ms / 1000` — send either, not both. |
+| `status` | string | Default `ok`, or `error` when `success` is present and false. |
+| `success` | bool | Only consulted when `status` is absent. |
+
+Success is `200 {"ok": true, "request_id": "…"}`, and the record is fanned out on the SSE stream
+(§3's `/v1/stream`) as a `call.completed` frame with `priority: "P2_POST_TURN"` — a pushed call has
+no band of its own, so one is asserted rather than left null.
+
+🚨 **A `409` means the proxy already recorded this call itself.** Two guards, because the same
+double-count arrived under both spellings: a `kind` of `chat`, `embed`, `rerank` or `llm` is refused
+outright, and so is any `endpoint` that normalizes to a class the proxy serves — the 2026-06-11
+rerank double-count arrived with `kind: "external"` and a rerank endpoint, and only the second guard
+would have caught it. Push what the proxy cannot see, never what it can.
+
+The other refusals are `400` (unparseable JSON, or no endpoint) and `500 {"error": "ingest failed"}`
+— the ingest is best-effort and a failed write is logged rather than raised. ⚠️ These three bodies
+carry `error` alone, **no `code`**: §2.1's codes are minted by the gate in front of this handler
+(`401`, `403`, `415`), not by the handler itself.
+
+#### `GET /v1/fleet/cache-stats` → `build_fleet_payload(...)`
+
+**Prefix-cache observability**: what share of prompt tokens the backends served out of their KV
+prefix cache, and which call_sites are throwing that reuse away by varying their leading block.
+Computed from the periodic snapshots the proxy takes, not from a live scrape.
+
+Query: `window` (default `7d`, floor 60s). ⚠️ **Capped at 7 days despite the 30-day argument in the
+handler** — `_clamp_window`'s cap is a keyword, the `30 * 86400` is the fallback for an unparseable
+string, and it is itself clamped. `?window=30d` returns 7 days of snapshots.
+
+| field | type | meaning |
+|---|---|---|
+| `models` | list | One row per routed chat endpoint, ascending by class. |
+| `offenders` | list | Misaligned call_sites from each endpoint's latest screen, ROI-descending, **capped at 25**. |
+| `rollup` | object | Fleet totals — see below. |
+| `trend` | object | `{endpoint: [{t, rate}]}`, the windowed hit-rate between each consecutive pair of snapshots. `t` is the later snapshot's epoch seconds. An endpoint with fewer than two counter-bearing snapshots is absent. |
+| `drift` | list | `{call_site, endpoint, from, to}` — call_sites whose front-loaded-prefix share collapsed below its own trailing baseline, i.e. someone edited a prompt and broke the cacheable leading block. Shared with the periodic drift alarm, one implementation. |
+| `snapshots` | int | How many snapshots the window held. `0` makes every rate above `null` — read it before reading anything else. |
+
+`models[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `endpoint` | string | Endpoint class. |
+| `label` | string | The class plus every alias that resolves to it, `/`-joined, so a row reads as the names callers actually use. |
+| `engine` | string | The backend engine, or `?` when the catalog does not say. |
+| `actual_hit_rate` | float \| null | Lifetime rate from the latest snapshot's cumulative counters, 4dp. **`null` unless the engine publishes prefix-cache counters** — that is a missing instrument, never a 0% hit rate. |
+| `window_hit_rate` | float \| null | The rate across the window: Δhits / Δqueries between the first and last counter-bearing snapshots, 4dp. This is the one to quote — `actual_hit_rate` is cumulative since the backend booted. |
+| `screen_misaligned` | int | Call_sites in the latest screen whose verdict is `misaligned`. |
+| `screen_total` | int | Call_sites in that screen at all. The denominator `screen_misaligned` needs. |
+
+`offenders[]` carries the screen row plus its `endpoint`: `{call_site, reqs, avg_tok, lcp_pct, jacc,
+verdict, wasted_tokens, roi, endpoint}`. `lcp_pct` (front-loaded common prefix, char-level) and
+`jacc` (word-set overlap) are **proxies** for block-level KV reuse, not measurements of it — a
+`misaligned` verdict says two requests share most of their words while sharing little of their
+opening, which is the shape a cache cannot exploit.
+
+`rollup`:
+
+| field | type | meaning |
+|---|---|---|
+| `wasted_cacheable_tokens` | int | Σ `wasted_tokens × reqs` over **every** misaligned screen row, including the ones the 25-row `offenders` cap drops — the size of the prize, not a measured loss. |
+| `captured_pct` | float \| null | Fleet windowed hit rate, 4dp. `null` when nothing in the window carried counters. |
+| `est_prefill_s_saved` | float | Prefill seconds the cache hits avoided, 1dp, at a fixed tokens-per-second constant. An estimate, and named one. |
 
 ---
 
@@ -1720,6 +1984,15 @@ SDK speaks all three, and that `ChatResult` is now `CallResult`. Pinned by
 `tests/test_openai_door_fields.py` (each §1.1 table against what the named module reads, both
 directions) and `tests/test_enriched_envelope_coverage.py` (every field the enriched door reads is
 one the SDK can send).
+
+**Updated 2026-09-04 — the routes and fields the code shipped and the document did not.** Four
+routes gained a section: `GET /v1/timeouts` and `GET /v1/timeout-advice/shadow-report` in §1.4,
+beside the advice they report on; `GET /v1/recent`, `POST /v1/calls/log` and
+`GET /v1/fleet/cache-stats` in the new §3.11, beside the analytics family in §3.6. §2.2 gains the two
+deferral markers it was missing — `truncated structured output` and `returned empty completion`,
+both of which mean *retry* — and §1.1 states that `X-Agent-Id` and `X-Call-Site` are ignored, since a
+migrating fleet reaches for the header spelling before it reads the body table. 🚨 §3.11 is a hand
+transcription: unlike §3.6 no test reads it back, and it says so in place.
 
 **Previously INCOMPLETE — both closed 2026-08-31:**
 1. ~~Nested response schemas for `/v1/fleet/*` analytics.~~ Chased to column level in §3.6 and
