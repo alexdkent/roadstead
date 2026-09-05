@@ -13,11 +13,22 @@ authors = [{ name = "Alex Kent" }]
 keywords = ["llm", "gateway", "proxy", "inference", "llama.cpp", "vllm", "admission-control", "scheduler"]
 classifiers = [
   "Development Status :: 3 - Alpha",
+  "Framework :: AsyncIO",
   "Intended Audience :: Developers",
+  # The other reader of this project is whoever operates it. The knobs are
+  # environment variables and a YAML catalog, not an API.
+  "Intended Audience :: System Administrators",
   "License :: OSI Approved :: Apache Software License",
+  # No Windows classifier, deliberately: the durable-state defaults, the
+  # SIGTERM drain and the stop-grace arithmetic are all POSIX signal semantics.
+  "Operating System :: POSIX",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: Internet :: Proxy Servers",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  # PEP 561: `roadstead/py.typed` ships, so an installing project's type
+  # checker reads these annotations instead of treating the package as Any.
+  "Typing :: Typed",
 ]
 
 # Deliberately few. Adding one is a decision, not a convenience — see CLAUDE.md.
@@ -50,6 +61,10 @@ Homepage = "https://github.com/alexdkent/roadstead"
 Repository = "https://github.com/alexdkent/roadstead"
 Issues = "https://github.com/alexdkent/roadstead/issues"
 Changelog = "https://github.com/alexdkent/roadstead/blob/main/CHANGELOG.md"
+# There is no hosted docs site; `docs/api.md` IS the contract document, and
+# `docs/compatibility.md` makes it executable — six tests read it back. Point
+# `Documentation` at the thing the policy actually pins.
+Documentation = "https://github.com/alexdkent/roadstead/blob/main/docs/api.md"
 
 [tool.setuptools.packages.find]
 include = ["roadstead*"]
@@ -60,7 +75,12 @@ include = ["roadstead*"]
 # CSP the server sends forbids them, and a test sweeps for them), and nothing in
 # the library imports it, so a deployment that never sets ROADSTEAD_ADMIN_UI
 # pays only the ~40KB on disk.
-roadstead = ["*.yaml", "ui/*.html"]
+#
+# `py.typed` is the PEP 561 marker and is EMPTY BY SPECIFICATION — its presence
+# is the whole signal. That makes it the package-data entry most likely to be
+# dropped by a well-meaning cleanup, so the CI `package` job asserts it survives
+# into the built wheel alongside the two YAMLs and the UI.
+roadstead = ["*.yaml", "ui/*.html", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

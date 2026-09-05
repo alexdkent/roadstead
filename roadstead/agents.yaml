@@ -3,7 +3,10 @@
 # 🚨 THIS IS AN EXAMPLE, and it is also the default — the same arrangement as
 # `models.yaml`. A shipped example that nothing loads rots; this one boots a
 # fresh install and is what the suite runs against, so it cannot. Point
-# `LLM_PROXY_AGENTS_CONFIG` at your own file for a real deployment.
+# `ROADSTEAD_AGENTS_CONFIG` at your own file for a real deployment. (It said
+# `LLM_PROXY_AGENTS_CONFIG` until 2026-09-05 — the pre-rename spelling, which
+# `config.env_with_legacy_prefix` still honours WITH A DEPRECATION WARNING, so
+# the shipped example was teaching every new reader the name on its way out.)
 #
 # Each top-level key is an `agent_id` — the caller identity, which is the DRR
 # fair-share key. Since 2026-09-01 that identity comes from an API key where one

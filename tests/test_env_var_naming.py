@@ -99,8 +99,9 @@ def test_the_helper_prefers_the_new_spelling_and_warns_on_the_old(monkeypatch, c
 def test_the_shipped_image_keeps_durable_state_off_the_writable_layer():
     """🚨 The production defect, guarded where it actually bit.
 
-    The default data dir is `/tmp/agents/llmproxy` — correct for a developer
-    running the module, wrong for the artifact that ships. In a real container
+    The default data dir is the XDG state directory (`__main__.default_data_dir`),
+    which is a home directory the shipped image has no business writing to — and
+    before 2026-09-05 it was `/tmp/agents/llmproxy`, which was worse. In a real container
     on 2026-09-02 `queue.db` sat on the ephemeral writable layer while the
     mounted volume held only the admin overlay, so every rebuild reset the DRR
     balances, the day's spend and the endpoint drain state: precisely the rows

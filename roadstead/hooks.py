@@ -1,17 +1,19 @@
 """Integration seam — the one place the proxy reports OUT to a host application.
 
 Every module in this package emits degradations and security events through the
-callables here, and each one has a working stdlib-only default. A host
-application (originfleet) may replace a sink at startup via ``set_*_sink``; a
+callables here, and each one has a working stdlib-only default. An application
+EMBEDDING the proxy may replace a sink at startup via ``set_*_sink``; a
 standalone deployment simply doesn't, and the defaults keep the proxy fully
 functional with no loss of information — only of integration.
 
-Why this file exists: before 2026-08-31 four modules imported
-``originfleet.framework.*`` directly, which meant the package could not be run
-or published without the whole monorepo. Those imports now live here and in
-``__main__.py`` (the entrypoint, which a standalone deployment replaces
-wholesale), so the other 29 modules import nothing but the standard library and
-this package's declared third-party dependencies.
+Why this file exists: before 2026-08-31 four modules imported a host
+application's framework directly, which meant the package could not be run or
+published without that application's whole source tree. Nothing in the package
+imports it any more — the last guarded import, in ``__main__.py``, went on
+2026-09-05 — so every module here reads the standard library, this package, and
+its declared third-party dependencies, and nothing else. The seams below are
+what remains of the coupling: an embedder registers its own sink, and a
+deployment that registers none loses no information.
 
 🚨 Keep this module dependency-free. An import of anything outside the stdlib
 re-creates the coupling it exists to remove.
@@ -31,8 +33,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class DegradationSink(Protocol):
-    """The shape ``originfleet.framework.observability.degradation`` already
-    has, so the host can register that function directly."""
+    """Keyword-only, and three named fields before ``**fields``.
+
+    Shaped to match the observability helper a host application already has, so
+    an embedder registers its existing reporter directly rather than writing an
+    adapter. ``component`` is what degraded, ``reason`` is why, ``impact`` is
+    what the caller experiences — everything else is free-form context.
+    """
 
     def __call__(
         self, *, component: str, reason: str, impact: str, **fields: Any,
@@ -45,8 +52,11 @@ _degradation_sink: DegradationSink | None = None
 def set_degradation_sink(sink: DegradationSink | None) -> None:
     """Register the host's degradation reporter (``None`` restores the default).
 
-    Called once at startup from ``__main__``. Not thread-safe by design — the
-    proxy wires this before the event loop starts and never mutates it again.
+    Called once, by an embedding application, before the event loop starts.
+    ``__main__`` does NOT call it: running the proxy as a service is the
+    standalone case, and the default log sink below is the right answer there.
+    Not thread-safe by design — an embedder wires this at startup and never
+    mutates it again.
     """
     global _degradation_sink
     _degradation_sink = sink
@@ -168,12 +178,19 @@ def clear_config_notices() -> None:
 # Security events
 # ---------------------------------------------------------------------------
 #
-# Vendored from ``originfleet/framework/prompt_security.py`` (2026-08-31). The
-# proxy's only call site passed ``store=None``, so the persistence half of the
-# framework helper was already dead here and the log line below is byte-for-byte
-# what it emitted. The event name ``llmproxy_cache_drift`` is documented in
-# ``config.py`` (the origin's prefix-cache observability note is not part of
-# this repository) — preserve the shape if you touch this.
+# Vendored from a host application's prompt-security helper (2026-08-31), which
+# also PERSISTED each event to a store. The proxy's only call site passed
+# ``store=None``, so that half was already dead here and was not carried across;
+# what survives is the log line, byte-for-byte as it was emitted.
+#
+# 🚨 The line is a CONTRACT, not a format choice. It is parsed by whatever reads
+# the logs, so the field order and the ``key=value`` spelling are the shape to
+# preserve: ``<event_type> severity= provider= msg= source= action= blocked=
+# reason= metadata=``, with ``metadata`` a sort-keyed JSON object.
+# ``llmproxy_cache_drift`` (``health.py``, when a call_site's
+# front-loaded-prefix share collapses against its own trailing
+# baseline) is the only ``event_type`` in the package today, and a second one
+# means adding a NAME, never a column.
 
 def compact_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     """JSON-safe, length-capped copy of ``metadata``.

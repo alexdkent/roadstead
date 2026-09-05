@@ -36,7 +36,6 @@ from .observability import (
     DEFAULT_REQUEST_LOG_BACKUPS,
     DEFAULT_REQUEST_LOG_MAX_BYTES,
 )
-from .hooks import set_degradation_sink
 from .routes import make_routes
 from .service import (
     RECOMMENDED_STOP_GRACE_S,
@@ -272,15 +271,49 @@ class RequestSizeLimitMiddleware:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Centralized LLM scheduler proxy")
+    p = argparse.ArgumentParser(
+        # `prog` is pinned because there are two ways in — the console script
+        # and `python -m roadstead` — and argparse would otherwise derive
+        # `__main__.py` from argv[0] for the second, printing a usage line
+        # nobody can type.
+        prog="roadstead",
+        # Kept word-for-word in step with `pyproject.toml`'s `description`, so
+        # `--help` and the package index say the same thing about what this is.
+        # The old text ("Centralized LLM scheduler proxy") described the origin
+        # deployment's role, not the project.
+        description="Capacity-aware admission control for self-hosted LLM "
+                    "inference fleets (llama.cpp + vLLM), without Kubernetes.",
+        epilog="These four flags are the whole command line; everything else "
+               "this proxy does is configured by environment variable. The "
+               "full reference — every ROADSTEAD_* variable, its default, and "
+               "whether it is contract or internal — is docs/configuration.md: "
+               "https://github.com/alexdkent/roadstead/blob/main/docs/"
+               "configuration.md",
+    )
     p.add_argument("--port", type=int, default=int(_env("PORT", "42161")))
     p.add_argument("--host", default=_env("HOST", "0.0.0.0"))
     p.add_argument("--log-level", default=_env("LOG_LEVEL", "info"))
+    p.add_argument(
+        "--data-dir", default=None,
+        help="Directory for durable state — queue.db, runtime flags, the admin "
+             "overlay and the request log all live under it. Overrides "
+             f"ROADSTEAD_DATA_DIR; default {default_data_dir()}.")
     return p.parse_args()
 
 
+#: Variables that were REMOVED rather than renamed, and what to do instead.
+#: A rename leaves a name that means something else somewhere; a removal leaves
+#: a name that means nothing at all, which is the quieter of the two failures —
+#: nothing is wrong, the setting simply does not happen.
+_REMOVED_VARS = {
+    "ROADSTEAD_HOT_ROOT": (
+        "it only composed the default data directory, which is now the XDG "
+        "state directory. Set ROADSTEAD_DATA_DIR to the full path instead"),
+}
+
+
 def warn_on_retired_env_vars() -> list[str]:
-    """Say something when a `COLLECTIVE_*` variable is still set.
+    """Say something when a variable that no longer works is still set.
 
     🚨 Every environment variable was renamed `COLLECTIVE_* -> ROADSTEAD_*` on
     2026-08-31 (CHANGELOG: a recorded break). The dangerous half of that rename
@@ -290,22 +323,33 @@ def warn_on_retired_env_vars() -> list[str]:
     old names are NOT honoured, deliberately — two spellings for one switch is
     how they end up disagreeing — but an unread one is worth a loud line.
 
+    The same argument covers a variable that was **removed** outright, and it is
+    the reason `_REMOVED_VARS` exists rather than the name just disappearing
+    from the source: a deployment carrying `ROADSTEAD_HOT_ROOT=/srv/state`
+    across the 2026-09-05 upgrade would otherwise find its durable record in a
+    new place with nothing to read that explains it.
+
     Returns the retired names found, so a test can prove this fires.
     """
+    log = logging.getLogger(__name__)
     stale = sorted(k for k in os.environ if k.startswith("COLLECTIVE_"))
     for name in stale:
-        logging.getLogger(__name__).warning(
+        log.warning(
             "IGNORED: %s is a retired variable name and has no effect. Rename it "
             "to %s.", name, "ROADSTEAD_" + name[len("COLLECTIVE_"):])
-    return stale
+
+    removed = sorted(k for k in _REMOVED_VARS if k in os.environ)
+    for name in removed:
+        log.warning("IGNORED: %s was removed and has no effect — %s.",
+                    name, _REMOVED_VARS[name])
+    return stale + removed
 
 
-#: Storage that a container recreate or a reboot throws away. `/tmp` is the
-#: default root below, which is right for a dev run and wrong for the thing this
-#: process calls its DURABLE record.
+#: Storage that a container recreate or a reboot throws away. Since 2026-09-05
+#: no DEFAULT lands here — `default_data_dir` resolves to the XDG state dir — so
+#: this fires for a path somebody chose, or for the no-home fallback.
 #: `/private/tmp` is macOS's real `/tmp` (the latter is a symlink to it), and it
-#: is where a developer on a Mac actually lands — so omitting it would make the
-#: warning silent on the one platform where the default is exercised most.
+#: is kept because `TMPDIR`-style paths and hand-typed ones both land there.
 _EPHEMERAL_PREFIXES = ("/tmp/", "/private/tmp/", "/var/tmp/",
                        "/private/var/tmp/", "/dev/shm/")
 
@@ -313,20 +357,23 @@ _EPHEMERAL_PREFIXES = ("/tmp/", "/private/tmp/", "/var/tmp/",
 def _warn_if_durable_state_is_ephemeral(queue_db_path: str) -> bool:
     """🚨 The durable record on storage that does not survive a restart.
 
-    Disclosed rather than moved, because the default is right for the case it
-    was written for — a developer running the module directly — and changing it
-    would relocate an existing deployment's state on upgrade, which is a worse
-    failure than the one being fixed.
+    This used to be the DEFAULT's disclosure, and the default moved on
+    2026-09-05 (`default_data_dir`). The check stays, and it is not vestigial:
+    the two remaining ways to land here are an operator who set
+    `ROADSTEAD_DATA_DIR`/`ROADSTEAD_QUEUE_DB`/`--data-dir` to a temporary path
+    on purpose, and the no-home fallback. Both are cases where the path was
+    chosen rather than inherited, which is when the warning is most worth
+    reading — and neither would be caught by anything else.
 
     What makes it worth an alarm is the gap between the care taken on one side
     and the storage on the other: SIGTERM runs a bounded drain specifically to
     persist DRR budgets and completion rows, the shutdown budget is computed and
     published so a container stop-grace of 108s does not truncate that flush,
     and `startup` replays the day's rows so a caller's spend survives a deploy.
-    All of it lands in `/tmp` by default. Measured on a real container the same
-    day: `queue.db` sat on the ephemeral writable layer while the mounted volume
-    held only the admin overlay, so every rebuild silently reset the DRR
-    balances and the day's spend that the drain had carefully written.
+    Measured on a real container 2026-09-02: `queue.db` sat on the ephemeral
+    writable layer while the mounted volume held only the admin overlay, so
+    every rebuild silently reset the DRR balances and the day's spend that the
+    drain had carefully written.
     """
     if not queue_db_path.startswith(_EPHEMERAL_PREFIXES):
         return False
@@ -340,16 +387,73 @@ def _warn_if_durable_state_is_ephemeral(queue_db_path: str) -> bool:
     return True
 
 
+def default_data_dir() -> str:
+    """Where durable state goes when nobody says otherwise: the XDG state dir.
+
+    ``$XDG_STATE_HOME/roadstead``, or ``~/.local/state/roadstead`` when that is
+    unset — the XDG basedir spec's home for *state that should persist between
+    restarts and is not a cache and not config*, which is this data verbatim.
+
+    🚨 **This replaced ``/tmp/agents/llmproxy`` on 2026-09-05, and the move is
+    the point.** The old default put the durable record on storage a reboot
+    throws away, and the previous position was to DISCLOSE that rather than fix
+    it, on the argument that moving the default would relocate an existing
+    deployment's state on upgrade. That argument was answered rather than
+    ignored: the shipped image sets ``ROADSTEAD_DATA_DIR`` explicitly and is
+    unaffected, and for anyone who was relying on the old default, silently
+    keeping a durable record somewhere a reboot deletes is not a state worth
+    preserving. It is a recorded break (``CHANGELOG.md``), which is what
+    ``docs/compatibility.md`` asks of one.
+
+    Three things the old arrangement did, and where each one went:
+
+    * *it was relocatable without naming a full path*, via
+      ``ROADSTEAD_HOT_ROOT``. That variable is DELETED — it composed this path
+      and did nothing else, and ``ROADSTEAD_DATA_DIR`` says the same thing
+      directly.
+    * *it disclosed itself as ephemeral at boot.* Unchanged:
+      ``_warn_if_durable_state_is_ephemeral`` still fires, now only for an
+      operator who points at ``/tmp`` deliberately, which is the case where the
+      warning is worth reading.
+    * *it was absolute without depending on the environment.* Preserved below,
+      and it took explicit work — see the fallback.
+
+    Every caller resolves the default HERE: the entry point, ``--data-dir``'s
+    help text, and ``roadstead test``, which used to carry its own copy of the
+    literal. That copy was not merely duplication — ``roadstead test replay``
+    and ``ab`` read ``queue.db`` out of it, so a deployment that had moved its
+    data dir (the documented, supported thing to do) had its own replay tooling
+    look somewhere else and find an empty database, with nothing saying why.
+    """
+    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+    if xdg:
+        return os.path.join(xdg, "roadstead")
+
+    home_state = os.path.expanduser("~/.local/state")
+    if os.path.isabs(home_state):
+        return os.path.join(home_state, "roadstead")
+
+    # 🚨 ``expanduser`` returns its argument UNCHANGED when it cannot resolve
+    # ``~`` — no HOME and no passwd entry for the uid, which is exactly the
+    # distroless/``runAsUser: 10001`` container. Left alone, the result is a
+    # RELATIVE path and the durable record lands under the working directory,
+    # in a place nobody would look and nothing would say. Fall back to an
+    # absolute path that the ephemeral check below will then complain about, so
+    # the operator gets two loud lines instead of a silent wrong location.
+    logging.getLogger(__name__).warning(
+        "cannot resolve a home directory (no HOME, no passwd entry), so the "
+        "XDG state directory is unavailable and durable state falls back to "
+        "/tmp/roadstead. Set ROADSTEAD_DATA_DIR or pass --data-dir.")
+    return "/tmp/roadstead"
+
+
 def build_app(config: ProxyConfig | None = None) -> Starlette:
     """Build the Starlette app.  Usable from tests without running uvicorn."""
     warn_on_retired_env_vars()
     if config is None:
-        data_dir = _env(
-            "DATA_DIR",
-            os.path.join(os.environ.get("ROADSTEAD_HOT_ROOT", "/tmp"), "agents", "llmproxy"),
-        )
+        data_dir = _env("DATA_DIR", default_data_dir())
         os.makedirs(data_dir, exist_ok=True)
-        # 🚨 UNDER the data dir, not beside it in $ROADSTEAD_HOT_ROOT/logs.
+        # 🚨 UNDER the data dir, not beside it in a separately-rooted log dir.
         # Changed 2026-09-02, and the reason is the deployment contract: the
         # operator is asked to provide ONE persistent path and the application
         # undertakes to keep everything it owns inside it. With the log rooted
@@ -394,8 +498,8 @@ def build_app(config: ProxyConfig | None = None) -> Starlette:
             request_log_backups=int(_env(
                 "REQUEST_LOG_BACKUPS", DEFAULT_REQUEST_LOG_BACKUPS)),
             # Per-agent DRR quota overrides (weight, max_balance_ss,
-            # default_priority). Reads originfleet/llmproxy/agents.yaml
-            # by default, or the path in ROADSTEAD_AGENTS_CONFIG.
+            # default_priority). Reads the shipped `roadstead/agents.yaml` by
+            # default, or the path in ROADSTEAD_AGENTS_CONFIG.
             # Missing file → empty dict → proxy lazy-creates agent
             # configs at AgentQuotaConfig dataclass defaults.
             agents=load_agent_configs(),
@@ -495,30 +599,15 @@ def main() -> None:
     # was already removed for. Failures still surface via our own handlers.
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    # ---- Host-application integration (OPTIONAL) --------------------------
-    # This entrypoint is the ONLY module in the package that knows originfleet
-    # exists, and every import below is soft: the proxy runs fully standalone
-    # without them, falling back to the built-in reporting in ``hooks.py``. A
-    # standalone deployment replaces this file wholesale and drops the block.
-    # Keep it that way — an unguarded import here re-couples the package.
-    try:
-        from originfleet.framework.observability import degradation
-        set_degradation_sink(degradation)
-    except ImportError:
-        logging.getLogger(__name__).debug(
-            "originfleet observability unavailable — degradations will be "
-            "reported via the built-in logging sink")
-
-    # Emit a ship_version line on startup so the ship harness'
-    # restart-phase health-poll can confirm the new build is running.
-    # Same shape as originfleet.tools.llm_qos and every agent — the
-    # harness greps for "[ship_version] agent=<name>" in the log.
-    try:
-        from originfleet.framework.ship_version import log_ship_version
-        log_ship_version("llmproxy")
-    except ImportError:
-        logging.getLogger(__name__).debug(
-            "originfleet ship_version unavailable — no [ship_version] marker")
+    # 🚨 Published into the environment rather than passed down, and the reason
+    # is that the data dir is a ROOT: the queue DB, the runtime flags, the admin
+    # overlay and the request log are each derived from it by their OWN
+    # `ROADSTEAD_*` variable further down, and each of those must still be able
+    # to override the flag individually. Setting the variable puts the flag
+    # exactly where the existing precedence already works — flag beats env,
+    # env beats default — instead of adding a fourth rule.
+    if args.data_dir is not None:
+        os.environ["ROADSTEAD_DATA_DIR"] = args.data_dir
 
     app = build_app()
 
@@ -582,10 +671,12 @@ def _test_cli() -> None:
 
     # `sim` defines no --db (pure in-process); replay/ab do. getattr keeps the
     # shared path computation from AttributeError-ing the sim mode.
+    #
+    # ROADSTEAD_DATA_DIR is honoured here, which it was not before: this line
+    # rebuilt the default path itself and so ignored the one variable an
+    # operator sets to move the database it is trying to read.
     db_path = getattr(args, "db", None) or os.path.join(
-        os.environ.get("ROADSTEAD_HOT_ROOT", "/tmp"),
-        "agents", "llmproxy", "queue.db",
-    )
+        _env("DATA_DIR", default_data_dir()), "queue.db")
 
     if args.mode == "sim":
         harness = ProxyTestHarness()

@@ -29,8 +29,11 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # 🚨 The durable event log, OFF the container's ephemeral writable layer.
-# Without this the default data dir is `/tmp/agents/llmproxy` — right for a
-# developer running the module directly, wrong for the artifact that ships.
+# Without this the default data dir is the XDG state directory
+# (`$XDG_STATE_HOME/roadstead`, else `~/.local/state/roadstead`) — right for a
+# developer running the module directly, and wrong for the artifact that ships,
+# which runs with no home directory worth writing to. Before 2026-09-05 the
+# default was `/tmp/agents/llmproxy` and the argument was even stronger.
 # Measured in a real container 2026-09-02: `queue.db` sat on the writable layer
 # while the mounted volume held only the admin overlay, so every rebuild
 # silently reset the DRR balances, the day's spend and the endpoint drain state
