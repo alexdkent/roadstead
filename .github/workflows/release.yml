@@ -1,0 +1,96 @@
+name: Release
+
+# A pushed `v*` tag is the whole trigger. Nothing publishes from `main`, from a
+# branch or by hand: the tag is the decision, and it is the one artifact of this
+# process that cannot be taken back once it reaches PyPI.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  # For softprops/action-gh-release. The PyPI upload authenticates with a token
+  # rather than the workflow identity, so no `id-token` here.
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # setuptools reads the version out of `pyproject.toml`, not out of
+          # git — but the release body is extracted from CHANGELOG.md and the
+          # scrub guards want history, so take the whole thing rather than a
+          # depth-1 tip that would make a future history check vacuous.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install the build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Build the sdist and the wheel
+        run: python -m build
+
+      - name: Check the metadata PyPI will render
+        # `twine check` catches a README that renders as a wall of plain text
+        # on the project page — which cannot be fixed after upload, because a
+        # version number is never reused.
+        run: twine check dist/*
+
+      - name: The tag must equal the declared version
+        id: version
+        # The one gate that stops a mis-typed tag publishing a package whose
+        # version says something else. `tests/test_version.py` already refuses a
+        # `.devN` version in the tree; this pairs it against what was tagged.
+        run: |
+          declared="$(python -c "
+          import pathlib, tomllib
+          print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])
+          ")"
+          tag="${GITHUB_REF_NAME}"
+          if [ "$tag" != "v$declared" ]; then
+            echo "::error::tag ${tag} does not match pyproject.toml version ${declared} (expected v${declared})"
+            exit 1
+          fi
+          echo "tag ${tag} matches the declared version"
+          echo "version=${declared}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract this version's CHANGELOG section
+        # The release body is the section already written for humans, not a
+        # generated commit list. An empty extraction fails the job: a release
+        # note nobody wrote is worse than no release, and the mistake is
+        # invisible once the tag is public.
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          awk -v v="$version" '
+            $0 ~ "^## " v "( |$)" { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > release-body.md
+          if [ ! -s release-body.md ]; then
+            echo "::error::CHANGELOG.md has no '## ${version}' section to release from"
+            exit 1
+          fi
+          echo "release body: $(wc -l < release-body.md) lines"
+
+      - name: Publish to PyPI
+        # Token auth, not trusted publishing: the repository is not public yet,
+        # so the OIDC publisher cannot be configured against it. Swap this for
+        # `id-token: write` and no `password:` once it is.
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Publish the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-body.md
+          files: |
+            dist/*.whl
+            dist/*.tar.gz

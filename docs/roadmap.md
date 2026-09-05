@@ -800,8 +800,8 @@ indistinguishable from one that cannot fire.
 **~~The shutdown budgets are measured but not bounded.~~ Closed 2026-09-01** — every phase is named
 and bounded, `SHUTDOWN_DEADLINE_S` is their sum rather than a literal, and the recommended container
 stop-grace went **up** (90 → 108s) because 90 had been an observation of a fast tail rather than a
-ceiling. See the Unreleased entry in `CHANGELOG.md` for why there is deliberately no outer
-`wait_for`.
+ceiling. See the shutdown-drain entry in `docs/changelog-archive.md` for why there is deliberately no
+outer `wait_for`.
 
 **Duration answered 2026-09-01, and the answer took three runs.** The soak had never been run long.
 

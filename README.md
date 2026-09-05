@@ -21,7 +21,7 @@ explicit overflow**, never the fallback that quietly becomes the norm.
 Local-first also means what you would hope: it runs with no account and no internet, and nothing
 leaves the machine unless someone opts into spilling it.
 
-> ⚠️ **Pre-release, and private.** Extracted from a production monorepo on 2026-08-31 and still
+> ⚠️ **Pre-1.0.** Extracted from a production monorepo on 2026-08-31 and still
 > stabilising. It is an independent project rather than a replacement for its origin — expect it to
 > become a superset, and expect occasional deliberate breaks (`docs/compatibility.md`). This
 > repository must not be made public until the git-history rewrite (S7) is complete.
@@ -92,11 +92,15 @@ plan on 2026-08-31**: a parity gate on a deliberate superset fails on every impr
 ## Quick start
 
 ```sh
-pip install git+https://github.com/alexdkent/roadstead
+pip install roadstead
 ```
 
-**Not on PyPI yet** — `pip install roadstead` is coming, and until it does the git URL above is the
-install. Python 3.11 or newer.
+Python 3.11 or newer. That is the 0.1.0 release on PyPI. The source is on GitHub (public soon), and
+once it is, the unreleased tip installs from it directly:
+
+```sh
+pip install git+https://github.com/alexdkent/roadstead
+```
 
 To work on it instead, take the source and its dev extras:
 

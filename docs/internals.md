@@ -650,6 +650,25 @@ by design; check your own project memory.
   has none of the server's dependencies — a subprocess test blocks Starlette, uvicorn, PyYAML,
   jsonschema and json_repair and requires it to import anyway.
 
+## Cutting a release
+
+`.github/workflows/release.yml` does the publishing, and a pushed `v*` tag is its only trigger.
+
+1. Bump `version` in `pyproject.toml` to the number being released — with no `.devN` suffix, which
+   `tests/test_version.py` refuses outright rather than leaving for the tag to catch.
+2. Move `CHANGELOG.md`'s `## Unreleased` body under a dated `## X.Y.Z — YYYY-MM-DD` heading and
+   leave `## Unreleased` empty. The workflow reads that section verbatim as the release body and
+   fails the job if there is none.
+3. Commit both, then tag and push: `git tag vX.Y.Z && git push origin main --follow-tags`.
+4. The workflow builds the sdist and wheel, `twine check`s them, refuses to go further unless the
+   tag equals `v` + the declared version, uploads to PyPI with the `PYPI_API_TOKEN` secret, and
+   opens the GitHub release with both artifacts attached.
+5. Verify from outside the tree, because a green workflow proves an upload and not an install:
+   `pip install roadstead==X.Y.Z` into a fresh venv, then `roadstead --version`.
+
+Everything before 0.1.0 is in `docs/changelog-archive.md` — a closed record, not a file anything
+appends to.
+
 ## 🚨 Before this repo goes public
 
 It is **private** and must stay private until the scrub is done. The plan that tracks that work
