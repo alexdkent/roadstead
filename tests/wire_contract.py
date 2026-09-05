@@ -5,11 +5,11 @@ inside Roadstead. Whether an error is *deferrable* is decided by the CALLER,
 which matches substrings of the error message; the classifier historically
 lives in the host application's ``framework/nexus_errors.py`` and is not
 importable here. Several tests used to import it and use it as an oracle, which
-is what coupled them to the monorepo (``tests/_pending/README.md``, Group A).
+is what coupled them to that application and made them unrunnable standalone.
 
 Importing Roadstead's own copy of the rule instead would be worse than useless:
 asserting that one source agrees with itself proves nothing. That is the
-tautology trap the quarantine README names.
+tautology trap.
 
 So the markers live here as literals transcribed from ``docs/api.md``, which is
 Roadstead's published contract rather than a copy of anyone's implementation.
@@ -17,8 +17,8 @@ These tests pin what Roadstead EMITS against it; a caller pins what its
 classifier MATCHES against it. Neither side reads the other's code, so neither
 can drift silently into agreement with itself.
 
-(The caller in question was the origin monorepo, and this file was written while
-the two projects were coupled. Roadstead became independent on 2026-08-31 — see
+(The caller in question was the application Roadstead was extracted from, and
+this file was written while the two were coupled. Roadstead became independent on 2026-08-31 — see
 ``docs/compatibility.md`` — which changes nothing here: a published contract
 checked from the emitting side is the right shape whoever is consuming it.)
 

@@ -32,7 +32,7 @@ looks arbitrary until it bites:
 address.** Falling back would mean a caller with a wrong or revoked credential
 silently becomes a *different, weaker* identity that still works. That is the
 same failure shape as the ``finish_reason`` repair that became a silencer
-(``CLAUDE.md``): a correction indistinguishable, from the outside, from the
+(``docs/internals.md``): a correction indistinguishable, from the outside, from the
 thing being correct. The error message names the situation and says what to do
 about it, so an operator is never left guessing.
 

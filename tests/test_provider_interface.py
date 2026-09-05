@@ -12,7 +12,7 @@ guards). What is NOT covered by those, and is covered here, is the seam itself:
     engine has always taken the llama.cpp path and a config typo has never taken
     an endpoint offline;
   * the llama.cpp/vLLM capacity asymmetry is a DECLARATION, not a comment. It is
-    the reason vLLM concurrency stays config-seeded (CLAUDE.md), so it should
+    the reason vLLM concurrency stays config-seeded (docs/internals.md), so it should
     fail here if someone "tidies" it into symmetry;
   * nothing outside the config plumbing may go back to comparing
     `backend_engine` against a literal.
@@ -69,7 +69,7 @@ def test_shim_endpoints_are_not_a_provider_kind():
 
 def test_providers_are_stateless_singletons():
     """One instance per engine is shared by every endpoint on the single event
-    loop (CLAUDE.md: no locks, one thread). Per-request state on a provider
+    loop (docs/internals.md: no locks, one thread). Per-request state on a provider
     would be a data race nothing in this suite could catch."""
     a = EndpointConfig(endpoint_class="a", role="a", backend_engine="vllm")
     b = EndpointConfig(endpoint_class="b", role="b", backend_engine="vllm")
@@ -86,7 +86,7 @@ def test_providers_are_stateless_singletons():
 # ---------------------------------------------------------------------------
 
 def test_capacity_discovery_is_asymmetric_on_purpose():
-    """🚨 CLAUDE.md, "Engine-behaviour findings": llama.cpp /props yields real
+    """🚨 docs/internals.md, "Engine-behaviour findings": llama.cpp /props yields real
     n_parallel and per-slot n_ctx; vLLM exposes only max_model_len and keeps
     --max-num-seqs off the API, so vLLM concurrency stays CONFIG-SEEDED with a
     drift alert. That is a property of the engines, not an oversight — if this

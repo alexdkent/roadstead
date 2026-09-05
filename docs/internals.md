@@ -1,7 +1,7 @@
 # Roadstead — engineering internals
 
-> This was `CLAUDE.md` at the repository root until 2026-09-05, and the code and docs still
-> cite it under that name in a few dozen comments. Root `CLAUDE.md` is now a pointer here.
+> This was `CLAUDE.md` at the repository root until 2026-09-05. Root `CLAUDE.md` is now a
+> three-line pointer here, and the citations elsewhere in the tree were updated to this path.
 
 > A **roadstead** is the sheltered anchorage outside a harbour where vessels wait for a berth to
 > free up. That is not a metaphor for the admission queue — it *is* the queue, and specifically one

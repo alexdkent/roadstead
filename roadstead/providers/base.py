@@ -21,7 +21,7 @@ things engines genuinely disagree about, and nothing else:
 **Transport is not a provider concern.** Connection pools, deadlines, the error
 taxonomy and the SSE relay live in ``backend.py`` and are the same for every
 backend; a provider that opened its own sockets would fork the single-loop
-concurrency invariant (``CLAUDE.md``). Providers are handed the pool and ask it
+concurrency invariant (``docs/internals.md``). Providers are handed the pool and ask it
 to probe, which is also what keeps the unit suite's network isolation working —
 it stubs probes by name on ``BackendClientPool``.
 

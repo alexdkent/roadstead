@@ -1,6 +1,6 @@
 """The five "pure computation, no I/O" modules, held to that claim.
 
-``CLAUDE.md`` calls them the crown jewels and says "keep them that way", and
+``docs/internals.md`` calls them the crown jewels and says "keep them that way", and
 until now nothing checked it. That is the shape this repo keeps having to close:
 a property asserted in prose, true on the day it was written, with no mechanism
 to notice the commit that ends it. The vision capability was documentation for
@@ -34,7 +34,7 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 
 #: The claim, module by module. Kept as a literal rather than parsed out of
-#: CLAUDE.md: the point is to fail when the CODE moves, and reading the list
+#: docs/internals.md: the point is to fail when the CODE moves, and reading the list
 #: from the document would make deleting a line there enough to disarm this.
 PURE_MODULES = (
     "scheduler",     # DRR + priority bands + admission
@@ -110,7 +110,7 @@ def test_a_pure_module_imports_nothing_that_does_io(module):
                 if root in FORBIDDEN_IMPORTS:
                     offenders.append(f"from {node.module} import ...")
     assert not offenders, (
-        f"roadstead/{module}.py claims 'pure computation, no I/O' (CLAUDE.md) "
+        f"roadstead/{module}.py claims 'pure computation, no I/O' (docs/internals.md) "
         f"but imports {offenders}. Every decision in it is currently testable "
         f"against a fleet that does not exist; this would end that, and nothing "
         f"else would object.")

@@ -5,11 +5,11 @@ wins that race, a caller's POST lands on a socket the server has already closed
 and fails with ``RemoteProtocolError("Server disconnected without sending a
 response.")`` — a transport error for a request that was never attempted.
 
-This lived in ``tests/_pending/test_timeout_apply.py``, which imported the
-client's ``_CLIENT_KEEPALIVE_EXPIRY_S`` and compared the two constants directly.
-That file was 21 tests of ``ProxyLLMClient`` — host code — and went back to the
-monorepo whole; this one assertion is the only part of it Roadstead owns, so it
-is rehomed here rather than lost.
+This assertion came from a quarantined file that imported the client's
+``_CLIENT_KEEPALIVE_EXPIRY_S`` and compared the two constants directly. That
+file was 21 tests of client code, which is not Roadstead's to test; this one
+assertion is the only part of it Roadstead owns, so it is rehomed here rather
+than lost.
 
 🚨 ``PROXY_SERVER_KEEPALIVE_S`` reads ``ROADSTEAD_PROXY_SERVER_KEEPALIVE_S``,
 so the invariant can be broken from a deployment config without touching code —

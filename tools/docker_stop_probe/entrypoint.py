@@ -1,7 +1,7 @@
 """Roadstead in a container, with a parked in-flight request, ready for SIGTERM.
 
 Measures what `docker stop` actually costs, which is the containerisation half
-of the shutdown question in `CLAUDE.md`. `tools/sigterm_drain_probe.py` measured
+of the shutdown question in `docs/internals.md`. `tools/sigterm_drain_probe.py` measured
 a raw SIGTERM to a bare process; this measures the thing that will actually
 happen in production, where a 10s default sits between SIGTERM and SIGKILL.
 

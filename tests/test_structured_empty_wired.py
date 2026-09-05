@@ -1,6 +1,6 @@
 """The detector is REACHED, and its counters reach /v1/status + /metrics.
 
-CLAUDE.md, on the five ways a green suite lies: "a module can be written,
+docs/internals.md, on the five ways a green suite lies: "a module can be written,
 unit-tested, and never called. Tests prove a unit works; only an end-to-end
 journey proves it is REACHED." The unit tests next door bind ``Correction``
 methods to a mock ``self``; these drive the REAL ``ProxyService`` with a fake

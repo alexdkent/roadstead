@@ -151,7 +151,7 @@ def test_a_grammar_is_refused_not_dropped(payload):
     Dropping the grammar would return free-form text to a caller that required
     conforming output, and the caller could not distinguish that from a model
     that answered badly — the same shape as the `finish_reason` repair that
-    became a silencer (CLAUDE.md). Refusing is loud and correct."""
+    became a silencer (docs/internals.md). Refusing is loud and correct."""
     with pytest.raises(UnsupportedRequest):
         OPENROUTER.prepare_chat_payload(payload, model_id=MODEL)
 

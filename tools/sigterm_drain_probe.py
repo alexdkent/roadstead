@@ -7,7 +7,7 @@ shutdown-signal question on 2026-08-31.
 Off the default test path on purpose: it spawns real processes, sends real
 signals, and the slowest scenario takes ~80 seconds. It is here so the
 measurement can be *re-run* rather than merely cited — the finding it produced
-is recorded in ``docs/ledger.md`` and summarised in ``CLAUDE.md``.
+is recorded in ``docs/ledger.md`` and summarised in ``docs/internals.md``.
 
 The question it answers (``docs/history.md``, open question 1): the origin
 project's knowledge layer contradicted itself on whether SIGTERM hangs behind

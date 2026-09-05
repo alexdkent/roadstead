@@ -1674,7 +1674,7 @@ bound, and a trail that presented itself as complete while being neither durable
 be the `finish_reason` repair again — a thing that looks like an answer and silences the question.
 
 **A record is written on the loop and reaches disk off it**, riding the same `to_thread` write as the
-change it describes (CLAUDE.md: *mutate on the loop, persist off it*). One consequence follows and is
+change it describes (docs/internals.md: *mutate on the loop, persist off it*). One consequence follows and is
 not treated as a bug: when the store is unwritable the trail applies and does not survive, exactly
 like the change it records. A trail that refused to record an action the plane had already taken
 would make the log *less* truthful, not more.

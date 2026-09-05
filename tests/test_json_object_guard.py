@@ -251,7 +251,7 @@ def test_streaming_requests_are_covered_too():
 
 # --- the strip must not silently drop what the constraint also bought -------
 #
-# CLAUDE.md: "replacing a component silently drops its guarantees — enumerate
+# docs/internals.md: "replacing a component silently drops its guarantees — enumerate
 # what it guaranteed and re-assert each." A bare json_object also armed the
 # Phase-1.1 truncation-integrity gate (finish_reason=length on a STRUCTURED
 # request fails loud + deferrable instead of handing back half an object), the

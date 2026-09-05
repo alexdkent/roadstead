@@ -153,7 +153,7 @@ def test_the_file_parser_actually_reads_every_field_it_allows():
 def test_an_unknown_policy_key_is_reported_rather_than_dropped(tmp_path):
     """`models.yaml` `policy:` keys outside `_POLICY_PASSTHROUGH` are dropped.
 
-    That is the failure `CLAUDE.md` says has bitten repeatedly, and its whole
+    That is the failure `docs/internals.md` says has bitten repeatedly, and its whole
     cost is that a dropped knob is indistinguishable from a knob that was never
     load-bearing. It stays dropped — a typo must not stop a fleet booting — but
     it is now RETAINED as a notice, which is what makes it findable a week
@@ -789,7 +789,7 @@ async def test_every_endpoint_the_catalog_declares_is_reported(tmp_path):
 
 @pytest.mark.asyncio
 async def test_discoverability_is_a_descriptor_property(tmp_path):
-    """🚨 Branch on a capability, never on an engine name (CLAUDE.md).
+    """🚨 Branch on a capability, never on an engine name (docs/internals.md).
 
     "Is this slot count real or config-seeded" is a property of the ENGINE kind
     — llama.cpp publishes `/props`, vLLM publishes nothing of the sort — and the

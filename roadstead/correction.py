@@ -1307,7 +1307,7 @@ class Correction:
             # Re-assert what the constraint was also buying. The payload no longer
             # looks structured, but the caller still parses JSON — so keep the
             # truncation-integrity gate, the JSON backstop and the structured-
-            # stream validity guard armed via this flag. (CLAUDE.md: "replacing a
+            # stream validity guard armed via this flag. (docs/internals.md: "replacing a
             # component silently drops its guarantees" — enumerate and re-assert.)
             try:
                 req.json_object_stripped = True

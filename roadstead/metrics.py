@@ -3,7 +3,7 @@
 Vendored from the origin monorepo's framework emitter (2026-08-31) so this
 package depends on nothing outside itself — see ``hooks.py`` for the rationale.
 The two copies are independent by design: this one serves the proxy, the one
-left behind serves that fleet's agents. Nothing keeps them in step, and nothing
+left behind serves that application. Nothing keeps them in step, and nothing
 needs to.
 
 The ``prometheus_client`` dependency is deliberately not taken. The write side

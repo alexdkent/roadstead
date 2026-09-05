@@ -11,16 +11,16 @@ proxy: callers match SUBSTRINGS of the error message, historically in the
 host's ``framework/nexus_errors.py``. The original version of this file
 imported that classifier and used it as an oracle, which is exactly why it
 could not run standalone. Importing Roadstead's own copy of the rule and
-asserting it agrees with itself would prove nothing — two values compared from
-one source (``tests/_pending/README.md``).
+asserting it agrees with itself would prove nothing: two values compared from
+one source.
 
 So the markers live in ``tests/wire_contract.py`` as literals transcribed from
 the shared boundary object, ``docs/api.md`` §2.2 — read that module's docstring
-for the full reasoning. This file pins the SERVER side to them; the monorepo's
-integration test pins the CLIENT side to the same literals. Drift on either side
+for the full reasoning. This file pins the SERVER side to them; a consuming
+client pins the CLIENT side to the same literals. Drift on either side
 then fails on that side, which is the whole point.
 
-The one assertion genuinely left to the monorepo is marked inline: that a 502
+The one assertion genuinely left to the calling client is marked inline: that a 502
 envelope becomes deferrable via the ``LLM proxy error 502`` prefix, because the
 client constructs that prefix — the proxy never emits it.
 """
@@ -139,7 +139,7 @@ async def test_backend_error_envelope_coded_and_deferrable_via_status():
         assert resp.status_code == 502
         assert body["status"] == "error"
         assert body["code"] == "backend_error"
-        # LEFT TO THE MONOREPO: a 502 envelope becomes deferrable via the
+        # LEFT TO THE CALLING CLIENT: a 502 envelope becomes deferrable via the
         # client-constructed "LLM proxy error 502: ..." prefix. The proxy never
         # emits that prefix, so there is nothing here to assert it against —
         # asserting it from this side would only restate the client's own rule.

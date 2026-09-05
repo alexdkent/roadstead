@@ -958,7 +958,7 @@ class Scheduler:
             return Admission.DEFER
         # Do not spill into a remote endpoint that is already at its own
         # config-seeded concurrency cap. That cap is a policy knob we chose
-        # rather than a discovered capacity (CLAUDE.md), which makes it the only
+        # rather than a discovered capacity (docs/internals.md), which makes it the only
         # bound on how fast a full local tier can turn into an invoice.
         if len(self._active.get(spill_target, {})) >= tgt_cfg.effective_max_slots:
             return Admission.DEFER

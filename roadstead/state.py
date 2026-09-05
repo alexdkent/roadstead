@@ -116,7 +116,7 @@ class ProxyState:
         # whose descriptor says `publishes_token_costs`; the ledger is the LIVE
         # per-caller account a threshold decision reads without going to the DB.
         # 🚨 Both are ordinary single-loop in-memory state — the concurrency
-        # invariant in CLAUDE.md covers them exactly as it covers `budget_mgr`.
+        # invariant in docs/internals.md covers them exactly as it covers `budget_mgr`.
         self.prices = PriceBook()
         for ep_name, ep_cfg in config.endpoints.items():
             declared = declared_price(ep_name, ep_cfg)

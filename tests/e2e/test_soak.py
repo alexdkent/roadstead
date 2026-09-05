@@ -1,6 +1,6 @@
 """Sustained concurrent load, with the concurrency invariant armed.
 
-**Workstream F.** `CLAUDE.md` names the single most dangerous thing in this repo
+**Workstream F.** `docs/internals.md` names the single most dangerous thing in this repo
 and, until this file, said plainly that nothing in the suite guarded it:
 
     🚨 Single event loop. No locks on in-memory scheduler / budget / cache
@@ -218,7 +218,7 @@ async def test_the_affinity_guard_actually_catches_a_second_writer(proxy):
         await proxy.client.post("/rs/v1/chat", json=_body(0))
 
         def offending_writer():
-            # Exactly what CLAUDE.md forbids: "a second thread that touches
+            # Exactly what docs/internals.md forbids: "a second thread that touches
             # scheduler or budget state".
             state.budget_mgr.charge("intruder", 1.0, 0.0)
 

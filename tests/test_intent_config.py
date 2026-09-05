@@ -292,7 +292,7 @@ def test_excluding_everything_names_the_exclusion_as_the_cause():
 
 def test_exclusion_is_reported_ahead_of_any_property_of_the_endpoint():
     """A caller who excluded an endpoint that is ALSO unrouted needs the reason
-    they can act on, not a fact about our fleet that reads as though the
+    they can act on, not a fact about the deployment that reads as though the
     exclusion had not been understood."""
     fleet = [facts("tier1"), facts("dead", routed=False)]
     res = resolve(parse_intent({"exclude": ["dead"]}), fleet)

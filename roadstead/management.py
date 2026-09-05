@@ -101,7 +101,7 @@ That is what nesting was wanted for. ``GET /rs/v1/admin/keys`` groups by
 
 🚨 The objects mutated here — the key registry, ``config.agents``, the DRR
 budgets — are read on the hot path, on the loop thread, with no locks
-(``CLAUDE.md``). So **the mutation happens on the loop and only the file write
+(``docs/internals.md``). So **the mutation happens on the loop and only the file write
 goes off it**, via ``asyncio.to_thread``. That is deliberately stricter than
 ``flags.py``, which runs its whole ``set_many`` off-loop: a flag dict is written
 once in a blue moon and read as a plain lookup, whereas a registry write racing
@@ -153,7 +153,7 @@ PREFIX = "/rs/v1/admin"
 # ---------------------------------------------------------------------------
 #
 # 🚨 ONE static HTML file, vanilla JS, no bundler and no third-party anything.
-# The dependency list is six packages on purpose (CLAUDE.md); a build step, a
+# The dependency list is six packages on purpose (docs/internals.md); a build step, a
 # node_modules or a React dependency is out, and the same judgement that keeps
 # ``roadstead.client`` on httpx-and-stdlib keeps this on the platform.
 #
@@ -298,7 +298,7 @@ class AdminOverlay:
         # Serialises overlay writes. An asyncio.Lock, NOT a threading one: it
         # orders two coroutines' read-modify-write of the same file on one loop
         # and holds across the `to_thread` that does the I/O. It guards no
-        # in-memory scheduler state, which is what CLAUDE.md forbids locking.
+        # in-memory scheduler state, which is what docs/internals.md forbids locking.
         # 🚨 It lives HERE rather than on one handler because TWO modules now
         # persist this file — the management plane and the four control routes
         # that predate it — and a lock owned by one of them serialises only half
@@ -604,7 +604,7 @@ class AdminOverlay:
         """Append one audit record. **Call on the loop.**
 
         🚨 In-memory only, deliberately, and this is the shape the concurrency
-        invariant forces (CLAUDE.md: *mutate on the loop, persist off it*). The
+        invariant forces (docs/internals.md: *mutate on the loop, persist off it*). The
         record lands here synchronously — it is a list append — and reaches the
         disk on the ``persist()`` that the same handler was already going to do
         through ``asyncio.to_thread``. Writing the trail with its own file write
@@ -2274,7 +2274,7 @@ class ManagementApi:
                     if entry.api_key_env else None,
                 },
                 # What this KIND of backend can tell us — the declared asymmetry
-                # (CLAUDE.md), so an operator reading "slots: config-seeded" can
+                # (docs/internals.md), so an operator reading "slots: config-seeded" can
                 # see it is a property of the engine rather than a missing probe.
                 "descriptor": dataclasses.asdict(descriptor),
                 "endpoints": by_provider.get(name, []),
@@ -2310,7 +2310,7 @@ class ManagementApi:
             # questions. `declared` is the catalog seed, `in_force` is what
             # admission actually uses, and `discovered` says whether the backend
             # was ever asked — which for a vLLM endpoint is permanently False and
-            # is a property of the engine, not a fault (CLAUDE.md).
+            # is a property of the engine, not a fault (docs/internals.md).
             "capacity": {
                 "slots": {
                     "declared": entry.slots if entry else 0,

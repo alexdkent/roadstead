@@ -439,7 +439,7 @@ class EnrichedApi:
         # 🚨 Two questions, two answers, and they never default from each other:
         # `degrade` is "this backend is DOWN, may a smaller model answer" and
         # `spill` is "this backend is BUSY, may we pay somebody else". Reporting
-        # them as one field is the collapse CLAUDE.md warns recurs.
+        # them as one field is the collapse docs/internals.md warns recurs.
         return {
             "degrade": {
                 "allowed": bool(cfg.degrade_ok),
@@ -606,7 +606,7 @@ def _substitution_request(body: dict) -> tuple[bool | None, bool | None]:
 # ---------------------------------------------------------------------------
 
 #: What moved a request off the endpoint that was chosen for it. Two values,
-#: never one: see ``docs/api.md`` §1.6 and ``CLAUDE.md`` — failover answers "this
+#: never one: see ``docs/api.md`` §1.6 and ``docs/internals.md`` — failover answers "this
 #: backend is DOWN" and spill answers "this backend is FULL", and a caller reacts
 #: to them differently (one got a worse answer, one got an invoice).
 SUBSTITUTION_FAILOVER = "failover"

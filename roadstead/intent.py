@@ -704,7 +704,7 @@ def resolve(intent: Intent, facts: list[ModelFacts] | tuple[ModelFacts, ...]) ->
             # First, ahead of every property of the endpoint itself. If a
             # caller excluded an endpoint that is also unrouted and also the
             # wrong kind, the answer they need is the one they can act on —
-            # "because you said so" — not a fact about our fleet that would
+            # "because you said so" — not a fact about one deployment that would
             # read as though the exclusion had not been understood.
             rejected.append(Rejection(f.endpoint, REJECT_EXCLUDED,
                                       "excluded by the request"))

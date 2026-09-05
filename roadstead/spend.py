@@ -266,7 +266,7 @@ class SpendLedger:
     """Per-caller token and cost accounting, live on the loop.
 
     Single-threaded like everything else in this package's in-memory state —
-    ``CLAUDE.md``'s concurrency invariant applies here in full. There is no lock
+    ``docs/internals.md``'s concurrency invariant applies here in full. There is no lock
     because there is one writer, and a second thread touching this would be the
     same data race as a second thread touching the DRR budgets.
 

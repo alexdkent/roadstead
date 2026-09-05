@@ -163,7 +163,7 @@ def test_the_poller_tick_actually_calls_it():
 
 def test_the_method_is_armed_against_the_concurrency_invariant():
     """It mutates single-loop state from a SECOND loop-side writer (the poller,
-    beside the submit path). CLAUDE.md's rule is that such a method goes in
+    beside the submit path). docs/internals.md's rule is that such a method goes in
     STATE_METHODS, or the soak watches less than it reports."""
     from tests.loop_affinity import STATE_METHODS
 

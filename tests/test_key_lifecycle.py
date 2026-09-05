@@ -479,7 +479,7 @@ async def test_the_read_view_says_what_a_binding_is_worth(tmp_path):
     assert view["binding"]["checked_against"] == "the peer address"
     assert "cannot be spoofed" in view["binding"]["note"]
 
-    # 🚨 The directory must EXIST before the sqlite open (see CLAUDE.md notes).
+    # 🚨 The directory must EXIST before the sqlite open (see docs/internals.md notes).
     (tmp_path / "proxied").mkdir()
     behind = _svc(tmp_path / "proxied")
     behind._state.identity.proxies = TrustedProxies.parse("10.0.0.1")

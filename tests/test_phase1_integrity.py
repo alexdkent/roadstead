@@ -56,14 +56,14 @@ class _FakeRequest:
     headers: dict = {}
 
 
-# --- 1.3 deferral classifier — LEFT TO THE MONOREPO -------------------------
+# --- 1.3 deferral classifier — NOT ROADSTEAD'S TO TEST ----------------------
 #
 # ``test_proxy_error_strings_are_deferrable`` lived here. It listed five message
 # shapes and asserted the host's ``is_deferrable_llm_error`` returned True for
 # each. That is a test of the CLIENT's classifier over a hardcoded list — it
-# exercises no Roadstead code at all — so under the split rule in
-# ``tests/_pending/README.md`` it belongs to the monorepo, as an integration
-# test against the published package. It is deliberately not reproduced here.
+# exercises no Roadstead code at all — so it belongs to a consuming client, as an
+# integration test against the published package, and is deliberately not
+# reproduced here.
 #
 # Nothing was lost on this side. The server half — that Roadstead still EMITS
 # those wordings — is asserted from real service behaviour by its neighbours

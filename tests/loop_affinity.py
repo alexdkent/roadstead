@@ -1,6 +1,6 @@
 """Arm the concurrency invariant so a violation FAILS instead of corrupting.
 
-``CLAUDE.md`` opens with the most dangerous thing in this repo, and says so:
+``docs/internals.md`` opens with the most dangerous thing in this repo, and says so:
 
     🚨 The concurrency invariant — NOT guarded by any test.
     Single event loop. No locks on in-memory scheduler / budget / cache state.
@@ -34,7 +34,7 @@ detecting nothing. Recording and asserting at the end cannot be swallowed.
 ## What it is for and what it is not
 
 **For:** running under load in an e2e test, or under ``tools/soak.py``, where
-concurrency is real. A violation here is a genuine defect — `CLAUDE.md`'s
+concurrency is real. A violation here is a genuine defect — `docs/internals.md`'s
 "never add a `workers=` parameter, a thread pool that WRITES, or a second thread
 that touches scheduler or budget state".
 
@@ -163,7 +163,7 @@ class LoopAffinity:
         problems = self.violations()
         assert not problems, (
             "🚨 CONCURRENCY INVARIANT VIOLATED — single-loop state was mutated "
-            "from more than one thread. CLAUDE.md: no locks protect any of it.\n"
+            "from more than one thread. docs/internals.md: no locks protect any of it.\n"
             + "\n".join(f"  - {p}" for p in problems))
 
 

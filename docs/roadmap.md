@@ -110,7 +110,7 @@ providers behind the same interface.
 Providers differ in what they can *tell* us, and the interface must make that explicit rather than
 average it away — a provider descriptor declares whether it publishes occupancy, per-slot context,
 token costs, or nothing at all. Capacity discovery is already asymmetric by necessity
-(`CLAUDE.md`); the abstraction should formalise that asymmetry, not hide it.
+(`docs/internals.md`); the abstraction should formalise that asymmetry, not hide it.
 
 ### Remote capacity is overflow, not a parallel universe
 
@@ -144,7 +144,7 @@ is for.
 Manage and monitor Roadstead as a standalone product — keys, quotas, budgets, providers, backends,
 and the live picture of what the fleet is doing. **The HTTP half landed 2026-09-01** (`/rs/v1/admin`
 — Workstream E) and **the UI with it** (Workstream G), with both constraints held rather than
-relaxed: it does not violate the concurrency invariant (`CLAUDE.md` — heavy reads go off-loop,
+relaxed: it does not violate the concurrency invariant (`docs/internals.md` — heavy reads go off-loop,
 mutations stay on it, and the only server-side work is an asset read that goes off-loop), and it
 drags no frontend toolchain into a package whose dependency list is deliberately short — one static
 file, vanilla JS, no bundler, and the dependency list is still six. **H** then split the scope it
@@ -762,7 +762,7 @@ Promoted from a cross-cutting note to a named workstream on 2026-09-01, because 
 turned out to mean "nobody's", and it had been carried unchanged through four workstreams while the
 state it protects grew by two modules.
 
-**The case.** `CLAUDE.md` opens by naming the single most dangerous thing in this repo — single
+**The case.** `docs/internals.md` opens by naming the single most dangerous thing in this repo — single
 loop, no locks on scheduler / budget / cache / spend state — and, until now, said in the same
 breath that nothing in the suite guarded it. A violation does not raise. It interleaves, and the
 symptom is a DRR budget that drifts or a request served twice, weeks later and nowhere near the
@@ -790,7 +790,7 @@ indistinguishable from one that cannot fire.
 - **`tools/soak.py`** is the unbounded version — minutes of load, growth and WAL behaviour — off
   the default path because it is an experiment rather than an assertion.
 - **`tests/test_pure_modules.py`** closes a second unguarded claim found on the way past.
-  `CLAUDE.md` calls the pure-computation modules the crown jewels and says "keep them that way";
+  `docs/internals.md` calls the pure-computation modules the crown jewels and says "keep them that way";
   nothing checked it. What purity buys is that every scheduling, costing, deadline, spend and
   routing decision is testable against a fleet that does not exist — and the first `httpx` import
   into one would take that away permanently while the suite stayed green. Same class of failure as

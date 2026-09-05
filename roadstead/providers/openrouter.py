@@ -172,7 +172,7 @@ class OpenRouterProvider(Provider):
           would return free-form text where the caller required conforming
           output, and — the part that matters — the caller could not tell the
           difference from a model that simply did badly. That is the exact shape
-          of the `finish_reason` bug recorded in CLAUDE.md, where a repair
+          of the `finish_reason` bug recorded in docs/internals.md, where a repair
           became a silencer. So it raises, and the request fails with a reason.
 
         (The correction layer's schema backstop is a repair for output that came
