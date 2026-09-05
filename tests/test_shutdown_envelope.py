@@ -254,10 +254,16 @@ def test_build_app_installs_it():
 
 
 def test_the_code_it_emits_is_one_docs_api_md_publishes():
-    """§2.1 is a closed list of fifteen. Minting a sixteenth for this would be a
-    new error code for a condition that already has one — `lifecycle` emits
-    exactly this triple for work REFUSED while draining, and the caller's
-    situation is identical."""
+    """§2.1 is a closed list — seventeen as of 2026-09-05, when the two the
+    correction layer had been emitting all along were published. Minting one
+    more for this would be a new error code for a condition that already has
+    one: `lifecycle` emits exactly this triple for work REFUSED while draining,
+    and the caller's situation is identical.
+
+    The COUNT is not what this asserts, and never was —
+    `test_error_codes_published.py` owns that, and owns it from the source side,
+    which is the only side that can see a code no handler names. This asserts
+    only that the code chosen here is one the document publishes."""
     from roadstead.__main__ import _SHUTDOWN_CANCELLED_BODY
 
     section = Path("docs/api.md").read_text().split("### 2.1 Codes")[1]

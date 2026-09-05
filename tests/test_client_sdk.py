@@ -56,12 +56,17 @@ def test_the_sdk_knows_every_code_the_document_publishes(doc):
     """The other direction, and the one that actually bites: a code added to the
     contract that the SDK has never heard of classifies as non-deferrable by
     default, so a caller stops retrying something it should retry."""
+    # §2.1's ENUMERATION — the one `·`-separated paragraph — rather than every
+    # backticked token in the section. The looser read needed a filter to drop
+    # the prose (`type: invalid_request_error`, and since 2026-09-05 a table
+    # naming `_schema_retry` and `mislabels_truncated_tool_calls`), and the only
+    # filter that kept `backpressure` and `draining` was "underscore OR already
+    # in ERROR_CODES" — which quietly excused the SDK from any code that has no
+    # underscore and that it has not heard of. Reading the list itself needs no
+    # filter and makes no exceptions.
     section = doc.split("### 2.1 Codes", 1)[1].split("### 2.2", 1)[0]
-    published = set(re.findall(r"`([a-z_]+)`", section))
-    # The section also names `type: invalid_request_error` and prose words in
-    # backticks; intersect with the shape of a code rather than trusting the
-    # regex to be exact.
-    published = {c for c in published if "_" in c or c in W.ERROR_CODES}
+    listing = next(para for para in section.split("\n\n") if "·" in para)
+    published = set(re.findall(r"`([a-z_]+)`", listing))
     missing = published - W.ERROR_CODES
     assert not missing, (
         f"docs/api.md §2.1 publishes {sorted(missing)}, which "
@@ -76,6 +81,14 @@ def test_the_deferrable_set_is_a_real_subset(doc):
     assert "backpressure" in W.DEFERRABLE_CODES
     assert "invalid_grammar" not in W.DEFERRABLE_CODES
     assert "invalid_api_key" not in W.DEFERRABLE_CODES
+    # 🚨 The pair the fifteen-vs-seventeen defect turned on (2026-09-05). A
+    # truncation is retry work — §2.1's row and §2.2's `truncated structured
+    # output` row are the same fault — while a schema the model failed twice
+    # with the error fed back needs the caller to change the schema. Pinned
+    # because both were non-deferrable-by-omission before, so restoring that
+    # state is a one-line edit no other assertion would notice.
+    assert "toolcall_truncated" in W.DEFERRABLE_CODES
+    assert "schema_invalid" not in W.DEFERRABLE_CODES
 
 
 def test_the_context_overflow_marker_is_verbatim(doc):

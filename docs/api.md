@@ -1067,13 +1067,37 @@ per caller — both are fleet-wide, ASGI/transport-level bounds.
 
 ### 2.1 Codes
 
-Every error envelope carries a machine-readable `code`. **Fifteen exist** (a common under-count is
+Every error envelope carries a machine-readable `code`. **Seventeen exist** (a common under-count is
 eight):
 
 `backpressure` · `circuit_open` · `draining` · `unknown_endpoint` · `invalid_grammar` ·
 `proxy_timeout` · `backend_error` · `context_overflow` · `access_denied` · `invalid_api_key` ·
 `invalid_messages` · `invalid_request_error` · `vision_not_supported` · `on_demand_unavailable` ·
-`structured_invalid_json`
+`structured_invalid_json` · `schema_invalid` · `toolcall_truncated`
+
+🚨 **The last two were emitted for months before this list named them, and one of them cost real
+work.** The correction layer mints both, and `lifecycle.py` forwards whatever a correction rule
+attached — `body["code"] = result.get("code") or "backend_error"` — so neither ever appeared in a
+handler that names a code, and the list stayed at fifteen while the wire carried seventeen. No check
+could catch it: every one of them compared this document to the SDK's transcription of it, and two
+transcriptions of one document agree perfectly about a code neither has heard of.
+`toolcall_truncated` is the expensive half — a client classifies on the code and treats an unknown
+one as non-deferrable, so a truncated tool call, which §2.2 says to retry with a larger budget, was
+discarded rather than retried. `tests/test_error_codes_published.py` now walks the package for every
+`code` it assigns and fails when one reaches the wire without a row below.
+
+| code | status | emitted when | deferrable | what the client should do |
+|---|---|---|---|---|
+| `schema_invalid` | `502` | A structured response parsed as JSON but violated the declared schema, and the proxy's own repair **and** its one bounded retry-with-the-error-fed-back both failed (`correction.py`, `_schema_retry` — "never retries more than once"). The body is dropped rather than served, and never cached. | **No** | **Change something.** The model has now failed this schema twice with the validation error in front of it; a third identical attempt is a third billed call for the same answer. Simplify the schema, or send the request to a model that can hold it. |
+| `toolcall_truncated` | `502` | A tool call whose `function.arguments` were cut mid-JSON while the backend labelled the response `finish_reason=tool_calls` — the same fault as a `finish_reason=length` truncation, wearing the wrong label. Emitted only for backends whose `ProviderDescriptor` declares `mislabels_truncated_tool_calls`; llama.cpp labels it `length` correctly and never reaches this rule. | **Yes** | **Raise the output budget and retry** — exactly as §2.2's `truncated structured output` row says, because it is that fault. The answer did not fit; it was not refused. |
+
+`schema_invalid` is non-deferrable for the reason §2.2 gives `backend_error` below: **the proxy
+already declined to retry**, and a caller that retries on its behalf loops against a schema the model
+cannot satisfy while the proxy watches. Its published sibling `structured_invalid_json` — same
+family, fewer attempts already spent — is non-deferrable on the same grounds. (Two comments in
+`correction.py` and one e2e docstring still call this path "deferrable". They describe the *legacy*
+classifier, which read the `LLM proxy error 502` prefix a client builds from the status and which
+§2.2 has superseded with the code; the same supersession already narrowed `backend_error`.)
 
 🚨 **`invalid_request_error` now also covers `413` (§1.10's request-size cap).** No new code was
 minted for it — the same reasoning as §3's "mints no error code of its own": a caller that already
@@ -1098,11 +1122,16 @@ either as terminal throws away a call the next attempt would have completed:
 
 | marker | emitted when | what the client must do |
 |---|---|---|
-| `truncated structured output` | A structured request (a grammar, a `response_format` schema, structured outputs) came back with `finish_reason=length`, so the body is almost certainly unparseable JSON — `lifecycle.py` fails it loud with a deferrable error rather than record garbage, and never caches it. `correction.py` emits the same marker for the other spelling of the same fault: a tool call whose `arguments` were cut mid-JSON while `finish_reason` claimed `tool_calls`. That variant additionally reports `toolcall_truncated` in `X-Roadstead-Corrected` (§1.8). | **Raise the output budget and retry** — a larger `max_tokens`, or re-chunk the input so the answer fits under the one in force. Retrying the identical request unchanged truncates identically. |
+| `truncated structured output` | A structured request (a grammar, a `response_format` schema, structured outputs) came back with `finish_reason=length`, so the body is almost certainly unparseable JSON — `lifecycle.py` fails it loud with a deferrable error rather than record garbage, and never caches it. `correction.py` emits the same marker for the other spelling of the same fault: a tool call whose `arguments` were cut mid-JSON while `finish_reason` claimed `tool_calls`. That variant carries the code `toolcall_truncated` (§2.1, deferrable) and additionally reports `toolcall_truncated` in `X-Roadstead-Corrected` (§1.8). | **Raise the output budget and retry** — a larger `max_tokens`, or re-chunk the input so the answer fits under the one in force. Retrying the identical request unchanged truncates identically. |
 | `returned empty completion` | A backend answered `200` with no content at all (`backend.py`). The proxy retries this itself first, and arms a `min_tokens` re-dispatch to break a position-0-EOS degeneration — it matches this very substring to decide to do so, which makes the marker load-bearing *inside* the proxy as well as at the caller. A caller only sees it once those attempts have been spent. | **Retry.** It surfaces as a `502` carrying `backend_status: 502`, so the rule below keeps it deferrable — but a caller matching prose must not read "empty" as "the model had nothing to say". |
 
 Free-form truncation is *not* in this set: a `finish_reason=length` on an unstructured request is a
 short answer, not a broken one, and it is returned normally.
+
+Nor is `schema_invalid`: its message says *schema-invalid structured output*, which carries **no
+marker in this table** and is meant to carry none. A response that violated the schema is not a
+response that was cut off, and giving it the truncation marker would tell a prose-matching caller to
+raise `max_tokens` for a fault more output cannot fix. The absence is the contract, as in §1.6.
 
 Two consequences, both easy to get wrong:
 
@@ -1759,10 +1788,11 @@ of them.
 exists so one store answers "what did the fleet spend?", rather than the proxy's own traffic living
 here and everything else living somewhere a dashboard has to join against.
 
-🚨 **Admin-gated**, and it is the one admin-gated route that is not an `admin/` path: the gate is
-`deny_non_admin`, so the network gate, the `admin` scope and — because this is a mutation — the three
-CSRF checks of §3 all apply. In practice a pusher must send `Content-Type: application/json` (else
-`415`) and, if it authenticates with HTTP Basic, `X-Roadstead-Request: 1`.
+🚨 **Admin-gated**, and one of the two admin-gated routes that are not an `admin/` path — the other
+is `GET /v1/stream` (§3.7), gated since 2026-09-01. The gate is `deny_non_admin`, so the network
+gate, the `admin` scope and — because this is a mutation — the three CSRF checks of §3 all apply. In
+practice a pusher must send `Content-Type: application/json` (else `415`) and, if it authenticates
+with HTTP Basic, `X-Roadstead-Request: 1`.
 
 Body — every field optional except the endpoint, which may arrive under any of three names:
 
