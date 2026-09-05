@@ -1,19 +1,22 @@
-"""The straggler sweep (`docs/corpus_and_scrub_plan.md` S5), as a test.
+"""The straggler sweep, as a test.
 
-This repo is **private until the scrub is done**, and S5 is a shell command in a
-document that somebody has to remember to run. The topology half of it is
-mechanical, so it runs here on every commit instead — the point being that a
-sweep re-run by hand months later has to re-adjudicate every false positive from
-scratch, and a false positive that survives goes into S6's `replacements.txt`
-and gets rewritten through 312 commits of history for nothing.
+The topology half of the pre-publication scrub is mechanical, so it runs here on
+every commit rather than living as a shell command in a document somebody has to
+remember to run — the point being that a sweep re-run by hand months later has to
+re-adjudicate every false positive from scratch, and a false positive that
+survives gets rewritten through the whole history for nothing.
 
-🚨 **Only the topology half is automatable, and pretending otherwise is the
-trap S4 already sprang.** The original sweep looked only for addresses, which is
-what the extraction was *known* to have carried; it could not have found a
-person's name typed into an example prompt, and it did not — S4 found exactly
-that afterwards. There is no `10.0.0.` to key on for a name. That half stays a
+🚨 **Only the topology half is automatable, and pretending otherwise is the trap
+that has already sprung once.** The original sweep looked only for addresses,
+which is what the extraction was *known* to have carried; it could not have found
+a person's name typed into an example prompt, and it did not — one was found by
+hand afterwards. There is no `10.0.0.` to key on for a name. That half stays a
 human pass, and this file says so rather than quietly implying the sweep is
-covered.
+covered:
+
+    The address sweep is mechanical and runs on every commit. Real names — a
+    host, a person, a private path typed into an example — are a HUMAN pass
+    before publication; see CONTRIBUTING.md.
 """
 from __future__ import annotations
 
@@ -159,17 +162,81 @@ def test_the_example_catalog_uses_documentation_addresses():
     assert all(h.startswith("192.0.2.") for h in hosts), hosts
 
 
-def test_the_plan_still_says_the_identifier_half_is_a_HUMAN_pass():
+#: 🚨 The sentence this module must never stop carrying, quoted into the
+#: docstring above.
+#:
+#: It used to live in a planning document, and this guard read that document
+#: back. The document has since been removed from the tree — it was a map of the
+#: names still in the history, which is not a thing to publish — and the guard
+#: went with it, which is the failure mode a cross-file assertion has: the
+#: caveat's survival depended on a file nobody had promised to keep. It now
+#: depends on this module, the one file that CANNOT be deleted without the guard
+#: itself disappearing and the deletion being obvious.
+_HUMAN_PASS_CAVEAT = (
+    "The address sweep is mechanical and runs on every commit. Real names — a "
+    "host, a person, a private path typed into an example — are a HUMAN pass "
+    "before publication; see CONTRIBUTING.md."
+)
+
+
+def _squashed(text: str) -> str:
+    """Whitespace-insensitive, so re-wrapping a paragraph is not a failure.
+
+    The thing worth failing on is the caveat being DELETED, not a line break
+    moving. A guard that reddens on reflow gets loosened rather than heeded.
+    """
+    return " ".join(text.split())
+
+
+def test_this_guard_still_says_the_identifier_half_is_a_HUMAN_pass():
     """🚨 The guard against this file being mistaken for the whole sweep.
 
     If somebody deletes that caveat, the next reader sees a green test named
-    after S5 and concludes the sweep is covered. It is not: the identifier half
-    has to be written out by hand, because there is no pattern to key on — which
-    is precisely how S4's finding survived the first sweep.
+    after the sweep and concludes the sweep is covered. It is not: the
+    identifier half has to be written out by hand, because there is no pattern
+    to key on — which is precisely how the one real name in this tree survived
+    the first sweep.
     """
-    plan = (REPO / "docs" / "corpus_and_scrub_plan.md").read_text()
-    assert "written out by hand" in plan
-    assert "S4" in plan
+    assert _squashed(_HUMAN_PASS_CAVEAT) in _squashed(__doc__ or ""), (
+        "the human-pass caveat is no longer stated in this module's docstring. "
+        "Restore it — the whole point of this file is that it must not read as "
+        "the complete sweep.")
+
+
+#: The claims that would make a reader stop doing the human pass. Deliberately a
+#: SHORT, literal list rather than a clever pattern: a narrow blacklist cannot
+#: false-positive on ordinary prose, and a guard that cries wolf on the front
+#: page is a guard somebody deletes. It is not a proof — an overclaim phrased
+#: some other way slips past, and that is accepted, because the assertion this
+#: file can actually make about a human pass is the one above.
+_OVERCLAIMS = (
+    "fully scrubbed",
+    "completely scrubbed",
+    "automatically scrubbed",
+    "scrubbed automatically",
+    "the scrub is automated",
+    "no manual review",
+)
+
+#: The two files a prospective publisher and a first-time reader actually read.
+#: Scoped to them on purpose: `CHANGELOG.md` and the history docs are a RECORD
+#: and may describe a past state in any words they like.
+_FRONT_DOOR = ("README.md", "SECURITY.md")
+
+
+@pytest.mark.parametrize("rel", _FRONT_DOOR)
+def test_the_front_door_does_not_claim_automation_finished_the_scrub(rel):
+    """The other half of the caveat, aimed where it would do the damage.
+
+    This guard only proves the ADDRESS half. A front page that says otherwise
+    would retire the human pass by implication, and the human pass is the half
+    that has actually caught something.
+    """
+    text = (REPO / rel).read_text(encoding="utf-8").lower()
+    found = [p for p in _OVERCLAIMS if p in text]
+    assert not found, (
+        f"{rel} claims the tree is scrubbed by automation ({found}). This "
+        f"guard covers addresses only: {_HUMAN_PASS_CAVEAT}")
 
 
 def test_endpoint_normalization_has_no_hardcoded_fleet_NAMES():

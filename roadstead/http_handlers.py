@@ -1364,7 +1364,7 @@ class ProxyHttpHandlers:
         `consecutive_failures` to 0 whenever `/health` answers — so a backend that
         responds promptly and generates at a fraction of its speed is, to this
         endpoint, perfectly ready. Slow detection lives in two other places by
-        design: `infra/jetty/tier2-chat/bootgate.py` catches a bad SPAWN at boot
+        design: the tier2 host's boot gate catches a bad SPAWN at boot
         (§8.0 req 1), and the health-verifier ground-truth verifier catches slow DRIFT
         continuously (§8.0 req 2). Do not add a latency guess here to paper over
         that — a readiness endpoint that flaps on a slow prompt is worse than one
