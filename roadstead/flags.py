@@ -63,7 +63,7 @@ DEFAULT_FLAGS: dict[str, bool] = {
     # via POST /v1/admin/flags once the surge math has soaked. Kept False here so
     # the flip is an explicit, reversible operator action, not a code-default
     # behavior change to every no-deadline caller in one push (guard-tested:
-    # tests/llmproxy/test_smart_default_timeout*.py pin OFF-by-default as
+    # tests/test_smart_default_timeout*.py pin OFF-by-default as
     # load-bearing). ENFORCED LIVE since after the 2026-07-01 closeout via the
     # persisted runtime flag (/data/agents/llmproxy/runtime_flags.json = true,
     # shadow-validated 0.0% would-timeout / 168h) — this ship-dark default is

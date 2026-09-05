@@ -1,4 +1,4 @@
-"""Lifecycle — admission -> scheduling -> dispatch -> response for the LLMProxy.
+"""Lifecycle — admission -> scheduling -> dispatch -> response for Roadstead.
 
 The request hot path: endpoint resolution, the `handle_submit` admission
 sequence, the sync/stream response paths, the scheduler loop, backend dispatch

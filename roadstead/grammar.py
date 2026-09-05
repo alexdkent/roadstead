@@ -21,9 +21,13 @@ Two failure classes drove this (both confirmed against llama.cpp upstream):
     changing semantics → FAIL LOUD.
 
 Alignment: this is a pure-Python validator encoding the documented rules.
-It is kept honest by tests/llmproxy/test_grammar_validator.py, which runs
-the grammar corpus through the real `test-gbnf-validator` binary and asserts
-this module agrees. Re-capture those fixtures on every llama.cpp upgrade.
+In this repository it is kept honest by `tests/test_grammar_authority.py`,
+which runs the vendored corpus in `tests/corpus/grammars/` through
+`normalize_and_validate` and pins the shapes real callers send. Note what that
+does NOT do: it does not cross-check against llama.cpp's own
+`test-gbnf-validator` binary, so agreement with the engine is asserted by the
+encoded rules, not measured. The binary cross-check is an origin-fleet step and
+is re-run there on llama.cpp upgrades.
 """
 
 from __future__ import annotations

@@ -36,7 +36,7 @@ def empty_completion_error(role: str, msg: dict, finish_reason: str | None,
     Extracted 2026-07-31 rather than left inline: a test that re-implements this
     logic is a copy that drifts, and the whole point of the change is that the
     message must stay precise. See
-    `tests/llmproxy/test_empty_completion_names_its_cause.py`.
+    `tests/test_empty_completion_names_its_cause.py`.
 
     Returns the error to raise, or None when the response is fine.
     """

@@ -1,4 +1,4 @@
-"""Correction — the LLMProxy's output-integrity layer (de-monolith Step 3).
+"""Correction — Roadstead's output-integrity layer (de-monolith Step 3).
 
 Grammar validate/normalize, the shadow egress-conformance detector, the
 egress degeneration (repetition-loop) guard, and the native-thinking

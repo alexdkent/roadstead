@@ -1,4 +1,4 @@
-"""Health — circuit breaker + capacity poller + drain/pause for the LLMProxy.
+"""Health — circuit breaker + capacity poller + drain/pause for Roadstead.
 
 Extracted from the ``service.py`` monolith (de-monolith Phase 1, Step 3). A
 near-stateless behavior object: it receives the shared :class:`ProxyState` and

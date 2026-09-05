@@ -1,4 +1,4 @@
-"""ProxyHttpHandlers — the Starlette HTTP surface for the LLMProxy.
+"""ProxyHttpHandlers — the Starlette HTTP surface for Roadstead.
 
 The ~26 `handle_*` request handlers (OpenAI front door, admin, metrics, status,
 SSE, fleet usage) + the admin-IP audit. Thin translators: parse the request,

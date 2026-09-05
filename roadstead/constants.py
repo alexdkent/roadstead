@@ -1,4 +1,4 @@
-"""Shared numeric constants for the LLMProxy service (de-monolith Step 3).
+"""Shared numeric constants for the Roadstead service (de-monolith Step 3).
 
 Extracted so both ``service.py`` (Lifecycle retry path) and ``correction.py``
 (degeneration re-dispatch) can reference them without a circular import.

@@ -1,5 +1,5 @@
 """ProxyState — the shared mutable state + injected-singleton references for the
-LLMProxy ``ProxyService`` (de-monolith, Phase 1 Step 3).
+Roadstead ``ProxyService`` (de-monolith, Phase 1 Step 3).
 
 The composed-collaborators split (``Health`` / ``Correction`` / ``Lifecycle`` /
 ``ProxyHttpHandlers``) keeps the *behavior* in near-stateless collaborator
