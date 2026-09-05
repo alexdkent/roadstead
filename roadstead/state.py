@@ -185,6 +185,12 @@ class ProxyState:
         # touches either object outside a request.
         self.admin_overlay = AdminOverlay(config.admin_store_path or None)
         self.admin_overlay.apply(self.identity.keys, config)
+        # 🚨 Re-run AFTER the overlay: the resolver checked the env/file keys at
+        # construction, and the overlay restores runtime enrolments on top of
+        # them. A bearer placeholder that collides with one of those would
+        # silently demote it, so this refuses to start for the same reason the
+        # first check does.
+        self.identity.assert_placeholders_are_not_keys()
         # Real-time fan-out (Phase 1: proxy = fleet call-metrics authority).
         # Every completion emits a `call.completed` event; the poller pushes a
         # periodic `metrics` frame. Drives the unified Inference page's usage
@@ -403,6 +409,14 @@ class ProxyState:
         # The caller map is capped (`legacy._MAX_TRACKED_CALLERS`): the name is
         # caller-asserted on that door, so its cardinality is not ours to trust.
         self.legacy_submits: dict = {"count": 0, "callers": {}}
+        # Placeholder-bearer usage since boot: {count, by_address{ip: n}}. The
+        # OTHER migration inventory — ROADSTEAD_BEARER_PLACEHOLDERS is a
+        # compatibility shim for callers whose SDK refuses an empty api_key, and
+        # this is how "has anybody still not got a real key" gets an answer.
+        # Aliased to the resolver's own tally rather than copied: one object,
+        # two names, so a copy cannot drift from what the request path counts.
+        # Stays {"count": 0, "by_address": {}} where the variable is unset.
+        self.placeholder_bearers: dict = self.identity.placeholders.tally
         # Context-overflow gate counter (shadow): endpoint → {count, callers,
         # max_est_in}. Feeds the context_gate_enforce flip check — compared
         # against ACTUAL backend overflow errors before enforcement flips.

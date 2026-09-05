@@ -156,6 +156,21 @@ keys:
 An OpenAI client needs nothing but its `api_key` set — the key rides the `Authorization: Bearer`
 header it already sends.
 
+🚨 **…and an SDK that has no key still sends one.** Most OpenAI SDKs refuse to construct a client
+with an empty `api_key`, so a fleet authorised by ADDRESS ends up sending a literal that means
+nothing — `not-needed`, `EMPTY`, `sk-no-key-required`. That is harmless until the first real key is
+configured, at which point rule 1 above refuses every one of those callers at once. Declare the
+literals and they are read as no credential at all:
+
+```sh
+ROADSTEAD_BEARER_PLACEHOLDERS='not-needed,EMPTY'   # empty by default, which is off
+```
+
+Exact, case-sensitive matching; `Bearer` only; it grants exactly what the address grants and no
+admin; and a value that is also a registered key's plaintext refuses to start rather than silently
+demote that key. It is a migration shim — `GET /v1/status` → `reliability.placeholder_bearers` names
+who still needs it. `docs/api.md` §1.5 has the rest.
+
 **Out of the box there is no key and no configuration**: loopback and docker-internal callers are
 admitted as `internal`, and everything else is refused. That is default-deny with the local-first
 case free. To admit a host without issuing it a key, enrol its address:

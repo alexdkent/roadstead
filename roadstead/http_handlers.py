@@ -692,6 +692,11 @@ class ProxyHttpHandlers:
                 # is the migration inventory: removing that door again is gated
                 # on `callers` being empty, not on a date.
                 "legacy_submits": self.state.legacy_submits,
+                # Requests identified by ADDRESS because they presented a
+                # declared placeholder bearer (see `identity.BearerPlaceholders`).
+                # The other migration inventory: the shim comes out when this
+                # stays empty, not on a date.
+                "placeholder_bearers": self.state.placeholder_bearers,
                 # Context-gate hits since boot (shadow counter for the
                 # context_gate_enforce flip check — compare against actual
                 # backend overflow errors before flipping).

@@ -43,6 +43,15 @@ key is ignored and the address decides. Every OpenAI client sends an
 significant before an operator has configured any would 401 the entire existing
 world on upgrade, for a credential nobody chose.
 
+🚨 **…and once one key IS configured, that same header 401s them.** Which is
+right, and is also how an upgrade takes a fleet's chat path down — it did, for
+eleven minutes on 2026-09-04. ``ROADSTEAD_BEARER_PLACEHOLDERS`` is the narrow
+answer: a deployment DECLARES the literals its callers are forced to send, and a
+declared one is read as though the header were absent. See
+:class:`BearerPlaceholders`, which is where the reasons it is exact-match,
+``Bearer``-only, and refuses to start on a collision with a real key are set
+out.
+
 🚨 **A key is an authenticated identity; an address is a weak hint.** So a key
 OVERRIDES a body-declared ``agent_id`` and an address only fills in one that was
 omitted. Anything else would let the body launder a claim past the credential.
@@ -976,6 +985,20 @@ def _basic_password(blob: str) -> str:
     return password.strip() if sep else ""
 
 
+def presented_bearer(request: Any) -> str:
+    """The token of an ``Authorization: Bearer`` header, or ``""``.
+
+    :func:`presented_key` collapses three carriers into one string, which is
+    what the registry wants. This one keeps the carrier, because exactly one
+    decision needs it: :class:`BearerPlaceholders` applies to ``Bearer`` and to
+    nothing else — see that class for why Basic in particular is left alone.
+    """
+    auth = _header(request, "Authorization").strip()
+    if auth.lower().startswith(_BEARER_PREFIX):
+        return auth[len(_BEARER_PREFIX):].strip()
+    return ""
+
+
 def presented_key(request: Any) -> str:
     """The API key on this request, or ``""``.
 
@@ -1008,6 +1031,216 @@ def remote_ip(request: Any) -> str:
     client = getattr(request, "client", None)
     host = getattr(client, "host", None)
     return str(host) if host else _UNKNOWN_ADDRESS
+
+
+# ---------------------------------------------------------------------------
+# Placeholder bearers — the credential an SDK insists on sending
+# ---------------------------------------------------------------------------
+
+#: The env var. A comma-separated list of literal bearer values, EMPTY by
+#: default, which is off.
+_PLACEHOLDER_ENV = "ROADSTEAD_BEARER_PLACEHOLDERS"
+
+#: Marker set on a REQUEST once its placeholder has been counted. 🚨 The two
+#: OpenAI doors and ``/rs/v1/chat`` resolve identity TWICE on purpose — the door
+#: resolves, and ``Lifecycle.handle_submit`` resolves again so it is safe on its
+#: own rather than safe by virtue of who calls it — so a counter incremented in
+#: ``resolve`` counts RESOLUTIONS, which is 2 per request on the hot doors and 1
+#: elsewhere. That number is not the one the removal decision asks for ("how much
+#: traffic still needs the shim"), it merely tracks it; measured live on
+#: 2026-09-05 as ``count: 2`` for one ``curl``.
+_NOTED_ATTR = "_roadstead_placeholder_noted"
+
+#: How many distinct addresses the counter and the once-a-day notice track
+#: before they stop growing. The address is resolved (`client_address`), so
+#: behind a trusted proxy it is caller-influenced and the IPv6 space is
+#: effectively unbounded — the same argument `legacy._MAX_TRACKED_CALLERS`
+#: makes about a caller-asserted name. Past the cap the notice logs on EVERY
+#: call instead of once a day, which is the right failure for a shim that
+#: exists to be removed.
+_MAX_TRACKED_PLACEHOLDER_ADDRESSES = 256
+
+
+class BearerPlaceholders:
+    """Literal bearer values this deployment reads as *no credential presented*.
+
+    🚨 **A compatibility shim with a removal condition, not a feature.** An
+    OpenAI SDK refuses to construct a client with an empty ``api_key``, so a
+    fleet that authorises by ADDRESS has to send something — and what it sends
+    is a literal that means nothing: ``not-needed``, ``EMPTY``,
+    ``sk-no-key-required``. Rule 2 already covers that for a deployment with no
+    keys configured, where the registry is not in play at all. The moment an
+    operator configures ONE key, rule 1 takes over and every such caller is
+    refused: correct, and on 2026-09-04 fatal — two fleet callers sending
+    ``Authorization: Bearer not-needed`` took the interactive chat path down for
+    eleven minutes and the cutover was rolled back.
+
+    So a deployment may DECLARE those literals, and a declared one is read as
+    though the header had not been sent. Three things this is careful not to be:
+
+    * **Not a match on shape.** "Looks like a placeholder" is a heuristic, and a
+      heuristic that demotes a credential is a silencer — a real key that
+      happened to match it would become an address identity and keep working, at
+      a different fair share, with nothing anywhere saying so. Only an exact,
+      **case-sensitive** match against a list an operator wrote qualifies;
+      everything else keeps rule 1 in full.
+    * **Not a way in.** What it yields is the ADDRESS's identity, which confers
+      no admin, no ``may_assert`` and no band — everything §1.5 already says an
+      address does not confer. On an admin route the request proceeds as
+      address-identified and the admin gate refuses it exactly as it refuses a
+      caller that sent no header at all. It does not satisfy
+      ``ROADSTEAD_REQUIRE_API_KEY`` either: no credential was presented, so a
+      deployment that requires one still answers 401.
+    * **Not applied to Basic.** ``Authorization: Basic`` is the management UI's
+      channel and the CSRF gate keys off it (``_csrf_denial``), so a placeholder
+      password would move a browser-attached credential onto a path where the
+      one signal that tells the UI's own ``fetch()`` from a forged cross-site
+      submission no longer applies. The knob is named for the scheme it covers.
+
+    Removal is gated on a fact rather than a date, as ``legacy.py``'s door is:
+    ``GET /v1/status`` → ``reliability.placeholder_bearers`` reports
+    ``{count, by_address}`` since boot, and an INFO line names each
+    (placeholder, address) pair once per UTC day. When that stays empty across a
+    representative window, the callers have real keys and the variable can go.
+    """
+
+    def __init__(self, values: "tuple[str, ...] | list[str]" = ()) -> None:
+        seen: dict[str, None] = {}
+        for raw in values:
+            text = str(raw).strip()
+            # A bearer token is stripped before it is compared, so a value with
+            # surrounding whitespace could never match anything — stripping here
+            # is what makes `a, b` in a compose file mean what it looks like.
+            if text:
+                seen[text] = None
+        self._values: tuple[str, ...] = tuple(seen)
+        #: ``{count, by_address}`` since boot. Published on ``/v1/status``; the
+        #: object is shared with ``ProxyState`` by reference, so there is one
+        #: tally and not a copy that drifts.
+        self.tally: dict = {"count": 0, "by_address": {}}
+        #: ``(value, address)`` → the UTC date its notice was last logged.
+        self._notified: dict[tuple[str, str], str] = {}
+
+    def __bool__(self) -> bool:
+        return bool(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    @property
+    def values(self) -> tuple[str, ...]:
+        """The declared literals, in the order they were written."""
+        return self._values
+
+    def declares(self, token: str) -> bool:
+        """Whether ``token`` is one of the declared placeholders.
+
+        Exact and case-sensitive on purpose. A case-insensitive compare would
+        make ``Not-Needed`` and ``NOT-NEEDED`` credentials-that-are-not, which
+        is a wider hole than anybody asked for and one an operator cannot see in
+        their own configuration.
+        """
+        return bool(token) and token in self._values
+
+    @classmethod
+    def from_env(cls) -> "BearerPlaceholders":
+        """Build from ``ROADSTEAD_BEARER_PLACEHOLDERS``. Empty is the default.
+
+        Warns when the list is non-empty, and names the condition under which it
+        goes away — a shim that logs nothing at startup is a shim nobody
+        remembers is load-bearing.
+        """
+        raw = os.environ.get(_PLACEHOLDER_ENV, "")
+        placeholders = cls(raw.split(","))
+        if placeholders:
+            logger.warning(
+                "%s declares %d placeholder bearer value(s) (%s) — a request "
+                "presenting one is identified by its SOURCE ADDRESS, exactly as "
+                "if it had sent no Authorization header. This is a "
+                "compatibility shim for SDKs that refuse an empty api_key; "
+                "remove it once those callers present real keys (GET /v1/status "
+                "-> reliability.placeholder_bearers names who still needs it)",
+                _PLACEHOLDER_ENV, len(placeholders),
+                ", ".join(repr(v) for v in placeholders.values))
+        return placeholders
+
+    def assert_not_registered(self, keys: "KeyRegistry") -> None:
+        """Refuse to start if a placeholder is also a registered key.
+
+        🚨 This one raises where the rest of this package reports. The house
+        rule elsewhere — ``model_catalog``'s duplicate alias, a keys file's
+        unknown field — is that a typo must not stop a fleet booting, because
+        the cost of the typo is a name routing somewhere unintended. The cost
+        here is different in kind: the colliding key would still be *presented*
+        and would still be *accepted*, as a weaker, address-derived identity
+        with a different fair share, a different band and no admin. That is a
+        silent demotion of a working credential, indistinguishable from the
+        outside from the credential being fine, and it is the exact failure §1.5
+        rule 1 exists to prevent. A configuration that cannot be served safely
+        is a configuration to refuse.
+
+        Checked against the registry as loaded — environment, keys file and the
+        management overlay, which is why ``ProxyState`` re-runs it after the
+        overlay is applied. A key enrolled at RUNTIME through the admin plane is
+        not covered until the next boot; the registry stores digests and knows
+        nothing about this list, and teaching it would put an identity decision
+        in a second place.
+        """
+        for value in self._values:
+            found = keys.lookup(value)
+            if found.key_id is None:
+                continue
+            raise ValueError(
+                f"{_PLACEHOLDER_ENV} declares {value!r}, which is also the "
+                f"plaintext of registered API key {found.key_id!r}. A "
+                f"placeholder is read as NO credential, so that key would "
+                f"silently stop authenticating and its holder would be "
+                f"identified by source address instead — a working credential "
+                f"demoted with nothing to say so. Remove one of the two: the "
+                f"placeholder, or the key.")
+
+    def note(self, request: Any, value: str, address: str) -> None:
+        """Count one placeholder-identified request, and say so once a day.
+
+        Per UTC day rather than per process, and per (placeholder, address)
+        rather than fleet-wide: the inventory this is taken for is a list of
+        callers to migrate, and one line a month names none of them while one
+        line a request buries everything else. Same shape and same reasoning as
+        ``legacy.LegacySubmitDoor._note_use``.
+
+        🚨 Once per REQUEST, via :data:`_NOTED_ATTR`, and not once per call —
+        see that constant for the doors that resolve twice by design. A double
+        counted here would be a number that answers a *different* question than
+        the one an operator asks of it, in the direction that always passes
+        review: plausible, stable, and consistently wrong by a factor.
+        """
+        try:
+            if getattr(request, _NOTED_ATTR, False):
+                return
+            setattr(request, _NOTED_ATTR, True)
+        except Exception:  # noqa: BLE001 — a double that refuses attributes
+            # Counted twice rather than not at all: over-reporting a shim's
+            # usage delays its removal, under-reporting removes it under a
+            # caller still using it.
+            pass
+        self.tally["count"] = self.tally.get("count", 0) + 1
+        by_address = self.tally.setdefault("by_address", {})
+        if address in by_address or len(by_address) < _MAX_TRACKED_PLACEHOLDER_ADDRESSES:
+            by_address[address] = by_address.get(address, 0) + 1
+
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        mark = (value, address)
+        if self._notified.get(mark) == today:
+            return
+        if len(self._notified) >= _MAX_TRACKED_PLACEHOLDER_ADDRESSES:
+            # Dropped rather than grown, exactly as `legacy.py` does. What that
+            # costs is a repeat notice for pairs whose day-mark went with it,
+            # which is the harmless direction.
+            self._notified.clear()
+        self._notified[mark] = today
+        logger.info(
+            "placeholder bearer %s from %s treated as no credential (%s)",
+            value, address, _PLACEHOLDER_ENV)
 
 
 # ---------------------------------------------------------------------------
@@ -1225,12 +1458,17 @@ class IdentityResolver:
         *,
         require_key: bool | None = None,
         trusted_proxies: TrustedProxies | None = None,
+        placeholders: BearerPlaceholders | None = None,
     ) -> None:
         self.acl = acl
         self.keys = keys if keys is not None else KeyRegistry()
         self.proxies = (
             TrustedProxies.from_env() if trusted_proxies is None else trusted_proxies
         )
+        self.placeholders = (
+            BearerPlaceholders.from_env() if placeholders is None else placeholders
+        )
+        self.assert_placeholders_are_not_keys()
         self.require_key = (
             _require_key_from_env() if require_key is None else require_key
         )
@@ -1265,6 +1503,20 @@ class IdentityResolver:
     def resolve(self, request: Any) -> Resolution:
         """Identify ``request``. See the module docstring for the three rules."""
         key = presented_key(request)
+
+        # A DECLARED placeholder is not a credential — see
+        # `BearerPlaceholders`. This sits ahead of every branch below because
+        # the promise is that the request is read as though the header had not
+        # been sent: rule 1 does not refuse it, rule 2 does not have to be
+        # configured for it, and `require_key` still does, because nothing was
+        # presented.
+        if key and self.placeholders.declares(presented_bearer(request)):
+            self.placeholders.note(request, key, self.client_ip(request))
+            # Falls back to `X-API-Key` rather than to `""` for the same reason:
+            # as if the header were absent. A caller that also set that header
+            # presented a credential deliberately, and dropping it here would be
+            # the silent demotion `assert_not_registered` exists to prevent.
+            key = _header(request, "X-API-Key").strip()
 
         # Rule 2: with no keys configured the registry is not in play, so a
         # placeholder Authorization header from an OpenAI client is invisible.
@@ -1461,6 +1713,18 @@ class IdentityResolver:
         except Exception:  # noqa: BLE001 — a floor lookup must never 500 a call
             logger.debug("identity floor lookup failed", exc_info=True)
             return None
+
+    def assert_placeholders_are_not_keys(self) -> None:
+        """Re-run the load-time collision check against the CURRENT registry.
+
+        Called at construction, and again by ``ProxyState`` once the management
+        overlay has been applied — the overlay enrols keys after the resolver
+        exists, and a key it restores must not be one this list would demote.
+        Raises :class:`ValueError`; see
+        :meth:`BearerPlaceholders.assert_not_registered` for why this one is a
+        refusal to start rather than a notice.
+        """
+        self.placeholders.assert_not_registered(self.keys)
 
     def is_admin(self, request: Any) -> bool:
         """Whether ``request`` may reach the admin/control surfaces.

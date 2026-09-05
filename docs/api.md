@@ -467,6 +467,52 @@ ours.
 A deployment that has keys configured *and* callers presenting an unrelated Basic header will now see
 those callers refused with a 401 rather than identified by address. Recorded in `CHANGELOG.md`.
 
+#### A placeholder bearer, for an SDK that refuses an empty key 🚨
+
+**`ROADSTEAD_BEARER_PLACEHOLDERS`** is a comma-separated list of literal bearer values — **empty by
+default, which is off** — that this proxy reads as *no credential presented*. A request carrying one
+is identified by its **source address**, exactly as if it had sent no `Authorization` header at all.
+
+**Why it exists.** An OpenAI SDK will not construct a client with an empty `api_key`, so a fleet
+that authorises by address has to send *something*, and what it sends is a literal that means
+nothing: `not-needed`, `EMPTY`, `sk-no-key-required`. Rule 2 already covers that while no keys are
+configured. The moment an operator configures one, rule 1 takes over and every such caller is
+refused — correctly, and on 2026-09-04 fatally: two fleet callers sending
+`Authorization: Bearer not-needed` took an interactive chat path down for eleven minutes and the
+cutover was rolled back. This is the narrow, declared way across.
+
+| | |
+|---|---|
+| **matching** | an **exact, case-sensitive** match of the presented token against a declared value. `Not-Needed` is not `not-needed`. Nothing is inferred from shape |
+| **anything else** | unchanged: a registered key authenticates, an unregistered one is a **401** and still never falls back to the address |
+| **where** | every door that resolves identity — `/v1/chat/completions`, `/v1/embeddings`, `/rs/v1/*`, the flag-gated `/v1/submit` (§1.9) and the admin routes |
+| **scheme** | **`Bearer` only.** `Basic` is untouched — see below |
+| **what it grants** | what an address grants, and no more: no `may_assert`, no admin, no band and no deadline floor. On an admin route the request proceeds as address-identified and is then refused by the admin gate, exactly as a request with no header is |
+| **with `ROADSTEAD_REQUIRE_API_KEY=1`** | still a **401**. Nothing was presented, so the requirement is not met |
+
+🚨 **It is not applied to `Basic`.** Basic is the management UI's channel and the CSRF gate keys off
+it (§3.7): a browser attaches a cached Basic credential to any request to this origin on its own,
+and `X-Roadstead-Request: 1` is the one signal that tells the UI's own `fetch()` from a forged
+cross-site submission riding it. Reading a placeholder *password* as "no credential" would move that
+request onto a path where the signal no longer applies. A Basic password that is a declared
+placeholder is therefore an ordinary unregistered credential: **401**, per rule 1.
+
+🚨 **A placeholder that is also a registered key's plaintext refuses to start**, with a message
+naming the `key_id`. That key would still be presented and still be accepted — as a weaker,
+address-derived identity with a different fair share — which is a working credential silently
+demoted, the failure rule 1 exists to prevent. Elsewhere this package reports a configuration
+mistake and carries on (§3.5); this one it will not serve. Checked against the environment, the keys
+file and the management overlay at boot; a key enrolled at runtime through §3.3 is checked on the
+next start.
+
+**It is a shim, and it comes out.** A non-empty list logs a WARNING at startup naming the removal
+condition, `GET /v1/status` → `reliability.placeholder_bearers` reports `{count, by_address}` since
+boot — **requests**, counted once each even on the doors that resolve identity twice — and an INFO
+line — `placeholder bearer <value> from <addr> treated as no credential
+(ROADSTEAD_BEARER_PLACEHOLDERS)` — names each (placeholder, address) pair once per UTC day. When
+that stays empty across a representative window the callers hold real keys and the variable can be
+deleted.
+
 **Every door is gated**, the three `/rs/v1` routes included. Out of the box, loopback and docker-internal
 addresses resolve to the identity `internal` and everything else is refused — default-deny, and the
 local-first case needs no configuration at all. `ROADSTEAD_REQUIRE_API_KEY=1` additionally refuses

@@ -16,6 +16,42 @@ their query params and every response field; §2.2 gains the `truncated structur
 `returned empty completion` deferral markers; §1.1 states that `X-Agent-Id` and `X-Call-Site` are
 ignored on the OpenAI doors.
 
+### Added — `ROADSTEAD_BEARER_PLACEHOLDERS`, for an SDK that refuses an empty key
+
+A comma-separated list of literal bearer values — **empty by default** — that Roadstead reads as *no
+credential presented*: the request is identified by its source address, exactly as if it had sent no
+`Authorization` header (`docs/api.md` §1.5).
+
+**The rollback it answers.** An OpenAI SDK will not construct a client with an empty `api_key`, so a
+fleet that authorises by address has to send *something* — and two callers sent the literal
+`Authorization: Bearer not-needed` on every `/v1/chat/completions` call. The proxy they came from
+ignored any bearer; this one applies §1.5 rule 1 and refuses an unregistered credential rather than
+falling back to the address, which is the right behaviour and which took the interactive chat path
+down for eleven minutes on 2026-09-04. The cutover was rolled back. This is the declared way across,
+and it is deliberately narrow:
+
+- **exact, case-sensitive matching** against a list an operator wrote. Nothing is inferred from
+  shape: a heuristic that demotes a credential is a silencer, and a real key that happened to match
+  one would keep working as a *different, weaker* identity with nothing to say so;
+- **`Bearer` only.** `Basic` is untouched — it is the management UI's channel and the CSRF gate keys
+  off it, so a placeholder *password* would move a browser-attached credential onto a path where the
+  one signal distinguishing the UI's own `fetch()` from a forged cross-site submission no longer
+  applies;
+- **it grants what an address grants and no more** — no `may_assert`, no admin, no band, no deadline
+  floor. On an admin route the request proceeds as address-identified and the admin gate refuses it,
+  and `ROADSTEAD_REQUIRE_API_KEY=1` still answers 401 because nothing was presented;
+- **a placeholder that is also a registered key's plaintext refuses to start**, naming the `key_id`.
+  Elsewhere this package reports a configuration mistake and carries on; a configuration that would
+  silently demote a working credential is one it will not serve.
+
+**It is a shim with a removal condition.** A non-empty list warns at startup, `GET /v1/status` →
+`reliability.placeholder_bearers` reports `{count, by_address}` since boot — **requests**, counted
+once each: the OpenAI doors and `/rs/v1/chat` resolve identity twice by design, and a per-resolution
+counter would report double the traffic an operator reads it as — and an INFO line names each
+(placeholder, address) pair once per UTC day. When that inventory stays empty, the callers hold
+real keys and the variable, its class in `identity.py`, the branch in `IdentityResolver.resolve` and
+`tests/test_bearer_placeholders.py` all come out together.
+
 ### Added — the legacy `/v1/submit` door, flag-gated
 
 `POST /v1/submit` was removed in Workstream C, deliberately and recorded. That decision stands and
