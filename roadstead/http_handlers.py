@@ -1004,7 +1004,14 @@ class ProxyHttpHandlers:
         """Prefix-cache observability: per-model actual hit-rate + per-call_site
         misalignment offenders + rollup + trend + drift. Computed from the
         periodic snapshots in proxy_cache_stats (see _compute_cache_stats)."""
-        window_s = _clamp_window(request.query_params.get("window", "7d"), 30 * 86400)
+        # 🚨 The 30 days belong in `cap`, not in the default. Written as a
+        # positional this reached `_clamp_window`'s DEFAULT slot — the fallback
+        # for an unparseable string, itself clamped — leaving the real cap at
+        # the 7-day keyword default. `?window=30d` parsed fine, clamped to
+        # 604800 and returned a week of snapshots under a 30-day label, which is
+        # the shape of drift this route exists to show.
+        window_s = _clamp_window(
+            request.query_params.get("window", "7d"), 7 * 86400, cap=30 * 86400)
         snaps = await asyncio.to_thread(self.state.queue_db.cache_stats_snapshots, window_s)
         labels = cache_stats.chat_endpoint_labels()
         engines = {ep: cfg.backend_engine for ep, cfg in self.state.config.endpoints.items()}
@@ -1019,7 +1026,10 @@ class ProxyHttpHandlers:
         cached_tokens counter) are surfaced as unattributed, not folded into a
         false 0% (the ~4.8% global-scrape artifact this fixes). Heavy GROUP-BY →
         off the event loop so a dashboard poll can't stall fleet scheduling."""
-        window_s = _clamp_window(request.query_params.get("window", "1h"), 7 * 86400)
+        # The default is the 1h this route documents; the 7 days that used to sit
+        # in this slot made an unparseable `?window=abc` run a WEEK-wide GROUP BY
+        # instead of an hour — the widest scan on the plane, off a typo.
+        window_s = _clamp_window(request.query_params.get("window", "1h"), 3600)
         limit = max(1, min(_to_int(request.query_params.get("limit"), 40), 200))
         data = await asyncio.to_thread(
             self.state.queue_db.cache_attribution, window_s, limit)
