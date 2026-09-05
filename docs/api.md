@@ -1602,8 +1602,8 @@ cannot change anything is often exactly the one auditing what changed.
 Chased to column level 2026-08-31. Every field in the three schemas below is pinned by
 `tests/test_fleet_analytics_schema.py`, which drives the real producers against a seeded
 `queue.db` and reads **this section** back — so an added, renamed or dropped field fails the suite
-rather than silently breaking a dashboard. §3.11 documents the three call-metrics routes that ship
-beside these and are **not** pinned that way.
+rather than silently breaking a dashboard. §3.12 pins seven more the same way. §3.11 documents the
+three call-metrics routes that ship beside these and are **not** pinned that way.
 
 All three run **off the event loop** via `asyncio.to_thread` (§5c): a heavy `GROUP BY` over the
 whole-fleet completions table must never stall scheduling under a hot dashboard.
@@ -1613,7 +1613,8 @@ whole-fleet completions table must never stall scheduling under a hot dashboard.
 
 #### `GET /v1/fleet/activity` → `fleet_activity(window_s, bin_s)`
 
-Query: `window` (default `24h`, clamped to 24h), `bin` (defaults from the window).
+Query: `window` (default `24h`, floor 60s, **capped at 7 days** — the shared clamp's default
+cap, not 24h), `bin` (defaults from the window).
 
 | field | type | meaning |
 |---|---|---|
@@ -1800,9 +1801,12 @@ carry `error` alone, **no `code`**: §2.1's codes are minted by the gate in fron
 prefix cache, and which call_sites are throwing that reuse away by varying their leading block.
 Computed from the periodic snapshots the proxy takes, not from a live scrape.
 
-Query: `window` (default `7d`, floor 60s). ⚠️ **Capped at 7 days despite the 30-day argument in the
-handler** — `_clamp_window`'s cap is a keyword, the `30 * 86400` is the fallback for an unparseable
-string, and it is itself clamped. `?window=30d` returns 7 days of snapshots.
+Query: `window` (default `7d`, floor 60s, **capped at 30 days**). ⚠️ Until 2026-09-05 the cap was
+7 days: the handler passed `30 * 86400` positionally, which is `_clamp_window`'s DEFAULT slot — the
+fallback for an unparseable string — leaving the keyword cap at a week, so `?window=30d` returned
+seven days of snapshots and echoed `window_s: 604800` while doing it.
+`tests/test_analytics_window_clamp.py` pins the window the producer is handed, since the payload
+cannot show the difference.
 
 | field | type | meaning |
 |---|---|---|
@@ -1838,6 +1842,315 @@ opening, which is the shape a cache cannot exploit.
 | `wasted_cacheable_tokens` | int | Σ `wasted_tokens × reqs` over **every** misaligned screen row, including the ones the 25-row `offenders` cap drops — the size of the prize, not a measured loss. |
 | `captured_pct` | float \| null | Fleet windowed hit rate, 4dp. `null` when nothing in the window carried counters. |
 | `est_prefill_s_saved` | float | Prefill seconds the cache hits avoided, 1dp, at a fixed tokens-per-second constant. An estimate, and named one. |
+
+### 3.12 The rest of the analytics plane — live, historical and forensic reads
+
+🚨 **The whole analytics family is OPEN to any admitted caller — `/v1/recent`, `/v1/inflight`,
+`/v1/history`, `/v1/series`, `/v1/usage`, `/v1/fleet/*`, `/v1/timeouts/*`, `/v1/metrics/cost-model` —
+while `GET /v1/stream`, which carries the same facts, is admin-gated (§3.7). The split is
+deliberate, and it is about the bound rather than the sensitivity.** Everything here is a POLLED
+aggregate over a window the caller asks for and the server caps: 30 days of cache snapshots, 168
+hours of usage, 200 rows of feed, one run's stalls. One request buys one bounded answer, and what it
+contains is identities and arithmetic — agent, call_site, endpoint, token counts, timings — never a
+payload, a prompt or a completion. The stream is those same frames with the bound removed: a
+subscriber holds the connection open and receives every call the fleet serves for as long as it
+stays connected, which is a different capability from reading a dashboard. An operator who wants the
+family closed as well will not find a flag here: today the remedy is the deployment's rather than
+the process's — put the proxy behind a reverse proxy (README, *Behind a reverse proxy*) or make it
+reachable only from the admin nets, and gate it there. That is the shape `SECURITY.md` already asks
+for around the admin plane, and it is why an open analytics route is a documented decision to
+disagree with rather than a finding to report.
+
+Seven routes the code shipped and this document did not: the live board, the history and series
+charts, the calibration state, the two fleet rollups that are not in §3.6, and the per-caller stall
+lookup. Transcribed from the handlers 2026-09-05, and — unlike §3.11 — **pinned in both directions**
+by `tests/test_fleet_analytics_schema.py`, which drives these handlers against a seeded `queue.db`
+and reads the tables below back. The tables describe the **HTTP response**, not the producer's
+return: where a handler wraps or adds something (`/v1/history`'s envelope, `/v1/inflight`'s `ts`,
+`hit_rate_source` on the attribution rollups) the row is here and the test drives the handler.
+
+#### `GET /v1/inflight` → `inflight_snapshot(now)`
+
+**The live board** — every request currently executing, plus per-endpoint occupancy. A pure
+in-memory read off the scheduler: no DB, no query params, and nothing here survives a restart. The
+proxy is the dispatch authority, so this is the authoritative answer to "what is flowing right now";
+the same snapshot is pushed as the SSE `inflight` frame for sub-second feel.
+
+| field | type | meaning |
+|---|---|---|
+| `requests` | list | Everything dispatched and not yet complete, **descending by `elapsed_s`** — the longest-running call first, which is the one an operator is looking for. |
+| `per_endpoint` | object | `{endpoint: occupancy}` for **every configured endpoint**, including the idle ones. |
+| `ts` | float | Server wall-clock, epoch seconds, stamped by the handler. The snapshot's own arithmetic is monotonic; this is the only wall-clock value in it. |
+
+`requests[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `request_id` | string | The id Roadstead minted (§4.1). |
+| `endpoint` | string | The endpoint CLASS the request was routed to (a role resolves to one, §1.1). |
+| `served_model` | string \| null | The model id that class actually serves, `null` when the catalog does not say. |
+| `backend` | string \| null | `host:port` for a local engine (`192.0.2.13:8000`), the base URL for a remote provider, `null` when the address is genuinely unknown. |
+| `agent` | string | The resolved caller identity (§1.5). Named `agent` here and `agent_id` on `/v1/recent` (§3.11) — same value, two spellings. |
+| `call_site` | string | The finer-grained attribution key. |
+| `priority` | string | 🚨 The band's **enum NAME** (`P1_TURN_SUPPORT`), where `/v1/recent` returns the same band as an **int**. A consumer joining the two converts one of them. |
+| `band` | string | The scheduling band, lower-cased — `interactive` \| `foreground` \| `background`. |
+| `input_tokens` | int | The ESTIMATE admission used, not a measurement — the real count is not known until the backend answers. |
+| `elapsed_s` | float | Since dispatch, 2dp. Excludes queue wait: a queued request is not in this list at all. |
+| `estimated_remaining_s` | float | From the cost model, 2dp. An estimate, and it does not shrink to zero reliably — read it as a hint about which call is long, not as a countdown. |
+
+`per_endpoint{}` — one object per endpoint class:
+
+| field | type | meaning |
+|---|---|---|
+| `max_slots` | int | Concurrency the endpoint is configured for; `0` for an endpoint the catalog declares and nothing serves. |
+| `in_flight` | int | Dispatched, not yet complete. |
+| `queued` | int | Waiting for a slot, all bands. |
+| `queue_by_band` | object | The same depth split three ways: `{interactive, foreground, background}`. Always all three keys, zeros included. |
+
+#### `GET /v1/history` → `history_buckets(hours, bucket_minutes)`
+
+**Time-bucketed history**, the chart behind the dashboard's activity view. Same corpus as §3.6's
+`fleet_activity`, cut differently: buckets carry a per-endpoint AND a per-agent breakdown, and the
+timestamps are ISO strings rather than epoch bin starts.
+
+Query: `hours` (default 4, **capped at 168**), `bucket_minutes` (default 5, clamped to **1–60**).
+Both fall back to the default on anything unparseable rather than erroring.
+
+| field | type | meaning |
+|---|---|---|
+| `buckets` | list | Ascending by time, **only the buckets that have rows** — an idle stretch is absent, not a zero-filled bucket. `[]` with no DB. |
+
+`buckets[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `start` | string | **ISO-8601 UTC**. The window's own start plus `n × bucket_minutes`, so the boundaries move with the request rather than sitting on the clock. |
+| `end` | string | ISO-8601 UTC, `start + bucket_minutes`. |
+| `per_endpoint` | object | `{endpoint: {...}}` for the endpoints active in this bucket. |
+| `per_agent` | object | `{agent_id: {...}}` for the agents active in this bucket. |
+
+`per_endpoint{}`:
+
+| field | type | meaning |
+|---|---|---|
+| `requests` | int | |
+| `ok` | int | `status = 'ok'`. |
+| `errors` | int | Everything else. |
+| `avg_duration_s` | float | 2dp. ⚠️ An AVERAGE of the SQL averages when a bucket spans several groups — good enough for a sparkline, not a statistic to quote. |
+| `total_in_tokens` | int | |
+| `total_out_tokens` | int | |
+
+`per_agent{}`:
+
+| field | type | meaning |
+|---|---|---|
+| `requests` | int | |
+| `slot_seconds` | float | Summed `duration_s`, 1dp — how much backend time this agent occupied in the bucket. The fairness number; `requests` alone hides one caller holding a slot for a minute. |
+
+#### `GET /v1/series` → `endpoint_series(endpoint, window_s, bin_s)`
+
+**One endpoint's own chart** — the detail-modal counterpart to `fleet_activity`, with latency
+percentiles the fleet view does not carry.
+
+Query: `endpoint` (**required** — absent or empty is a `400` with `{"error": "endpoint query param
+required"}`, the one refusal in §3.12); `window` (default `24h`, floor 60s, capped at 7 days); `bin`
+(defaults from the window: 60s under an hour, 300s under six, 600s under a day, else 3600s). An
+unknown endpoint is not an error — it is an empty series, because a class that has served nothing and
+a class that does not exist are the same absence of data.
+
+| field | type | meaning |
+|---|---|---|
+| `endpoint` | string | The **normalized** class, so an alias comes back as what it resolved to. |
+| `window_s` | int | Echo of the resolved window. |
+| `bin_s` | int | Echo of the resolved bin width. |
+| `now` | float | Server wall-clock at computation. ⚠️ **Absent when the DB is unopened** — as in §3.6. |
+| `calls_series` | list | Ascending by `ts`, only the bins that have rows. |
+
+`calls_series[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `ts` | int | Bin start, epoch seconds. |
+| `n` | int | Completions in the bin. |
+| `fail_pct` | float | Percentage of `n` whose `status != 'ok'`, 1dp — a PERCENTAGE where §3.6's `calls[]` carries a `fails` COUNT. |
+| `tokens_in` | int | |
+| `tokens_out` | int | |
+| `p50` | float \| null | Milliseconds, 1dp. `null` — not `0.0` — when the bin carried no latencies, which is the opposite convention to `fleet_activity`'s `p95`. |
+| `p95` | float \| null | Milliseconds, 1dp. |
+| `p99` | float \| null | Milliseconds, 1dp. |
+| `avg_in_toks` | int \| null | Mean `input_tokens`, rounded. `null` when every row in the bin had none. |
+
+#### `GET /v1/metrics/cost-model` → `cost_model.snapshot()`
+
+**What the deadline arithmetic is calibrated to.** The proxy computes timeouts rather than accepting
+them (§1.2), and this is the state that computation reads: per endpoint, the prefill constant and
+the decode curve, both EWMA-calibrated from real completions. Read it when a recommended timeout
+looks wrong — the answer is usually a `samples` count of 0.
+
+No query params. **The response is an object keyed by endpoint class**; the table describes one
+value. It is `{}` before startup registers the endpoints, and an endpoint absent from it has no
+model rather than a zeroed one.
+
+| field | type | meaning |
+|---|---|---|
+| `endpoint` | string | The class, repeated inside its own entry. |
+| `max_slots` | int | Concurrency the curve below is indexed against. |
+| `prefill_k` | float | Seconds per input token, 6dp. |
+| `decode_tps` | list | Tokens/second at occupancy 1..`max_slots`, 1dp, **1-indexed by position** — `decode_tps[0]` is the single-caller rate. Empty when capacity discovery has cleared it. |
+| `prefill_ewma` | object | The tracker behind `prefill_k` — see below. |
+| `per_call_site` | object | `{call_site: {p50_output_tokens, samples}}` — how long this caller's answers usually are, which is what sizes its deadline. Absent call_sites have never completed a call here. |
+
+`prefill_ewma` (the shape every EWMA tracker in the snapshot uses):
+
+| field | type | meaning |
+|---|---|---|
+| `value` | float | Current EWMA, 6dp. |
+| `stddev` | float | 6dp. |
+| `p95` | float | 6dp. |
+| `samples` | int | 🚨 **0 means the number beside it is a DEFAULT, not a measurement.** Read this first. |
+
+`per_call_site{}`:
+
+| field | type | meaning |
+|---|---|---|
+| `p50_output_tokens` | int | The EWMA of observed output length, truncated to int. |
+| `samples` | int | How many completions it is built from. |
+
+#### `GET /v1/fleet/top-callers` → `top_callers(window_s, per_endpoint)`
+
+**Who is using each endpoint** — the attribution view, ranked per endpoint rather than fleet-wide, so
+a busy endpoint cannot bury a small one's top caller.
+
+Query: `window` (default `1h`, floor 60s, capped at 7 days); `per_endpoint` (default 5, clamped to
+**1–20**).
+
+| field | type | meaning |
+|---|---|---|
+| `window_s` | int | Echo of the resolved window. |
+| `now` | float | Server wall-clock. ⚠️ **Absent when the DB is unopened.** |
+| `providers` | object | `{endpoint: [caller, …]}`, each list descending by `n` and truncated to `per_endpoint`. Endpoints with no traffic in the window are absent, not empty. |
+
+`providers[][]`:
+
+| field | type | meaning |
+|---|---|---|
+| `agent` | string | The caller. Falls back to `"—"` (em dash) on a NULL, the same defensive-only fallback §3.6 documents for `usage_rollup`. |
+| `n` | int | Completions in the window. |
+| `tokens_in` | int | |
+| `tokens_out` | int | |
+
+#### `GET /v1/fleet/cache-attribution` → `cache_attribution(window_s, limit)`
+
+**Per-caller MEASURED prefix-cache hit rate** — the Tier-2 complement to §3.11's
+`/v1/fleet/cache-stats`, which reports the backends' own counters. Hit rate here is
+`sum(cached_tokens) / sum(input_tokens)` over **only** the rows a backend actually attributed; rows
+it did not are counted as `unattributed_calls` and excluded from the ratio, so a backend that reports
+nothing can never masquerade as a 0% hit rate. Reads `kind = 'chat'` only — nothing else has a prefix
+cache to hit.
+
+Query: `window` (default `1h`, floor 60s, capped at 7 days); `limit` on `by_call_site` (default 40,
+clamped to **1–200**).
+
+| field | type | meaning |
+|---|---|---|
+| `window_s` | int | Echo of the resolved window. |
+| `now` | float \| null | Server wall-clock, **`null` when the DB is unopened** — present-but-null rather than absent, unlike the routes above. |
+| `by_call_site` | list | Per `(call_site, endpoint)`, descending by `calls`, capped at `limit`. |
+| `by_endpoint` | list | Per endpoint, descending by `calls`. |
+| `fleet` | object \| null | One row over everything in the window. `null` only with no DB. |
+
+`by_call_site[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `call_site` | string | |
+| `endpoint` | string | |
+| `calls` | int | Chat completions in the window. |
+| `attributed_calls` | int | Of those, the ones carrying a `cached_tokens` count. |
+| `unattributed_calls` | int | `calls - attributed_calls`. **Not** zeros — a backend that does not report. |
+| `cached_tokens` | int | Summed, over attributed rows only. |
+| `attributable_input_tokens` | int | Summed `input_tokens` over the SAME rows, so the ratio's denominator matches its numerator's population. |
+| `hit_rate` | float \| null | 4dp. `null` when nothing in the group was attributable — n/a, never 0%. |
+
+`by_endpoint[]` — the same fields without `call_site`, plus one the handler adds:
+
+| field | type | meaning |
+|---|---|---|
+| `endpoint` | string | |
+| `calls` | int | |
+| `attributed_calls` | int | |
+| `unattributed_calls` | int | |
+| `cached_tokens` | int | |
+| `attributable_input_tokens` | int | |
+| `hit_rate` | float \| null | 4dp — **overwritten by the backend's own windowed rate when this endpoint had nothing attributable of its own**, and left strictly alone when it did. Real per-request measurement always wins. |
+| `hit_rate_source` | string | 🚨 **Present only on an overlaid row** (`backend_prefix_cache_metrics`). Its absence means the number beside it was summed from per-request counts. A consumer must treat it as optional; `tests/test_cache_attribution_overlay.py` pins both halves. |
+
+`fleet` — identical to a `by_endpoint` row with `scope` in place of `endpoint`:
+
+| field | type | meaning |
+|---|---|---|
+| `scope` | string | Always `"fleet"`. |
+| `calls` | int | |
+| `attributed_calls` | int | |
+| `unattributed_calls` | int | |
+| `cached_tokens` | int | |
+| `attributable_input_tokens` | int | |
+| `hit_rate` | float \| null | 4dp. Overlaid — as a query-weighted mean of the backends' rates — only when NOTHING in the window was attributable. |
+| `hit_rate_source` | string | Optional, exactly as above. |
+
+#### `GET /v1/timeouts/stalls` → `stall_aborts(caller, since, until)`
+
+**Did the backend stall under THIS run?** The forensic counterpart to `/v1/timeouts` (§1.4), which
+aggregates and answers "is the fleet under pressure?". A consumer that died needs the other question
+— an aggregate has already thrown away which caller and which second — and the two failures it
+separates, an upstream substrate stall and its own hang, are indistinguishable from the outside.
+
+Query: `caller` (**a PREFIX**, matched `caller%`, because caller ids carry a per-run suffix; `_` and
+`%` are escaped, so `dsh_write` cannot match `dshXwrite`); `since` / `until` (epoch seconds,
+**inclusive both ends** — a stall recorded on the exact terminalisation second counts). `since`
+defaults to 0 and `until` to now.
+
+🚨 **An unknown caller and an empty window are `count: 0`, never an error** — the consumer is meant to
+read "no evidence" and "cannot tell" the same way. An **empty `caller` is also `count: 0`**, and
+deliberately: a blank prefix would `LIKE`-match every caller in the window and hand back somebody
+else's stall as evidence about your own run.
+
+| field | type | meaning |
+|---|---|---|
+| `caller` | string | Echo of the prefix, stripped. |
+| `since` | float | Echo, epoch seconds. |
+| `until` | float | Echo. |
+| `count` | int | `len(rows)`. |
+| `rows` | list | Ascending by `occurred_at`. |
+
+`rows[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `request_id` | string | |
+| `occurred_at` | float | Epoch seconds — when the stream was killed, which is the instant the consumer observed as its own failure. |
+| `endpoint` | string | |
+| `abort_reason` | string | Only the backend-stall reasons; a capacity decision of ours is not in this table. |
+| `caller_id` | string | The full id, suffix included — what the `caller` prefix matched. |
+| `agent_id` | string | |
+| `call_site` | string | |
+| `elapsed_s` | float | How long the call had been alive when it was abandoned. |
+| `layer` | string | Where it was abandoned — `stream`, `transport`, … |
+
+#### ⚠️ The unopened-DB shapes are narrower here too
+
+The same trap §3.6 documents, in four more places. With no DB connection:
+
+| producer | degraded shape |
+|---|---|
+| `history_buckets` | `[]` → the response is `{"buckets": []}`, the only one whose shape is unchanged |
+| `endpoint_series` | `endpoint`, `window_s`, `bin_s`, `calls_series` — **no `now`** |
+| `top_callers` | `window_s`, `providers` — **no `now`** |
+| `cache_attribution` | every key, but `now` and `fleet` are **null** |
+| `stall_aborts` | `[]` → `count: 0`, envelope intact |
+
+`/v1/inflight` and `/v1/metrics/cost-model` read no DB at all and are unaffected — though the cost
+model is `{}` until startup registers the endpoints, which is the same "empty is not zero" reading.
 
 ---
 
