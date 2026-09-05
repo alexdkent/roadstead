@@ -131,7 +131,7 @@ async def test_the_rate_gauge_is_withheld_until_the_endpoint_is_judgeable():
         await svc.handle_submit(
             _submit("{}", {"type": "json_object"}), _LoopbackRequest())
         text = (await svc.handle_prometheus_metrics(_LoopbackRequest())).body.decode()
-        assert "llmproxy_structured_empty_rate" not in text
+        assert "roadstead_structured_empty_rate" not in text
     finally:
         await svc.shutdown()
 
@@ -147,9 +147,9 @@ async def test_the_rate_gauge_is_published_once_the_floor_is_met():
                 _submit("{}", {"type": "json_object"}), _LoopbackRequest())
         text = (await svc.handle_prometheus_metrics(_LoopbackRequest())).body.decode()
         # render_prometheus normalizes 1.0 -> "1", so match the label+prefix.
-        assert 'llmproxy_structured_empty_rate{endpoint="tier3"} 1' in text
-        assert 'llmproxy_structured_samples_30m{endpoint="tier3"} 20' in text
+        assert 'roadstead_structured_empty_rate{endpoint="tier3"} 1' in text
+        assert 'roadstead_structured_samples_30m{endpoint="tier3"} 20' in text
         # …and only for the endpoint that has traffic.
-        assert 'llmproxy_structured_empty_rate{endpoint="tier1"}' not in text
+        assert 'roadstead_structured_empty_rate{endpoint="tier1"}' not in text
     finally:
         await svc.shutdown()

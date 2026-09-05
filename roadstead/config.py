@@ -707,7 +707,7 @@ def cache_drift_alarm_enabled() -> bool:
     ``compute_cache_stats`` cycle, detect call_sites whose front-loaded-prefix
     share (LCP%) collapsed vs their own trailing baseline (a prompt edit broke
     the cacheable leading block) and raise a ``CACHE_DRIFT_ALERT`` log marker +
-    a store-less ``llmproxy_cache_drift`` security event (dedup'd, re-fires at
+    a store-less ``roadstead_cache_drift`` security event (dedup'd, re-fires at
     most every ``CACHE_DRIFT_REALERT_S``). OBSERVABILITY ONLY — it never changes
     routing/admission/output (zero caller-visible effect, like the max_slots
     reconciler + shadow-egress detector), so default ON. Env kill-switch
@@ -749,7 +749,7 @@ def structured_validity_guard_enabled() -> bool:
     parse-only floor when they're off or exhausted. Schema CONFORMANCE is
     deliberately NOT checked here (the backends enforce grammar; the backstop
     owns schema validation) — this catches truncation/malformation only. The
-    LLMPROXY_TRUNCATION / LLMPROXY_STRUCTURED_INVALID observability (ERROR log
+    ROADSTEAD_TRUNCATION / ROADSTEAD_STRUCTURED_INVALID observability (ERROR log
     + per-(model, caller) tallies) is NOT gated by this switch — it's read-only.
     Default ON. Env kill-switch ``ROADSTEAD_PROXY_STRUCTURED_VALIDITY``."""
     return os.environ.get("ROADSTEAD_PROXY_STRUCTURED_VALIDITY", "1").strip().lower() not in (

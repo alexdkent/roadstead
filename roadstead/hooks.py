@@ -171,7 +171,7 @@ def clear_config_notices() -> None:
 # Vendored from ``originfleet/framework/prompt_security.py`` (2026-08-31). The
 # proxy's only call site passed ``store=None``, so the persistence half of the
 # framework helper was already dead here and the log line below is byte-for-byte
-# what it emitted. The event name ``llmproxy_cache_drift`` is documented in
+# what it emitted. The event name ``roadstead_cache_drift`` is documented in
 # ``config.py`` (the origin's prefix-cache observability note is not part of
 # this repository) — preserve the shape if you touch this.
 

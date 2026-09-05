@@ -1254,6 +1254,52 @@ and prices. An unenrolled caller has no more business reading that than dispatch
 🚨 **`/v1/status` and `/metrics` have external consumers** — in the origin fleet a gateway, a
 ground-truth verifier and a web UI all read them. Treat their top-level key names as public API.
 
+**`GET /metrics` — Prometheus text exposition (`text/plain; version=0.0.4`), open, no credential.**
+In-memory reads only (the scheduler, the 300s rolling window, since-boot counters), so a scrape
+costs nothing and a busy proxy is not slowed by being watched. It **never raises**: a render failure
+logs and returns an empty body rather than a 500, because a monitoring endpoint that can take the
+process down with it is worse than one that goes quiet. Layer-split timeout counts and
+would-timeout% are deliberately **not** here — they need SQL over the event tables and live on
+`GET /v1/timeouts`.
+
+Every series it can emit is listed below, and 🔒 **the names are contract** (`docs/compatibility.md`).
+A dashboard or alert rule may rely on this being the whole set — `tests/test_metrics_names.py` reads
+this table back and fails if the builder emits a name that is not here, or if a name here stops being
+emitted. `_total` on a `gauge` row is a legacy suffix on a since-boot tally that can be reset by a
+restart; it is kept rather than corrected because the name is the contract.
+
+| Series | Type | Labels | What it is |
+|---|---|---|---|
+| `roadstead_endpoint_slots_total` | gauge | `endpoint` | Configured max concurrent slots. |
+| `roadstead_endpoint_inflight` | gauge | `endpoint` | Requests dispatched and in flight. |
+| `roadstead_endpoint_queued` | gauge | `endpoint` | Requests waiting in queue. |
+| `roadstead_endpoint_queued_by_band` | gauge | `endpoint`, `band` | Queued requests split by priority band. |
+| `roadstead_queue_wait_ms` | gauge | `endpoint`, `quantile` | Queue-wait latency (ms). `quantile` is `0.5` or `0.95`; absent for an endpoint with no samples in the window. |
+| `roadstead_backend_latency_ms` | gauge | `endpoint`, `quantile` | Backend latency (ms), same quantiles and same absence rule. |
+| `roadstead_recent_timeouts_5m` | gauge | `endpoint` | Timeouts in the last 5 min. |
+| `roadstead_recent_requests_5m` | gauge | `endpoint` | Requests in the last 5 min. |
+| `roadstead_slot_seconds_5m` | gauge | `endpoint` | Slot-seconds consumed in 5 min. |
+| `roadstead_endpoint_utilization_pct` | gauge | `endpoint` | 5-min slot utilization %. Emitted only where `max_slots > 0`. |
+| `roadstead_endpoint_healthy` | gauge | `endpoint` | 1 if the endpoint is healthy (not paused), else 0. |
+| `roadstead_structured_empty_rate` | gauge | `endpoint` | Fraction of structured responses carrying no answer (30m window). 🚨 **Emitted only once the endpoint clears the sample floor** — an unevaluated endpoint must not publish a 0/0 that reads as "healthy", so absence here is not zero. |
+| `roadstead_structured_samples_30m` | gauge | `endpoint` | Structured responses in that window; same sample-floor rule. |
+| `roadstead_empty_completion_total` | gauge | `endpoint` | Empty (position-0-EOS) completions, counted each time the fail-loud gate trips. |
+| `roadstead_truncations_total` | gauge | `endpoint`, `caller`, `structured` | Output-cap (`finish_reason=length`) hits, split `structured="true"`/`"false"` so a rule can alert on structured truncations alone — a climbing structured series is a caller's `max_tokens` set too low. |
+| `roadstead_dispatched_total` | counter | — | Since-boot scheduler dispatches. |
+| `roadstead_completed_total` | counter | — | Since-boot scheduler completions. |
+| `roadstead_timeouts_total` | counter | — | Since-boot scheduler timeouts. |
+| `roadstead_scheduler_alive` | gauge | — | 1 if the scheduler loop ticked recently. |
+| `roadstead_poller_alive` | gauge | — | 1 if the capacity poller iterated recently. |
+| `roadstead_writer_thread_alive` | gauge | — | 1 if the SQLite writer thread is alive. |
+| `roadstead_alerts_active` | gauge | `severity` | Standing alert conditions by severity — `CRITICAL`, `ERROR`, `WARNING`, `INFO`, all four always emitted. |
+
+The three liveness gauges exist because a dead poller, scheduler or DB-writer used to be visible
+only on `/health` and in the log — nothing a TSDB rule could fire on.
+
+**Log markers are not contract.** The greppable `ROADSTEAD_*` markers (`ROADSTEAD_TRUNCATION`,
+`ROADSTEAD_STRUCTURED_EMPTY`, `ROADSTEAD_FAILOVER_ENTER`, …) are 🔓 internal — grep them, but pin an
+alert to a metric or to a `/v1/status` field, not to log wording that may be reworded.
+
 ### 3.2 What a control action promises 🚨
 
 Every mutating route answers with the change it made **plus** `persisted` and, when that is false, a

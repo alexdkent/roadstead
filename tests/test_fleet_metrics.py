@@ -282,10 +282,10 @@ async def test_metrics_renders_truncation_gauge():
         "count": 3, "structured": 2, "freetext": 1}
     resp = await svc.handle_prometheus_metrics(_LoopReq({}))
     text = resp.body.decode()
-    assert "llmproxy_truncations_total" in text
-    assert ('llmproxy_truncations_total{endpoint="tier2",caller="kv4_grader",'
+    assert "roadstead_truncations_total" in text
+    assert ('roadstead_truncations_total{endpoint="tier2",caller="kv4_grader",'
             'structured="true"} 2') in text
-    assert ('llmproxy_truncations_total{endpoint="tier2",caller="kv4_grader",'
+    assert ('roadstead_truncations_total{endpoint="tier2",caller="kv4_grader",'
             'structured="false"} 1') in text
 
 
@@ -298,7 +298,7 @@ async def test_metrics_renders_empty_completion_gauge():
     svc._state.empty_completion_by_endpoint["tier2"] = 5
     resp = await svc.handle_prometheus_metrics(_LoopReq({}))
     text = resp.body.decode()
-    assert 'llmproxy_empty_completion_total{endpoint="tier2"} 5' in text
+    assert 'roadstead_empty_completion_total{endpoint="tier2"} 5' in text
 
 
 @_pt.mark.asyncio

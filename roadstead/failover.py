@@ -132,7 +132,7 @@ class Failover:
                 self.state.degraded_endpoints.discard(src)
                 self.state.degraded_since.pop(src, None)
                 logger.warning(
-                    "LLMPROXY_FAILOVER_LEAVE endpoint=%s target=%s "
+                    "ROADSTEAD_FAILOVER_LEAVE endpoint=%s target=%s "
                     "degraded_for_s=%.0f rerouted=%d refused=%d — recovered, "
                     "drained and past dwell; next request goes to %s",
                     src, tgt, now - since,
@@ -146,7 +146,7 @@ class Failover:
                 self.state.degraded_endpoints.add(src)
                 self.state.degraded_since[src] = now
                 logger.critical(
-                    "LLMPROXY_FAILOVER_ENTER endpoint=%s target=%s — %s is "
+                    "ROADSTEAD_FAILOVER_ENTER endpoint=%s target=%s — %s is "
                     "unhealthy; opted-in callers will be served by %s until it "
                     "recovers, drains and clears a %.0fs dwell",
                     src, tgt, src, tgt,
@@ -267,7 +267,7 @@ class Failover:
         req.ctx_per_slot_at_admission = tgt_cfg.context_per_slot
         self.state.degraded_rerouted[src] = self.state.degraded_rerouted.get(src, 0) + 1
         logger.info(
-            "LLMPROXY_FAILOVER_REROUTE %s -> %s agent=%s call_site=%s request_id=%s",
+            "ROADSTEAD_FAILOVER_REROUTE %s -> %s agent=%s call_site=%s request_id=%s",
             src, target, req.agent_id, req.call_site, req.request_id,
         )
 

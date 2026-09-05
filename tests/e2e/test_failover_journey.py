@@ -249,13 +249,13 @@ async def test_tier3_failover_full_journey(journey, caplog):
 
     # -- 3. health-verifier chip raised -------------------------------------------
     # health-verifier's llmproxy verifier chips off exactly two observable signals: the
-    # CRITICAL LLMPROXY_FAILOVER_ENTER log line (its alert path is filtered to
+    # CRITICAL ROADSTEAD_FAILOVER_ENTER log line (its alert path is filtered to
     # CRITICAL/ERROR — a WARNING here would be recorded and never chipped) and
     # the /v1/status `degraded_endpoints` SET (the same surface `paused_endpoints`
     # already uses). Both are asserted directly since health-verifier itself is a
     # separate agent/process, out of scope for an llmproxy journey.
-    enter_lines = [r for r in caplog.records if "LLMPROXY_FAILOVER_ENTER" in r.getMessage()]
-    assert enter_lines, "no LLMPROXY_FAILOVER_ENTER — the chip has nothing to fire on"
+    enter_lines = [r for r in caplog.records if "ROADSTEAD_FAILOVER_ENTER" in r.getMessage()]
+    assert enter_lines, "no ROADSTEAD_FAILOVER_ENTER — the chip has nothing to fire on"
     assert enter_lines[0].levelno == logging.CRITICAL, (
         "ENTER logged below CRITICAL — health-verifier's alert filter would swallow it silently")
     status = await _status(client)
@@ -314,8 +314,8 @@ async def test_tier3_failover_full_journey(journey, caplog):
     # request required to observe it (§ 9.7 — "must not require traffic").
     left = await _wait_until(lambda: SRC not in svc._state.degraded_endpoints, timeout_s=3.0)
     assert left, "never left degraded mode after drain + dwell"
-    leave_lines = [r for r in caplog.records if "LLMPROXY_FAILOVER_LEAVE" in r.getMessage()]
-    assert leave_lines, "no LLMPROXY_FAILOVER_LEAVE — the chip has nothing to clear on"
+    leave_lines = [r for r in caplog.records if "ROADSTEAD_FAILOVER_LEAVE" in r.getMessage()]
+    assert leave_lines, "no ROADSTEAD_FAILOVER_LEAVE — the chip has nothing to clear on"
 
     status = await _status(client)
     assert SRC not in status["degraded_endpoints"], "chip surface not cleared"

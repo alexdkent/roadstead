@@ -219,7 +219,7 @@ async def test_every_stream_logs_one_accountable_line(caplog):
             resp = await svc.handle_submit(_body(), _Req(), wire=WIRE_OPENAI)
             await _collect(resp)
         lines = [r.getMessage() for r in caplog.records
-                 if "LLMPROXY_STREAM_DONE" in r.getMessage()]
+                 if "ROADSTEAD_STREAM_DONE" in r.getMessage()]
         assert len(lines) == 1, lines
         line = lines[0]
         for field in ("caller=beacon", "finish_reason=stop", "backend_done=True",
@@ -243,6 +243,6 @@ async def test_an_absent_finish_reason_is_named_in_the_log(caplog):
             await _collect(resp)
         msgs = [r.getMessage() for r in caplog.records]
         assert any("finish_reason=ABSENT" in m for m in msgs), msgs
-        assert any("LLMPROXY_STREAM_UNTERMINATED" in m for m in msgs), msgs
+        assert any("ROADSTEAD_STREAM_UNTERMINATED" in m for m in msgs), msgs
     finally:
         await svc.shutdown()

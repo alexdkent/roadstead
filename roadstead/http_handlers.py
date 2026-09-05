@@ -417,54 +417,54 @@ class ProxyHttpHandlers:
                 lbl = {"endpoint": ep_name}
                 snap = self.state.scheduler.endpoint_snapshot(ep_name)
                 if snap.get("max_slots") is not None:
-                    out.append(Metric("llmproxy_endpoint_slots_total",
+                    out.append(Metric("roadstead_endpoint_slots_total",
                                       snap["max_slots"], lbl, "gauge",
                                       help="configured max concurrent slots"))
                 if snap.get("in_flight") is not None:
-                    out.append(Metric("llmproxy_endpoint_inflight",
+                    out.append(Metric("roadstead_endpoint_inflight",
                                       snap["in_flight"], lbl, "gauge",
                                       help="requests dispatched and in flight"))
                 if snap.get("queued") is not None:
-                    out.append(Metric("llmproxy_endpoint_queued", snap["queued"],
+                    out.append(Metric("roadstead_endpoint_queued", snap["queued"],
                                       lbl, "gauge", help="requests waiting in queue"))
                 for band, n in (snap.get("queue_by_band") or {}).items():
-                    out.append(Metric("llmproxy_endpoint_queued_by_band", n,
+                    out.append(Metric("roadstead_endpoint_queued_by_band", n,
                                       {"endpoint": ep_name, "band": str(band)},
                                       "gauge", help="queued requests by priority band"))
                 for q, qlabel in _Q.items():
                     w = self.state.metrics.percentile("queue_wait_ms", q,
                                                  endpoint=ep_name, now=now)
                     if w is not None:
-                        out.append(Metric("llmproxy_queue_wait_ms", w,
+                        out.append(Metric("roadstead_queue_wait_ms", w,
                                           {"endpoint": ep_name, "quantile": qlabel},
                                           "gauge", help="queue-wait latency (ms)"))
                     b = self.state.metrics.percentile("backend_latency_ms", q,
                                                  endpoint=ep_name, now=now)
                     if b is not None:
-                        out.append(Metric("llmproxy_backend_latency_ms", b,
+                        out.append(Metric("roadstead_backend_latency_ms", b,
                                           {"endpoint": ep_name, "quantile": qlabel},
                                           "gauge", help="backend latency (ms)"))
-                out.append(Metric("llmproxy_recent_timeouts_5m",
+                out.append(Metric("roadstead_recent_timeouts_5m",
                                   self.state.metrics.count(endpoint=ep_name,
                                                       status="timeout", now=now),
                                   lbl, "gauge",
                                   help="timeouts in the last 5 min"))
-                out.append(Metric("llmproxy_recent_requests_5m",
+                out.append(Metric("roadstead_recent_requests_5m",
                                   self.state.metrics.count(endpoint=ep_name, now=now),
                                   lbl, "gauge",
                                   help="requests in the last 5 min"))
                 ep_cfg = self.state.config.endpoints[ep_name]
                 ss_consumed = self.state.metrics.slot_seconds_consumed(ep_name, now)
-                out.append(Metric("llmproxy_slot_seconds_5m", ss_consumed, lbl,
+                out.append(Metric("roadstead_slot_seconds_5m", ss_consumed, lbl,
                                   "gauge", help="slot-seconds consumed in 5 min"))
                 if ep_cfg.max_slots > 0:
                     ss_available = ep_cfg.max_slots * 300.0
                     util = (ss_consumed / ss_available * 100) if ss_available > 0 else 0
-                    out.append(Metric("llmproxy_endpoint_utilization_pct",
+                    out.append(Metric("roadstead_endpoint_utilization_pct",
                                       round(util, 1), lbl, "gauge",
                                       help="5-min slot utilization %"))
                 h = self.state.endpoint_health.get(ep_name, {})
-                out.append(Metric("llmproxy_endpoint_healthy",
+                out.append(Metric("roadstead_endpoint_healthy",
                                   1 if h.get("healthy", True) else 0, lbl, "gauge",
                                   help="1 if the endpoint is healthy (not paused)"))
                 # Empty-structured rate (ledger tier3-json-object-empty-brace):
@@ -475,18 +475,18 @@ class ProxyHttpHandlers:
                 # endpoint must not publish a 0/0 that reads as "healthy".
                 se = _se_rates.get(ep_name)
                 if se and se.get("evaluated"):
-                    out.append(Metric("llmproxy_structured_empty_rate",
+                    out.append(Metric("roadstead_structured_empty_rate",
                                       se["rate"], lbl, "gauge",
                                       help="fraction of structured responses "
                                            "carrying no answer (30m window)"))
-                    out.append(Metric("llmproxy_structured_samples_30m",
+                    out.append(Metric("roadstead_structured_samples_30m",
                                       se["n"], lbl, "gauge",
                                       help="structured responses in the window"))
 
             stats = self.state.scheduler.stats()
-            for key, name in (("total_dispatched", "llmproxy_dispatched_total"),
-                              ("total_completed", "llmproxy_completed_total"),
-                              ("total_timeouts", "llmproxy_timeouts_total")):
+            for key, name in (("total_dispatched", "roadstead_dispatched_total"),
+                              ("total_completed", "roadstead_completed_total"),
+                              ("total_timeouts", "roadstead_timeouts_total")):
                 if stats.get(key) is not None:
                     out.append(Metric(name, stats[key], {}, "counter",
                                       help="since-boot scheduler counter"))
@@ -494,13 +494,13 @@ class ProxyHttpHandlers:
             # Liveness + active-alert gauges (audit 2026-07-02): before these,
             # a dead poller/scheduler/DB-writer or a standing ALERT was visible
             # only on /health and the log — nothing a TSDB rule could fire on.
-            out.append(Metric("llmproxy_scheduler_alive",
+            out.append(Metric("roadstead_scheduler_alive",
                               1 if self.health.scheduler_loop_alive() else 0, {},
                               "gauge", help="1 if the scheduler loop ticked recently"))
-            out.append(Metric("llmproxy_poller_alive",
+            out.append(Metric("roadstead_poller_alive",
                               1 if self.health.poller_alive() else 0, {}, "gauge",
                               help="1 if the capacity poller iterated recently"))
-            out.append(Metric("llmproxy_writer_thread_alive",
+            out.append(Metric("roadstead_writer_thread_alive",
                               1 if self.state.queue_db.writer_alive() else 0, {},
                               "gauge", help="1 if the SQLite writer thread is alive"))
             by_sev: dict[str, int] = {}
@@ -508,7 +508,7 @@ class ProxyHttpHandlers:
                 sev = str(a.get("severity", "WARNING"))
                 by_sev[sev] = by_sev.get(sev, 0) + 1
             for sev in ("CRITICAL", "ERROR", "WARNING", "INFO"):
-                out.append(Metric("llmproxy_alerts_active",
+                out.append(Metric("roadstead_alerts_active",
                                   by_sev.get(sev, 0), {"severity": sev}, "gauge",
                                   help="standing alert conditions by severity"))
 
@@ -523,7 +523,7 @@ class ProxyHttpHandlers:
                 for structured_flag, field in (("true", "structured"),
                                                 ("false", "freetext")):
                     out.append(Metric(
-                        "llmproxy_truncations_total",
+                        "roadstead_truncations_total",
                         int(t.get(field, 0) or 0),
                         {"endpoint": endpoint, "caller": caller,
                          "structured": structured_flag},
@@ -536,11 +536,11 @@ class ProxyHttpHandlers:
             # backend.call() fail-loud gate trips. Watch it — investigate if it
             # climbs.
             for endpoint, n in (self.state.empty_completion_by_endpoint or {}).items():
-                out.append(Metric("llmproxy_empty_completion_total", int(n or 0),
+                out.append(Metric("roadstead_empty_completion_total", int(n or 0),
                                   {"endpoint": str(endpoint)}, "gauge",
                                   help="empty (position-0-EOS) completions by endpoint"))
         except Exception:
-            logger.exception("llmproxy /metrics render failed")
+            logger.exception("roadstead /metrics render failed")
             out = []
         return Response(render_prometheus(out),
                         media_type="text/plain; version=0.0.4")
@@ -737,7 +737,7 @@ class ProxyHttpHandlers:
                 # Truncation / structured-validity guard (operator mandate
                 # 2026-07-11): per-(model, caller) finish_reason=length tallies
                 # (structured vs freetext) and structured json.loads failures.
-                # Grep markers: LLMPROXY_TRUNCATION / LLMPROXY_STRUCTURED_INVALID.
+                # Grep markers: ROADSTEAD_TRUNCATION / ROADSTEAD_STRUCTURED_INVALID.
                 "truncation_total": self.state.truncation_total,
                 "truncation_by_model_caller": self.state.truncation_by_model_caller,
                 "structured_parse_failure_total":
@@ -771,7 +771,7 @@ class ProxyHttpHandlers:
                 # came back a well-formed JSON object with no answer in it.
                 # `{}` passes every other guard here, so this is the only place
                 # the 31-hour silent outage would have shown up. Grep marker:
-                # LLMPROXY_STRUCTURED_EMPTY. `structured_empty_rate` is the
+                # ROADSTEAD_STRUCTURED_EMPTY. `structured_empty_rate` is the
                 # live per-endpoint sliding window the standing alert reads.
                 "structured_empty_total": self.state.structured_empty_total,
                 "structured_empty_by_call_site":

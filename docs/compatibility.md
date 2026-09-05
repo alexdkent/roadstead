@@ -21,7 +21,23 @@ Not "anything goes" — that gives callers no signal and turns every upgrade int
 | | | |
 |---|---|---|
 | 🔒 **Stable** | The wire contract in `docs/api.md` | Request/response shapes, the error `code` values, the marker substrings, the published constants (keepalive, timeout floor, ceilings), the `/v1/*` route names. Changing any of these is a breaking change **even when the behaviour is unchanged** — §2.2 spells out why rewording an error message counts. |
-| 🔓 **Internal** | Everything else | Module layout, class and function names, `roadstead.testing`'s fault list, database schema, log wording, config field names. Change freely; no entry needed unless a caller could notice. |
+| 🔒 **Stable** | **Prometheus metric names** on `/metrics` | The 22 series enumerated in `docs/api.md` §3 — name, type and label set. A metric name is not a string in a log an operator reads once; it is a *stored key*, written into every dashboard panel and alert selector that has ever scraped this proxy, and a rename silently empties a graph rather than failing anything. See below for the one rename that was taken. |
+| 🔓 **Internal** | Everything else | Module layout, class and function names, `roadstead.testing`'s fault list, database schema, log wording (including the greppable `ROADSTEAD_*` markers), config field names. Change freely; no entry needed unless a caller could notice. |
+
+🚨 **The `llmproxy_*` → `roadstead_*` metric rename, 2026-09-05 — and it was the last free one.**
+Every series shipped under the origin project's name. Publishing that would have exported a dead
+brand into other people's dashboards permanently, so the whole family was renamed **before** there
+was a public consumer to break: `llmproxy_<x>` → `roadstead_<x>`, same suffixes, same types, same
+labels. The greppable log markers went with it (`LLMPROXY_*` → `ROADSTEAD_*`), and so did the
+`llmproxy_cache_drift` security event.
+
+**This was free exactly once.** The only consumer was the origin fleet, which is operated by the same
+people and could be migrated by hand from the map in the commit message. From this point the names
+are in the 🔒 column with everything else on the wire, and `tests/test_metrics_names.py` refuses a
+`llmproxy_` name or an `LLMPROXY_` marker anywhere under `roadstead/` so the old family cannot creep
+back in on a copy-paste. Filesystem paths that still carry the old word (`llmproxy_requests.jsonl`,
+the `llmproxy` agent directory) are deliberately untouched — moving those relocates a running
+deployment's durable state, which is a worse break than a stale name.
 
 `roadstead.testing` is a deliberate middle case: it is *published* surface, so renaming
 `FakeBackendServer` earns a CHANGELOG line, but its fault library and profiles are expected to grow
