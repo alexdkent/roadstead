@@ -155,6 +155,7 @@ from .correction import (
     _top_shingle_reps,  # noqa: F401
 )
 from .enriched import WIRE_ENRICHED, EnrichedApi
+from .legacy import LegacySubmitDoor
 from .management import ManagementApi
 from .failover import Failover
 from .health import Health
@@ -306,6 +307,11 @@ class ProxyService:
         # admin gate rather than reimplementing it — this repo already carries a
         # note about a predicate written out three times.
         self._management = ManagementApi(self._state, self._http)
+        # The legacy `/v1/submit` door. Built unconditionally and ROUTED only
+        # when ROADSTEAD_LEGACY_SUBMIT is set (`routes.make_routes`): the flag
+        # decides what is reachable, and an object that costs one dict is not
+        # worth a second place for the flag to be read differently.
+        self._legacy = LegacySubmitDoor(self._state, self._lifecycle)
 
     # ----- lifecycle -----
 
@@ -777,6 +783,16 @@ class ProxyService:
         back in. Nothing else about it varies — see
         ``Lifecycle.handle_submit``."""
         return await self._lifecycle.handle_submit(body, request, wire=wire)
+
+    # ----- handler: the legacy submit door (/v1/submit, flag-gated) -----
+
+    async def handle_legacy_submit(self, body: dict, request: Request) -> Response:
+        """``POST /v1/submit`` — see ``legacy.py`` for what it is and why.
+
+        Reachable only when ``ROADSTEAD_LEGACY_SUBMIT`` put the route in the
+        table; this method exists either way so nothing has to branch on the
+        flag twice."""
+        return await self._legacy.handle(body, request)
 
     # ----- handler: the enriched north face (/rs/v1) -----
 

@@ -8,6 +8,42 @@ Pre-1.0: breaks are permitted, but each one is a recorded decision rather than a
 
 ## Unreleased
 
+### Added — the legacy `/v1/submit` door, flag-gated
+
+`POST /v1/submit` was removed in Workstream C, deliberately and recorded. That decision stands and
+this does not reverse it — what it did not allow for was a fleet with a dozen callers already
+speaking the old envelope and no window in which to move them all at once. Setting
+**`ROADSTEAD_LEGACY_SUBMIT`** re-opens the door byte-compatible with what it published
+(`docs/api.md` §1.9.1–§1.9.4): the same envelope, the same six-key success shape, the same error
+codes and marker substrings, the same `queued`/`admitted`/`chunk`/`done` SSE framing with `data` as
+a **string** and no `[DONE]`, and embedding/rerank bodies passed through **verbatim**.
+
+**Default OFF, and OFF means the route does not exist** — a request gets the same `404` any unknown
+path gets, the posture `ROADSTEAD_ADMIN_UI` established. It is not a second hot path either: the
+door translates into `Lifecycle.handle_submit` like the other two north faces and `wire` picks the
+response bytes, so nothing about admission, correction or accounting varies with it.
+
+🚨 **It carries one deliberate departure from §1.5, valid only on this route and only under the
+flag:** a caller inside the built-in internal nets is identified by the `agent_id` in its own body,
+unchecked — which is what that door always did and what every fleet caller's DRR share depends on.
+The edges are narrow and are the point: a **registered** address keeps its registration (making this
+door *stricter* than `/rs/v1/chat`, where §1.5 rule 3 lets the body fill in an omitted identity), a
+**forwarded** address never reaches the exception at all, a **key** keeps key semantics through
+`may_assert`, and an address still never grants admin.
+
+Two additions to the old shapes, both stated rather than left to be discovered by diffing: the `504`
+body gains `"status":"error"` (the old one omitted it; every caller reads `.get("status") != "ok"`),
+and a `502` carries `backend_status` when the failure came from a backend (§2.2 — no caller pins the
+key set of an *error* envelope, and the alternative is this door advising a retry the proxy itself
+declined to make).
+
+**Removal is gated on the inventory being empty, not on a date.** `GET /v1/status` →
+`reliability.legacy_submits` reports `{count, callers{agent_id: n}}` since boot, and a WARNING names
+each caller once per UTC day beside it — `legacy /v1/submit used by agent_id=<x> (call_site=<y>) —
+migrate to /rs/v1/chat (docs/api.md §1.9)`. When `callers` stays empty across a representative
+window, delete `roadstead/legacy.py`, its two tests, the flag branch in `routes.make_routes` and the
+four `WIRE_LEGACY` branches in `lifecycle.py`.
+
 ### Fixed — an on-demand endpoint's in-flight lease could never idle-release
 
 `OnDemandManager.ensure_loaded` counts a request in-flight before `handle_submit` has decided

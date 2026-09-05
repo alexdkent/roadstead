@@ -239,6 +239,26 @@ class IPIdentityMap:
     def is_allowed(self, remote_ip: str) -> bool:
         return self.identify(remote_ip) is not None
 
+    def is_internal(self, remote_ip: str) -> bool:
+        """Whether this address is one of the BUILT-IN internal nets.
+
+        Deliberately narrower than :meth:`is_allowed`, and deliberately not
+        satisfied by an operator registration: it answers "did this request come
+        from the machine (or the container network) the proxy is on", which is
+        the only question the legacy ``/v1/submit`` door's self-declared
+        ``agent_id`` exception may turn on (``legacy.may_self_declare``).
+
+        🚨 An exact ``ROADSTEAD_ACL`` entry for a loopback address still matches
+        here — ``_lookup`` prefers it for the IDENTITY, and that is right, but
+        it does not make the address external. The two answers are about
+        different things and this one is about topology.
+        """
+        try:
+            addr = ipaddress.ip_address(remote_ip)
+        except ValueError:
+            return False
+        return any(addr in net for net in self._internal_nets)
+
     def builtin_admin_nets(self) -> list[str]:
         """The nets admin is granted to WITHOUT an operator saying so.
 

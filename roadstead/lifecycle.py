@@ -66,6 +66,13 @@ from .enriched import (
     identity_block,
     timing_block,
 )
+from .legacy import (
+    WIRE_LEGACY,
+    may_self_declare,
+    queued_frame,
+    sync_response as legacy_sync_response,
+    timeout_response as legacy_timeout_response,
+)
 from .observability import MetricsSample, RequestLogRecord
 from .on_demand import OnDemandUnavailable
 from .scheduler import CompletionRecord, DispatchDecision, QueuedRequest
@@ -382,7 +389,7 @@ class Lifecycle:
         self, body: dict, request: Request, *, wire: str = WIRE_ENRICHED,
     ) -> Response:
         # 🚨 ``wire`` varies ONLY the response serialization — never a routing,
-        # admission, correction or accounting decision. Two shapes:
+        # admission, correction or accounting decision. Three shapes:
         #
         #   WIRE_OPENAI    the bare OpenAI chat.completion / chat.completion.chunk
         #                  + [DONE] stream, set by /v1/chat/completions and
@@ -390,11 +397,20 @@ class Lifecycle:
         #                  the body — see ``enriched.ENRICHMENT_HEADERS``.
         #   WIRE_ENRICHED  the Roadstead envelope, with its attribution and
         #                  timing blocks. What /rs/v1/chat serves.
+        #   WIRE_LEGACY    the pre-Workstream-C /v1/submit envelope, served only
+        #                  when ROADSTEAD_LEGACY_SUBMIT registered that route —
+        #                  see ``legacy.py``. It is a compatibility shape with a
+        #                  removal condition, not a third north face.
         #
         # The enqueue / scheduler / grammar / cache / DRR / telemetry path is
-        # identical for both, and keeping it that way is the whole reason this
-        # is one method with a serialization flag rather than two doors: a
-        # second hot path is a second set of admission bugs.
+        # identical for all three, and keeping it that way is the whole reason
+        # this is one method with a serialization flag rather than three doors:
+        # a second hot path is a second set of admission bugs.
+        #
+        # 🚨 The one place ``wire`` decides something that is NOT bytes is the
+        # identity block below, and it is a NARROWING plus one documented
+        # exception. It is called out there rather than here so it cannot be
+        # read as licence for a second.
         if self.state.draining.is_set():
             # Phase 2.1: refuse new work while draining for shutdown so it defers
             # to the (about-to-restart) next instance instead of being dropped.
@@ -466,6 +482,16 @@ class Lifecycle:
                      "code": denial.code},
                     status_code=denial.status)
             principal = delegated.principal
+            agent_id = principal.agent_id
+        elif wire == WIRE_LEGACY and not may_self_declare(self.state, request):
+            # 🚨 The legacy door is STRICTER here than the rule above, not
+            # looser. Its published contract (docs/api.md §1.9.2) is that a
+            # caller inside the built-in internal nets names itself and a
+            # REGISTERED address is identified by its registration — because an
+            # operator who wrote an ACL entry has said who that host is, and a
+            # door whose whole purpose is reproducing an old contract must not
+            # widen it on the way. `may_self_declare` also refuses a forwarded
+            # address, on `acl.is_admin(trust_builtin_nets=False)`'s reasoning.
             agent_id = principal.agent_id
         else:
             agent_id = str(body.get("agent_id") or principal.agent_id)
@@ -963,6 +989,8 @@ class Lifecycle:
                     f"proxy timeout after {req.timeout_s:.0f}s", "proxy_timeout", 504,
                     code="proxy_timeout",
                 )
+            if wire == WIRE_LEGACY:
+                return legacy_timeout_response(req)
             return JSONResponse(
                 {"status": "error", "request_id": req.request_id,
                  "code": "proxy_timeout",
@@ -982,6 +1010,8 @@ class Lifecycle:
                     f"proxy timeout after {req.timeout_s:.0f}s", "proxy_timeout", 504,
                     code="proxy_timeout",
                 )
+            if wire == WIRE_LEGACY:
+                return legacy_timeout_response(req)
             return JSONResponse(
                 {"status": "error", "request_id": req.request_id,
                  "code": "proxy_timeout",
@@ -1045,6 +1075,12 @@ class Lifecycle:
                 result.get("error", "backend error"), "backend_error", 502,
                 code="backend_error",
             )
+        if wire == WIRE_LEGACY:
+            # The six-key envelope, and no `corrections` list: the legacy shape
+            # has nowhere to carry one, and the OpenAI door's header channel is
+            # the precedent for saying nothing rather than inventing a field on
+            # a contract somebody else is validating against.
+            return legacy_sync_response(req, result)
         return self._enriched_response(req, result, corrections)
     def _predicted_ms(self, req: QueuedRequest) -> float | None:
         """What the timeout model would recommend for this call, in ms.
@@ -1161,7 +1197,7 @@ class Lifecycle:
             # OpenAI consumers (goose-cli) get ONLY chat.completion.chunk
             # frames, so no marker is emitted at all: an OpenAI client chokes
             # parsing one.
-            if wire != WIRE_OPENAI:
+            if wire == WIRE_ENRICHED:
                 yield ("data: " + json.dumps({
                     "type": "accepted",
                     "request_id": req.request_id,
@@ -1170,6 +1206,12 @@ class Lifecycle:
                         req, queue_wait_ms=0.0, backend_latency_ms=0.0,
                         predicted_ms=self._predicted_ms(req)),
                 }) + "\n\n")
+            elif wire == WIRE_LEGACY:
+                # The old door's opening frame: a request id and nothing else.
+                # `accepted` would be a better frame and it is the wrong one to
+                # send here — a caller that switched on `type` and dropped what
+                # it did not recognise is exactly who this door exists for.
+                yield "data: " + json.dumps(queued_frame(req)) + "\n\n"
 
             try:
                 while True:
@@ -1212,12 +1254,21 @@ class Lifecycle:
                     if (uniform_correction_enabled()
                             and event.get("type") == "chunk" and "data" in event):
                         event = {**event, "data": toolcall_sanitizer.feed(event["data"])}
-                    if event.get("type") == "done":
+                    if wire == WIRE_ENRICHED and event.get("type") == "done":
                         # Reshape the producer's flat done frame onto the
                         # enriched wire HERE, at the serializer boundary, rather
                         # than teaching the producer about a wire. The producer
                         # measures; this decides how to say it — which is why
                         # adding this API changed nothing in `execute_streaming`.
+                        #
+                        # 🚨 The LEGACY wire skips the reshape and emits the
+                        # producer's frame as measured — `queue_wait_ms`,
+                        # `backend_latency_ms`, `ttft_ms`, `usage.prompt_tokens`
+                        # / `.completion_tokens`, plus `degraded`/`degraded_from`
+                        # — because that flat frame IS the shape the old door
+                        # published. It is a coincidence worth naming rather
+                        # than relying on: if the producer's frame ever changes,
+                        # the legacy wire needs its own translation here.
                         event = _enriched_done(self.state, req, event)
                     yield f"data: {json.dumps(event)}\n\n"
                     if event.get("type") in ("done", "error"):

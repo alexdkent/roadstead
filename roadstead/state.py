@@ -395,6 +395,14 @@ class ProxyState:
         # DECLARED vision:false throughout and nothing read the field.
         # Ledger: `a-role-rename-carried-vision-to-a-text-only-box`.
         self.vision_capability_violations: dict[str, dict] = {}
+        # Legacy `/v1/submit` usage since boot: {count, callers{agent_id: n}}.
+        # The migration inventory, as a number — this door exists to be turned
+        # off again, and "is anybody still on it" is the only fact that decides
+        # when. Stays {"count": 0, "callers": {}} for a deployment that never
+        # set ROADSTEAD_LEGACY_SUBMIT, since the route is not registered at all.
+        # The caller map is capped (`legacy._MAX_TRACKED_CALLERS`): the name is
+        # caller-asserted on that door, so its cardinality is not ours to trust.
+        self.legacy_submits: dict = {"count": 0, "callers": {}}
         # Context-overflow gate counter (shadow): endpoint → {count, callers,
         # max_est_in}. Feeds the context_gate_enforce flip check — compared
         # against ACTUAL backend overflow errors before enforcement flips.

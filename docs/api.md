@@ -248,7 +248,7 @@ and the budget holder.** It is established in one of three ways, in strict prece
 |---|---|---|
 | 1 | **API key** — `Authorization: Bearer <key>` (what an OpenAI client already sends), `Authorization: Basic <base64(anything:key)>` (what a *browser* can send — the key is the **password** half and the username is ignored), or `X-API-Key: <key>` | authenticated |
 | 2 | **Source address** — an operator registration in `ROADSTEAD_ACL` | a weak second factor: it identifies a *host*, and several callers may share one |
-| 3 | **`agent_id` in the body** | **Only a name the credential was granted** (`may_assert`, below). It was unchecked on `/v1/submit`, which was removed in Workstream C (§1.9); it came back on `/rs/v1/*` on 2026-09-02 as a *delegation* rather than a claim. A caller still cannot name its own fair-share key — it can only pick from the ones its operator wrote down. |
+| 3 | **`agent_id` in the body** | **Only a name the credential was granted** (`may_assert`, below). It was unchecked on `/v1/submit`, which was removed in Workstream C (§1.9); it came back on `/rs/v1/*` on 2026-09-02 as a *delegation* rather than a claim. 🚨 The flag-gated legacy door restores the unchecked reading for an internal-net caller and for nobody else — §1.9.2, the one deliberate departure from this section. A caller still cannot name its own fair-share key — it can only pick from the ones its operator wrote down. |
 
 A key carries its own default `priority`, an optional `min_timeout_s` deadline floor, and an
 optional `admin` scope, so all four facts travel with the caller rather than with the machine it
@@ -713,7 +713,12 @@ absence as "not ours", never as a default.
 **`POST /v1/submit` was removed** (Workstream C; `CHANGELOG.md`). It carried no
 intent vocabulary, no attribution and no timing, and each of those would have had
 to be bolted onto a shape never designed to hold them. `/rs/v1/chat` is its
-replacement, and the map is mechanical:
+replacement, and the map is mechanical.
+
+🚨 **It can be re-opened, unchanged, behind `ROADSTEAD_LEGACY_SUBMIT`** — see
+§1.9.1. That is a migration window with a removal condition, not a reprieve: the
+map below is still the destination, and the flag exists so a fleet can cross it
+one caller at a time instead of all at once.
 
 | `/v1/submit` | `/rs/v1/chat` |
 |---|---|
@@ -732,6 +737,134 @@ replacement, and the map is mechanical:
 | stream frame `done` fields | `timing`, `usage`, `attribution`. |
 
 `roadstead.client` (§7) speaks this API and is the shortest path across.
+
+#### 1.9.1 …and the door itself, back behind a flag 🚨
+
+**`POST /v1/submit` can be re-opened, unchanged, by setting
+`ROADSTEAD_LEGACY_SUBMIT`.** Removing it was the right decision and this does not
+reverse it; what the removal did not allow for was a fleet with a dozen callers
+already speaking the old envelope and no window in which to move them all at
+once. So the door comes back **byte-compatible with what it published**, and it
+comes back **off**:
+
+| | |
+|---|---|
+| Flag | `ROADSTEAD_LEGACY_SUBMIT` — `1` \| `true` \| `yes` \| `on` |
+| Default | **OFF, and OFF means the route does not exist.** A request gets the same `404` any unknown path gets — not a `405`, not a `404` that mentions itself. Same posture as `ROADSTEAD_ADMIN_UI` (§3.7). |
+| Where it lives | `roadstead/legacy.py`. It translates into `Lifecycle.handle_submit` like the other doors do and adds no admission path of its own: `wire` picks the response shape and nothing else. |
+| Removal | Gated on **the inventory being empty**, not on a date. `GET /v1/status` → `reliability.legacy_submits` (`{count, callers{agent_id: n}}`) is that inventory; a WARNING names each caller once per UTC day beside it. |
+
+**Request envelope.** Exactly these fields; anything else in the body is ignored,
+including the four `/rs/v1/chat` reads that this door never published
+(`declared_agent_id`, `requested`, `allow_degrade`, `allow_spill`).
+
+| Field | Type | Effect |
+|---|---|---|
+| `agent_id` | string | The fair-share key — subject to §1.9.2. Absent → the resolved identity's own. |
+| `endpoint` | string | The routing endpoint (a role or alias). Default `chat`. 🚨 Overridden by `payload.model` when that names a *different known* endpoint and `payload_type` is `chat_completion`; the reconcile is logged. |
+| `priority` | string \| int \| null | Coerced, never rejected — see the table below. `null`/absent means *declared nothing*, and §1.5's four-step precedence resolves the band. |
+| `call_site` | string | Attribution. Default `unknown`. |
+| `payload_type` | string | `chat_completion` \| `embedding` \| `rerank`. Unvalidated, as before: an unknown value takes the chat route. |
+| `payload` | object | The model request. `payload.stream` selects SSE. |
+| `timeout_s` | number | The caller's deadline, and it wins. Absent (or `null`, or malformed — which logs and defaults) → the computed default, per-identity floor included (§1.2, §1.5). |
+| `session_id`, `turn_id`, `caller_id`, `request_id` | string \| null | Carried to the durable record. `request_id` is minted when absent. |
+
+Priority coercion — the same table `LLMPriority.coerce` has always applied, restated because a
+caller of this door depends on a malformed value *defaulting* rather than failing its LLM call:
+
+| sent | resolved |
+|---|---|
+| a member name, any case (`P0_REALTIME`, `p2_post_turn`) | that member |
+| `interactive` \| `foreground` \| `background` | `P1_TURN_SUPPORT` \| `P2_POST_TURN` \| `P3_INGESTION` |
+| `realtime`, `turn`, `turn_support`, `post_turn`, `ingestion`, `hygiene` | the named member |
+| any `P<n>_<suffix>` (e.g. `P3_BACKGROUND`) | by its numeric prefix, with a WARNING |
+| an int, in or out of range | the member, clamped to `0…4` |
+| `null` or absent | *declared nothing* → §1.5's precedence |
+| anything else, including a JSON `true` | `P1_TURN_SUPPORT`, with a WARNING. **Never a 500.** |
+
+#### 1.9.2 The identity exception 🚨
+
+**On this door, and only under the flag, a caller inside the built-in internal
+nets is identified by the `agent_id` in its own body, unchecked.** That is the
+one place Roadstead deliberately departs from §1.5, it is written down here
+because it cannot be reproduced quietly, and its edges are narrow:
+
+| caller | identified by |
+|---|---|
+| loopback / docker-internal (`127.0.0.0/8`, `172.16.0.0/12`, `::1`), on a connection the transport itself vouches for | **the body's `agent_id`**, unchecked — the exception |
+| a **registered** address (`ROADSTEAD_ACL`) | its registration. An operator who wrote the entry said who that host is. |
+| an address that arrived via `X-Forwarded-For` | its registration, never the body. "Already on the box" is what the internal nets stand for, and a front proxy is exactly what makes that untrue — the same reasoning `acl.is_admin(trust_builtin_nets=False)` applies to the admin grant. |
+| a caller presenting an **API key** | the key, with `may_assert` deciding a declared name (§1.5 rule 3). Unchanged. |
+
+It grants **a name and nothing else**: no band, no deadline floor, no quota, and
+🚨 **an address still never grants admin** (§3). Note that this makes the legacy
+door *stricter* than `/rs/v1/chat` for a registered address, where §1.5 rule 3
+lets the body fill in an identity the registration did not claim — a door
+reproducing an old contract must not widen it on the way past.
+
+#### 1.9.3 Response shapes
+
+**Sync success** — HTTP 200, **exactly six keys**:
+
+```json
+{"status":"ok","request_id":"req_…","queue_wait_ms":0.0,"backend_latency_ms":0.0,
+ "estimated_cost_ss":0.0,"response": <the backend body, verbatim>}
+```
+
+🚨 The key **set** is the contract, and callers validate it — so an additive field
+here is a breaking change, which is why the enriched envelope's `attribution`,
+`identity`, `timing`, `usage` and `corrections` blocks are absent rather than
+merely unused. Two documented additions: `"cache_hit": true` on a cache hit (with
+the timing fields at zero), and `degraded` / `degraded_from` when a failover
+served a smaller model.
+
+For `payload_type: "embedding"` and `"rerank"`, `response` is the backend body
+**verbatim** — no OpenAI translation, unlike `POST /v1/embeddings` (§1.1). A
+caller reading the embedding shim's own dialect keeps reading it.
+
+**Streaming** (`payload.stream` true) — `text/event-stream`, framed `data: {json}\n\n`,
+headers `Cache-Control: no-cache` and `X-Accel-Buffering: no`, and **no `[DONE]`
+sentinel**. (The four `X-Roadstead-*` enrichment headers of §1.8 ride along too;
+they are additive and no legacy consumer reads them.)
+
+| # | frame |
+|---|---|
+| 1 | `{"type":"queued","request_id":"req_…"}` — *not* the enriched wire's `accepted`, which carries attribution a legacy consumer would drop |
+| 2 | `{"type":"admitted","queue_wait_ms":<float>}` |
+| 3… | `{"type":"chunk","data":"<raw backend chunk JSON>"}` — 🚨 `data` is a **string**, not an object. Every consumer of this door parses it itself. |
+| last | `{"type":"done","queue_wait_ms":…,"backend_latency_ms":…,"ttft_ms":…,"usage":{"prompt_tokens":…,"completion_tokens":…}}` (+ `degraded`/`degraded_from`) |
+| or | `{"type":"error","error":"<string>"}` on any failure, including the consumer-side deadline (`"timeout"`) |
+
+#### 1.9.4 Errors
+
+The §2.1 codes and the §2.2 marker substrings, in the envelope this door
+published: `{"status":"error","request_id":…,"error":…,"code":…}`.
+
+| status | `code` | when |
+|---|---|---|
+| 503 + `Retry-After` | `draining` | draining for shutdown, or the endpoint is paused for maintenance |
+| 404 | `unknown_endpoint` | `unknown_endpoint_enforce` is on and the endpoint is not routable |
+| 400 | `vision_not_supported` | `vision_capability_enforce` is on and the payload carries an image |
+| 400 | `invalid_messages` | `payload.messages` is not a list of objects |
+| 422 | `invalid_grammar` | the GBNF grammar does not parse (`detail` carries why) |
+| 422 | `context_overflow` | `context_gate_enforce` is on and the request does not fit |
+| 503 | `on_demand_unavailable` | an on-demand backend could not be loaded |
+| 503 + `Retry-After` | `circuit_open` | the backend is unhealthy (`degraded_refusal` appended when a failover was refused) |
+| 429 + `Retry-After` | `backpressure` | a non-interactive band's queue is saturated |
+| 502 | `backend_error` | the backend failed after dispatch |
+| 504 | `proxy_timeout` | the deadline fired |
+| 400 / 401 / 403 / 413 | `invalid_request_error` / `invalid_api_key` / `access_denied` | §1.5, §1.10 |
+
+Two deliberate differences from what this door published before it was removed,
+both additive and both stated so nobody has to diff a response to find them:
+
+* the **504** body is `{"status":"error","request_id":…,"error":"timeout","code":"proxy_timeout"}`.
+  `error` is still the bare `"timeout"`; `status` is new. The old body omitted it, every caller
+  reads `.get("status") != "ok"`, and supplying it can only make more of them agree with the rest of
+  the taxonomy.
+* a **502** carries `backend_status` when the failure came from a backend (§2.2). No caller pins the
+  key set of an error envelope, and the alternative is this door advising a retry the proxy itself
+  declined to make.
 
 ### 1.10 Request and response size caps 🚨
 

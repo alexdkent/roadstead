@@ -294,7 +294,12 @@ it pointed here, and *"we only added fields"* is not a defence — strict valida
 keys. So the OpenAI body is byte-identical and its enrichment rides in four `X-Roadstead-*` response
 headers, which carry only what admission had already settled: a streaming response's headers are on
 the wire before a failover the enriched `done` frame can still report. **`POST /v1/submit` is gone**
-(`docs/api.md` §1.9 maps it field by field).
+(`docs/api.md` §1.9 maps it field by field) — and can be re-opened UNCHANGED behind `ROADSTEAD_LEGACY_SUBMIT`
+(`legacy.py`, §1.9.1), off by default, route absent rather than refusing. It is a migration
+window whose removal condition is `GET /v1/status` -> `reliability.legacy_submits.callers`
+being empty, and it carries the project's ONE deliberate departure from §1.5: an
+internal-net caller on that door names its own `agent_id` unchecked, as it always did.
+A registered address, a forwarded address and a key are all unaffected.
 
 🚨 **Resolution is not substitution, and `intent.py` is where that line is drawn.** A caller declares
 a capability and Roadstead owns the choice of model; a `model` is a *pin* and is a constraint on

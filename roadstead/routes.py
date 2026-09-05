@@ -12,6 +12,7 @@ Provides:
   - GET  /rs/v1/models     — enriched catalogue: capabilities, live state, price
   - POST /rs/v1/plan       — resolve an intent and price it, without dispatching
   - POST /rs/v1/chat       — the enriched call
+  - POST /v1/submit        — the LEGACY envelope (only when ROADSTEAD_LEGACY_SUBMIT)
   - POST /v1/chat/completions — OpenAI-compatible (LAN consumers)
   - POST /v1/embeddings    — OpenAI-compatible embeddings
   - GET  /v1/models        — list available endpoints
@@ -54,6 +55,8 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .enriched import PREFIX
+from .legacy import ROUTE as LEGACY_SUBMIT_ROUTE
+from .legacy import enabled as legacy_submit_enabled
 from .management import PREFIX as ADMIN_PREFIX
 from .management import admin_ui_enabled
 
@@ -76,6 +79,10 @@ def make_routes(svc: "ProxyService") -> list[Route]:
     async def handle_rs_chat(request: Request) -> Response:
         body = await request.json()
         return await svc.handle_rs_chat(body, request)
+
+    async def handle_legacy_submit(request: Request) -> Response:
+        body = await request.json()
+        return await svc.handle_legacy_submit(body, request)
 
     async def handle_chat_completions(request: Request) -> Response:
         body = await request.json()
@@ -228,12 +235,25 @@ def make_routes(svc: "ProxyService") -> list[Route]:
             Route(f"{ADMIN_PREFIX}/stream", handle_stream, methods=["GET"]),
         ]
 
-    return ui_routes + [
+    legacy_routes: list[Route] = []
+    if legacy_submit_enabled():
+        # 🚨 Registered only when ROADSTEAD_LEGACY_SUBMIT is set, so OFF means
+        # the route does not EXIST — a request gets the same 404 any unknown
+        # path gets, which is what a caller has seen since Workstream C removed
+        # it. Same posture as the admin UI above, and for a sharper reason: this
+        # one re-opens a surface somebody deliberately closed. See `legacy.py`.
+        legacy_routes = [
+            Route(LEGACY_SUBMIT_ROUTE, handle_legacy_submit, methods=["POST"]),
+        ]
+
+    return ui_routes + legacy_routes + [
         # --- the enriched north face (roadmap Workstream C) -----------------
         # 🚨 This REPLACES the `/v1/submit` envelope, which was removed rather
         # than deprecated: it had no intent vocabulary, no attribution and no
         # timing, and every one of those would have had to be bolted onto a
         # shape that was never designed to carry them. See CHANGELOG.md.
+        # (`legacy_routes` above re-opens that envelope behind a flag, for a
+        # fleet that has to cross one caller at a time. Still the replacement.)
         Route(f"{PREFIX}/models", handle_rs_models, methods=["GET"]),
         Route(f"{PREFIX}/plan", handle_rs_plan, methods=["POST"]),
         Route(f"{PREFIX}/chat", handle_rs_chat, methods=["POST"]),

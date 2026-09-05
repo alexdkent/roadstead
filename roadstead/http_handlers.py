@@ -688,6 +688,10 @@ class ProxyHttpHandlers:
                 "unknown_endpoint_submits": self.state.unknown_endpoint_submits,
                 "vision_capability_violations":
                     self.state.vision_capability_violations,
+                # Legacy `/v1/submit` usage since boot (see `legacy.py`). This
+                # is the migration inventory: removing that door again is gated
+                # on `callers` being empty, not on a date.
+                "legacy_submits": self.state.legacy_submits,
                 # Context-gate hits since boot (shadow counter for the
                 # context_gate_enforce flip check — compare against actual
                 # backend overflow errors before flipping).
