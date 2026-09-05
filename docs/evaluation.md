@@ -1,16 +1,19 @@
-<!-- Provenance: copied verbatim from the origin monorepo's
-     originfleet/docs/llmproxy_vs_open_source_evaluation_2026-08.md on 2026-08-31.
-     It is a decision RECORD — paths and names inside refer to the origin project and are
-     correct as history. Do not 'fix' them to Roadstead names. -->
+<!-- Provenance: copied from the origin monorepo's evaluation of the same date, 2026-08-31.
+     It is a decision RECORD — paths and names in the BODY refer to the origin project, where the
+     code was still called `llmproxy`, and are correct as history. Do not 'fix' them to Roadstead
+     names. Two things were changed after the copy, on 2026-09-05: the title now names the product
+     that exists, and the forward pointer in §1 now names documents that exist in THIS repo (the
+     origin's execution plan does not). Nothing in the body, and no figure or verdict, was touched. -->
 
 <!-- FRESHNESS: 2026-08-31 — original evaluation. Landscape figures pulled from the GitHub API on 2026-08-31; re-verify project activity before relying on the dismissal list after ~2026-11. The llmproxy capability inventory is code-truth as of a72e2c3a7 + live runtime-flag state. -->
 
-# llmproxy vs the open-source field — 2026-08-31
+# Roadstead vs the open-source field — 2026-08-31
 
 **Status:** current. Decision record. Evaluates whether to abandon `llmproxy` for an existing
 open-source LLM gateway, extract it as a standalone open-sourceable project, or leave it as a
-fleet-internal component. **Verdict: extract.** The execution plan is
-`llmproxy_extraction_plan_2026-08.md`.
+fleet-internal component. **Verdict: extract.** The extraction has since happened — what it cost and
+what it broke is the closed record in `docs/history.md`; where the project goes from here is
+`docs/roadmap.md`. (The execution plan itself stayed in the origin monorepo.)
 
 ---
 

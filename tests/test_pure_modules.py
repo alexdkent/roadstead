@@ -188,15 +188,19 @@ def test_the_guard_is_not_vacuous():
                and n.names[0].name in FORBIDDEN_IMPORTS for n in ast.walk(bad))
 
 
-def test_claude_md_still_names_them_all():
+def test_the_internals_doc_still_names_them_all():
     """The document and the code have to agree about which modules are the
-    crown jewels — one added to CLAUDE.md and not to `PURE_MODULES` would be
-    unguarded, and a module dropped from the list here should have been dropped
-    there too. `rate.py` is the sixth, added 2026-09-01; this test is what made
-    the layout section get updated with it rather than a week later."""
-    text = (_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    crown jewels — one added to the internals doc and not to `PURE_MODULES`
+    would be unguarded, and a module dropped from the list here should have been
+    dropped there too. `rate.py` is the sixth, added 2026-09-01; this test is
+    what made the layout section get updated with it rather than a week later.
+
+    The document was `CLAUDE.md` until 2026-09-05 and is `docs/internals.md`
+    now; root `CLAUDE.md` is a three-line pointer, which this test would have
+    read as a document that had silently stopped naming anything."""
+    text = (_ROOT / "docs" / "internals.md").read_text(encoding="utf-8")
     for module in PURE_MODULES:
         assert f"{module}.py" in text, (
-            f"CLAUDE.md no longer mentions {module}.py — reconcile the layout "
-            f"section with tests/test_pure_modules.py::PURE_MODULES")
+            f"docs/internals.md no longer mentions {module}.py — reconcile the "
+            f"layout section with tests/test_pure_modules.py::PURE_MODULES")
     assert "pure computation, no I/O" in text

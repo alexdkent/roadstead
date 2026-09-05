@@ -183,10 +183,10 @@ forced by this change.
 falling back to `"0.0.0+unknown"` off a bare checkout. Added `SECURITY.md` and `CONTRIBUTING.md`, and
 `Homepage`/`Issues`/`Changelog` under `[project.urls]`.
 
-A private Proxmox container id (`CTnnn`) in `docs/roadmap.md` was replaced with "the deployment
-sandbox" — `docs/corpus_and_scrub_plan.md` §S1 now flags that the human identifier-sweep half of the
-scrub (S5/S7) needs re-running over everything committed after 2026-09-01, since this finding postdates
-both passes.
+A private Proxmox container id in `docs/roadmap.md` was replaced with "the deployment
+sandbox" — and the scrub plan was amended to flag that the human identifier-sweep half of the scrub
+needs re-running over everything committed after 2026-09-01, since this finding postdates both
+passes.
 
 ### Added — the durable record names the credential behind a delegated call
 
@@ -534,11 +534,10 @@ magnitude — the tracked half is ordinary edits and stops the name shipping *to
 half needs a second `filter-repo` pass that changes every SHA again. Leaving them coupled is why
 neither had happened.
 
-🚨 **One entry in this file is now knowingly inaccurate.** The `ANVIL_DISPATCHER_URL` →
-`ROADSTEAD_ON_DEMAND_DISPATCHER_URL` note recorded the old variable under its real spelling, and that
-spelling carried the host name. It now reads `ANVIL_DISPATCHER_URL`, naming a variable that never
-existed. Accepted for the reason S6 rewrote commit messages: a scrub that spares the record leaks
-through the record.
+🚨 **One entry in this file is now knowingly inaccurate.** The on-demand dispatcher rename below
+recorded the old environment variable under its original spelling, and that spelling carried the host
+name. It now reads under the pseudonym, so it names a variable that never existed. Accepted for the
+reason S6 rewrote commit messages: a scrub that spares the record leaks through the record.
 
 ### Added — the wire contract, confirmed against a real vLLM for the first time
 
