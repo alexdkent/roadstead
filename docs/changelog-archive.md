@@ -525,25 +525,23 @@ after the disclosure proved silent on macOS, which is the platform where the
 `/tmp` default is exercised most.
 
 
-### Scrub — a real host name shipped in source, and is gone from the tree (S7, half-closed)
+### Scrub — a real host name shipped in source, and is gone from the tree (half-closed)
 
-Landed 2026-09-01. The scrub plan (archived privately) § S7 has the full account.
+Landed 2026-09-01. The scrub plan (archived privately) has the full account.
 
-S6 claimed host names were pseudonymised through the whole history. They were not. A fresh check
-found real, currently-resolving names surviving in history, and one of them — the GPU head node — was
-in **eleven tracked files, four of them shipping source** (`roadstead/health.py`, `config.py`,
-`lifecycle.py`, `correction.py`), next to a port that turned out to belong to a **live production
-inference server**. So what shipped in the wheel was a working address, not just a name.
+An earlier pass claimed host names were pseudonymised through the whole history. They were not. A
+fresh check found real, currently-resolving names surviving in history, and one of them was in
+several tracked files, some shipping source, next to material that made it more than just a name in
+a comment. So what shipped in the wheel was more than a label.
 
-It is now spelled `anvil` (`anvil2` for its paired worker) throughout the tracked tree. The
-measurements those comments record are untouched — same rule as `models.yaml`: the measurement is
-real, the machine it names is not.
+It is now pseudonymised throughout the tracked tree. The measurements those comments record are
+untouched — same rule as `models.yaml`: the measurement is real, the machine it names is not.
 
-🚨 **Only half of S7 is closed.** The tracked tree is clean; the **history is not**, and that still
-blocks going public. The two halves were split deliberately because their costs differ by orders of
-magnitude — the tracked half is ordinary edits and stops the name shipping *today*, while the history
-half needs a second `filter-repo` pass that changes every SHA again. Leaving them coupled is why
-neither had happened.
+🚨 **Only half of this is closed.** The tracked tree is clean; the **history is not**, and that
+still blocks going public. The two halves were split deliberately because their costs differ by
+orders of magnitude — the tracked half is ordinary edits and stops the name shipping *today*, while
+the history half needs a second `filter-repo` pass that changes every SHA again. Leaving them
+coupled is why neither had happened.
 
 🚨 **One entry in this file is now knowingly inaccurate.** The on-demand dispatcher rename below
 recorded the old environment variable under its original spelling, and that spelling carried the host
@@ -867,40 +865,40 @@ were doctrine tests asserting the old behaviour in as many words, including one 
 called the unauthenticated audit record *"a meaningful — and slightly alarming — thing for an
 operator to find"*. It was.
 
-### Changed — BREAKING for anyone holding a clone or a SHA: the history was rewritten (scrub S6)
+### Changed — BREAKING for anyone holding a clone or a SHA: the history was rewritten (scrub)
 
-Landed 2026-09-01. The second and final `git filter-repo` pass, the last item in the scrub plan
-(archived privately). **Every commit SHA in this repository changed.** A clone from
-before this date shares no ancestor with `main` and cannot be fast-forwarded; re-clone rather than
-pull. Any SHA cited in an external document, a branch name, or a bookmark is dead.
+Landed 2026-09-01. A `git filter-repo` pass, an item in a scrub plan archived privately.
+**Every commit SHA in this repository changed.** A clone from before this date shares no ancestor
+with `main` and cannot be fast-forwarded; re-clone rather than pull. Any SHA cited in an external
+document, a branch name, or a bookmark is dead.
 
 **It took two passes, not one.** The first rewrote blobs and commit messages. The second was a
 `--mailmap` run over commit *metadata*: author and committer identity is neither blob content nor a
-commit message, so it survived the first pass entirely. All 322 commits now carry one identity at a
-public address. 🚨 **That pass found a second private hostname on 103 commits that nothing had
-flagged** — because a sweep over tracked files cannot see the author line, and every check to that
-point had been a sweep over tracked files.
+commit message, so it survived the first pass entirely. Every commit now carries one identity at a
+public address — 🚨 including some private material a sweep over tracked files cannot see at all,
+because the author line isn't a tracked file, and every check up to that point had been a sweep
+over tracked files.
 
 This is recorded here rather than passed over as housekeeping because it is the most broadly
 breaking change the project has made — it breaks something for every holder of a copy, which no API
 break does — and because two things about it were wrong in the plan that specified it:
 
 - 🚨 **`--replace-text` rewrites blobs and nothing else.** The documented one-liner would have left
-  all 321 commit messages untouched, and messages were the *denser* surface: 282 of the 321 commits
-  were authored inside the origin monorepo and describe its hosts, its container IDs and its sibling
-  projects far more freely than the code ever did. `--replace-message` takes the same rules file.
-- 🚨 **Bare-word rules would have corrupted content.** `Delta` also occurs as `Gated DeltaNet`, a
-  model architecture, and `Chase` as "Chased to column level". Every one of the 42 rules is a
-  multi-word key or a distinctive stem, authored against an inventory of the actual occurrences.
+  commit messages untouched, and messages were the *denser* surface, authored with more freedom about
+  hosts and internals than the code ever had. `--replace-message` takes the same rules file.
+- 🚨 **Bare-word rules would have corrupted content.** A rule's own text could recur as an unrelated
+  term (a model architecture name, a phrase like "chased to column level"). Every rule is a
+  multi-word key or a distinctive stem, authored against an inventory of the actual occurrences —
+  not a bare word.
 
-Host and sibling-project names became pseudonyms throughout — the names you will now read are
-`nexus`, `nasbox`, `boxa`, `tideway`, `beacon` and `sidekick` — and the fleet's `/24` became
-`10.0.0.x`. 🚨 **The mapping itself is not recorded anywhere in this repository, deliberately.**
-Writing `old`→`new` in a changelog would restore every name the pass removed and hand a reader the
-key to reverse the rest; a scrub that documents its own substitutions has not scrubbed anything. **The measurement comments are still records** — `CLAUDE.md` says so, and now
-also says the box names within them are pseudonyms, because a reader who goes looking for the
-machine should be told there isn't one. Model and endpoint-class vocabulary was out of scope and is
-unchanged.
+Host and sibling-project names became pseudonyms throughout, and private address ranges were
+replaced with documentation ranges. 🚨 **The mapping itself is not recorded anywhere in this
+repository, deliberately.** Writing `old`→`new` in a changelog would restore every name the pass
+removed and hand a reader the key to reverse the rest; a scrub that documents its own substitutions
+has not scrubbed anything. **The measurement comments are still records** — `CLAUDE.md` says so,
+and now also says the box names within them are pseudonyms, because a reader who goes looking for
+the machine should be told there isn't one. Model and endpoint-class vocabulary was out of scope
+and is unchanged.
 
 Also fixed in passing: **a real airline booking reference was still in the working tree.** S4
 replaced the traveller, the airline and the airports around it and carried the booking reference
@@ -952,16 +950,15 @@ the endpoint from the `GROUP BY` changed nothing — a caller spanning two price
 grouping observable.
 
 
-### Removed — BREAKING: `normalize_endpoint` no longer rewrites a `nexus-` prefix
+### Removed — BREAKING: `normalize_endpoint` no longer rewrites a hardcoded host prefix
 
-Landed 2026-09-01, found by re-running the straggler sweep (S5 in the scrub plan, archived privately).
+Landed 2026-09-01, found by re-running the straggler sweep (scrub plan, archived privately).
 Recorded here per `docs/compatibility.md`: this is internal behaviour rather than the wire contract,
 but it changes how a *name a caller sends* resolves, which is as close to the contract as internal
 gets.
 
-`normalize_endpoint` stripped a `nexus-` prefix and mapped a bare `nexus` to `chat` — **one private
-fleet's host naming, hardcoded since the first commit (`1becf53`, 2026-05-27) and shipped to
-everyone.** It was a
+`normalize_endpoint` stripped a hardcoded host prefix and mapped the bare hostname to `chat` — **one
+private fleet's host naming, hardcoded since the first commit and shipped to everyone.** It was a
 scrub finding and a design defect at once, and the second is the reason it is removed rather than
 renamed:
 
@@ -969,22 +966,22 @@ renamed:
   this codebase refuses everywhere else — and the refusal has a name here, since the alias
   duplicate/shadow notice added in the same release cannot see this one at all.
 - It could not be configured, overridden or disabled, and it silently rewrote **any** endpoint whose
-  name happened to begin with those six characters. An operator with `nexus-a` and `a` had a pin
-  at the first silently reaching the second.
+  name happened to begin with that prefix. An operator with a two endpoints, one a prefixed variant
+  of the other, had a pin at the first silently reaching the second.
 
 **Migration**, if you actually want that mapping: put it where every other name lives —
-`aliases: [nexus]` on the endpoint, which is declared, reported and collision-checked. The whole
-suite passed unchanged with the branch removed, which is how long it had been dead weight.
+`aliases:` on the endpoint, which is declared, reported and collision-checked. The whole suite
+passed unchanged with the branch removed, which is how long it had been dead weight.
 
-Two smaller findings from the same sweep: three arbitrary test addresses that merely *looked* like
-the private subnet (a sweep cannot tell, so each cost a human adjudication per re-run and S6 would
-have rewritten them through the history for nothing), and a sibling private project's name used as a
+Two smaller findings from the same sweep: a few arbitrary test addresses that merely *looked* like
+the private subnet (a sweep cannot tell, so each cost a human adjudication per re-run, to avoid
+rewriting them through the history for nothing), and a sibling private project's name used as a
 shipped `ROADSTEAD_ACL` example.
 
-🚨 **The topology half of S5 now runs on every commit** (`tests/test_scrub_sweep.py`) — a sweep that
-lives in a shell command in a document is one somebody has to remember. The identifier half stays a
-human pass **and the test says so**, because there is no pattern to key on for a name, which is
-exactly how S4's finding survived the first sweep. Four mutations, all red.
+🚨 **The topology half of the sweep now runs on every commit** (`tests/test_scrub_sweep.py`) — a
+sweep that lives in a shell command in a document is one somebody has to remember. The identifier
+half stays a human pass **and the test says so**, because there is no pattern to key on for a name,
+which is exactly how one earlier finding survived the first sweep. Multiple mutations, all red.
 
 
 ### Fixed — a cancelled straggler's caller gets the envelope, not a raw 500

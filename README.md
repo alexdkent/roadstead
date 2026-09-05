@@ -429,6 +429,26 @@ machine" the moment a front door exists. Administer with an `admin` API key, whi
 anywhere and can be revoked, or name the address in `ROADSTEAD_ADMIN_NETS`. `GET
 /rs/v1/admin/config` shows what is trusted and which admin nets are built in versus yours.
 
+Two more consequences of leaving `ROADSTEAD_TRUSTED_PROXIES` empty behind a real proxy, both
+worth naming because they compound rather than just collapsing identity:
+
+- **The collapsed address doesn't just merge every caller — it lands them in the top priority
+  band.** An internal/docker-local address resolves to `P1_TURN_SUPPORT`, the interactive lane
+  (`roadstead/acl.py`). So every internet caller queues ahead of the operator's own background
+  work, not merely alongside it.
+- **The forwarded-address check that would normally stop this fails open in exactly this
+  misconfiguration.** §1.9.2 of `docs/api.md` refuses the legacy self-declare exception to an
+  address that arrived via `X-Forwarded-For` — but that check depends on Roadstead recognizing the
+  request as forwarded at all, and it only does that for a peer in `ROADSTEAD_TRUSTED_PROXIES`
+  (`roadstead/identity.py`). With the setting empty, every hop reads as unforwarded, so
+  `may_self_declare` (`roadstead/legacy.py`) sees "internal, not forwarded" and grants the
+  exception anyway. With `ROADSTEAD_LEGACY_SUBMIT` also enabled, any internet caller can then
+  declare any `agent_id` in the request body and inherit that agent's DRR weight and priority.
+
+Neither of these is a default-open hole — an unfronted Roadstead, or one with the setting
+configured, doesn't have them. They're what "unset behind a real proxy" actually costs, on top of
+the identity collapse above.
+
 ## Managing it — `/rs/v1/admin`
 
 Keys, quotas, and budgets are runtime operations, so enrolling a caller does not mean editing a file

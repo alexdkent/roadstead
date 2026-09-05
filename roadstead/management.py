@@ -129,7 +129,8 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from . import hooks, model_catalog
-from .config import AgentQuotaConfig, EndpointConfig, LLMPriority, env_with_legacy_prefix
+from .config import (AgentQuotaConfig, CANONICAL_ENV_PREFIX, EndpointConfig,
+                     LEGACY_ENV_PREFIX, LLMPriority, env_with_legacy_prefix)
 from .enriched import _error
 from .identity import iso_time
 from .providers import known_engines, provider_for_engine
@@ -2141,6 +2142,17 @@ class ManagementApi:
                 "stored. Set the variable's VALUE with "
                 "POST /rs/v1/admin/providers/{provider}/credential, which is "
                 "write-only and never persisted.", 400)
+        if env_var.upper().startswith(_RESERVED_ENV_PREFIXES):
+            # Echoing this one IS safe: it passed the name pattern above, so it
+            # is a variable NAME and not a pasted credential.
+            return _error(
+                "invalid_request_error",
+                f"api_key_env may not name {env_var} — the "
+                f"{'/'.join(p.rstrip('_') for p in _RESERVED_ENV_PREFIXES)} "
+                f"prefixes are the proxy's own configuration, and a provider "
+                f"credential is never one of them. Setting it through this "
+                f"route would reconfigure the running proxy under an audit "
+                f"record that reads as a credential rotation.", 400)
         if section == "providers":
             refusal = self._provider_address_refusal(name, body, method)
             if refusal is not None:
@@ -2453,6 +2465,22 @@ _CATALOG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 #: field that merely *looked* like it wanted a secret. The rule was right and
 #: nothing enforced its precondition.
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+#: 🚨 Prefixes a CATALOG STANZA may not name. `api_key_env` says which variable
+#: holds a provider's credential, and the credential route then writes it into
+#: this process's environment. Without this, that pair is a general
+#: "set any environment variable" primitive reachable from the admin plane:
+#: `PUT /rs/v1/admin/providers/{name}` declaring `api_key_env:
+#: ROADSTEAD_MODELS_YAML`, then `POST .../credential`, and the catalog loader
+#: reads a path of the caller's choosing on its next load.
+#:
+#: An admin key is a full trust boundary and SECURITY.md says so, so this is not
+#: a privilege boundary — it is blast-radius containment for a STOLEN key, and
+#: an honesty fix for the audit trail: `provider.credential` reads to an
+#: operator as "somebody set the OpenRouter key", which is exactly what an
+#: attacker wants their config mutation to look like. A provider credential has
+#: no business being one of the proxy's own knobs.
+_RESERVED_ENV_PREFIXES = (CANONICAL_ENV_PREFIX, LEGACY_ENV_PREFIX)
 
 
 # ---------------------------------------------------------------------------

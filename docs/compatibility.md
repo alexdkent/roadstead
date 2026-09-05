@@ -3,7 +3,7 @@
 **Adopted 2026-08-31**, when Roadstead stopped being tied to its origin monorepo and stopped
 pretending to be a 1:1 replacement for it.
 
-Until then, "does it match `originfleet.llmproxy`?" was the compatibility question, and a planned
+Until then, "does it match the copy it came from?" was the compatibility question, and a planned
 golden-oracle parity gate was going to answer it. That gate is gone: **a parity check on a
 deliberate superset fails on every improvement**, so it would have measured the wrong thing and
 punished the right work. This document is what replaces it.
@@ -70,7 +70,7 @@ executable**. You cannot quietly drift from it, because the suite reads it.
 
 ## What about the origin monorepo?
 
-It still runs `originfleet.llmproxy` in production, and the two will diverge. That is expected and
+It still runs its own copy in production, and the two will diverge. That is expected and
 is not a defect on either side.
 
 It remains useful as **evidence, not authority**. It serves real traffic across real hardware; this

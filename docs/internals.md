@@ -42,8 +42,8 @@ Four things make it different from every gateway surveyed in `docs/evaluation.md
 
 ## Provenance — and why the authority rule is GONE
 
-This code was extracted on 2026-08-31 from a private monorepo (`OriginFleet`), where it still runs
-in production as `originfleet.llmproxy`. The history here is the real thing — 282 commits at
+This code was extracted on 2026-08-31 from a private monorepo, where it still runs in production.
+The history here is the real thing — 282 commits at
 extraction, going back to `1becf53` (the first commit, 2026-05-27, *"centralized LLM scheduler
 proxy — DRR scheduling, priority bands"*), extracted with `git filter-repo` rather than copied, so `git log`/`git blame` on
 any line still reaches its original rationale. **Use that.** It is the best documentation this project has.
@@ -240,21 +240,23 @@ so it is a worked example that cannot rot. Point `ROADSTEAD_MODELS_YAML` at your
 **Comments throughout this package cite measurements taken on a real fleet under ITS names**
 (`gemma`, `creative`, `tier2-chat`, `llama-thinker`, specific model names). Those are
 records of what was measured — do not "fix" them to match the example, and do not read them as
-references to classes that exist here. 🚨 **The HOST names in the TRACKED TREE are pseudonyms**
-— `nexus`, `nasbox`, `boxa`, `beacon`, `sidekick`, `anvil`/`anvil2` (S7), and `jetty` (the tier2
-llama.cpp/Vulkan box, 2026-09-05). The measurement is real; the machine it names is not, and there
-is nothing to look up. Model and endpoint-class vocabulary was left alone (`laguna` and `deckard`
-are legacy MODEL names, not hosts), so those are still the fleet's own words.
+references to classes that exist here. 🚨 **The HOST names in the TRACKED TREE are pseudonyms.**
+The measurement is real; the machine it names is not, and there is nothing to look up. Model and
+endpoint-class vocabulary was left alone, since that is still the fleet's own words rather than a
+private identifier.
 
-🚨 **The same is NOT yet true of the HISTORY, and S6 was wrong to say it was.** S6 claimed
-host names were pseudonymised "through the whole history"; a fresh check on 2026-09-01 found real,
-currently-resolving host names surviving in thousands of history blobs — including the GPU head node
-now spelled `anvil`, which was also in **eleven tracked files, four of them shipping source**, beside
-a port that turned out to be a live production inference server. The tracked half is fixed. **The
-history half is open and blocks going public** — tracked in the scrub plan held privately in the
-origin monorepo (§ S7), which also records why no guard caught it (`tests/test_scrub_sweep.py`
-reads `git ls-files`, never history) and why the obvious guard cannot simply be written here: it
-needs the list of real names, and putting that list in the repo is the leak.
+🚨 **The same is NOT yet true of the HISTORY, and an earlier pass was wrong to say it was.** A
+rewrite claimed host names were pseudonymised "through the whole history"; a later check found
+that untrue — real, currently-resolving host names survived in history. **The tracked half is
+fixed. The history half is open and blocks going public** — tracked in a scrub plan held privately,
+which also records why no guard caught it (`tests/test_scrub_sweep.py` reads `git ls-files`, never
+history). The guard that *would* catch it cannot be written here: catching a private name means
+having the list of private names, and a repo that ships the list of things it is hiding has not
+hidden them. That is why `tests/test_scrub_sweep.py` inverts the problem instead — it doesn't grep
+for known names, it flags any address literal outside a small allowlisted range (loopback,
+RFC 5737 documentation ranges, the examples this repo actually ships). That catches names nobody
+has thought to enumerate yet, including the next one, and it is why the identifier half above
+stays a human pass: a person can recognize an unlabeled name in a prompt, a grep cannot.
 
 **`providers/` is where engine differences live, and nowhere else.** A provider owns the two things
 backends genuinely disagree about: what a request must look like to be accepted
@@ -698,20 +700,18 @@ that is not the same as no personal data, and the sweep in S5 now runs both patt
 model and endpoint-class vocabulary is not. 🚨 **In the HISTORY they are not — S7 is open and
 blocks publication.**
 
-✅ **S6 is DONE (2026-09-01)** — `git filter-repo` ran over all 322 commits (282 of them
-extracted), rewriting blobs, commit messages *and*, in a second pass, commit metadata: author and
-committer identity is reached by none of the text flags and needs `--mailmap`. 🚨 **Every SHA in this repository
-changed on that date**, so any SHA cited in a document, a branch, or an external reference from
-before it is dead. The citations in this file, `CHANGELOG.md`, `docs/history.md` and
-`docs/roadmap.md` were translated through filter-repo's `commit-map` and now carry a date and
+✅ **An earlier rewrite pass is DONE (2026-09-01)** — `git filter-repo` ran over the full commit
+history, rewriting blobs, commit messages *and*, in a second pass, commit metadata: author and
+committer identity is reached by none of the text flags and needs `--mailmap`. 🚨 **Every SHA in
+this repository changed on that date**, so any SHA cited in a document, a branch, or an external
+reference from before it is dead. The citations in this file, `CHANGELOG.md`, `docs/history.md`
+and `docs/roadmap.md` were translated through filter-repo's `commit-map` and now carry a date and
 subject as well, so the next rewrite cannot orphan them silently.
 
-🚨 **S7 is OPEN, and it is the ONLY thing still blocking publication.** S6's claim to have
-pseudonymised host names "through the whole history" did not hold: real, currently-resolving names
-survive in history, and one of them — the GPU head node, now `anvil` — was in eleven **tracked**
-files, four of them shipping source, next to a port belonging to a live production inference server.
-**The tracked-tree half is closed as of 2026-09-01**; the history half needs a second `filter-repo`
-pass that will change every SHA again and force the citations above to be re-pointed a second time.
-Full account, including the fresh sweep and why the obvious guard cannot be written in-repo, in
-the privately-held scrub plan § S7. 🚨 **Do not read "S6 is DONE" as "the history is
-clean".**
+🚨 **A further pass is OPEN, and it is the ONLY thing still blocking publication.** The earlier
+pass's claim to have pseudonymised host names "through the whole history" did not hold: real,
+currently-resolving names survive in history. **The tracked-tree half is closed as of 2026-09-01**;
+the history half needs a second `filter-repo` pass that will change every SHA again and force the
+citations above to be re-pointed a second time. Full account, including the fresh sweep and why the
+obvious guard cannot be written in-repo, lives in a privately-held scrub plan. 🚨 **Do not read
+"the tracked tree is clean" as "the history is clean".**

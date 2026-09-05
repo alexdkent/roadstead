@@ -906,42 +906,32 @@ was written, surfaced in two views, and read for no decision.
 ### Cross-cutting · The scrub
 
 Tracked privately in the origin monorepo; the half a contributor needs is the scrub rule in
-`CONTRIBUTING.md`. Gates the open-source goal. **S2 is done** (2026-08-31), together with
-the catalog redesign it shared its work with — and it turned up a second inventory nobody had listed,
-`usage_rates.py`, which is now anchored to model classes rather than to one fleet's models.
+`CONTRIBUTING.md`. Gates the open-source goal. Several inventories that carried private topology or
+fleet-specific rosters have been generalized to model classes and caller archetypes instead — the
+same treatment `models.yaml` gets as a worked example.
 
-**S1 and S3 are done** (2026-09-01), with Workstream B, which is what made S1 possible: removing the
-address seeds needed an identity mechanism to remove them *in favour of*. The working tree is clean
-of private topology. It also turned up a fourth inventory nobody had listed — `agents.yaml` shipped
-one fleet's agent roster with weekly volumes and infra paths — which is now a generic example on the
-caller archetypes named above, exactly as `models.yaml` is.
+**The structured-output corpus has been swept for real identifiers as well as topology** — it
+corrected an earlier assumption that ruling out a bulk data leak was the same as ruling out personal
+data, which it is not. The straggler sweep looks for both kinds of leak now.
 
-**S4 is done** (2026-09-01): the structured-output corpus keeps every fixture and loses the
-vocabulary around them — and it corrected this plan's own headline finding, which had ruled personal
-data out of the repo on the strength of no bulk corpus having come across. The synthesized prompts
-were written around real identifiers. The straggler sweep now looks for both.
+**The address half of the sweep runs on every commit** as `tests/test_scrub_sweep.py`. 🚨 **Two
+patterns, not one.** A topology grep can never find a person's name typed into an example prompt —
+that half is, and stays, a human pass; there is no fixed string to key on the way there is for an
+address.
 
-**S5 is done** (2026-09-01), and its topology half now runs on every commit as
-`tests/test_scrub_sweep.py`. 🚨 **Two patterns, not one.** The topology grep could never have found a
-person's name typed into an example prompt, and S4 found exactly that, so the identifier half is a
-human pass — there is no fixed string to key on.
+✅ **A history rewrite has run once already**, over the full commit history, rewriting blobs,
+messages, and — in a required second pass — author/committer identity, since none of the
+text-rewriting flags reach that. 🚨 **Every SHA in this repository changed** when it ran, so any
+SHA cited in a document or an external reference from before that date is dead; citations in this
+plan and elsewhere were re-pointed through the rewrite's commit map so a future rewrite doesn't
+orphan them again.
 
-**S6 — the history rewrite — is done** (2026-09-01), over all 321 commits. Two corrections to what
-this section used to say about it, both found by doing it:
-
-- 🚨 **`--replace-text` is blobs only.** The plan's one-liner would have left all 321 commit
-  messages untouched, and the messages are the *richer* surface — 282 of them were written inside
-  the origin monorepo. `--replace-message` takes the same file.
-- 🚨 **Every SHA in this repository changed**, this document's own `455e736` included. The citations
-  were translated through filter-repo's `commit-map` and now carry a date and subject too, so a
-  future rewrite cannot orphan them silently. Two SHAs in `docs/evaluation.md` turned out never to
-  have been commits here at all — they cite the origin monorepo.
-
-**Commit metadata took a second pass** the same day: `--replace-text` reaches blobs, `--replace-
-message` reaches messages, and *neither* reaches author or committer identity. A `--mailmap` run
-normalised all 322 commits onto one public address — and turned up a second private hostname nobody
-had flagged, on 103 commits. 🚨 **A sweep over tracked files cannot see the author line**, which is
-why that one survived every check until somebody looked directly at it.
+🚨 **A further rewrite pass is still open, and it is the ONLY thing blocking publication.** The
+first pass's claim to have pseudonymised host names through the whole history did not hold —
+real, currently-resolving names still survive there, found only because somebody looked directly
+rather than trusting a sweep that can see tracked files but not history or the author line. Full
+account of what was found and why the obvious automated guard cannot be written in-repo: the
+privately-held scrub plan.
 
 ⚠️ **What remains is a visibility decision, and it is not this plan's to make.**
 

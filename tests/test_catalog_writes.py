@@ -429,3 +429,59 @@ async def test_an_unknown_provider_is_a_404(tmp_path):
     r = await svc.handle_admin_provider_models(
         _Req(path_params={"provider": "nope"}))
     assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# The catalog is not a channel for setting the proxy's own environment
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reserved", [
+    "ROADSTEAD_MODELS_YAML",
+    "ROADSTEAD_REQUIRE_API_KEY",
+    "ROADSTEAD_ADMIN_NETS",
+    "roadstead_data_dir",          # case does not buy you the prefix
+    "LLM_PROXY_ACL",               # the retired spelling is still read
+])
+async def test_api_key_env_may_not_name_one_of_the_proxys_own_knobs(
+        tmp_path, reserved):
+    """🚨 Found by an adversarial pre-publication review, 2026-09-05.
+
+    `api_key_env` names the variable holding a provider's credential, and
+    `POST .../credential` then writes that variable into THIS process's
+    environment. Chained, and with no restriction on the name, that pair is a
+    general "set any environment variable" primitive reachable from the admin
+    plane — the reviewer drove it to `ROADSTEAD_MODELS_YAML` and the catalog
+    loader read a path of their choosing on the next load.
+
+    This is deliberately NOT claimed as a privilege boundary. `SECURITY.md`
+    accepts that an admin key is full trust, and the reviewer also measured that
+    flipping `ROADSTEAD_REQUIRE_API_KEY` this way is INERT, because the resolver
+    reads it once at construction. Two things are still worth having:
+
+    * blast-radius containment for a key that has been STOLEN rather than
+      issued, and
+    * an honest audit trail. Before this, the chain recorded as
+      ``provider.credential / env_var: ROADSTEAD_MODELS_YAML`` — which reads to
+      an operator exactly like "somebody rotated the OpenRouter key". A config
+      mutation that disguises itself as a credential rotation is the part worth
+      refusing outright.
+    """
+    svc = _svc(tmp_path)
+    r = await _put(svc, "providers", "evil", {
+        "engine": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": reserved})
+    assert r.status_code == 400, r.body
+    assert "may not name" in r.body.decode()
+    # Nothing was stored, so the credential route has no stanza to act through.
+    assert "evil" not in model_catalog.load_catalog().providers
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_provider_variable_is_still_accepted(tmp_path):
+    """The guard is a prefix rule, not a new hurdle for real providers."""
+    svc = _svc(tmp_path)
+    r = await _put(svc, "providers", "openrouter-2", {
+        "engine": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY_2"})
+    assert r.status_code == 200, r.body

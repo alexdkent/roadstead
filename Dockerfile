@@ -65,24 +65,30 @@ COPY roadstead/ roadstead/
 # The default; `docker stop` sends it anyway. Stated so the image documents it.
 STOPSIGNAL SIGTERM
 
-# 🚨 STAYS ROOT — a considered trade-off, not an oversight. The only real
-# deployment of this image today bind-mounts a ZFS path (`ROADSTEAD_DATA_DIR`)
-# that is owned by root on the host, inside an unprivileged LXC — so the host
-# side of that mount cannot be re-owned to a container UID without the
-# operator's cooperation, and a bind mount's permissions come from the HOST,
-# not from anything `chown`ed at image-build time. Flipping the default user
-# here would not make the image "more non-root" for that deployment; it would
-# just make `/var/lib/roadstead` unwritable the next time the image is
-# rebuilt, silently, on a path nobody is watching for a permissions error.
+# 🚨 RUNS AS ROOT BY DEFAULT, and you should probably change that.
 #
-# The two ways to actually get non-root without that landmine both need action
-# OUTSIDE this file: (a) `chown` the host-side data directory to a fixed
-# container UID before the next `up`, or (b) `chmod 0777` it — no sticky bit,
-# since it holds one app's data, not several tenants' — and either is a
-# decision for whoever owns that host path, not a default this image can pick
-# for them. Until one of those happens, HEALTHCHECK below is the hardening
-# that ships unconditionally; non-root is tracked as needing the deployment's
-# cooperation, not blocked on code here.
+# Say it plainly because it is the image's weakest property: any RCE or
+# container escape lands as uid 0. It is the default because a bind mount takes
+# its permissions from the HOST, not from anything `chown`ed at build time — so
+# an image that switched to a non-root UID on its own would simply make
+# `ROADSTEAD_DATA_DIR` unwritable for every existing deployment, silently, on a
+# path nobody is watching for a permissions error. That is a worse failure than
+# the one it fixes, and it is not a decision an image can take for the host.
+#
+# To run it non-root — recommended for any deployment that can:
+#
+#     chown -R 65532:65532 /path/to/roadstead-data      # once, on the HOST
+#     docker run --user 65532:65532 --stop-timeout 108 \
+#       -v /path/to/roadstead-data:/var/lib/roadstead roadstead
+#
+# `--chmod 0777` on the host directory works too and needs no fixed UID; there
+# is no sticky bit to worry about, since it holds one application's data rather
+# than several tenants'. Nothing in the process needs root: it binds 42161
+# (above 1024), writes only under ROADSTEAD_DATA_DIR, and opens no raw sockets.
+#
+# This default is expected to flip once the data-directory contract can carry
+# ownership with it. Until then HEALTHCHECK below is the hardening that ships
+# unconditionally.
 EXPOSE 42161
 
 # Liveness, not readiness: `/health` fails OPEN on a dead BACKEND by design

@@ -1021,6 +1021,15 @@ _AGENT_CONFIG_FIELDS = frozenset({
 
 
 
+#: The two spellings of a configuration variable. Named rather than
+#: inlined because `management.py` needs to REFUSE the legacy prefix in
+#: `api_key_env` without spelling it — `tests/test_env_var_naming.py`
+#: fails any module outside this one that writes the literal, which is
+#: the guard that keeps the documented name from going silently inert.
+CANONICAL_ENV_PREFIX = "ROADSTEAD_"
+LEGACY_ENV_PREFIX = "LLM_PROXY_"
+
+
 def env_with_legacy_prefix(name: str, default: str | None = None) -> str | None:
     """Read ``ROADSTEAD_<name>``, falling back to pre-rename ``LLM_PROXY_<name>``.
 
@@ -1041,10 +1050,10 @@ def env_with_legacy_prefix(name: str, default: str | None = None) -> str | None:
     `config` is imported by the entry point, so the reverse direction would be a
     cycle, and a second copy is how the two spellings drift apart again.
     """
-    val = os.environ.get("ROADSTEAD_" + name)
+    val = os.environ.get(CANONICAL_ENV_PREFIX + name)
     if val is not None:
         return val
-    legacy = os.environ.get("LLM_PROXY_" + name)
+    legacy = os.environ.get(LEGACY_ENV_PREFIX + name)
     if legacy is not None:
         logging.getLogger(__name__).warning(
             "LLM_PROXY_%s is the pre-rename spelling; it is still honoured, "
