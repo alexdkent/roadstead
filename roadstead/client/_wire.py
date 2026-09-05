@@ -73,7 +73,12 @@ PAYLOAD_TYPES: frozenset[str] = frozenset({
 # Error codes — docs/api.md §2.1
 # ---------------------------------------------------------------------------
 
-#: Every code the proxy emits. Fifteen (a common under-count is eight).
+#: Every code the proxy emits. Seventeen (a common under-count is eight, and
+#: this file itself under-counted at fifteen until 2026-09-05: the correction
+#: layer's two codes reach the wire through a passthrough in ``lifecycle.py``
+#: rather than a handler that names them, so no reading of the server's error
+#: HANDLERS finds them. ``tests/test_error_codes_published.py`` walks the whole
+#: package for assignments instead, which is the only reading that can).
 ERROR_CODES: frozenset[str] = frozenset({
     "backpressure",
     "circuit_open",
@@ -90,6 +95,8 @@ ERROR_CODES: frozenset[str] = frozenset({
     "vision_not_supported",
     "on_demand_unavailable",
     "structured_invalid_json",
+    "schema_invalid",
+    "toolcall_truncated",
 })
 
 #: Codes a caller should DEFER on: retry later, or hand the work to a queue.
@@ -106,6 +113,17 @@ DEFERRABLE_CODES: frozenset[str] = frozenset({
     "proxy_timeout",
     "backend_error",
     "on_demand_unavailable",
+    # 🚨 A truncation, not a refusal — §2.1's row says raise the output budget
+    # and retry, and §2.2 has said so of the same fault under its marker name
+    # since before this code existed. It was absent from ERROR_CODES entirely
+    # until 2026-09-05, and `deferrable` reads an unknown code as non-deferrable
+    # without consulting the prose, so this SDK threw away a tool call the next
+    # attempt would have completed.
+    "toolcall_truncated",
+    # `schema_invalid` is deliberately NOT here: the proxy repaired, then
+    # retried once with the validation error fed back, and the model failed the
+    # schema anyway. §2.1 — the caller must change the schema, not the clock.
+    # Its sibling `structured_invalid_json` is out for the same reason.
 })
 
 #: §2.2 — the legacy marker substrings, matched case-insensitively against the
