@@ -1947,6 +1947,29 @@ reachable only from the admin nets, and gate it there. That is the shape `SECURI
 for around the admin plane, and it is why an open analytics route is a documented decision to
 disagree with rather than a finding to report.
 
+🚨 **Two fields are exempt, because the argument above does not cover them.** "Identities and
+arithmetic" is accurate for the whole family except `GET /v1/status`'s
+`reliability.admin_ips_seen` (the source addresses seen on admin routes) and
+`reliability.placeholder_bearers.by_address` (the addresses of callers presenting a credential that
+means nothing). Those are ADDRESSING, and specifically the addressing of the privileged callers and
+the weakly-credentialled ones — a target list and a shortlist of who to try first, from one
+unauthenticated GET. Since 2026-09-05 they degrade for any caller who could not reach the admin
+plane from where they are standing:
+
+| field | admin-net caller | anyone else |
+|---|---|---|
+| `admin_ips_seen` | `{route: [addresses]}` | `{route: count}` |
+| `placeholder_bearers` | `{count, by_address}` | `{count, by_address_count}` |
+
+The route stays open and still answers — this is a redaction of two fields, not a narrowing of the
+family. The counts are what the fields are read for: an ACL-tightening go/no-go asks *has anything
+but me touched an admin route*, and the placeholder inventory asks *is it empty yet*. Both are
+answered without naming anyone. The predicate is the admin plane's own NETWORK gate
+(`acl.may_reach_admin`), not a credential check, so the operator reading status on the box still
+sees the addresses — and a FORWARDED address never counts as on-box, so the reverse-proxy collapse
+in the README cannot hand a stranger the list by arriving through a sidecar.
+Pinned by `tests/test_status_address_disclosure.py`.
+
 Seven routes the code shipped and this document did not: the live board, the history and series
 charts, the calibration state, the two fleet rollups that are not in §3.6, and the per-caller stall
 lookup. Transcribed from the handlers 2026-09-05, and — unlike §3.11 — **pinned in both directions**

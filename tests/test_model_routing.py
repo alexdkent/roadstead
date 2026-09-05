@@ -34,7 +34,7 @@ def test_requested_model_wins_when_known_and_different():
     })
     # tier2 (30B) fully decommissioned 2026-07-03; after the 2026-07-11
     # boxa one-model consolidation its legacy alias (like classify/analyst/vision)
-    # resolves to the `tier2` endpoint (boxa :9196), not a distinct endpoint.
+    # resolves to the `tier2` endpoint, not a distinct endpoint.
     assert ep == "tier2"  # routed to tier2, not tier3
 
 

@@ -73,8 +73,7 @@ def extract_cached_tokens(usage: Any) -> int | None:
 
     🚨 CORRECTED 2026-08-20 — this docstring said "llama.cpp does NOT emit any
     such field". IT DOES, on every build we run. Measured directly against all
-    three llama.cpp backends (tier1 :9091, tier2-analyst :9196, tier2-chat
-    :30000): each returns ``prompt_tokens_details: {"cached_tokens": N}``, and
+    three llama.cpp backends (tier1, tier2-analyst, tier2-chat): each returns ``prompt_tokens_details: {"cached_tokens": N}``, and
     the live ``/v1/fleet/cache-attribution`` rollup attributes them 321/321,
     37/37 and 5/7 respectively. The function was always correct — it keys on the
     SHAPE, not the backend — but the comment would have talked a reader out of

@@ -1215,7 +1215,7 @@ class Correction:
         BANNED (``EndpointConfig.disable_any_whitespace``, mirrored from the serve
         script — the proxy cannot introspect a launch flag).
 
-        WHY (measured live 2026-08-01, tier3 = vLLM on anvil:9083). tier3 restarted
+        WHY (measured live 2026-08-01, tier3 = a vLLM backend). tier3 restarted
         2026-07-31 15:06:52 UTC with ``--structured-outputs-config
         '{"backend":"guidance","disable_any_whitespace":true}'``. That flag is
         load-bearing — without it structured output runs away emitting whitespace

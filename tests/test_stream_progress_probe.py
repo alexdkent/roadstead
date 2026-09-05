@@ -310,7 +310,7 @@ vllm:prompt_tokens_total{engine="0",model_name="m"} 7815245.0
 vllm:generation_tokens_total{engine="0",model_name="m"} 358688.0
 """
 
-# Real shape, copied from the live boxa (nasbox:9196). Note `n_decode_total`
+# Real shape, copied from a live llama.cpp backend. Note `n_decode_total`
 # carries no labels and no `tokens_total` substring — an earlier cut of this
 # parser filtered on `"tokens_total" in line` and would have dropped it.
 _LLAMACPP = """# HELP llamacpp:prompt_tokens_total x

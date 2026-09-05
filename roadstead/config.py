@@ -433,7 +433,7 @@ class EndpointConfig:
 
     # When True, the capacity poller probes ONLY /health for this endpoint —
     # no /props, /v1/models, or vLLM capacity discovery. For non-OpenAI
-    # FastAPI shims (embed :9087, rerank :9084) that have neither route:
+    # FastAPI shims (the embed and rerank roles) that have neither route:
     # without this they 404 both discovery probes every 10s forever (httpx
     # log spam + a consecutive_failures counter that cycles 1-2-3-reset and
     # never means anything). max_slots/context stay config-seeded.

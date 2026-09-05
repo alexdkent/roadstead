@@ -545,6 +545,21 @@ class ProxyHttpHandlers:
         return Response(render_prometheus(out),
                         media_type="text/plain; version=0.0.4")
     async def handle_status(self, request: Request) -> Response:
+        # Open route, two address-bearing FIELDS that are not — see the notes
+        # in `reliability` below.
+        #
+        # The predicate is the admin plane's own NETWORK gate, not
+        # `admin_denial`: the question here is "is this caller already on a box
+        # that may reach the admin plane", not "did they present an admin
+        # credential". Using the credential check would take the addresses away
+        # from the operator reading status on the machine itself, which is the
+        # one caller the fields exist for. `may_reach_admin` also honours
+        # ROADSTEAD_ADMIN_NETS and refuses a FORWARDED address, so the
+        # reverse-proxy collapse the README warns about cannot hand a stranger
+        # the operator's IP list by arriving through a sidecar.
+        _addr = self.state.identity.client_address(request)
+        _admin = self.state.identity.acl.may_reach_admin(
+            _addr.ip, trust_builtin_nets=not _addr.forwarded)
         now = time.monotonic()
         endpoints = {}
         for ep_name in self.state.config.endpoints:
@@ -679,8 +694,16 @@ class ProxyHttpHandlers:
                 "poller_alive": self.health.poller_alive(),
                 # Source IPs seen on admin-ish routes since boot — the
                 # ACL-tightening go/no-go reads this instead of grepping logs.
+                # 🚨 ADDRESSES ONLY FOR AN ADMIN CALLER. This route is open by
+                # design (docs/api.md §3.12: "identities and arithmetic, never a
+                # payload"), and that argument does not cover this field — it is
+                # ADDRESSING, and specifically the addressing of the privileged
+                # callers, which is a target list for anyone who can reach the
+                # port. An unauthenticated reader gets the per-route COUNT, which
+                # is what the go/no-go actually needs ("has anything but me hit
+                # an admin route?"), and none of the addresses.
                 "admin_ips_seen": {
-                    route: sorted(ips)
+                    route: (sorted(ips) if _admin else len(ips))
                     for route, ips in self.state.admin_ips_seen.items()
                 },
                 # Unknown-endpoint submits since boot (shadow counter for the
@@ -696,7 +719,19 @@ class ProxyHttpHandlers:
                 # declared placeholder bearer (see `identity.BearerPlaceholders`).
                 # The other migration inventory: the shim comes out when this
                 # stays empty, not on a date.
-                "placeholder_bearers": self.state.placeholder_bearers,
+                # 🚨 `by_address` names the callers still authenticating with a
+                # literal that means nothing — a weak-credential list — so it is
+                # admin-only for the same reason as `admin_ips_seen` above. The
+                # `count` is what the inventory is read for and stays open;
+                # `by_address_count` keeps "how many distinct callers" without
+                # naming them.
+                "placeholder_bearers": (
+                    self.state.placeholder_bearers if _admin else {
+                        "count": self.state.placeholder_bearers.get("count", 0),
+                        "by_address_count": len(
+                            self.state.placeholder_bearers.get("by_address", {})),
+                    }
+                ),
                 # Context-gate hits since boot (shadow counter for the
                 # context_gate_enforce flip check — compare against actual
                 # backend overflow errors before flipping).

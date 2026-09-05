@@ -62,7 +62,7 @@ async def test_shadow_counts_but_admits():
     _ok_backend(svc)
     await svc.startup()
     try:
-        # chat (-> tier2, jetty :30000, since the 2026-08-19 tier2 split;
+        # chat (-> tier2, since the 2026-08-19 tier2 split;
         # 262144/slot). ~300K tokens ≈ 1.2M chars blows it. The old numbers here
         # (600K chars against tier2's 65536) went with the alias.
         resp = await asyncio.wait_for(

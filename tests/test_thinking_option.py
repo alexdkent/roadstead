@@ -381,7 +381,7 @@ def test_apply_thinking_is_called_before_the_stream_branch():
 # ===========================================================================
 # The template-KEY contract. Added 2026-08-22 after the tier3 cutover, because
 # "thinking works" had only ever been verified by calling vLLM DIRECTLY on
-# :9083 — which bypasses the proxy, and the proxy is what constructs the
+# the backend directly — which bypasses the proxy, and the proxy is what constructs the
 # switch. A layer test is not a journey test.
 #
 # The failure this pins is SILENT: the server pins a default

@@ -15,8 +15,15 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # 🚨 A pushed `v*` tag is the only trigger, and it carries a long-lived
+    # PyPI token. A tag is cheap to create and easy to create by accident, so
+    # the job waits on an approval configured against this environment rather
+    # than publishing on the push alone. Configure required reviewers on the
+    # `pypi` environment in repo settings — declaring it here does nothing on
+    # its own. Remove this once trusted publishing (OIDC) replaces the token.
+    environment: pypi
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # setuptools reads the version out of `pyproject.toml`, not out of
           # git — but the release body is extracted from CHANGELOG.md and the
@@ -24,7 +31,7 @@ jobs:
           # depth-1 tip that would make a future history check vacuous.
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
           cache: pip
@@ -82,13 +89,17 @@ jobs:
       - name: Publish to PyPI
         # Token auth, not trusted publishing: the repository is not public yet,
         # so the OIDC publisher cannot be configured against it. Swap this for
-        # `id-token: write` and no `password:` once it is.
-        uses: pypa/gh-action-pypi-publish@release/v1
+        # `id-token: write` and no `password:` once it is — that removes the
+        # long-lived secret entirely and is the real fix. Until then the job
+        # runs in the `pypi` environment, so a pushed tag needs an approval
+        # before anything reaches the index: a tag is a weak trigger to hang a
+        # publishing credential on by itself.
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
 
       - name: Publish the GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           body_path: release-body.md
           files: |

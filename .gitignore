@@ -11,3 +11,18 @@ htmlcov/
 *.db-wal
 *.db-shm
 .DS_Store
+
+# Credential material. Nothing here has ever been committed (the tree is clean),
+# and this list exists so that stays true by construction rather than by care:
+# CONTRIBUTING's rule is that deleting a line today leaves it one `git log -p`
+# away, so the cheap guard is never adding it.
+*.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+keys.yaml

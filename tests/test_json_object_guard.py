@@ -1,7 +1,7 @@
 """A bare `response_format:{"type":"json_object"}` returns literally `{}` on a
 backend launched with structured-output whitespace banned.
 
-tier3 (vLLM, anvil:9083) restarted 2026-07-31 15:06:52 UTC with
+tier3 (a vLLM backend) restarted 2026-07-31 15:06:52 UTC with
 ``--structured-outputs-config '{"backend":"guidance","disable_any_whitespace":true}'``.
 That flag is load-bearing — without it structured output runs away emitting
 whitespace until max_tokens — but with whitespace banned, the two-character
