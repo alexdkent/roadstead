@@ -20,8 +20,9 @@ Breaking changes are allowed here; they must be deliberate and written down. Bef
 anything in the 🔒 **stable** column of `docs/compatibility.md` (the wire contract in `docs/api.md`:
 route names, error codes, marker substrings, published constants), read that document's "How to make
 a breaking change" section. In short: make the change, explain why in the commit message, add a
-`CHANGELOG.md` entry under `### Breaking`, and update `docs/api.md` in the same commit if it
-invalidates something there — several tests read that document back and will fail otherwise.
+`CHANGELOG.md` entry under `## Unreleased` in a `### Breaking` subsection (add that heading if the
+release has not needed one yet), and update `docs/api.md` in the same commit if it invalidates
+something there — several tests read that document back and will fail otherwise.
 
 ## The scrub rule
 

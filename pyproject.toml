@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "roadstead"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Capacity-aware admission control for self-hosted LLM inference fleets (llama.cpp + vLLM), without Kubernetes."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -51,6 +51,10 @@ dev = [
   "pytest-asyncio>=0.23",
   "pytest-timeout>=2.3",
   "build>=1.2",
+  # `build` already pulls it in; named anyway because a test reads the version
+  # in `pyproject.toml` back through it, and a transitive dependency that stops
+  # being transitive fails as a collection error rather than as a missing dep.
+  "packaging>=23.0",
 ]
 
 [project.scripts]
