@@ -635,18 +635,33 @@ class ProxyState:
 
         Fully guarded: any fault falls back to the raw advice so timeout
         resolution can never 500 a request. Adds ``surge`` / ``size_stretch`` /
-        ``ceiling_s`` to the dict for observability."""
+        ``ceiling_s`` to the dict for observability.
+
+        ``floor_s`` handed to ``resolve_ceiling_s`` is ``max(class floor,
+        decode-rate floor)``, not the class floor alone — ``resolve_ceiling_s``
+        already promises "never below floor_s", but until this lifted the
+        decode floor into that argument the promise only covered the CLASS
+        floor, so a tight interactive band (600s) could still clip a
+        physically-necessary deadline back down below what ``advise()`` had
+        just floored it to. That is the reported bug, one layer further down
+        the same caller-facing path this method feeds: ``GET
+        /v1/timeout-advice`` and the real dispatch deadlines both consume this
+        return value, not raw ``advise()``. The decode floor is itself
+        bounded at ``_BACKGROUND_CEILING_S`` (``decode_rate_floor_ms``), so
+        this can never lift the ceiling past that absolute bound either."""
         from .timeout_model import apply_load_and_ceiling, resolve_ceiling_s
 
         advice = self.timeout_model.advise(endpoint, priority, est_in, est_out)
         try:
             snap = self.scheduler.endpoint_snapshot(normalize_endpoint(endpoint))
             floor_s = self.timeout_model.floor_ms(endpoint) / 1000.0
+            decode_floor_s = self.timeout_model.decode_floor_ms(
+                endpoint, est_out) / 1000.0
             ceiling_s = resolve_ceiling_s(
                 endpoint,
                 interactive=int(priority) <= 2,  # P0/P1/P2 (see LLMPriority)
                 role_ceilings=self.timeout_ceilings,
-                floor_s=floor_s,
+                floor_s=max(floor_s, decode_floor_s),
                 interactive_s=self.config.timeout_ceiling_interactive_s,
                 background_s=self.config.timeout_ceiling_background_s,
             )

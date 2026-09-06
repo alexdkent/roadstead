@@ -12,8 +12,17 @@ summary. The bullets below link in there where the long version is worth reading
 
 ## Unreleased
 
-Nothing yet. Entries go under `### Breaking`, `### Added`, `### Changed`, `### Fixed` or
-`### Documented`; add the heading you need rather than keeping an empty one.
+### Fixed
+
+- **`GET /v1/timeout-advice` could recommend a deadline below the physical decode time of the
+  output being asked for** — a sparse/thin high-`est_out` bucket could never accumulate the
+  `status=="ok"` samples that would have corrected it, because every call at that size timed out.
+  `TimeoutModel.advise()` now floors `recommended` at `(est_out / token_speed) * margin` for any
+  endpoint with a declared `token_speed` (new, optional `models.yaml` endpoint field — a fleet
+  measurement, absent by default, so an endpoint nobody profiled is unaffected). The same floor is
+  threaded into `effective_timeout_advice`'s ceiling resolution, so an INTERACTIVE call's tighter
+  600s band cannot clip the deadline back down below what decode alone requires — closing the same
+  bug on the caller-facing path, not just the raw advice.
 
 ## 0.1.1 — 2026-09-06
 

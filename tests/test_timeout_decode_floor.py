@@ -31,6 +31,20 @@ lattice walk. The rate comes from ``models.yaml`` ``token_speed``
 (``model_catalog.build_class_decode_rates``) — a fleet measurement, never a
 number invented here — so a class nobody profiled gets floor 0.0, i.e. no
 floor, i.e. unchanged behaviour.
+
+THE SAME BUG, ONE LAYER DOWN
+=============================
+Fixing ``advise()`` was not the end of it: ``ProxyState.effective_timeout_advice``
+(the method behind ``GET /v1/timeout-advice`` and the real dispatch deadlines)
+uplifts ``advise()``'s answer and then CLIPS it at a per-caller-class ceiling
+(``apply_load_and_ceiling``'s ``min(recommended_ms * surge * stretch,
+ceiling_ms)``). ``resolve_ceiling_s`` already promises "never below floor_s" —
+but until this closed, the only floor it was ever told about was the CLASS
+floor, so an INTERACTIVE call (600s band) whose decode floor exceeds 600s got
+its already-floored `advise()` answer clipped straight back down below what
+decode requires. The fix: pass ``floor_s=max(class_floor_s, decode_floor_s)``
+into ``resolve_ceiling_s``, using the new ``TimeoutModel.decode_floor_ms``
+accessor. See the tests under "effective_timeout_advice" below.
 """
 from __future__ import annotations
 
@@ -40,6 +54,7 @@ from roadstead.timeout_model import (
     TimeoutModel,
     _BACKGROUND_CEILING_S,
     _DECODE_FLOOR_MARGIN,
+    _INTERACTIVE_CEILING_S,
     decode_rate_floor_ms,
 )
 
@@ -240,3 +255,98 @@ def test_token_speed_is_parsed_and_filtered_like_every_other_class_field():
     assert rates["ghost"] == 26.6
     # tier1 in the shipped example declares no token_speed.
     assert "tier1" not in rates
+
+
+# ---------------------------------------------------------------------------
+# effective_timeout_advice — the ceiling has to know about the decode floor
+# too, or the caller-facing path clips the very deadline advise() just floored
+# ---------------------------------------------------------------------------
+
+def _proxy_state_with_token_speed(endpoint: str, token_speed: float):
+    """Build a real ``ProxyState`` with ``token_speed`` layered onto
+    ``endpoint`` via the runtime overlay — this exercises the actual
+    ``model_catalog -> state.py -> TimeoutModel`` seam, not a stand-in."""
+    from roadstead import model_catalog
+    from roadstead.config import ProxyConfig
+    from roadstead.state import ProxyState
+
+    model_catalog.set_runtime_overlay(
+        {"endpoints": {endpoint: {"token_speed": token_speed}}})
+    try:
+        return ProxyState(ProxyConfig())
+    finally:
+        model_catalog.set_runtime_overlay(None)
+
+
+def test_an_interactive_calls_ceiling_lifts_to_cover_the_decode_floor():
+    """The reported bug, one layer further down the caller-facing path.
+
+    tier2's interactive band is 600s (``_INTERACTIVE_CEILING_S``, no per-role
+    override for tier2). 15,000 tokens at 26.6 tok/s needs ~705s with the
+    decode-floor margin — MORE than the interactive band — so an unfixed
+    ``effective_timeout_advice`` clips it back to 600s: a deadline decode
+    alone cannot meet, on the P0_REALTIME priority every real-time chat call
+    uses. This goes through ``effective_timeout_advice`` itself (not
+    ``advise()``), because that is the layer the fix actually lives in."""
+    from roadstead.config import LLMPriority
+
+    st = _proxy_state_with_token_speed("tier2", _TIER2_ANALYST_TOK_S)
+    est_out = 15_000
+    advice = st.effective_timeout_advice(
+        "tier2", int(LLMPriority.P0_REALTIME), 4_000, est_out)
+
+    pure_decode_s = est_out / _TIER2_ANALYST_TOK_S
+    assert advice["recommended_timeout_s"] >= pure_decode_s, (
+        f"the interactive ceiling clipped a decode-necessary deadline: "
+        f"{advice['recommended_timeout_s']}s < {pure_decode_s:.0f}s of pure "
+        "decode")
+    # The ceiling itself had to lift, not just recommended_ms happening to
+    # land under an unlifted one — prove the mechanism, not the coincidence.
+    assert advice["ceiling_s"] > 600.0, (
+        f"ceiling_s ({advice['ceiling_s']}) never lifted past the "
+        "interactive band — the floor never reached resolve_ceiling_s")
+
+
+def test_a_background_calls_ceiling_is_unaffected_it_was_already_1800s():
+    """Background priority already gets the 1800s band, which already covers
+    any bounded decode floor — this closes the loop only for INTERACTIVE
+    calls; a background call's ceiling should be untouched by the fix."""
+    from roadstead.config import LLMPriority
+
+    st = _proxy_state_with_token_speed("tier2", _TIER2_ANALYST_TOK_S)
+    advice = st.effective_timeout_advice(
+        "tier2", int(LLMPriority.P3_INGESTION), 4_000, 15_000)
+    assert advice["ceiling_s"] == _BACKGROUND_CEILING_S
+
+
+def test_an_absurd_interactive_ask_is_bounded_not_rejected():
+    """A decode floor past 1800s describes a request that is genuinely
+    impossible under any policy. This does not invent a rejection path for
+    that — it stays bounded at the same absolute ceiling every other path
+    respects, and HONEST about it: `decode_floor_applied_ms` still reports
+    the (capped) floor that was applied, so a caller or dashboard can see the
+    ask exceeded what any deadline could satisfy, rather than the cap being
+    silently indistinguishable from a normal large-but-satisfiable one."""
+    from roadstead.config import LLMPriority
+
+    st = _proxy_state_with_token_speed("tier2", 1.0)  # deliberately slow
+    advice = st.effective_timeout_advice(
+        "tier2", int(LLMPriority.P0_REALTIME), 4_000, 100_000_000)
+    assert advice["recommended_timeout_s"] == int(_BACKGROUND_CEILING_S)
+    assert advice["ceiling_s"] == _BACKGROUND_CEILING_S
+    assert advice["decode_floor_applied_ms"] == _BACKGROUND_CEILING_S * 1000.0
+
+
+def test_absent_rate_leaves_effective_timeout_advice_unchanged():
+    """The same compatibility guarantee, at this layer: an endpoint with no
+    ``token_speed`` gets ``decode_floor_s == 0.0``, so
+    ``max(class_floor_s, 0.0) == class_floor_s`` and ``resolve_ceiling_s``
+    resolves exactly as it did before this fix existed."""
+    from roadstead.config import LLMPriority, ProxyConfig
+    from roadstead.state import ProxyState
+
+    st = ProxyState(ProxyConfig())  # no overlay -> tier2 has no token_speed
+    advice = st.effective_timeout_advice(
+        "tier2", int(LLMPriority.P0_REALTIME), 4_000, 15_000)
+    assert advice["ceiling_s"] == _INTERACTIVE_CEILING_S
+    assert "decode_floor_applied_ms" not in advice

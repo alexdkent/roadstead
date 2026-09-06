@@ -482,6 +482,15 @@ class TimeoutModel:
     def floor_ms(self, endpoint: str) -> float:
         return self._floors.get(normalize_endpoint(endpoint), _DEFAULT_FLOOR_S) * 1000.0
 
+    def decode_floor_ms(self, endpoint: str, est_out: int) -> float:
+        """The decode-rate floor for this ``(endpoint, est_out)``, independent
+        of any recorded sample — the same number ``advise()`` folds into
+        ``recommended`` via ``max()``, exposed so a caller building its OWN
+        floor (``effective_timeout_advice``'s ceiling, below) can include it.
+        0.0 when the endpoint has no declared ``token_speed``."""
+        rate = self._decode_rates.get(normalize_endpoint(endpoint), 0.0)
+        return decode_rate_floor_ms(int(est_out), rate)
+
     def _resolve_unknown_out_bucket(self, ep: str, pri: int) -> int:
         """Out-bucket to use when the caller declared NO output budget (D3).
 
@@ -621,11 +630,10 @@ class TimeoutModel:
         # for. This never lowers the guard's answer, only raises it — an
         # endpoint with no declared `token_speed` gets 0.0 here and this is a
         # no-op, which is the compatibility guarantee.
-        decode_floor_ms = decode_rate_floor_ms(
-            int(est_out), self._decode_rates.get(ep, 0.0))
-        decode_floor_applied = decode_floor_ms > recommended
+        decode_floor = self.decode_floor_ms(ep, est_out)
+        decode_floor_applied = decode_floor > recommended
         if decode_floor_applied:
-            recommended = decode_floor_ms
+            recommended = decode_floor
 
         out = {
             "min_ms": round(mn, 1),
@@ -650,7 +658,7 @@ class TimeoutModel:
             # Observable, so a dashboard/shadow report can see that the
             # empirical answer was below what decode alone requires, rather
             # than that number silently disappearing into `recommended_ms`.
-            out["decode_floor_applied_ms"] = round(decode_floor_ms, 1)
+            out["decode_floor_applied_ms"] = round(decode_floor, 1)
         return out
 
     def _advise_at(
