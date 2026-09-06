@@ -55,7 +55,12 @@ from .constants import (
     _STREAM_PREFILL_FLOOR_TOK_S,
     _STREAM_TTFT_DEADLINE_S,
 )
-from .correction import _EMPTY_RESCUE_MIN_TOKENS, _ToolCallStreamSanitizer
+from .correction import (
+    _EMPTY_RESCUE_MIN_TOKENS,
+    _ToolCallStreamSanitizer,
+    _chat_completion_text,
+    _degenerate_text_arm,
+)
 from .cost_model import context_fit, estimate_input_tokens
 from .enriched import (
     WIRE_ENRICHED,
@@ -1581,11 +1586,59 @@ class Lifecycle:
             # error so the caller re-chunks instead of recording garbage, and
             # never cache it (status != ok). Free-form truncation is benign.
             if resp.finish_reason == "length" and self.correction.request_is_structured(req):
-                self.state.resolve_error(
-                    req,
+                truncated_msg = (
                     f"backend {ep_cfg.role} truncated structured output "
-                    f"(finish_reason=length, output_tokens={resp.output_tokens})",
+                    f"(finish_reason=length, output_tokens={resp.output_tokens})"
                 )
+                # 2026-09-06: some of this population isn't a benign cap at all —
+                # it's a repetition LOOP (usually whitespace) that re-caps on
+                # every retry. The uniform Correction.apply pipeline never runs
+                # here (we `return` before `result` exists), so the egress
+                # degeneration guard never got a look at exactly this shape.
+                # Classify BEFORE calling it a truncation, using the same
+                # detector `maybe_correct_degenerate` uses.
+                degen_arm = None
+                try:
+                    degen_arm = _degenerate_text_arm(_chat_completion_text(resp.body))
+                except Exception:  # noqa: BLE001 — classification must never break the response
+                    logger.debug("degenerate-length classification failed", exc_info=True)
+                if degen_arm is not None:
+                    # Same accounting maybe_correct_degenerate uses, so /v1/status
+                    # keeps one consistent view of "degeneration detected" whether
+                    # it was caught mid-stream or here, at the length gate.
+                    self.state.degeneration_detected += 1
+                    cs = req.call_site or "?"
+                    tally = self.state.degeneration_by_call_site.setdefault(
+                        cs, {"detected": 0, "recovered": 0})
+                    tally["detected"] += 1
+                    logger.warning(
+                        "DEGENERATION detected (structured length) call_site=%s "
+                        "endpoint=%s output_tokens=%d arm=%s",
+                        cs, req.endpoint, resp.output_tokens, degen_arm,
+                    )
+                    # No re-dispatch here — maybe_correct_degenerate's own
+                    # finish_reason=length branch already establishes (with a
+                    # comment) that a capped loop just re-caps on retry; the
+                    # same reasoning applies to this gate.
+                    if self.state.flags.get("degenerate_length_enforce"):
+                        # 🚨 Must NOT contain "truncated structured output" —
+                        # that substring is what a caller's truncation-recovery
+                        # path (is_output_truncation_error()) matches on to
+                        # decide to re-ask with MORE tokens, which is exactly
+                        # the defect: pouring more decode into a loop that
+                        # cannot terminate.
+                        self.state.resolve_error(
+                            req,
+                            f"backend {ep_cfg.role} degenerate structured output "
+                            f"(repetition loop, finish_reason=length, "
+                            f"output_tokens={resp.output_tokens})",
+                        )
+                    else:
+                        # Shadow: counted + logged above, but caller-visible
+                        # behavior stays byte-identical to today.
+                        self.state.resolve_error(req, truncated_msg)
+                else:
+                    self.state.resolve_error(req, truncated_msg)
                 self.record_completion(
                     req, decision, duration,
                     resp.input_tokens, resp.output_tokens, "truncated",

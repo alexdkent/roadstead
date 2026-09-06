@@ -120,6 +120,36 @@ async def test_handler_get_and_post_roundtrip(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_handler_roundtrips_degenerate_length_enforce(tmp_path):
+    """The R2/R3 shadow→enforce flip surface: runtime-mutable via
+    POST /v1/admin/flags with no redeploy, and a typo'd name is a hard error,
+    not a silent no-op — the whole point of putting it in flags.py."""
+    cfg = ProxyConfig(runtime_flags_path=str(tmp_path / "flags.json"))
+    svc = ProxyService(cfg)
+    enrol_admin(svc)
+
+    resp = await svc.handle_admin_flags(_Req(method="GET"))
+    assert json.loads(resp.body)["flags"]["degenerate_length_enforce"] is False
+
+    resp = await svc.handle_admin_flags(
+        _Req(method="POST", body={"degenerate_length_enforce": True}))
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["flags"]["degenerate_length_enforce"] is True
+    assert svc._flags.get("degenerate_length_enforce") is True
+
+    # Persisted across a fresh service instance over the same path.
+    svc2 = ProxyService(ProxyConfig(runtime_flags_path=str(tmp_path / "flags.json")))
+    enrol_admin(svc2)
+    assert svc2._flags.get("degenerate_length_enforce") is True
+
+    # A typo'd flag name is rejected outright, never a silent no-op.
+    resp = await svc.handle_admin_flags(
+        _Req(method="POST", body={"degenerate_length_enforc": False}))
+    assert resp.status_code == 400
+    assert svc._flags.get("degenerate_length_enforce") is True  # unchanged
+
+
+@pytest.mark.asyncio
 async def test_handler_rejects_bad_input_and_denies_unknown_ip(tmp_path):
     cfg = ProxyConfig(runtime_flags_path=str(tmp_path / "flags.json"))
     svc = ProxyService(cfg)

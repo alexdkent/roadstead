@@ -27,6 +27,24 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Fixed
 
+- **A structured `finish_reason=length` response that was actually a repetition LOOP (usually
+  whitespace) was always classified as a benign truncation** — measured 26 times in 14 days on
+  tier3, ~125 minutes of wasted decode. Two independent gaps let it through: the dispatch path for
+  a truncated structured request `resolve_error`s and `return`s before `Correction.apply` (and its
+  egress degeneration guard) ever runs, and `_is_degenerate_text`'s word-shingle detector floors at
+  40 words, so a pure-whitespace body — zero words under `str.split()` — sailed past it. The
+  downstream cost: the caller was told "truncated", and every truncation-recovery path in the fleet
+  responds to that by re-asking with more tokens, pouring more decode into a loop that never
+  terminates. `_is_degenerate_text` gained a second, character-level TAIL arm (`_DEGEN_TAIL_*`,
+  calibrated against 12,899 real completions — a blank-ratio check and a distinct-24-gram check,
+  since the measured shape is "legitimate prefix, then loop" and a whole-body ratio dilutes on the
+  good prefix) and the structured-length dispatch path now runs it before calling the response a
+  truncation. Ship dark behind the new `degenerate_length_enforce` runtime flag (`flags.py`,
+  `POST /v1/admin/flags`): shadow counts + logs under the existing `degeneration_detected` /
+  `degeneration_by_call_site` tally; enforce swaps the caller-visible error to a distinct
+  "degenerate structured output" marker that deliberately does NOT contain the `"truncated
+  structured output"` substring truncation-recovery callers match on.
+
 - **`GET /v1/timeout-advice` could recommend a deadline below the physical decode time of the
   output being asked for** — a sparse/thin high-`est_out` bucket could never accumulate the
   `status=="ok"` samples that would have corrected it, because every call at that size timed out.

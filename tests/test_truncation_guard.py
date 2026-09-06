@@ -187,6 +187,90 @@ async def test_sync_structured_truncation_502_and_marker(caplog):
     assert svc._correction.state.truncation_total == 1
 
 
+# --------------------------------------------------------------------------- #
+# sync — structured length classified as DEGENERATE (not benign truncation)
+# 2026-09-06: a structured finish_reason=length response is run through the
+# egress degeneration detector before it is called a truncation — some of the
+# population is a repetition LOOP (usually whitespace) that re-caps on every
+# retry, not a benign cap. Flag-gated (`degenerate_length_enforce`): shadow
+# (default) counts + logs but keeps the historical message; enforce flips to a
+# DISTINCT message so a caller's truncation-recovery path stops escalating
+# tokens into a loop that cannot terminate.
+# --------------------------------------------------------------------------- #
+
+def _degen_body():
+    # A valid-looking prefix, then a run of pure blank chars until max_tokens
+    # — the tier3 "loops on whitespace" shape this classification exists for.
+    return '{"a": 1}' + " " * 2000
+
+
+@pytest.mark.asyncio
+async def test_sync_structured_length_degenerate_shadow_counts_but_keeps_message(caplog):
+    """Flag OFF (default): detect + count + log, but the caller-visible error
+    stays byte-identical to today's truncation message."""
+    svc = _svc_sync(_degen_body(), "length", output_tokens=500)
+    with caplog.at_level(logging.WARNING):
+        resp, result = await _drive_sync(svc, _payload(structured=True))
+    assert resp.status_code == 502
+    assert "truncated structured output" in result["error"]
+    assert "degenerate structured output" not in result["error"]
+    st = svc._correction.state
+    assert st.degeneration_detected == 1
+    assert st.degeneration_by_call_site["kv4.judge"]["detected"] == 1
+    marker = [r for r in caplog.records if "DEGENERATION detected" in r.getMessage()]
+    assert len(marker) == 1
+    msg = marker[0].getMessage()
+    assert ("call_site=kv4.judge" in msg and "endpoint=tier3" in msg
+            and "output_tokens=500" in msg and "arm=blank_ratio" in msg)
+
+
+@pytest.mark.asyncio
+async def test_sync_structured_length_degenerate_enforce_changes_message(caplog):
+    """Flag ON: same detection + counting, but the error message flips to the
+    distinct 'degenerate structured output' marker — and MUST NOT contain the
+    'truncated structured output' substring a caller's truncation-recovery
+    path matches on to decide to re-ask with more tokens. This is the
+    load-bearing assertion the whole change exists for."""
+    svc = _svc_sync(_degen_body(), "length", output_tokens=500)
+    svc._flags.set_many({"degenerate_length_enforce": True})
+    with caplog.at_level(logging.WARNING):
+        resp, result = await _drive_sync(svc, _payload(structured=True))
+    assert resp.status_code == 502
+    assert "degenerate structured output" in result["error"]
+    assert "truncated structured output" not in result["error"]
+    st = svc._correction.state
+    assert st.degeneration_detected == 1
+    assert st.degeneration_by_call_site["kv4.judge"]["detected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_structured_length_non_degenerate_unaffected_by_flag():
+    """A genuinely truncated (non-degenerate) structured length response is
+    byte-identical to today under BOTH flag states — the common case, and it
+    must not change."""
+    for enforce in (False, True):
+        svc = _svc_sync('{"a":', "length", output_tokens=16)
+        svc._flags.set_many({"degenerate_length_enforce": enforce})
+        resp, result = await _drive_sync(svc, _payload(structured=True))
+        assert resp.status_code == 502
+        assert "truncated structured output" in result["error"]
+        assert "degenerate structured output" not in result["error"]
+        assert svc._correction.state.degeneration_detected == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_structured_length_degenerate_still_records_truncated_status():
+    """`record_completion(..., "truncated", ...)` stays unchanged even on the
+    degenerate branch — the completion `status` column feeds dashboards/health
+    and a new status value would shift consumers; the tripwire is the
+    degeneration tally, not the status."""
+    svc = _svc_sync(_degen_body(), "length", output_tokens=500)
+    svc._flags.set_many({"degenerate_length_enforce": True})
+    await _drive_sync(svc, _payload(structured=True))
+    assert _tally(svc) == {"count": 1, "structured": 1, "freetext": 0}
+    assert svc._correction.state.truncation_total == 1
+
+
 @pytest.mark.asyncio
 async def test_sync_freetext_truncation_served_but_loud(caplog):
     svc = _svc_sync("a long capped reply", "length")

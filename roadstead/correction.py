@@ -88,6 +88,74 @@ _DEGEN_MIN_WORDS = 40        # ignore short replies (a chorus/classification)
 _DEGEN_MIN_REPS = 6          # the top shingle must repeat at least this many times
 _DEGEN_MIN_FRACTION = 0.10   # …AND be ≥ this fraction of all shingles
 
+# Second arm — character-level, over the TAIL only. The word-shingle arm above
+# is blind to the measured tier3 shape: a valid JSON prefix followed by a
+# whitespace loop until max_tokens. `str.split()` yields zero words on a blank
+# tail (never reaches `_DEGEN_MIN_WORDS`), and even when it does, the good
+# prefix dilutes a whole-body ratio — so this arm looks only at the last
+# `_DEGEN_TAIL_CHARS` characters. Calibrated over 12,899 real completions
+# (`proxy_completions`, bodies >= 200 chars, warm-up pings excluded).
+_DEGEN_TAIL_CHARS = 2000        # tail window this arm evaluates
+_DEGEN_TAIL_MIN_CHARS = 200     # bodies shorter than this are never judged by this arm
+# Blank-ratio: the corpus is cleanly bimodal — every known-degenerate tail
+# measured blank=1.00, the highest LEGITIMATE body measured 0.31. Any
+# threshold from 0.60-0.95 catches 10/10 degenerate and flags zero other rows;
+# 0.90 is deliberately conservative inside that wide gap.
+_DEGEN_BLANK_RATIO = 0.90
+_DEGEN_TAIL_GRAM = 24           # character shingle length for the tail arm
+# Distinct-24-gram ratio: degenerate bodies measured 0.002-0.014 (whitespace
+# loops) plus one semantic loop at 0.058 (housetunes.album.converge.produce —
+# "me try that. responseI'll search for the release-group..." repeating). The
+# nearest LEGITIMATE body is videogen.treatment at 0.192 (real prose). 0.10
+# sits between them with ~2x margin on both sides. 🚨 An older internal doc
+# claims 0.32/0.15 — that is STALE for this corpus; use 0.10, cite 0.192.
+_DEGEN_TAIL_MIN_DISTINCT = 0.10
+
+# Blank/invisible chars the tail arm counts: ASCII whitespace plus the
+# zero-width unicode family a whitespace loop can hide behind — one measured
+# case was U+200B repeated 500 times, which `str.split()` treats as a single
+# "word" and the word-shingle arm never sees.
+_BLANK_CHARS = frozenset(
+    " \t\n\r\v\f" "\u00a0\u200b\u200c\u200d\u2060\ufeff"
+)
+
+
+def _degen_tail(text) -> str:
+    """The last `_DEGEN_TAIL_CHARS` characters of `text` — the window the tail
+    arm evaluates. Total: never raises, `None`/`""` → `""`."""
+    try:
+        return (text or "")[-_DEGEN_TAIL_CHARS:]
+    except Exception:  # noqa: BLE001 — the guard is fail-open
+        return ""
+
+
+def _blank_ratio(text) -> float:
+    """Fraction of the tail that is a blank/invisible char (`_BLANK_CHARS`).
+    Total: never raises, `None`/`""` → 0.0."""
+    try:
+        tail = _degen_tail(text)
+        if not tail:
+            return 0.0
+        blank = sum(1 for ch in tail if ch in _BLANK_CHARS)
+        return blank / len(tail)
+    except Exception:  # noqa: BLE001 — the guard is fail-open
+        return 0.0
+
+
+def _distinct_gram_ratio(text) -> float:
+    """Distinct `_DEGEN_TAIL_GRAM`-char shingle ratio over the tail — 1.0
+    ("diverse", never degenerate) when the tail is shorter than the gram, and
+    on any failure (fail-open). Total: never raises."""
+    try:
+        tail = _degen_tail(text)
+        n = len(tail) - _DEGEN_TAIL_GRAM + 1
+        if n <= 0:
+            return 1.0
+        grams = {tail[i:i + _DEGEN_TAIL_GRAM] for i in range(n)}
+        return len(grams) / n
+    except Exception:  # noqa: BLE001 — the guard is fail-open
+        return 1.0
+
 
 def _top_shingle_reps(text: str) -> tuple[int, int]:
     """Return (max repeats of any `_DEGEN_GRAM`-word shingle, total shingles)."""
@@ -100,17 +168,34 @@ def _top_shingle_reps(text: str) -> tuple[int, int]:
     return (c.most_common(1)[0][1], n)
 
 
-def _is_degenerate_text(text: str) -> bool:
-    """True iff `text` is a repetition LOOP — the same long shingle repeated many
-    times AND dominating the output. Conservative on both axes so legitimate
-    repetition (a chorus) passes through untouched."""
+def _degenerate_text_arm(text: str) -> str | None:
+    """Which arm flags `text` as a repetition LOOP, for logging — one of
+    ``"word_shingle"`` (the original arm: the same long word-shingle repeated
+    many times AND dominating the output), ``"blank_ratio"`` / ``"distinct_gram"``
+    (the tail arm, see the `_DEGEN_TAIL_*` block above), or ``None`` when
+    neither fires. `_is_degenerate_text` is this predicate collapsed to a bool
+    — single source of truth so the two can never disagree. Conservative on
+    every axis so legitimate repetition (a chorus) and a legitimate long body
+    pass through untouched."""
     words = (text or "").split()
-    if len(words) < _DEGEN_MIN_WORDS:
-        return False
-    reps, total = _top_shingle_reps(text)
-    if total <= 0:
-        return False
-    return reps >= _DEGEN_MIN_REPS and (reps / total) >= _DEGEN_MIN_FRACTION
+    if len(words) >= _DEGEN_MIN_WORDS:
+        reps, total = _top_shingle_reps(text)
+        if total > 0 and reps >= _DEGEN_MIN_REPS and (reps / total) >= _DEGEN_MIN_FRACTION:
+            return "word_shingle"
+    if len(text or "") < _DEGEN_TAIL_MIN_CHARS:
+        return None
+    if _blank_ratio(text) >= _DEGEN_BLANK_RATIO:
+        return "blank_ratio"
+    if _distinct_gram_ratio(text) <= _DEGEN_TAIL_MIN_DISTINCT:
+        return "distinct_gram"
+    return None
+
+
+def _is_degenerate_text(text: str) -> bool:
+    """True iff `text` is a repetition LOOP — the word-shingle arm (a long
+    shingle repeating and dominating) OR the tail arm (a blank/near-duplicate
+    tail; see `_degenerate_text_arm` for which one and why)."""
+    return _degenerate_text_arm(text) is not None
 
 
 def _chat_completion_text(body: dict) -> str:

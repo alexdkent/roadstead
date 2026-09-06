@@ -69,6 +69,21 @@ DEFAULT_FLAGS: dict[str, bool] = {
     # shadow-validated 0.0% would-timeout / 168h) — this ship-dark default is
     # working as designed, NOT drift. See docs/llm_timeout_centralization.md.
     "smart_default_timeout": False,
+    # Structured finish_reason=length classification (2026-09-06): a truncated
+    # STRUCTURED response is run through the egress degeneration detector
+    # before it is called a truncation, because some of the population is not
+    # a benign cap — it's a repetition loop (usually whitespace) that will
+    # re-cap on every retry a caller's truncation-recovery path attempts.
+    # False = shadow: detect, count (degeneration_detected /
+    # degeneration_by_call_site — the SAME tally maybe_correct_degenerate
+    # uses), log a WARNING, but still resolve with the historical "truncated
+    # structured output" message — byte-identical caller behavior. True =
+    # enforce: resolve with a DISTINCT "degenerate structured output" message
+    # so a caller keying truncation-recovery off the old marker (as
+    # `is_output_truncation_error()` does fleet-wide) stops escalating tokens
+    # into a loop that cannot terminate. Ship dark until the shadow tally has
+    # soaked — flip live via POST /v1/admin/flags, no redeploy.
+    "degenerate_length_enforce": False,
 }
 
 
