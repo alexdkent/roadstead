@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "roadstead"
-version = "0.1.0"
+version = "0.1.1"
 description = "Capacity-aware admission control for self-hosted LLM inference fleets (llama.cpp + vLLM), without Kubernetes."
 readme = "README.md"
 requires-python = ">=3.11"

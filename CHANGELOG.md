@@ -15,6 +15,21 @@ summary. The bullets below link in there where the long version is worth reading
 Nothing yet. Entries go under `### Breaking`, `### Added`, `### Changed`, `### Fixed` or
 `### Documented`; add the heading you need rather than keeping an empty one.
 
+## 0.1.1 — 2026-09-06
+
+The first release anybody should install. Functionally 0.1.0 plus the documentation and hardening
+commits that followed it; the version number moved because **0.1.0 was deleted from PyPI**, and a
+deleted version can never be re-uploaded.
+
+0.1.0 was published on 2026-09-05 and withdrawn about three and a half hours later. Its sdist
+shipped `tests/`, and both artifacts carried internal names and backend ports from the private
+monorepo this project was extracted from — material the extraction was supposed to have removed.
+Deleting it (rather than yanking it, which only stops pip *selecting* a version and leaves it
+downloadable by exact pin) reduces that exposure but does not reverse it: anything already
+downloaded stays downloaded, and mirrors may retain copies. Treat every string in 0.1.0 as public.
+
+This release is built from history that has been rewritten to remove those names.
+
 ## 0.1.0 — 2026-09-05
 
 The first release, and the first version anybody outside the project can install.
