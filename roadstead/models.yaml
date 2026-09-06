@@ -76,14 +76,20 @@
 #   stream_hard_cap_s per-class override of the ABSOLUTE cap on a PROXY-CHOSEN
 #                     streaming deadline being extended by token progress.
 #                     Never applies to an explicit caller deadline.
-#   token_speed       measured decode rate, output tokens/sec. Optional and
-#                     absent by default (0.0) — a MEASUREMENT of this class on
-#                     your fleet, never a number to guess. Seeds TimeoutModel's
-#                     decode-rate floor: `recommended` is never advised below
-#                     (est_out / token_speed) x margin, so a thin/absent sample
-#                     cannot hand back a deadline the call physically cannot
-#                     meet at any load. A class with no `token_speed` gets no
-#                     floor at all — behaviour for it is unchanged.
+#   decode_tok_s      conservative decode rate, output tokens/sec, for the SLOW
+#                     TAIL of real contended traffic — a low percentile of
+#                     observed tok/s, never a single-stream idle benchmark.
+#                     An idle number is roughly 2x optimistic (a caller sharing
+#                     the endpoint gets about half of it) and produces a floor
+#                     too low to catch the failure it exists to prevent.
+#                     Optional and absent by default (0.0) — a MEASUREMENT of
+#                     this class on your fleet, never a number to guess. Seeds
+#                     TimeoutModel's decode-rate floor: `recommended` is never
+#                     advised below (est_out / decode_tok_s) x margin, so a
+#                     thin/absent sample cannot hand back a deadline the call
+#                     physically cannot meet at any load. A class with no
+#                     `decode_tok_s` gets no floor at all — behaviour for it is
+#                     unchanged.
 #   failover_to       endpoint class to degrade to when this one is unhealthy.
 #                     Ignored unless the target is itself routed.
 #   spill_to          endpoint class to spill to when this one is FULL. A

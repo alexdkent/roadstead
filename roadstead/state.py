@@ -84,7 +84,7 @@ class ProxyState:
             window_s=config.timeout_advice_window_s,
             min_samples=config.timeout_advice_min_samples,
             floors=floors,
-            # Per-class decode-rate floor (models.yaml `token_speed`) — unlike
+            # Per-class decode-rate floor (models.yaml `decode_tok_s`) — unlike
             # `floors` above there is no hardcoded fallback mirror to layer
             # under it: these are fleet MEASUREMENTS with no synced constant
             # in this public repo, so a class the operator never profiled

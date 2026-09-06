@@ -137,7 +137,7 @@ def resolve_ceiling_s(
 # of that loop, same as above.
 #
 # The floor is `(est_out / decode_tok_s) * margin`: the rate is a per-endpoint
-# fleet MEASUREMENT (models.yaml `token_speed`, seeded via
+# fleet MEASUREMENT (models.yaml `decode_tok_s`, seeded via
 # ``model_catalog.build_class_decode_rates`` — never a number invented here.
 # An endpoint absent from the rate table gets floor 0.0, i.e. no floor at all:
 # behaviour for it is byte-identical to before this landed.
@@ -392,7 +392,7 @@ class TimeoutModel:
         self._min_samples = min_samples
         self._max_per_cell = max_samples_per_cell
         self._floors = dict(FLOOR_S if floors is None else floors)
-        # endpoint class -> measured decode tok/s (models.yaml `token_speed`,
+        # endpoint class -> measured decode tok/s (models.yaml `decode_tok_s`,
         # via model_catalog.build_class_decode_rates). Unlike FLOOR_S there is
         # no hardcoded synced mirror here: these are fleet MEASUREMENTS, this
         # repo is public, and defaulting to {} means an endpoint nobody
@@ -487,7 +487,7 @@ class TimeoutModel:
         of any recorded sample — the same number ``advise()`` folds into
         ``recommended`` via ``max()``, exposed so a caller building its OWN
         floor (``effective_timeout_advice``'s ceiling, below) can include it.
-        0.0 when the endpoint has no declared ``token_speed``."""
+        0.0 when the endpoint has no declared ``decode_tok_s``."""
         rate = self._decode_rates.get(normalize_endpoint(endpoint), 0.0)
         return decode_rate_floor_ms(int(est_out), rate)
 
@@ -628,7 +628,7 @@ class TimeoutModel:
         # The empirical ladder + monotonicity guard above can still land on a
         # number below the physical decode time of the output being asked
         # for. This never lowers the guard's answer, only raises it — an
-        # endpoint with no declared `token_speed` gets 0.0 here and this is a
+        # endpoint with no declared `decode_tok_s` gets 0.0 here and this is a
         # no-op, which is the compatibility guarantee.
         decode_floor = self.decode_floor_ms(ep, est_out)
         decode_floor_applied = decode_floor > recommended

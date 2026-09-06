@@ -12,13 +12,26 @@ summary. The bullets below link in there where the long version is worth reading
 
 ## Unreleased
 
+### Breaking
+
+- **`models.yaml` endpoint field `token_speed` renamed to `decode_tok_s`.** Nothing outside this
+  repo has populated the field yet, so the blast radius is zero today. Two collisions forced the
+  rename: (1) the fleet catalog this repo mirrors already uses `token_speed` for an unrelated
+  `dict[str, Any]` shape served over the wire — a scalar in either catalog would raise `TypeError`
+  in the other, and the two catalogs are kept equal by a reconciliation test; (2) worse, that
+  fleet's own budgeting code documents `token_speed` as a **single-stream idle benchmark**, known to
+  run ~2x optimistic versus real contended traffic — enforcing a floor on it would reproduce the
+  exact "deadline the call physically cannot meet" bug the floor exists to prevent. `decode_tok_s`
+  names the quantity the floor actually needs: a conservative rate for the slow tail of real
+  traffic, not an idle number.
+
 ### Fixed
 
 - **`GET /v1/timeout-advice` could recommend a deadline below the physical decode time of the
   output being asked for** — a sparse/thin high-`est_out` bucket could never accumulate the
   `status=="ok"` samples that would have corrected it, because every call at that size timed out.
-  `TimeoutModel.advise()` now floors `recommended` at `(est_out / token_speed) * margin` for any
-  endpoint with a declared `token_speed` (new, optional `models.yaml` endpoint field — a fleet
+  `TimeoutModel.advise()` now floors `recommended` at `(est_out / decode_tok_s) * margin` for any
+  endpoint with a declared `decode_tok_s` (new, optional `models.yaml` endpoint field — a fleet
   measurement, absent by default, so an endpoint nobody profiled is unaffected). The same floor is
   threaded into `effective_timeout_advice`'s ceiling resolution, so an INTERACTIVE call's tighter
   600s band cannot clip the deadline back down below what decode alone requires — closing the same

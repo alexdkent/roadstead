@@ -27,7 +27,7 @@ THE FIX
 ``decode_rate_floor_ms(est_out, decode_tok_s)`` = ``(est_out / decode_tok_s) *
 margin``, bounded by ``_BACKGROUND_CEILING_S``. ``TimeoutModel.advise()``
 applies ``max(recommended, floor)`` with it after the monotonicity guard's
-lattice walk. The rate comes from ``models.yaml`` ``token_speed``
+lattice walk. The rate comes from ``models.yaml`` ``decode_tok_s``
 (``model_catalog.build_class_decode_rates``) — a fleet measurement, never a
 number invented here — so a class nobody profiled gets floor 0.0, i.e. no
 floor, i.e. unchanged behaviour.
@@ -236,24 +236,24 @@ def test_interaction_with_the_monotonicity_guard_result_is_the_max():
 
 
 # ---------------------------------------------------------------------------
-# The catalog seam — models.yaml `token_speed` reaches the class map
+# The catalog seam — models.yaml `decode_tok_s` reaches the class map
 # ---------------------------------------------------------------------------
 
-def test_token_speed_is_parsed_and_filtered_like_every_other_class_field():
+def test_decode_tok_s_is_parsed_and_filtered_like_every_other_class_field():
     """Mirrors ``test_the_runtime_overlay_is_seen_by_every_caller`` in
     ``test_catalog_writes.py``: a candidate build (``overlay=``) never touches
     the cached/served catalog, so this needs no cleanup. A class that omits
-    ``token_speed`` must not appear in the map at all — that absence is what
+    ``decode_tok_s`` must not appear in the map at all — that absence is what
     makes "no rate declared" the same thing as "no floor" downstream."""
     from roadstead.model_catalog import build_class_decode_rates, load_catalog
 
     cat = load_catalog(overlay={"endpoints": {"ghost": {
         "provider": "small-box", "kind": "chat", "status": "active",
-        "slots": 1, "context_per_slot": 2048, "token_speed": 26.6,
+        "slots": 1, "context_per_slot": 2048, "decode_tok_s": 26.6,
     }}})
     rates = build_class_decode_rates(cat)
     assert rates["ghost"] == 26.6
-    # tier1 in the shipped example declares no token_speed.
+    # tier1 in the shipped example declares no decode_tok_s.
     assert "tier1" not in rates
 
 
@@ -262,8 +262,8 @@ def test_token_speed_is_parsed_and_filtered_like_every_other_class_field():
 # too, or the caller-facing path clips the very deadline advise() just floored
 # ---------------------------------------------------------------------------
 
-def _proxy_state_with_token_speed(endpoint: str, token_speed: float):
-    """Build a real ``ProxyState`` with ``token_speed`` layered onto
+def _proxy_state_with_decode_tok_s(endpoint: str, decode_tok_s: float):
+    """Build a real ``ProxyState`` with ``decode_tok_s`` layered onto
     ``endpoint`` via the runtime overlay — this exercises the actual
     ``model_catalog -> state.py -> TimeoutModel`` seam, not a stand-in."""
     from roadstead import model_catalog
@@ -271,7 +271,7 @@ def _proxy_state_with_token_speed(endpoint: str, token_speed: float):
     from roadstead.state import ProxyState
 
     model_catalog.set_runtime_overlay(
-        {"endpoints": {endpoint: {"token_speed": token_speed}}})
+        {"endpoints": {endpoint: {"decode_tok_s": decode_tok_s}}})
     try:
         return ProxyState(ProxyConfig())
     finally:
@@ -290,7 +290,7 @@ def test_an_interactive_calls_ceiling_lifts_to_cover_the_decode_floor():
     ``advise()``), because that is the layer the fix actually lives in."""
     from roadstead.config import LLMPriority
 
-    st = _proxy_state_with_token_speed("tier2", _TIER2_ANALYST_TOK_S)
+    st = _proxy_state_with_decode_tok_s("tier2", _TIER2_ANALYST_TOK_S)
     est_out = 15_000
     advice = st.effective_timeout_advice(
         "tier2", int(LLMPriority.P0_REALTIME), 4_000, est_out)
@@ -313,7 +313,7 @@ def test_a_background_calls_ceiling_is_unaffected_it_was_already_1800s():
     calls; a background call's ceiling should be untouched by the fix."""
     from roadstead.config import LLMPriority
 
-    st = _proxy_state_with_token_speed("tier2", _TIER2_ANALYST_TOK_S)
+    st = _proxy_state_with_decode_tok_s("tier2", _TIER2_ANALYST_TOK_S)
     advice = st.effective_timeout_advice(
         "tier2", int(LLMPriority.P3_INGESTION), 4_000, 15_000)
     assert advice["ceiling_s"] == _BACKGROUND_CEILING_S
@@ -329,7 +329,7 @@ def test_an_absurd_interactive_ask_is_bounded_not_rejected():
     silently indistinguishable from a normal large-but-satisfiable one."""
     from roadstead.config import LLMPriority
 
-    st = _proxy_state_with_token_speed("tier2", 1.0)  # deliberately slow
+    st = _proxy_state_with_decode_tok_s("tier2", 1.0)  # deliberately slow
     advice = st.effective_timeout_advice(
         "tier2", int(LLMPriority.P0_REALTIME), 4_000, 100_000_000)
     assert advice["recommended_timeout_s"] == int(_BACKGROUND_CEILING_S)
@@ -339,13 +339,13 @@ def test_an_absurd_interactive_ask_is_bounded_not_rejected():
 
 def test_absent_rate_leaves_effective_timeout_advice_unchanged():
     """The same compatibility guarantee, at this layer: an endpoint with no
-    ``token_speed`` gets ``decode_floor_s == 0.0``, so
+    ``decode_tok_s`` gets ``decode_floor_s == 0.0``, so
     ``max(class_floor_s, 0.0) == class_floor_s`` and ``resolve_ceiling_s``
     resolves exactly as it did before this fix existed."""
     from roadstead.config import LLMPriority, ProxyConfig
     from roadstead.state import ProxyState
 
-    st = ProxyState(ProxyConfig())  # no overlay -> tier2 has no token_speed
+    st = ProxyState(ProxyConfig())  # no overlay -> tier2 has no decode_tok_s
     advice = st.effective_timeout_advice(
         "tier2", int(LLMPriority.P0_REALTIME), 4_000, 15_000)
     assert advice["ceiling_s"] == _INTERACTIVE_CEILING_S
