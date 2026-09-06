@@ -1,0 +1,25 @@
+# Four GitHub Actions are pinned to full-length commit SHAs, which this repo
+# REQUIRES (`sha_pinning_required`). Pinning without automated bumps just
+# converts "mutable" into "stale", so the github-actions ecosystem is the
+# load-bearing entry here — not pip.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    groups:
+      dev:
+        dependency-type: development
