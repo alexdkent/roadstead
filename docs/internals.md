@@ -44,7 +44,7 @@ Four things make it different from every gateway surveyed in `docs/evaluation.md
 
 This code was extracted on 2026-08-31 from a private monorepo, where it still runs in production.
 The history here is the real thing — 282 commits at
-extraction, going back to `1becf53` (the first commit, 2026-05-27, *"centralized LLM scheduler
+extraction, going back to `5156ab8` (the first commit, 2026-05-27, *"centralized LLM scheduler
 proxy — DRR scheduling, priority bands"*), extracted with `git filter-repo` rather than copied, so `git log`/`git blame` on
 any line still reaches its original rationale. **Use that.** It is the best documentation this project has.
 

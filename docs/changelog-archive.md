@@ -1358,7 +1358,7 @@ spill gate (`scheduler._admit`) and the WAL-recovery shadow tally (`service`). I
   residue of a fix that meant to call it.
 - **Nothing else changes behaviour.** The three live gates were byte-identical in effect and are
   verified so rather than asserted so: a differential harness ran the pre-split implementations
-  transcribed verbatim from `7563fa6` (2026-09-01, *"Give the operator a face"*) against the
+  transcribed verbatim from `6315402` (2026-09-01, *"Give the operator a face"*) against the
   shared one over **2295** combinations of payload
   shape, payload type, ceiling and endpoint name, comparing the boolean *and* the refusal-message
   bytes. Zero mismatches.
