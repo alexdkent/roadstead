@@ -74,7 +74,7 @@ class ProxyState:
         # loadout) silently did nothing — enforcement kept using the stale
         # hardcoded values. Fallback covers any class absent from the yaml.
         from .model_catalog import (
-            build_class_ceilings, build_class_floors,
+            build_class_ceilings, build_class_decode_rates, build_class_floors,
             build_class_stream_hard_caps,
         )
         from .timeout_model import FLOOR_S
@@ -84,6 +84,12 @@ class ProxyState:
             window_s=config.timeout_advice_window_s,
             min_samples=config.timeout_advice_min_samples,
             floors=floors,
+            # Per-class decode-rate floor (models.yaml `token_speed`) — unlike
+            # `floors` above there is no hardcoded fallback mirror to layer
+            # under it: these are fleet MEASUREMENTS with no synced constant
+            # in this public repo, so a class the operator never profiled
+            # simply gets no entry and no floor.
+            decode_rates=build_class_decode_rates(),
         )
         # Per-role timeout-ceiling overrides (models.yaml `timeout_ceiling_s`) —
         # let an inherently long-running class keep a generous ceiling even on an

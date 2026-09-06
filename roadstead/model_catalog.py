@@ -105,6 +105,12 @@ class EndpointEntry:
     timeout_floor_s: float = 0.0
     timeout_ceiling_s: float = 0.0
     stream_hard_cap_s: float = 0.0
+    #: Measured decode rate, output tokens/sec. Seeds TimeoutModel's per-class
+    #: decode-rate floor (timeout_model.decode_rate_floor_ms) — a fleet
+    #: MEASUREMENT, never a value this repo invents. Absent (0.0, the
+    #: default) means no floor for the class: ``build_class_decode_rates``
+    #: filters it out like every other ``> 0`` catalog field.
+    token_speed: float = 0.0
     #: The endpoint class to degrade to when this one is unhealthy.
     failover_to: str = ""
     #: The endpoint class to spill to when this one is FULL. A different
@@ -214,6 +220,7 @@ def _coerce_endpoint(name: str, raw: dict[str, Any]) -> EndpointEntry:
         timeout_floor_s=float(raw.get("timeout_floor_s", 0) or 0),
         timeout_ceiling_s=float(raw.get("timeout_ceiling_s", 0) or 0),
         stream_hard_cap_s=float(raw.get("stream_hard_cap_s", 0) or 0),
+        token_speed=float(raw.get("token_speed", 0) or 0),
         failover_to=raw.get("failover_to", ""),
         spill_to=raw.get("spill_to", ""),
         capabilities=dict(raw.get("capabilities") or {}),
@@ -743,6 +750,18 @@ def build_class_floors(cat: Catalog | None = None) -> dict[str, float]:
     fall back to ``timeout_model.FLOOR_S``.
     """
     return _class_map(cat or load_catalog(), "timeout_floor_s")
+
+
+def build_class_decode_rates(cat: Catalog | None = None) -> dict[str, float]:
+    """endpoint class → measured decode rate (output tokens/sec).
+
+    Seeds ``TimeoutModel``'s decode-rate floor (``timeout_model.
+    decode_rate_floor_ms``), the same yaml→catalog→state path as
+    ``build_class_floors`` above. ``_class_map`` already drops any class with
+    no ``token_speed`` (or 0), so a model nobody profiled gets no entry —
+    which is what makes "absent rate ⇒ no floor" the default rather than a
+    special case this function has to remember."""
+    return _class_map(cat or load_catalog(), "token_speed")
 
 
 def build_class_ceilings(cat: Catalog | None = None) -> dict[str, float]:

@@ -16,9 +16,13 @@ any separate queue model.
 query:
   - ``min`` / ``median`` / ``p95`` — raw percentiles, for callers that
     want a tighter fail-fast bound (e.g. an interactive chat turn).
-  - ``recommended`` — ``max(p99 * margin, floor)``: the conservative
-    default most callers should use.  The margin absorbs tail/load drift;
-    the floor keeps a thin sample from returning a dangerously low value.
+  - ``recommended`` — ``max(p99 * margin, floor, decode_rate_floor)``: the
+    conservative default most callers should use.  The margin absorbs
+    tail/load drift; the class floor keeps a thin sample from returning a
+    dangerously low value; the decode-rate floor (``decode_rate_floor_ms``)
+    keeps the empirical answer from landing below the physical decode time
+    of the output being asked for, which a thin sample cannot self-correct
+    (see the block comment above it).
 """
 
 from __future__ import annotations
@@ -109,6 +113,66 @@ def resolve_ceiling_s(
         interactive_s if interactive else background_s
     )
     return max(ceiling, float(floor_s))
+
+
+# ---------------------------------------------------------------------------
+# Decode-rate floor — sibling of the MONOTONICITY GUARD in ``advise()`` below
+# (regression ledger `llm-output-budget-starvation`, extraction leftover: this
+# repo has no access to that ledger, but the reasoning it points at is live).
+#
+# That guard stopped the advice INVERTING as ``est_out`` grew. This is the same
+# trap one rung up: the advice can be ABSOLUTELY too small, not merely smaller
+# than a shorter request's. Measured on a fleet deployment (2026-09-06): a
+# dense 27B endpoint decoding at ~26.6 tok/s was asked for 12,000 output
+# tokens (~451s of decode alone) and ``advise()`` returned 352s — a deadline
+# the call could not meet at ANY load, because nothing but decode time stood
+# between it and the timeout.
+#
+# And it cannot self-correct, for the same reason the out-of-order case
+# couldn't: ``record()`` admits only ``status == "ok"`` samples, so a bucket
+# whose calls always time out at 12,000 tokens can never accumulate the
+# samples that would raise its own recommendation. The largest output that
+# endpoint had EVER completed was 9,650 tokens — the 12k cell is permanently
+# empty, and waiting for it to fill waits forever. A guard is the only way out
+# of that loop, same as above.
+#
+# The floor is `(est_out / decode_tok_s) * margin`: the rate is a per-endpoint
+# fleet MEASUREMENT (models.yaml `token_speed`, seeded via
+# ``model_catalog.build_class_decode_rates`` — never a number invented here.
+# An endpoint absent from the rate table gets floor 0.0, i.e. no floor at all:
+# behaviour for it is byte-identical to before this landed.
+# ---------------------------------------------------------------------------
+
+#: Multiplier over pure decode time, for prefill + queue wait + jitter.
+#: ``end_to_end_ms`` (what ``record()`` is fed) already INCLUDES admission
+#: queue wait, so a mean tok/s derived from it understates the model's true
+#: decode speed — the floor this margin produces is a touch more generous
+#: than pure decode alone would need. That is the safe direction to be wrong
+#: in for a FLOOR: it can only make the guarantee looser, never tighter.
+_DECODE_FLOOR_MARGIN = 1.25
+
+
+def decode_rate_floor_ms(
+    est_out: int,
+    decode_tok_s: float,
+    *,
+    margin: float = _DECODE_FLOOR_MARGIN,
+    ceiling_s: float = _BACKGROUND_CEILING_S,
+) -> float:
+    """Milliseconds a decode of ``est_out`` tokens needs at ``decode_tok_s``,
+    marked up by ``margin`` and bounded by ``ceiling_s``.
+
+    Pure. ``decode_tok_s <= 0`` (no measured rate for this endpoint) or
+    ``est_out <= 0`` (no declared output budget — see D3 in ``advise()``)
+    returns ``0.0``, i.e. "no floor"; the caller composes this with ``max()``
+    so an absent rate or an absent estimate changes nothing. The ceiling bound
+    is on the FLOOR itself — three of ``advise()``'s five call sites bypass
+    the downstream ``resolve_ceiling_s`` entirely, so a floor that could
+    exceed 1800s unbounded would defeat the ceiling on those paths."""
+    if decode_tok_s <= 0 or est_out <= 0:
+        return 0.0
+    floor_s = min((float(est_out) / decode_tok_s) * margin, ceiling_s)
+    return floor_s * 1000.0
 
 
 def surge_factor(
@@ -321,12 +385,19 @@ class TimeoutModel:
         min_samples: int = 30,
         max_samples_per_cell: int = 2000,
         floors: dict[str, float] | None = None,
+        decode_rates: dict[str, float] | None = None,
     ) -> None:
         self._margin = margin
         self._window_s = window_s
         self._min_samples = min_samples
         self._max_per_cell = max_samples_per_cell
         self._floors = dict(FLOOR_S if floors is None else floors)
+        # endpoint class -> measured decode tok/s (models.yaml `token_speed`,
+        # via model_catalog.build_class_decode_rates). Unlike FLOOR_S there is
+        # no hardcoded synced mirror here: these are fleet MEASUREMENTS, this
+        # repo is public, and defaulting to {} means an endpoint nobody
+        # profiled gets no decode floor rather than an invented one.
+        self._decode_rates = dict(decode_rates or {})
         # key -> deque of (timestamp_s, latency_ms)
         self._cells: dict[tuple[str, int, int, int], Deque[tuple[float, float]]] = {}
 
@@ -544,6 +615,18 @@ class TimeoutModel:
                     lifted_from = lo_out if lo_out < out_b else None
                     lifted_from_in = lo_in if lo_in < in_b else None
 
+        # ── DECODE-RATE FLOOR (see decode_rate_floor_ms above) ──
+        # The empirical ladder + monotonicity guard above can still land on a
+        # number below the physical decode time of the output being asked
+        # for. This never lowers the guard's answer, only raises it — an
+        # endpoint with no declared `token_speed` gets 0.0 here and this is a
+        # no-op, which is the compatibility guarantee.
+        decode_floor_ms = decode_rate_floor_ms(
+            int(est_out), self._decode_rates.get(ep, 0.0))
+        decode_floor_applied = decode_floor_ms > recommended
+        if decode_floor_applied:
+            recommended = decode_floor_ms
+
         out = {
             "min_ms": round(mn, 1),
             "median_ms": round(med, 1),
@@ -563,6 +646,11 @@ class TimeoutModel:
             out["monotonic_lift_from_out_bucket"] = lifted_from
         if lifted_from_in is not None:
             out["monotonic_lift_from_in_bucket"] = lifted_from_in
+        if decode_floor_applied:
+            # Observable, so a dashboard/shadow report can see that the
+            # empirical answer was below what decode alone requires, rather
+            # than that number silently disappearing into `recommended_ms`.
+            out["decode_floor_applied_ms"] = round(decode_floor_ms, 1)
         return out
 
     def _advise_at(
