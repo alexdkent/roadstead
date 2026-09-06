@@ -14,10 +14,10 @@ for the measured distribution these thresholds sit inside.
 
 Pinned here:
   - every measured degenerate shape (60000 spaces; a blank+newline loop; 500
-    zero-width spaces; a mixed-whitespace loop; the housetunes semantic loop)
+    zero-width spaces; a mixed-whitespace loop; the a metadata-resolution caller semantic loop)
     is flagged, and by the arm that should catch it;
   - the highest measured legitimate blank ratio (~0.31) and a legitimate body
-    near the measured distinct-gram floor (~0.192, videogen.treatment) both
+    near the measured distinct-gram floor (~0.192, long-form prose) both
     pass — the real margins, not a trivially-safe value;
   - ordinary varied prose passes;
   - a body under `_DEGEN_TAIL_MIN_CHARS` is never judged by this arm, however
@@ -65,9 +65,9 @@ def test_mixed_whitespace_loop():
     assert correction._degenerate_text_arm(text) == "blank_ratio"
 
 
-def test_semantic_loop_housetunes_shape():
+def test_semantic_loop_a_metadata_resolution_caller_shape():
     # ~0.06 distinct-24-gram ratio: a ~20-word sentence fragment repeating.
-    # The real shape: housetunes.album.converge.produce, measured at 0.058.
+    # The real shape: a metadata-resolution caller, measured at 0.058.
     unit = ("me try that. responseI'll search for the release-group with "
             "the title 'Spring'... Let me try ")
     text = unit * 40
@@ -123,7 +123,7 @@ def test_highest_measured_legitimate_blank_ratio_passes():
 
 def test_legitimate_body_near_the_distinct_gram_floor_passes():
     """~0.192 distinct-24-gram ratio — the nearest LEGITIMATE body measured
-    (videogen.treatment: real cinematic-description prose with recurring
+    (long-form prose: real cinematic-description prose with recurring
     shot-transition phrasing, "The camera holds wide, then slowly pulls back
     as the song ends…"). Built to land NEAR that value, not trivially above
     it — that is the real margin over `_DEGEN_TAIL_MIN_DISTINCT`."""
@@ -172,3 +172,83 @@ def test_degen_tail_windows_to_the_last_n_chars():
     tail = correction._degen_tail(text)
     assert len(tail) == correction._DEGEN_TAIL_CHARS
     assert tail.endswith("b" * 100)
+
+
+# --- threshold recalibration + evidence reporting (2026-09-06, second pass) ---
+#
+# These pin the two changes made after the first implementation: the
+# distinct-gram threshold moved 0.10 -> 0.08 on new measurement, and the
+# verdict now carries its EVIDENCE so a caller can check the claim.
+
+import pytest  # noqa: E402
+
+from roadstead.correction import (  # noqa: E402
+    _DEGEN_TAIL_MIN_DISTINCT,
+    _degeneracy_evidence,
+    _fmt_evidence,
+)
+
+
+def _tuned(target: float, n: int = 2400) -> str:
+    """A body whose tail distinct-24-gram ratio lands near `target`."""
+    import random
+    rng = random.Random(1234)
+    words = [f"w{rng.randrange(int(4 + 300 * target))}" for _ in range(n)]
+    return "start " + " ".join(words)
+
+
+def test_threshold_is_pinned_at_the_measured_value():
+    """0.08, not 0.10 and NOT the 0.15 an older doc recommends: that caller's
+    measured WORST legitimate body is 0.141, so 0.15 would flag real work."""
+    assert _DEGEN_TAIL_MIN_DISTINCT == 0.08
+    assert _DEGEN_TAIL_MIN_DISTINCT < 0.141, (
+        "threshold must sit below the nearest legitimate caller's measured worst case"
+    )
+    assert _DEGEN_TAIL_MIN_DISTINCT > 0.058, (
+        "threshold must still catch the measured semantic loop at 0.058"
+    )
+
+
+def test_nearest_legitimate_body_is_not_flagged():
+    """A body at the nearest legitimate caller's measured floor (0.141) must PASS.
+    A false positive tells that caller 'do not raise your budget', which would
+    break its legitimate 25,920 -> 46,656 truncation-recovery escalation."""
+    from roadstead.correction import _distinct_gram_ratio, _is_degenerate_text
+    body = _tuned(0.141)
+    ratio = _distinct_gram_ratio(body)
+    assert ratio > _DEGEN_TAIL_MIN_DISTINCT, f"built body measured {ratio}"
+    assert not _is_degenerate_text(body)
+
+
+def test_evidence_reports_measured_values_for_a_real_loop():
+    ev = _degeneracy_evidence(" " * 60000)
+    assert ev["measurable"] is True
+    assert ev["blank_ratio"] == 1.0
+    assert ev["distinct_gram"] is not None
+    rendered = _fmt_evidence(ev)
+    assert "blank_ratio=1.000" in rendered
+    assert "n/a" not in rendered
+
+
+@pytest.mark.parametrize("body", [None, "", "x" * 50])
+def test_unmeasurable_evidence_is_none_never_zero(body):
+    """🚨 The DECISION fails open; the EVIDENCE must refuse to assert.
+    A blank_ratio of 0.00 on an unreadable body would say 'measured, healthy'
+    — a confidently wrong number is worse than the label it replaced, because
+    it looks checkable."""
+    ev = _degeneracy_evidence(body)
+    assert ev["measurable"] is False
+    assert ev["blank_ratio"] is None
+    assert ev["distinct_gram"] is None
+    rendered = _fmt_evidence(ev)
+    assert "blank_ratio=n/a" in rendered and "distinct_24gram=n/a" in rendered
+    assert "0.00" not in rendered
+
+
+def test_evidence_helpers_are_total():
+    for bad in (None, "", 12345, object()):
+        ev = _degeneracy_evidence(bad)
+        assert isinstance(ev, dict) and "measurable" in ev
+        assert isinstance(_fmt_evidence(ev), str)
+    assert isinstance(_fmt_evidence({}), str)
+    assert isinstance(_fmt_evidence(None), str)

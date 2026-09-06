@@ -59,7 +59,9 @@ from .correction import (
     _EMPTY_RESCUE_MIN_TOKENS,
     _ToolCallStreamSanitizer,
     _chat_completion_text,
+    _degeneracy_evidence,
     _degenerate_text_arm,
+    _fmt_evidence,
 )
 from .cost_model import context_fit, estimate_input_tokens
 from .enriched import (
@@ -1598,8 +1600,20 @@ class Lifecycle:
                 # Classify BEFORE calling it a truncation, using the same
                 # detector `maybe_correct_degenerate` uses.
                 degen_arm = None
+                degen_ev: dict = {}
                 try:
-                    degen_arm = _degenerate_text_arm(_chat_completion_text(resp.body))
+                    _body_text = _chat_completion_text(resp.body)
+                    degen_arm = _degenerate_text_arm(_body_text)
+                    # The verdict must carry its EVIDENCE, not just its label.
+                    # This gate exists because the old code asserted
+                    # "truncated" without ever inspecting the body, so the only
+                    # signal downstream ever saw was the proxy's opinion of
+                    # itself — and a caller (and a human) raised a token budget
+                    # on it. Replacing one unfalsifiable verdict with a
+                    # better-calibrated unfalsifiable verdict would repeat that
+                    # mistake. The measured ratios let a caller who disagrees
+                    # check the claim against a number.
+                    degen_ev = _degeneracy_evidence(_body_text)
                 except Exception:  # noqa: BLE001 — classification must never break the response
                     logger.debug("degenerate-length classification failed", exc_info=True)
                 if degen_arm is not None:
@@ -1613,8 +1627,9 @@ class Lifecycle:
                     tally["detected"] += 1
                     logger.warning(
                         "DEGENERATION detected (structured length) call_site=%s "
-                        "endpoint=%s output_tokens=%d arm=%s",
+                        "endpoint=%s output_tokens=%d arm=%s %s",
                         cs, req.endpoint, resp.output_tokens, degen_arm,
+                        _fmt_evidence(degen_ev),
                     )
                     # No re-dispatch here — maybe_correct_degenerate's own
                     # finish_reason=length branch already establishes (with a
@@ -1630,7 +1645,8 @@ class Lifecycle:
                         self.state.resolve_error(
                             req,
                             f"backend {ep_cfg.role} degenerate structured output "
-                            f"(repetition loop, finish_reason=length, "
+                            f"(repetition loop, arm={degen_arm} "
+                            f"{_fmt_evidence(degen_ev)}, finish_reason=length, "
                             f"output_tokens={resp.output_tokens})",
                         )
                     else:

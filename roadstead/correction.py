@@ -103,13 +103,36 @@ _DEGEN_TAIL_MIN_CHARS = 200     # bodies shorter than this are never judged by t
 # 0.90 is deliberately conservative inside that wide gap.
 _DEGEN_BLANK_RATIO = 0.90
 _DEGEN_TAIL_GRAM = 24           # character shingle length for the tail arm
-# Distinct-24-gram ratio: degenerate bodies measured 0.002-0.014 (whitespace
-# loops) plus one semantic loop at 0.058 (housetunes.album.converge.produce —
-# "me try that. responseI'll search for the release-group..." repeating). The
-# nearest LEGITIMATE body is videogen.treatment at 0.192 (real prose). 0.10
-# sits between them with ~2x margin on both sides. 🚨 An older internal doc
-# claims 0.32/0.15 — that is STALE for this corpus; use 0.10, cite 0.192.
-_DEGEN_TAIL_MIN_DISTINCT = 0.10
+# Distinct-24-gram ratio over the tail. Calibrated against a real deployment's
+# completion corpus; the caller identities are deliberately not recorded here
+# (measurements about a specific deployment belong with that deployment, not in
+# this repo) but the SHAPE of the distribution is the part that generalises:
+#
+#   0.002 - 0.014   whitespace loops           degenerate, unambiguous
+#   0.058           one SEMANTIC loop          degenerate ("...let me try that.
+#                                              response I'll search for..." repeating)
+#   0.141           long-form prose, truncated LEGITIMATE  <- nearest neighbour
+#   0.192 - 0.844   the same caller, 5 more    LEGITIMATE
+#   0.287 - 0.386   repetitive JSON arrays     LEGITIMATE
+#
+# 🚨 0.08, and the margin is the whole story. The nearest legitimate body is at
+# 0.141 — but the corpus sweep alone surfaced that caller only at 0.192, which
+# read as comfortable room. The real edge appeared only after asking the caller
+# that OWNS the boundary for its FULL distribution. A nearest-neighbour computed
+# from a sample is a LOWER BOUND on how close the neighbour actually gets.
+#
+# Deliberately ASYMMETRIC rather than the 0.058/0.141 midpoint: a false positive
+# tells a caller "you degenerated, do not raise your budget", which turns a
+# RECOVERABLE truncation into a permanent failure by disabling that caller's
+# legitimate budget escalation. A false negative costs roughly one missed
+# semantic loop a fortnight, and the blank-ratio arm above still catches ~25 of
+# 26 regardless. The costs are not symmetric, so the threshold should not be
+# centred.
+#
+# ⚠️ This arm has FAR less margin than the blank-ratio arm. If a long-form
+# structured caller's output shape shifts, THIS is the constant to re-measure —
+# the blank arm, being bimodal with a ~0.6 gap, is not at risk.
+_DEGEN_TAIL_MIN_DISTINCT = 0.08
 
 # Blank/invisible chars the tail arm counts: ASCII whitespace plus the
 # zero-width unicode family a whitespace loop can hide behind — one measured
@@ -155,6 +178,46 @@ def _distinct_gram_ratio(text) -> float:
         return len(grams) / n
     except Exception:  # noqa: BLE001 — the guard is fail-open
         return 1.0
+
+
+def _degeneracy_evidence(text) -> dict:
+    """The MEASURED quantities behind a degeneracy verdict, for the error
+    message and the log — so a caller that disagrees can check the claim
+    against a number instead of arguing with a label.
+
+    🚨 An unmeasurable value is ``None``, never a default. `_blank_ratio` and
+    `_distinct_gram_ratio` fail OPEN (0.0 / 1.0) because the DECISION must
+    never flag a body it could not read — but reporting those defaults as
+    measurements would say "measured, and healthy" when the truth is "there was
+    nothing to measure". Failing open and refusing to assert are different
+    obligations, and collapsing them is what makes a default lie. Render a
+    ``None`` as ``n/a``, never as ``0.00``.
+
+    Total: never raises."""
+    try:
+        body = text or ""
+        tail = _degen_tail(body)
+        measurable = len(body) >= _DEGEN_TAIL_MIN_CHARS and bool(tail)
+        return {
+            "measurable": measurable,
+            "blank_ratio": _blank_ratio(body) if measurable else None,
+            "distinct_gram": (
+                _distinct_gram_ratio(body)
+                if measurable and len(tail) >= _DEGEN_TAIL_GRAM else None
+            ),
+            "tail_chars": len(tail),
+        }
+    except Exception:  # noqa: BLE001 — reporting must never break the response
+        return {"measurable": False, "blank_ratio": None,
+                "distinct_gram": None, "tail_chars": 0}
+
+
+def _fmt_evidence(ev: dict) -> str:
+    """Render `_degeneracy_evidence` for a message/log. ``None`` -> ``n/a``."""
+    def _n(v):
+        return "n/a" if v is None else f"{v:.3f}"
+    return (f"blank_ratio={_n((ev or {}).get('blank_ratio'))} "
+            f"distinct_24gram={_n((ev or {}).get('distinct_gram'))}")
 
 
 def _top_shingle_reps(text: str) -> tuple[int, int]:
