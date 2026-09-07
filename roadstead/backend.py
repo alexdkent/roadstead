@@ -293,7 +293,8 @@ class BackendClientPool:
                     payload,
                     model_id=ep_cfg.effective_model_id,
                     thinking_budget_ratio=ep_cfg.thinking_budget_ratio,
-                    thinking_kwargs=ep_cfg.thinking_kwargs)
+                    thinking_kwargs=ep_cfg.thinking_kwargs,
+                    reasoning_budget_tokens=ep_cfg.reasoning_budget_tokens)
         except ProviderError as exc:
             raise BackendError(
                 400, f"backend {ep_cfg.role} ({provider.name}): {exc}")
@@ -397,7 +398,8 @@ class BackendClientPool:
                     payload,
                     model_id=ep_cfg.effective_model_id,
                     thinking_budget_ratio=ep_cfg.thinking_budget_ratio,
-                    thinking_kwargs=ep_cfg.thinking_kwargs)
+                    thinking_kwargs=ep_cfg.thinking_kwargs,
+                    reasoning_budget_tokens=ep_cfg.reasoning_budget_tokens)
         except ProviderError as exc:
             raise BackendError(
                 400, f"backend {ep_cfg.role} ({provider.name}): {exc}")

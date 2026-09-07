@@ -62,6 +62,10 @@ class VLLMProvider(Provider):
         # Reasoning is OFF by default and opt-in per call — the proxy
         # defaults the declared switch(es) in chat_template_kwargs.
         reasoning_is_switchable=True,
+        # 🚨 Honoured ONLY when the server was launched with `--reasoning-config`;
+        # without it vLLM 400s the whole request rather than ignoring the field.
+        # That launch flag is what `thinking_budget_ratio` declares.
+        reasoning_budget_field="thinking_token_budget",
         # 🚨 Labels a tool call cut mid-JSON `finish_reason=tool_calls`, so
         # truncation is indistinguishable from completion without parsing the
         # arguments. correction.py's structured-validity guard exists for this
@@ -83,6 +87,7 @@ class VLLMProvider(Provider):
         model_id: str | None = None,
         thinking_budget_ratio: float = 0.0,
         thinking_kwargs: tuple[str, ...] = (),
+        reasoning_budget_tokens: int = 0,
     ) -> dict:
         """Make an Anthropic/extra_body-shaped chat payload wire-correct for vLLM.
 
@@ -119,6 +124,12 @@ class VLLMProvider(Provider):
             and not needs_thinking_default
             and not needs_vision_xlate
             and not (thinking_budget_ratio > 0)
+            # 🚨 The absolute cap has to be in this guard too. Without it a
+            # payload carrying no `system`/`extra_body` short-circuits out
+            # before `_apply_thinking_token_budget` runs, and a declared
+            # `reasoning_budget_tokens` silently never reaches the wire —
+            # the same shape of no-op the declaration exists to fix.
+            and not (reasoning_budget_tokens > 0)
         ):
             return payload
         p = dict(payload)
@@ -190,7 +201,10 @@ class VLLMProvider(Provider):
             for key in thinking_kwargs:
                 ck[key] = False
             p["chat_template_kwargs"] = ck
-        _apply_thinking_token_budget(p, thinking_budget_ratio)
+        _apply_thinking_token_budget(
+            p, thinking_budget_ratio,
+            field=self.descriptor.reasoning_budget_field,
+            absolute=reasoning_budget_tokens)
         return p
 
     async def discover_capacity(

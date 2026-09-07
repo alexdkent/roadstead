@@ -162,6 +162,22 @@ class ProviderDescriptor:
     #: top of the caller's cap. The switch's SPELLING is per model family and
     #: lives in the catalog, never here.
     reasoning_is_switchable: bool = False
+    #: Wire name this engine reads for a REASONING TOKEN CAP, or None where it
+    #: has none. Same rule as ``grammar_field`` directly above: the proxy knows
+    #: one concept and each engine names it differently, so branch on the
+    #: declaration rather than on ``backend_engine`` at the call site.
+    #:
+    #: 🚨 THE TWO SPELLINGS ARE NOT INTERCHANGEABLE, AND THE DIFFERENCE IS
+    #: SILENT. vLLM reads ``thinking_token_budget`` and only when the server was
+    #: launched with ``--reasoning-config``; llama.cpp reads
+    #: ``reasoning_budget_tokens`` and needs no launch flag. Sending vLLM's
+    #: spelling to llama.cpp is not an error — the field is simply ignored, so a
+    #: declared cap reads as applied and bounds nothing. Measured 2026-09-07:
+    #: llama.cpp b10488 honours ``reasoning_budget_tokens`` (reasoning 8,595 ->
+    #: 1,858 chars at a 512 cap, 2/2), while every llama.cpp stanza's
+    #: ``thinking_budget_ratio`` had been a documented no-op for exactly this
+    #: reason.
+    reasoning_budget_field: str | None = None
 
     # --- characterised DEFECTS -----------------------------------------------
     #: Labels a tool-call response ``finish_reason=tool_calls`` even when the
@@ -245,6 +261,7 @@ class Provider(ABC):
         model_id: str | None = None,
         thinking_budget_ratio: float = 0.0,
         thinking_kwargs: tuple[str, ...] = (),
+        reasoning_budget_tokens: int = 0,
     ) -> dict:
         """Make a caller's chat payload wire-correct for this backend.
 

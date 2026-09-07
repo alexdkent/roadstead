@@ -96,6 +96,11 @@ class OpenRouterProvider(Provider):
         # True here means model_catalog must NOT add the forced-CoT headroom
         # reserve, which exists for a llama.cpp model with no kill switch.
         reasoning_is_switchable=True,
+        # None, and NOT a spelling of the two local engines' flat field: this
+        # API nests a reasoning cap under `reasoning: {max_tokens: N}`, so a
+        # top-level key would be ignored and a declared cap would bound nothing.
+        # Wiring that nested shape is Workstream D's job, not this field's.
+        reasoning_budget_field=None,
         # No evidence either way, and a defect declaration must be earned by
         # measurement rather than assumed by analogy with vLLM.
         mislabels_truncated_tool_calls=False,
@@ -155,6 +160,7 @@ class OpenRouterProvider(Provider):
         model_id: str | None = None,
         thinking_budget_ratio: float = 0.0,
         thinking_kwargs: tuple[str, ...] = (),
+        reasoning_budget_tokens: int = 0,
     ) -> dict:
         """Reduce a payload shaped for our own engines to plain OpenAI chat.
 

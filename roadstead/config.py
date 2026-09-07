@@ -226,6 +226,75 @@ class EndpointConfig:
     #: prompt size, and not a constant that is generous for one caller and starving
     #: for the next.
     thinking_budget_ratio: float = 0.0
+    #: ABSOLUTE reasoning cap in tokens, from ``policy.reasoning_budget_tokens``.
+    #: 0 = undeclared, inject nothing. Sent under the wire name the endpoint's
+    #: provider publishes (``ProviderDescriptor.reasoning_budget_field``), which
+    #: is why this is ONE declaration and not one per engine.
+    #:
+    #: 🚨 WHY AN ABSOLUTE AND NOT ``thinking_budget_ratio`` ABOVE. The ratio is a
+    #: fraction of ``max_tokens``, and it only bites when reasoning would
+    #: otherwise consume the WHOLE allowance — the tier3 failure it was built for.
+    #: On an endpoint whose natural reasoning already lands well under the
+    #: allowance, a ratio computes a number far ABOVE the tail it was meant to
+    #: bound, and is inert. Measured 2026-09-07, N=2, ``max_tokens`` 4000 on a
+    #: Qwen3.6-35B-A3B llama.cpp endpoint: natural reasoning ~2,000 tokens, so a
+    #: 0.6 ratio (2,400) never bound, a declared 2000 barely bound, and only a
+    #: declared 512 moved anything — reasoning 8,595 -> 1,858 chars and wall time
+    #: 31s -> 14s, the answer shrinking only 5,082 -> 4,425 chars. A cap that
+    #: cannot bind looks exactly like a cap that is working.
+    #:
+    #: Deliberately NOT clamped by the ``_THINKING_BUDGET_*`` constants in
+    #: providers/payload.py: those were derived for the ratio path on a long-form
+    #: reasoner, and their 2000 FLOOR would silently raise a declared 512 to 2000
+    #: — i.e. to a value already measured not to bind. An operator who writes a
+    #: number here means that number.
+    reasoning_budget_tokens: int = 0
+    #: Chat-template reasoning EFFORT level, from ``policy.reasoning_effort``.
+    #: "" = undeclared, inject nothing. Folded into the SAME
+    #: ``chat_template_kwargs`` object as the thinking switch by
+    #: ``Correction.apply_thinking``.
+    #:
+    #: 🚨 "THINKING ON" IS NOT A NEUTRAL TOGGLE ON A TEMPLATE THAT CARRIES ITS OWN
+    #: EFFORT DEFAULT. Qwen3.8 renders ``reasoning_effort|default('xhigh')`` — its
+    #: MAXIMUM — so switching thinking on and saying nothing else asks the model to
+    #: be exhaustive. Verified 2026-09-07 against a live ``/apply-template``:
+    #: ``{enable_thinking:true}`` alone renders BYTE-IDENTICAL to
+    #: ``{enable_thinking:true, reasoning_effort:"xhigh"}``, injecting "Please think
+    #: carefully through the task, validate key assumptions, consider plausible
+    #: alternatives...". Same day, N=2, ``max_tokens`` 4000 on that endpoint:
+    #: unset/xhigh returned ``finish_reason=length`` with ZERO answer chars 2/2,
+    #: having spent all 4,000 tokens on ~15k chars of reasoning; ``low`` returned a
+    #: complete answer in half the wall time.
+    #:
+    #: It is a PROMPT PREFIX, not a token bound — ``low`` produced a LONGER answer
+    #: than unset, not a truncated one. On that template ``medium`` injects no
+    #: instruction at all, so ``low`` is the active brevity lever rather than the
+    #: middle of three; an unrecognised value hits the template's own
+    #: ``raise_exception`` and ERRORS the request. Declare it per model; never
+    #: guess it.
+    #:
+    #: 🚨 IT MUST TRAVEL IN THE SAME OBJECT AS THE SWITCH. Per-request
+    #: ``chat_template_kwargs`` merge KEY-BY-KEY over the server's own launch
+    #: default, so an effort sent WITHOUT the switch renders with thinking OFF and
+    #: the effort silently dropped — verified the same way, on the same endpoint.
+    #: Not every template has the branch: an endpoint whose ``/props``
+    #: ``chat_template_caps.supports_reasoning_effort`` is false does not read this
+    #: key at all, and declaring it there is inert rather than wrong. Re-check
+    #: ``/props`` after a model swap instead of assuming a family shares a template.
+    reasoning_effort: str = ""
+    #: Per-endpoint override of the global ``thinking_reasoning_budget()`` (8000)
+    #: headroom that ``Correction.apply_thinking`` ADDS to ``max_tokens`` on the
+    #: proxy's own thinking opt-in. 0 = undeclared, use the global.
+    #:
+    #: The global is one number for every endpoint and it was sized for a long-form
+    #: reasoner. Reasoning is generated output that counts against ``max_tokens``,
+    #: so on a slow endpoint that headroom is also a WALL-CLOCK commitment: 8,000
+    #: tokens of extra allowance at a measured ~20 tok/s is up to ~400s of decode
+    #: that the deadline never accounted for, because the deadline is resolved from
+    #: the caller's ``max_tokens`` BEFORE this inflation happens. Size it from the
+    #: reasoning the endpoint actually emits once its effort and cap are declared,
+    #: not from the worst case of a different model.
+    thinking_reasoning_budget: int = 0
     #: The chat-template variable(s) that switch REASONING on/off for the model
     #: this endpoint serves, from the stanza's ``policy.thinking_kwargs``.
     #:

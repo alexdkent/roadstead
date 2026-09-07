@@ -45,7 +45,7 @@ def test_an_endpoint_that_does_not_declare_support_gets_nothing():
     `--reasoning-config` returns 400 for the entire request, so silence is the only
     safe behaviour for every endpoint that has not declared the launch flag."""
     p = _payload()
-    _apply_thinking_token_budget(p, 0.0)
+    _apply_thinking_token_budget(p, 0.0, field="thinking_token_budget")
     assert "thinking_token_budget" not in p
 
 
@@ -60,7 +60,7 @@ def test_normalize_does_not_inject_without_a_declared_ratio():
 
 def test_a_declared_endpoint_gets_a_budget_proportional_to_max_tokens():
     p = _payload(max_tokens=12000)
-    _apply_thinking_token_budget(p, 0.6)
+    _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
     assert p["thinking_token_budget"] == 7200
     # And the answer keeps the rest — that is the entire point.
     assert p["thinking_token_budget"] < p["max_tokens"]
@@ -79,7 +79,7 @@ def test_either_spelling_of_the_thinking_switch_counts(key):
     silent no-op for half the fleet, which is the failure shape that reads as
     'the budget didn't work today'."""
     p = _payload(chat_template_kwargs={key: True})
-    _apply_thinking_token_budget(p, 0.6)
+    _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
     assert p["thinking_token_budget"] == 7200
 
 
@@ -87,14 +87,14 @@ def test_either_spelling_of_the_thinking_switch_counts(key):
 
 def test_thinking_off_gets_no_budget():
     p = _payload(chat_template_kwargs={"thinking": False})
-    _apply_thinking_token_budget(p, 0.6)
+    _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
     assert "thinking_token_budget" not in p
 
 
 def test_a_caller_that_set_its_own_budget_is_never_overridden():
     """Callers declare intent; the proxy supplies the number only when they didn't."""
     p = _payload(thinking_token_budget=1234)
-    _apply_thinking_token_budget(p, 0.6)
+    _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
     assert p["thinking_token_budget"] == 1234
 
 
@@ -102,14 +102,14 @@ def test_a_tiny_max_tokens_is_left_alone():
     """Below the floor there is no sane split: a 2000-token cap on a 1500-token
     allowance leaves nothing for an answer, which is the failure being prevented."""
     p = _payload(max_tokens=1500)
-    _apply_thinking_token_budget(p, 0.6)
+    _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
     assert "thinking_token_budget" not in p
 
 
 def test_a_missing_max_tokens_is_left_alone():
     p = _payload()
     p.pop("max_tokens")
-    _apply_thinking_token_budget(p, 0.6)
+    _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
     assert "thinking_token_budget" not in p
 
 
@@ -120,21 +120,21 @@ def test_the_floor_keeps_the_cap_clear_of_the_tool_call_corruption_zone():
     tokens in ~75% of runs. Our agents make dozens of tool calls per task, so the cap
     must never be computed down into that zone by a small max_tokens."""
     p = _payload(max_tokens=4000)
-    _apply_thinking_token_budget(p, 0.05)      # would compute to 200
+    _apply_thinking_token_budget(p, 0.05, field="thinking_token_budget")      # would compute to 200
     assert p["thinking_token_budget"] == _THINKING_BUDGET_FLOOR
     assert _THINKING_BUDGET_FLOOR > 1024       # above Anthropic's documented minimum
 
 
 def test_the_ceiling_stops_at_the_point_published_curves_turn_down():
     p = _payload(max_tokens=200000)
-    _apply_thinking_token_budget(p, 0.9)
+    _apply_thinking_token_budget(p, 0.9, field="thinking_token_budget")
     assert p["thinking_token_budget"] == _THINKING_BUDGET_CEILING
 
 
 def test_a_budget_that_would_leave_no_answer_room_is_refused():
     """Clamping to the floor must not itself produce the starvation it prevents."""
     p = _payload(max_tokens=_THINKING_BUDGET_FLOOR)
-    _apply_thinking_token_budget(p, 0.9)
+    _apply_thinking_token_budget(p, 0.9, field="thinking_token_budget")
     assert "thinking_token_budget" not in p
 
 

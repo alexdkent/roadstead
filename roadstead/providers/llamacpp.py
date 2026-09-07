@@ -62,6 +62,9 @@ class LlamaCppProvider(Provider):
         # CoT unconditionally, which is why model_catalog sets
         # `forces_reasoning` here and the submit path reserves answer headroom.
         reasoning_is_switchable=False,
+        # llama.cpp's own spelling, and it needs no launch flag (unlike vLLM's).
+        # Verified firing on b10488 and b10499.
+        reasoning_budget_field="reasoning_budget_tokens",
         # Labels a truncated tool call `length`, correctly.
         # Reached at host:port on a machine you run; no credential of its own.
         # Stated rather than defaulted — see test_provider_interface.
@@ -80,6 +83,7 @@ class LlamaCppProvider(Provider):
         model_id: str | None = None,
         thinking_budget_ratio: float = 0.0,
         thinking_kwargs: tuple[str, ...] = (),
+        reasoning_budget_tokens: int = 0,
     ) -> dict:
         """Make an Anthropic/extra_body-shaped chat payload wire-correct for
         llama-server.
@@ -114,6 +118,12 @@ class LlamaCppProvider(Provider):
             and not needs_vision_xlate
             and not needs_alternation
             and not (thinking_budget_ratio > 0)
+            # 🚨 The absolute cap has to be in this guard too. Without it a
+            # payload carrying no `system`/`extra_body` short-circuits out
+            # before `_apply_thinking_token_budget` runs, and a declared
+            # `reasoning_budget_tokens` silently never reaches the wire —
+            # the same shape of no-op the declaration exists to fix.
+            and not (reasoning_budget_tokens > 0)
         ):
             return payload
         p = dict(payload)
@@ -141,7 +151,10 @@ class LlamaCppProvider(Provider):
         # rather than dropped because "no-op today" is not "unreachable", and a
         # silent behaviour change in a payload path is the one thing the
         # provider split must not introduce.
-        _apply_thinking_token_budget(p, thinking_budget_ratio)
+        _apply_thinking_token_budget(
+            p, thinking_budget_ratio,
+            field=self.descriptor.reasoning_budget_field,
+            absolute=reasoning_budget_tokens)
         return p
 
     async def discover_capacity(

@@ -1543,6 +1543,21 @@ class Correction:
         ck = dict(ck) if isinstance(ck, dict) else {}
         for key in keys:
             ck[key] = True
+        # THE EFFORT RIDES IN THE SAME OBJECT AS THE SWITCH, and that is not a
+        # tidiness point. Per-request `chat_template_kwargs` merge KEY-BY-KEY
+        # over the server's launch default, so an effort sent on its own renders
+        # with thinking OFF and the effort dropped — verified 2026-09-07 via a
+        # live `/apply-template`. Building one dict here is what makes that
+        # impossible to get wrong from a catalog declaration.
+        #
+        # A CALLER'S OWN PIN WINS. Same rule the switch keys follow: this is a
+        # per-endpoint DEFAULT for callers that opted into thinking and said
+        # nothing about how hard to think, not an override of a caller that did.
+        # Absent declaration => nothing injected => the template's own default,
+        # which is the pre-2026-09-07 behaviour exactly.
+        declared_effort = getattr(ep, "reasoning_effort", "") if ep is not None else ""
+        if declared_effort and "reasoning_effort" not in ck:
+            ck["reasoning_effort"] = declared_effort
         p["chat_template_kwargs"] = ck
         # HOW MUCH REASONING HEADROOM. `thinking: true` keeps the historic flat
         # allowance; `thinking: <int>` asks for exactly that many tokens.
@@ -1558,7 +1573,18 @@ class Correction:
         # So an interactive caller wants a small explicit headroom, a long-form
         # author wants the generous default, and the proxy cannot tell which is
         # which from the payload. Let the caller say.
-        budget = thinking_reasoning_budget()
+        #
+        # An endpoint may DECLARE its own headroom (`policy.thinking_reasoning_
+        # budget`), which then replaces the flat global as the starting point —
+        # including as the ceiling the int form is capped against, so
+        # `thinking: <int>` still only ever asks for LESS. The global is one
+        # number for every endpoint and was sized for a long-form reasoner; on a
+        # slow endpoint its unused allowance is also unbudgeted WALL CLOCK, since
+        # the deadline was resolved from the caller's max_tokens before this line
+        # inflates it. Absent declaration => the global => unchanged behaviour.
+        declared_budget = (getattr(ep, "thinking_reasoning_budget", 0) or 0
+                           if ep is not None else 0)
+        budget = declared_budget if declared_budget > 0 else thinking_reasoning_budget()
         if isinstance(want, int) and not isinstance(want, bool) and want > 0:
             budget = min(want, budget)
         cur = p.get("max_tokens")

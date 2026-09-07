@@ -1610,6 +1610,59 @@ are distinguishable, which they are not on `/v1/status`. `GET /rs/v1/admin/calle
 three blocks — `in_force`, `declared` (what the file set) and `runtime` (what this API changed) — so
 an override reads as a difference rather than a label.
 
+#### 3.11 Tuning reasoning on an endpoint 🚨
+
+Switching thinking ON is not the same as making it usable. Three `policy:` keys tune it, and all
+three are **absent ⇒ inject nothing**, so an endpoint that declares none behaves exactly as it did
+before they existed.
+
+| key | what it does |
+|---|---|
+| `reasoning_effort` | Chat-template effort level, folded into the **same** `chat_template_kwargs` object as the thinking switch. |
+| `reasoning_budget_tokens` | Absolute reasoning cap, sent under the engine's own wire name. |
+| `thinking_reasoning_budget` | Per-endpoint replacement for the global headroom added to `max_tokens` on the `thinking:` opt-in. |
+
+🚨 **"Thinking on" is not a neutral toggle on a template that carries its own effort default.** Some
+templates render `reasoning_effort|default(...)` at their MAXIMUM, so switching thinking on and
+saying nothing else asks the model to be exhaustive — the observable result is a response that
+spends its whole allowance on reasoning and returns `finish_reason=length` with empty content. The
+effort is a **prompt prefix, not a token bound**: a lower level can produce a *longer* answer, not a
+truncated one. Levels are per model, an unrecognised value can hit the template's own
+`raise_exception` and error the request, and on some templates the middle level injects no
+instruction at all — so read the rendered prompt back from the backend's `/apply-template` rather
+than assuming. An endpoint whose `/props` reports `chat_template_caps.supports_reasoning_effort:
+false` does not read the key at all; declaring it there is inert.
+
+🚨 **The effort must travel in the same object as the switch.** Per-request `chat_template_kwargs`
+merge KEY-BY-KEY over the server's launch default, so an effort sent *without* the switch renders
+with thinking OFF and the effort silently dropped. The proxy builds one object for exactly this
+reason; a caller assembling its own should do the same. A caller's own `reasoning_effort` always
+wins — the declaration is a default for callers that opted into thinking and said nothing about how
+hard to think.
+
+🚨 **A cap's wire name is per ENGINE, and getting it wrong is silent.** vLLM reads
+`thinking_token_budget` and only when launched with `--reasoning-config` (without it, it 400s the
+whole request); llama.cpp reads `reasoning_budget_tokens` and needs no launch flag. llama.cpp
+*ignores* the vLLM spelling rather than rejecting it, so a cap declared in the wrong name reads as
+applied and bounds nothing. `reasoning_budget_tokens` is one declaration and each provider emits its
+own spelling from `ProviderDescriptor.reasoning_budget_field`.
+
+**Prefer the absolute cap to `thinking_budget_ratio`.** The ratio is a fraction of `max_tokens` and
+only bites when reasoning would otherwise consume the whole allowance. Where an endpoint's natural
+reasoning already lands well under the allowance, the ratio computes a number *above* the tail it
+was meant to bound and is inert — a cap that cannot bind looks exactly like a cap that is working.
+Size an absolute from what the endpoint actually emits. The absolute wins over a ratio, and is
+deliberately **not** clamped by the ratio path's floor/ceiling: those guard an arbitrary caller
+`max_tokens`, and would silently raise a small measured-good value to one already known not to bind.
+
+**On the headroom.** The global default (8000 tokens) is one number for
+every endpoint and is sized for a long-form reasoner. Reasoning is generated output that counts
+against `max_tokens`, so on a slow endpoint that headroom is also a **wall-clock commitment** — and
+the deadline is resolved from the caller's `max_tokens` *before* the opt-in inflates it, so the
+inflation is time no deadline accounted for. Declare a per-endpoint value sized to the reasoning the
+endpoint emits once its effort and cap are set. A caller's `thinking: <int>` is capped against the
+declared value where there is one, so it can still only ask for less.
+
 ### 3.7 The management UI 🚨
 
 `GET /rs/v1/admin/ui` — one static HTML page, vanilla JS, **no bundler and no external references at

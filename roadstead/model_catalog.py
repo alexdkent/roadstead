@@ -535,6 +535,21 @@ _POLICY_PASSTHROUGH = (
     # it, and 400s the request instead). Absent/0 = inject nothing, which is
     # what every endpoint except a reasoner wants.
     "thinking_budget_ratio",
+    # ABSOLUTE reasoning cap in tokens, sent under the engine's own wire name
+    # (ProviderDescriptor.reasoning_budget_field). Unlike the ratio above it needs
+    # no launch flag on llama.cpp. Absent/0 = inject nothing. Guarded by
+    # test_reasoning_tuning.py::test_reasoning_budget_tokens_reaches_endpoint_config.
+    "reasoning_budget_tokens",
+    # Chat-template reasoning EFFORT, folded into the SAME chat_template_kwargs
+    # object as the thinking switch. Absent = inject nothing — which, on a
+    # template carrying its own default (Qwen3.8: xhigh), means the model's
+    # MAXIMUM effort rather than a neutral one. Guarded by
+    # test_reasoning_tuning.py::test_reasoning_effort_reaches_endpoint_config.
+    "reasoning_effort",
+    # Per-endpoint override of the global thinking headroom (8000) added to
+    # max_tokens on the `thinking:` opt-in. Absent/0 = use the global. Guarded by
+    # test_reasoning_tuning.py::test_thinking_budget_override_reaches_endpoint_config.
+    "thinking_reasoning_budget",
     # Marks the endpoint backing the conversational lane, which is what
     # `/readyz` fails closed on. Guarded by
     # test_readyz.py::test_readiness_critical_flag_reaches_endpoint_config.

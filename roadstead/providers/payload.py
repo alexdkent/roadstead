@@ -205,7 +205,9 @@ _THINKING_BUDGET_CEILING = 16000
 _THINKING_BUDGET_MIN_MAX_TOKENS = 3000
 
 
-def _apply_thinking_token_budget(p: dict, ratio: float) -> None:
+def _apply_thinking_token_budget(p: dict, ratio: float, *,
+                                 field: str | None = None,
+                                 absolute: int = 0) -> None:
     """Cap REASONING at a fraction of `max_tokens`, so an answer always has room.
 
     Complements — never replaces — `Correction.apply_thinking`, which ADDS
@@ -227,10 +229,22 @@ def _apply_thinking_token_budget(p: dict, ratio: float) -> None:
     mirrored from its `--reasoning-config` launch flag). vLLM 400s the entire request
     when the parameter arrives at a server without that flag, so a wrong declaration
     does not degrade an endpoint, it breaks every thinking call to it.
+    ``field`` is the engine's wire name for the cap
+    (``ProviderDescriptor.reasoning_budget_field``) — vLLM says
+    ``thinking_token_budget``, llama.cpp says ``reasoning_budget_tokens``. None
+    means the engine has no such parameter and nothing is injected.
+
+    ``absolute`` is the endpoint's declared ``reasoning_budget_tokens`` and, when
+    set, WINS over the ratio and skips the clamps below. The clamps exist to keep
+    a RATIO of an arbitrary caller ``max_tokens`` inside a sane band; a number an
+    operator wrote against a measurement needs no such protection, and the 2000
+    floor would silently raise a measured-good 512 to a value measured NOT to bind.
     """
-    if not ratio or ratio <= 0:
+    if field is None:
+        return                      # engine has no reasoning-cap parameter
+    if not absolute and (not ratio or ratio <= 0):
         return
-    if "thinking_token_budget" in p:
+    if field in p:
         return                      # caller declared intent; never override it
     ck = p.get("chat_template_kwargs")
     if not isinstance(ck, dict):
@@ -238,11 +252,20 @@ def _apply_thinking_token_budget(p: dict, ratio: float) -> None:
     if not (ck.get("thinking") or ck.get("enable_thinking")):
         return                      # thinking is off — a budget would be meaningless
     mt = p.get("max_tokens")
+    if absolute and absolute > 0:
+        # An operator-declared absolute. Still refuse to leave nothing for an
+        # answer, which is the whole failure this function exists to prevent —
+        # but no floor, no ceiling, no minimum max_tokens: those are ratio-path
+        # guards and this path has a measurement behind it instead.
+        if isinstance(mt, int) and mt > 0 and absolute >= mt:
+            return
+        p[field] = int(absolute)
+        return
     if not isinstance(mt, int) or mt < _THINKING_BUDGET_MIN_MAX_TOKENS:
         return
     budget = int(mt * ratio)
     budget = max(_THINKING_BUDGET_FLOOR, min(budget, _THINKING_BUDGET_CEILING))
     if budget >= mt:
         return                      # nothing left for an answer; leave it alone
-    p["thinking_token_budget"] = budget
+    p[field] = budget
 
