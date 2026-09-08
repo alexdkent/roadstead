@@ -1,4 +1,4 @@
-<!-- FRESHNESS: 2026-08-31 — original evaluation. Landscape figures pulled from the GitHub API on 2026-08-31; re-verify project activity before relying on the dismissal list after ~2026-11. The capability inventory is code-truth as of the 2026-08-31 snapshot, plus live runtime-flag state. -->
+<!-- FRESHNESS: 2026-08-31 original evaluation, §3.4 added 2026-09-08. Landscape figures pulled from the GitHub API on 2026-08-31; re-verify project activity before relying on the dismissal list after ~2026-11. The capability inventory is code-truth as of the 2026-08-31 snapshot, plus live runtime-flag state. §3.4 (NVIDIA PAIR) is a later addendum on a project that did not exist at survey time and is paper-only — nothing in it has been run. -->
 
 # Roadstead vs the open-source field — 2026-08-31
 
@@ -98,6 +98,7 @@ fair-share between callers.
 | AIBrix standalone | ✅ | opt-in | ✅ | ❌ | ✅ | reduced |
 | LiteLLM | ✅ | ❌ static ceiling | ❌ | opaque | opaque | beta |
 | Olla | ✅ | ❌ by design | ❌ | ✅ | ✅ | ❌ |
+| NVIDIA PAIR | ✅ | ❌ steering only | partial | ❌ | ❌ | ❌ |
 
 **No project satisfies all six.**
 
@@ -160,6 +161,89 @@ round-robin, so the algorithm is coarser.
   deploy-time bin-packing, or meta-launchers. A different problem.
 - **Traefik AI Gateway / Cloudflare AI Gateway** — no OSS path, or SaaS only.
 
+
+### 3.4 Adjacent, not competing: NVIDIA PAIR (added 2026-09-08)
+
+**Personal AI Router**, `github.com/NVIDIA/Personal-AI-Router`, Apache-2.0, public beta v0.1.1
+announced 2026-09-03 at IFA. It postdates the survey above, and it is the first entry in this
+document that is local-first *and* multi-host, so it is the closest neighbour the list has. It is
+also the only one that could plausibly be a Roadstead **backend** rather than an alternative to
+Roadstead, which is a relationship this document had no prior example of.
+
+What it does: auto-discovers compatible machines on a LAN over mDNS (or by manual IP), pairs them
+behind a gate that blocks all node-to-node traffic until mTLS is established, and routes each
+*independent* request to one eligible node. Scheduling reads node readiness, whether a supported
+engine is enabled, **whether that exact model is present on that node**, active jobs on node and
+engine, and **GPU utilization including non-inference load** — it will steer away from a machine
+that is running a game. It fronts Ollama and LM Studio, and re-exposes Ollama-compatible,
+LM-Studio-compatible and OpenAI-compatible doors so no agent harness has to learn a cluster API.
+NVIDIA states plainly that it does not pool VRAM and does not shard a request: one request, one
+node.
+
+**Why it is not a competitor.** It is the "local tools assume one user, so fairness is
+uninteresting to them" case from §1, built well. There is no caller identity, no priority band, no
+queue, no deferral, and no admission decision — a request is *steered*, never *held*. Its scarce
+resource is an idle machine; Roadstead's is a slot on a machine that is never idle. Both are correct
+for their own problem, and the two problems do not overlap: PAIR helps when you have hardware nobody
+is using, and is silent on what to do when you don't.
+
+**Two convergences worth recording.** NVIDIA states the no-sharding boundary as flatly as this
+project does — two independent teams landing on *the router is a scheduler, not a distributed
+inference engine* is evidence the boundary is drawn in the right place. And PAIR is the second
+NVIDIA entry in the table: Dynamo is the datacentre answer, PAIR the household one, and neither
+does caller fair-share.
+
+**The one capability here that Roadstead does not have.** PAIR schedules against **GPU
+utilization from work that is not inference**. Roadstead admits against slot counts and knows
+nothing about a co-tenant on the same GPU; where that matters in the deployment this was extracted
+from, it is handled out-of-band by a separate GPU-slot dispatcher (`on_demand.py`) that Roadstead
+leases from rather than models. PAIR treats co-tenancy as one scheduler's problem; Roadstead treats
+it as two systems that have to agree, which is the more fragile arrangement. That is a real gap and
+it is not closed by anything in §2.
+
+**As a backend.** Fronting a PAIR fabric as a Roadstead endpoint is coherent but strictly
+subtractive on the south face, and the reasons are the descriptor fields in
+`providers/base.py`:
+
+- `publishes_slot_count` / `publishes_slot_context` / `publishes_context_ceiling` — **all false.**
+  Ollama and LM Studio publish no slot count, and PAIR does not synthesize one across the fabric.
+  This is blinder than vLLM, which at least yields `max_model_len`. `max_slots` becomes a guess
+  about a set of machines whose *membership changes*, and the `max_slots_drift` reconciler has
+  nothing to compare against.
+- `lists_available_models` — **true, and the one field that improves.** PAIR knows which models sit
+  on which node, so an operator picks from a list rather than guessing a slug.
+- `grammar_field` — **`None`.** Neither fronted engine takes GBNF, so a grammar-carrying request to
+  such an endpoint must *refuse* under the `ProviderError` doctrine rather than downgrade. Any tier
+  that relies on an enforced grammar cannot route here at all.
+- The **correction layer keeps working**, since it reads response shape rather than engine identity
+  — but Ollama is a third engine whose quirks (`mislabels_truncated_tool_calls`,
+  `reasoning_budget_field`, terminal-chunk behaviour) have never been characterised here. Assuming
+  llama.cpp's answers because Ollama wraps llama.cpp is exactly the inference this descriptor exists
+  to forbid.
+- **Attribution goes dark.** `attribution.endpoint` is a load-bearing promise: the caller is told
+  what actually served it. Behind PAIR the choice is PAIR's, and the Ollama response schema has no
+  field to carry it back. A per-node truth becomes a per-fabric one.
+- The latency model would learn a **mixture distribution** over heterogeneous hardware whose
+  composition changes when somebody shuts a lid — `(endpoint, tier, in-bucket, out-bucket)` buckets
+  assume one endpoint means one machine.
+
+Declaring each node as its own ordinary Roadstead endpoint instead recovers every one of those, at
+the cost of running llama.cpp on a machine you may not administer. **That trade — a signed
+cross-platform installer and a pairing flow, versus a `llama-server` you have to keep alive on
+someone else's gaming PC — is the actual argument for PAIR, and it is an operational argument
+rather than an architectural one.** Where it wins, it wins on people, not on scheduling.
+
+🚨 **`kind` has no honest value for it.** The enum offers `local` (finite, scarce, fair-shared in
+slot-seconds) and `remote` (elastic, governed by cost). Opportunistic borrowed capacity is finite
+*and* free *and* may vanish mid-request — none of the three. It would be declared `local` today,
+which is the least wrong option and still wrong.
+
+**Unverified.** Nothing here has been run. Open questions, in the order they would change the
+analysis: whether PAIR reports which node served a request through any channel a proxy could read;
+whether it exposes queue depth or per-node concurrency anywhere; and whether an unreachable or
+gaming-busy fabric fails fast or hangs, which decides whether it can be given the deferrable-error
+treatment `on_demand.py` gives a dispatcher that is down.
+
 ---
 
 ## 4. Method and limits
@@ -176,4 +260,6 @@ round-robin, so the algorithm is coarser.
   `json_schema` retry behavior; Higress's InferencePool admission (inferred); Dynamo's metric
   collection mechanism; whether Paddler retains a mode for fronting an external server (the single
   item most capable of changing the near-miss analysis); Portkey's claimed fair-share;
-  Cloudflare's non-self-hostability.
+  Cloudflare's non-self-hostability. NVIDIA PAIR (§3.4) was added after the survey and is
+  paper-only in the strongest sense — it was read, not run, and its own headline number is
+  labelled by NVIDIA as a configuration-specific demo rather than a benchmark.
