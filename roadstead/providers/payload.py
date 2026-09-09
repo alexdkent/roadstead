@@ -251,6 +251,56 @@ def _apply_thinking_token_budget(p: dict, ratio: float, *,
         return
     if not (ck.get("thinking") or ck.get("enable_thinking")):
         return                      # thinking is off — a budget would be meaningless
+    tools = p.get("tools")
+    if isinstance(tools, list) and tools:
+        # 🚨 TOOL TURN — inject NOTHING.
+        #
+        # A budget that cuts reasoning SHORT on a tool turn corrupts the
+        # TOOL-CALL CHANNEL: the model's tool-call control tokens are emitted as
+        # garbled literal text in `content` instead of being parsed, and
+        # `finish_reason` degrades from `tool_calls` to `stop`. The caller gets a
+        # confident prose answer and NO side effect. Observed content head from a
+        # suppressed turn:
+        #
+        #     |[Function]| The final answer should include.tool[Tool block]
+        #     Let me think about edge cases for `add(a, b)`::
+        #
+        # — the tool tokens mangled, and the reasoning simply CONTINUING into the
+        # answer channel. Reproduced NON-STREAMING, so this is not only the
+        # same-delta parser collision (vLLM #43221); it is closest to #39697, the
+        # forced reasoning-end string landing mid-emission. Both are open.
+        #
+        # 🔑 IT IS THE SEVERITY OF THE CUT, NOT "BINDING" AS SUCH. Measured
+        # dose-response, n=4 per cell, one fixed tool-calling turn whose natural
+        # reasoning is ~210 tokens:
+        #
+        #     budget    64 -> tool call 0/4      (~30% of natural)
+        #     budget   128 -> tool call 0/4      (~60%)
+        #     budget   256 -> tool call 3/4      (~120%)
+        #     budget   512 -> tool call 4/4      (~240%)
+        #     no budget    -> tool call 4/4
+        #
+        # So a budget comfortably ABOVE the turn's natural reasoning length is
+        # harmless — it never binds. The failure is confined to budgets at or
+        # below it. An earlier probe measured natural reasoning on a SIMPLE tool
+        # turn at 70-234 tokens against a ~3,600-token budget and concluded the
+        # ratio "cannot engage"; that was correct FOR THAT WORKLOAD. On an
+        # agentic multi-file build, reasoning consumes the entire allowance
+        # (output tokens pin to the budget: 2,048 -> 2,218 out; 16,384 -> 16,513)
+        # and the same ratio lands deep in the failure zone. 13 such draws wrote
+        # files in 2; the same harness with thinking OFF went 3/3.
+        #
+        # WHY THAT MEANS "INJECT NOTHING" RATHER THAN "PICK A BIGGER NUMBER":
+        # the safe budget is a function of the TURN's natural reasoning length,
+        # which is not knowable before generating it. Any fixed number is a
+        # gamble whose loss is silent. The cap exists to bound a runaway-reasoning
+        # tail on PLAIN generation; on a tool turn the model has an external
+        # action to take, so that tail is not the risk worth trading a suppressed
+        # call for.
+        #
+        # Applies to the operator-declared absolute too: the harm is where the cut
+        # lands, not the provenance of the number.
+        return
     mt = p.get("max_tokens")
     if absolute and absolute > 0:
         # An operator-declared absolute. Still refuse to leave nothing for an
