@@ -204,6 +204,15 @@ _THINKING_BUDGET_CEILING = 16000
 #: allowance and leave nothing for an answer, which is the failure we are preventing.
 _THINKING_BUDGET_MIN_MAX_TOKENS = 3000
 
+#: Tokens held back for the ANSWER on a TOOL-CALLING turn, where the cap is derived
+#: from the top of the allowance (`max_tokens - RESERVE`) rather than from a fraction
+#: of it. See the tool-turn branch below for why the ratio, the absolute and the
+#: floor/ceiling clamps are all wrong on that path. Not a measured number: in every
+#: non-runaway case this budget does not bind, and in the runaway case it trades
+#: room-for-the-tool-call against how high the cut lands. Changing it needs a probe at
+#: a BINDING shape.
+_TOOL_TURN_ANSWER_RESERVE = 1024
+
 
 def _apply_thinking_token_budget(p: dict, ratio: float, *,
                                  field: str | None = None,
@@ -239,6 +248,13 @@ def _apply_thinking_token_budget(p: dict, ratio: float, *,
     a RATIO of an arbitrary caller ``max_tokens`` inside a sane band; a number an
     operator wrote against a measurement needs no such protection, and the 2000
     floor would silently raise a measured-good 512 to a value measured NOT to bind.
+
+    On a turn that DECLARES TOOLS neither the ratio nor the absolute is used: the
+    budget is ``max_tokens - _TOOL_TURN_ANSWER_RESERVE``, which on every live caller
+    sits far above natural reasoning and cannot bind, and in the runaway case fires
+    at the tail so the answer channel is non-empty. A cut that lands SHORT of the
+    turn's natural reasoning suppresses the tool call outright; a cut that lands
+    nowhere at all restores the empty-completion 502. Both measured — see the branch.
     """
     if field is None:
         return                      # engine has no reasoning-cap parameter
@@ -253,22 +269,22 @@ def _apply_thinking_token_budget(p: dict, ratio: float, *,
         return                      # thinking is off — a budget would be meaningless
     tools = p.get("tools")
     if isinstance(tools, list) and tools:
-        # 🚨 TOOL TURN — inject NOTHING.
+        # 🚨 TOOL TURN — a RESERVE-derived budget, never the ratio or the absolute.
         #
-        # A budget that cuts reasoning SHORT on a tool turn corrupts the
-        # TOOL-CALL CHANNEL: the model's tool-call control tokens are emitted as
-        # garbled literal text in `content` instead of being parsed, and
-        # `finish_reason` degrades from `tool_calls` to `stop`. The caller gets a
-        # confident prose answer and NO side effect. Observed content head from a
-        # suppressed turn:
+        # THE FAILURE THIS AVOIDS. A budget that cuts reasoning SHORT on a tool
+        # turn corrupts the TOOL-CALL CHANNEL: the model's tool-call control
+        # tokens are emitted as garbled literal text in `content` instead of
+        # being parsed, and `finish_reason` degrades from `tool_calls` to
+        # `stop`. The caller gets a confident prose answer and NO side effect.
+        # Observed content head from a suppressed turn:
         #
         #     |[Function]| The final answer should include.tool[Tool block]
         #     Let me think about edge cases for `add(a, b)`::
         #
-        # — the tool tokens mangled, and the reasoning simply CONTINUING into the
-        # answer channel. Reproduced NON-STREAMING, so this is not only the
-        # same-delta parser collision (vLLM #43221); it is closest to #39697, the
-        # forced reasoning-end string landing mid-emission. Both are open.
+        # — the tool tokens mangled, and the reasoning simply CONTINUING into
+        # the answer channel. Reproduced NON-STREAMING, so this is not only the
+        # same-delta parser collision (vLLM #43221); it is closest to #39697,
+        # the forced reasoning-end string landing mid-emission. Both are open.
         #
         # 🔑 IT IS THE SEVERITY OF THE CUT, NOT "BINDING" AS SUCH. Measured
         # dose-response, n=4 per cell, one fixed tool-calling turn whose natural
@@ -290,16 +306,58 @@ def _apply_thinking_token_budget(p: dict, ratio: float, *,
         # and the same ratio lands deep in the failure zone. 13 such draws wrote
         # files in 2; the same harness with thinking OFF went 3/3.
         #
-        # WHY THAT MEANS "INJECT NOTHING" RATHER THAN "PICK A BIGGER NUMBER":
-        # the safe budget is a function of the TURN's natural reasoning length,
-        # which is not knowable before generating it. Any fixed number is a
-        # gamble whose loss is silent. The cap exists to bound a runaway-reasoning
-        # tail on PLAIN generation; on a tool turn the model has an external
-        # action to take, so that tail is not the risk worth trading a suppressed
-        # call for.
+        # 🚨 WHY NOT "INJECT NOTHING" — that was the previous fix, and it traded
+        # a silent failure for a loud one. Removing the cap entirely restores the
+        # runaway it existed to bound. Measured against the deployed build at
+        # `max_tokens=5000` (the ratio would have capped reasoning at 3,000):
         #
-        # Applies to the operator-declared absolute too: the harm is where the cut
-        # lands, not the provenance of the number.
+        #     no tools (control) -> completion_tokens 3017, finish=stop
+        #     tools declared     -> 502 Bad Gateway x2, status=error, out=0
+        #
+        # Reasoning ate the entire allowance, content came back EMPTY, and
+        # `empty_completion_error` turned it into a 502 — precisely the sporadic
+        # tier3 502 the cap was introduced to stop.
+        #
+        # THE RESERVE. Both failures are the same quantity read from opposite
+        # ends: how much of `max_tokens` is left for the ANSWER. So bound the
+        # runaway tail from the TOP of the allowance rather than from a fraction
+        # of it — `max_tokens - _TOOL_TURN_ANSWER_RESERVE`. On every live caller
+        # this sits so far above natural reasoning that it cannot bind (dsh's
+        # `coder` sends `max_tokens=32768`, n=176 -> a 31,744 budget against a
+        # worst-ever observed block of 16,562), and in the runaway case it fires
+        # at the very tail, leaving the reserve for content so the completion is
+        # non-empty instead of a 502.
+        #
+        # 🚨 THE RATIO, THE ABSOLUTE, THE FLOOR AND THE CEILING ALL STAY OFF THIS
+        # PATH. Each of them is a fraction-of-allowance or a plain-generation
+        # number, and every one of them can land in the failure zone: the 16,000
+        # ceiling would cut an agentic turn that naturally reaches 16.5k, and an
+        # operator absolute measured good for plain generation (512 on
+        # `tier2-chat`) is ~2x the simple-tool-turn natural length and well under
+        # an agentic one. The harm is WHERE THE CUT LANDS, not the provenance of
+        # the number. What the declarations still decide is WHETHER the endpoint
+        # opted in at all — the gates above this branch.
+        #
+        # ⚠️ THE RESERVE IS A CHOSEN NUMBER, NOT A MEASURED ONE. It is pulled in
+        # two directions that only ever conflict in the runaway case: bigger
+        # leaves more room for the tool-call arguments, smaller puts the cut at a
+        # higher fraction of the turn's natural reasoning. There is no
+        # measurement pinning it, because in every NON-runaway case it does not
+        # bind and its value is irrelevant. Treat a change to it as a change
+        # needing its own probe at a BINDING shape.
+        mt = p.get("max_tokens")
+        if not isinstance(mt, int) or mt <= 0:
+            return
+        budget = mt - _TOOL_TURN_ANSWER_RESERVE
+        if budget < _THINKING_BUDGET_FLOOR:
+            # Not enough allowance to place a cut ABOVE natural reasoning: at
+            # `max_tokens=2048` the reserve leaves 1,024, ~50% of an agentic
+            # turn's natural length and inside the measured failure zone. There
+            # is no good budget here, so inject none and accept that a runaway
+            # on a tiny allowance can still empty the content channel. A
+            # suppressed tool call is silent; the 502 is not.
+            return
+        p[field] = budget
         return
     mt = p.get("max_tokens")
     if absolute and absolute > 0:

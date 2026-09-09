@@ -27,6 +27,25 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Fixed
 
+- **A reasoning cap on a tool-calling turn is now derived from the top of the allowance
+  (`max_tokens` minus a fixed answer reserve) rather than from the ratio or the operator-declared
+  absolute.** A cap that cuts reasoning SHORT on a tool turn corrupts the tool-call channel: the
+  control tokens are emitted as garbled literal text in `content` and `finish_reason` degrades
+  `tool_calls` → `stop`, so the caller gets a confident prose answer and no side effect. Measured
+  dose-response against a turn whose natural reasoning is ~210 tokens: budget 64 → 0/4 tool calls,
+  128 → 0/4, 256 → 3/4, 512 → 4/4, no budget → 4/4 — it is the severity of the cut, not "binding"
+  as such. The previous release suppressed injection entirely on such turns, which restored the
+  runaway the cap existed to bound: at `max_tokens=5000` with tools declared, reasoning consumed the
+  whole allowance and the empty content channel returned **502** twice, while the no-tools control
+  completed at 3,017 tokens. Both failures are the same quantity read from opposite ends — how much
+  of the allowance is left for the answer — so the cap is now placed there. The ratio, the absolute
+  and the ratio path's floor/ceiling stay off the tool path; each is a fraction-of-allowance or
+  plain-generation number that can land in the failure zone (the 16,000 ceiling would cut an agentic
+  turn whose worst observed reasoning block was 16,562). Where `max_tokens` is too small to place a
+  cut above natural reasoning, nothing is injected and the residual runaway risk is accepted, since
+  a suppressed tool call is silent and a 502 is not. Upstream vLLM #39697 and #44676 are both open.
+  `docs/api.md` §3.11.
+
 - **A structured `finish_reason=length` response that was actually a repetition LOOP (usually
   whitespace) was always classified as a benign truncation** — measured 26 times in 14 days on
   tier3, ~125 minutes of wasted decode. Two independent gaps let it through: the dispatch path for

@@ -26,6 +26,7 @@ from roadstead.providers import VLLM
 from roadstead.providers.payload import (
     _THINKING_BUDGET_CEILING,
     _THINKING_BUDGET_FLOOR,
+    _TOOL_TURN_ANSWER_RESERVE,
     _apply_thinking_token_budget,
 )
 
@@ -211,53 +212,146 @@ def test_no_other_endpoint_declares_a_ratio_it_cannot_honour():
 # "it never binds here" is not a safety argument, it is a statement about the
 # workload that was sampled.
 #
-# Hence: on a turn that declares tools, inject nothing. The upstream failures a
-# binding budget triggers are open with no fix (vLLM #39697 leaks
-# `reasoning_end_str` into `content`; #44676 corrupts tool-call arguments), and
-# a suppressed tool call is silent — the caller gets a confident answer and no
-# side effect.
+# THE FIRST FIX WAS "INJECT NOTHING", AND IT TRADED A SILENT FAILURE FOR A LOUD
+# ONE. Removing the cap on a tool turn restores the runaway it existed to bound.
+# Measured against the deployed build at `max_tokens=5000`:
+#
+#     no tools (control) -> completion_tokens 3017, finish=stop  (cap live)
+#     tools declared     -> 502 Bad Gateway x2, status=error, out=0
+#
+# Reasoning ate the whole allowance, content came back empty, and
+# `empty_completion_error` turned it into a 502 — the exact failure the cap was
+# introduced to stop.
+#
+# Hence the CURRENT rule: on a tool turn the budget is derived from the TOP of
+# the allowance, `max_tokens - _TOOL_TURN_ANSWER_RESERVE`, not from a fraction of
+# it. On every live caller that sits far above natural reasoning and never binds
+# (dsh's `coder` sends 32768, n=176 -> 31,744 against a worst-observed 16,562
+# block); in the runaway case it fires at the tail and leaves the reserve for
+# content, so the completion is non-empty instead of a 502. The ratio, the
+# absolute and the floor/ceiling clamps all stay OFF this path — every one of
+# them is a fraction-of-allowance or plain-generation number that can land in the
+# failure zone. The upstream failures a SHORT budget triggers are open with no
+# fix (vLLM #39697 leaks `reasoning_end_str` into `content`; #44676 corrupts
+# tool-call arguments), and a suppressed tool call is silent.
 
 
-def test_tools_present_suppresses_ratio_injection():
-    """A tool-calling turn gets NO ratio-derived budget.
+def test_tool_turn_gets_a_RESERVE_derived_budget_not_the_ratio():
+    """A tool-calling turn is capped from the TOP of the allowance.
 
-    The safe budget is a function of the TURN's natural reasoning length, which
-    is not knowable before generating it — so any fixed number is a gamble whose
-    loss (a silently suppressed tool call) is worse than the runaway-reasoning
-    tail the cap exists to bound."""
+    The ratio would give 0.6 * 12000 = 7,200 — a fraction of the allowance, and
+    on an agentic turn whose reasoning reaches the whole of it that cut lands in
+    the measured failure zone (a suppressed tool call). The reserve-derived
+    budget leaves exactly the answer allowance and nothing more."""
     p = _payload(tools=[{"type": "function",
                          "function": {"name": "write", "parameters": {}}}])
     _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
-    assert "thinking_token_budget" not in p, (
-        "a tool-calling turn must not receive a ratio-derived reasoning budget: "
-        "a binding budget suppresses the tool call outright"
+    assert p["thinking_token_budget"] == 12000 - _TOOL_TURN_ANSWER_RESERVE
+    assert p["thinking_token_budget"] != int(12000 * 0.6), (
+        "the ratio reached the tool path — it is a fraction of the allowance and "
+        "cuts an agentic turn short"
     )
 
 
-def test_tools_present_suppresses_absolute_injection():
-    """Same for an operator-declared absolute — the harm is WHERE THE CUT LANDS,
-    not the provenance of the number."""
+def test_tool_turn_IGNORES_an_operator_declared_absolute():
+    """The harm is WHERE THE CUT LANDS, not the provenance of the number.
+
+    512 is measured good on `tier2-chat` plain generation and is ~2x a SIMPLE
+    tool turn's natural reasoning — but an agentic build reaches the whole
+    allowance, so the same number lands deep in the 0/4 zone."""
     p = _payload(tools=[{"type": "function",
                          "function": {"name": "write", "parameters": {}}}])
     _apply_thinking_token_budget(p, 0.0, field="thinking_token_budget",
-                                 absolute=4000)
+                                 absolute=512)
+    assert p["thinking_token_budget"] == 12000 - _TOOL_TURN_ANSWER_RESERVE
+
+
+def test_tool_turn_is_NOT_clamped_by_the_ceiling():
+    """🚨 The 16,000 ceiling must not reach this path.
+
+    `dsh`'s `coder` sends `max_tokens=32768` (n=176 live). Clamped to the ceiling
+    the budget would be 16,000 — BELOW the worst reasoning block actually
+    observed on this workload (16,562), i.e. a cut inside the failure zone on the
+    one caller that carries the traffic."""
+    p = _payload(max_tokens=32768,
+                 tools=[{"type": "function",
+                         "function": {"name": "write", "parameters": {}}}])
+    _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
+    assert p["thinking_token_budget"] == 32768 - _TOOL_TURN_ANSWER_RESERVE
+    assert p["thinking_token_budget"] > _THINKING_BUDGET_CEILING
+    assert p["thinking_token_budget"] > 16562, (
+        "the budget cuts below the worst reasoning block measured on this "
+        "workload — it can bind, and a binding cut suppresses the call"
+    )
+
+
+def test_tool_turn_at_the_502_repro_shape_leaves_room_for_an_answer():
+    """THE REGRESSION THIS FIX CLOSES, pinned at the shape that produced it.
+
+    `max_tokens=5000` with tools declared returned 502 Bad Gateway twice against
+    the deployed "inject nothing" build: reasoning consumed the entire
+    allowance, content was empty, `empty_completion_error` fired. A budget must
+    now be present and must leave the reserve for content."""
+    p = _payload(max_tokens=5000,
+                 tools=[{"type": "function",
+                         "function": {"name": "write", "parameters": {}}}])
+    _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
+    assert 5000 - p["thinking_token_budget"] == _TOOL_TURN_ANSWER_RESERVE, (
+        "a runaway can still empty the content channel -> empty_completion_error "
+        "-> 502"
+    )
+
+
+def test_tool_turn_on_a_tiny_allowance_injects_nothing():
+    """No good budget exists here, so state that rather than guess one.
+
+    At `max_tokens=2048` the reserve leaves 1,024 — roughly half an agentic
+    turn's natural reasoning, inside the measured failure zone (128 -> 0/4 at
+    ~60% of natural). A silently suppressed tool call is worse than a 502, so
+    this path deliberately keeps the residual runaway risk."""
+    p = _payload(max_tokens=2048,
+                 tools=[{"type": "function",
+                         "function": {"name": "write", "parameters": {}}}])
+    _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
     assert "thinking_token_budget" not in p
 
 
-def test_no_tools_still_injects():
-    """CONTROL — the guard must be narrow. Without tools the cap still applies,
-    because the bimodal-reasoning tail it exists to bound is real."""
+def test_tool_turn_still_needs_the_endpoint_to_have_DECLARED_a_cap():
+    """The reserve changes the MAGNITUDE, never the opt-in.
+
+    An endpoint that declares neither a ratio nor an absolute has the feature
+    off, and vLLM 400s the whole request when the parameter arrives at a server
+    launched without `--reasoning-config`."""
+    p = _payload(tools=[{"type": "function",
+                         "function": {"name": "write", "parameters": {}}}])
+    _apply_thinking_token_budget(p, 0.0, field="thinking_token_budget")
+    assert "thinking_token_budget" not in p
+
+
+def test_tool_turn_with_thinking_off_injects_nothing():
+    """CONTROL — a budget is meaningless with reasoning disabled, tools or not."""
+    p = _payload(chat_template_kwargs={"thinking": False},
+                 tools=[{"type": "function",
+                         "function": {"name": "write", "parameters": {}}}])
+    _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
+    assert "thinking_token_budget" not in p
+
+
+def test_no_tools_still_takes_the_RATIO_path():
+    """CONTROL — the tool branch must be narrow. Without tools the ratio, the
+    floor and the ceiling all still apply: that path bounds a bimodal
+    plain-generation tail and has its own measurements behind it."""
     p = _payload()
     _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
-    assert p["thinking_token_budget"] > 0
+    assert p["thinking_token_budget"] == int(12000 * 0.6)
 
 
-def test_empty_tools_list_still_injects():
+def test_empty_tools_list_takes_the_ratio_path():
     """`tools: []` is not a tool turn — an empty list means the caller declared
-    no tools, so nothing is suppressed."""
+    no tools, so nothing about the tool-call channel is at stake."""
     p = _payload(tools=[])
     _apply_thinking_token_budget(p, 0.6, field="thinking_token_budget")
-    assert p["thinking_token_budget"] > 0
+    assert p["thinking_token_budget"] == int(12000 * 0.6)
 
 
 def test_caller_supplied_budget_on_a_tool_turn_is_STILL_honoured():
@@ -288,9 +382,9 @@ def test_caller_supplied_budget_on_a_tool_turn_is_STILL_honoured():
     )
 
 
-def test_guard_is_REACHED_through_the_real_provider_call_site():
+def test_tool_branch_is_REACHED_through_the_real_provider_call_site():
     """A unit test proves the helper works; this proves the provider actually
-    calls it that way. The guard is worthless if `prepare_chat_payload` never
+    calls it that way. The branch is worthless if `prepare_chat_payload` never
     reaches it."""
     payload = {"model": "tier3", "max_tokens": 12000,
                "messages": [{"role": "user", "content": "hi"}],
@@ -300,9 +394,9 @@ def test_guard_is_REACHED_through_the_real_provider_call_site():
     out = VLLM.prepare_chat_payload(payload, model_id="tier3",
                                     thinking_budget_ratio=0.6,
                                     thinking_kwargs=("thinking",))
-    assert "thinking_token_budget" not in out, (
-        "the ratio was injected through the provider path despite tools being "
-        "declared — the guard is not on the path that production uses"
+    assert out.get("thinking_token_budget") == 12000 - _TOOL_TURN_ANSWER_RESERVE, (
+        "the tool turn did not get the reserve-derived budget through the "
+        "provider path — the branch is not on the path that production uses"
     )
 
 

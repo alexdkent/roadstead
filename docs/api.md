@@ -1655,6 +1655,23 @@ Size an absolute from what the endpoint actually emits. The absolute wins over a
 deliberately **not** clamped by the ratio path's floor/ceiling: those guard an arbitrary caller
 `max_tokens`, and would silently raise a small measured-good value to one already known not to bind.
 
+🚨 **A turn that declares `tools` is capped from the TOP of the allowance, not by the ratio or the
+absolute.** A cut that lands SHORT of the turn's natural reasoning corrupts the tool-call channel —
+the control tokens arrive as garbled literal text in `content` and `finish_reason` degrades
+`tool_calls` → `stop`, so the caller gets a confident prose answer and no side effect (measured
+dose-response against ~210 tokens of natural reasoning: budget 64 → 0/4 tool calls, 128 → 0/4,
+256 → 3/4, 512 → 4/4, none → 4/4; upstream vLLM #39697 and #44676, both open). Injecting *nothing*
+is not the answer either: with no cap, reasoning on an agentic turn consumes the entire allowance
+and the response comes back with empty content, which is an `empty_completion_error` — a 502 —
+rather than a reply. So on a tool turn the budget is `max_tokens` minus a fixed answer reserve. On
+any realistic allowance that sits far above natural reasoning and never binds; on a runaway it fires
+at the tail and leaves the reserve for the answer. The ratio, the absolute and the floor/ceiling are
+all fraction-of-allowance or plain-generation numbers and are deliberately off this path — what the
+declarations still decide is *whether* the endpoint caps at all. Where `max_tokens` is too small to
+place a cut above natural reasoning, nothing is injected. A caller that sends its **own** cap still
+gets it verbatim, tools or not: caller intent wins, and a caller that declares tools and a small
+budget is choosing that trade itself.
+
 **On the headroom.** The global default (8000 tokens) is one number for
 every endpoint and is sized for a long-form reasoner. Reasoning is generated output that counts
 against `max_tokens`, so on a slow endpoint that headroom is also a **wall-clock commitment** — and
