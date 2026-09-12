@@ -24,6 +24,7 @@ from . import cache_stats
 from .config import LLMPriority, normalize_endpoint
 from .constants import _PAYLOAD_KIND
 from .enriched import WIRE_OPENAI
+from .goodput import Verdict as GoodputVerdictOutcome
 from .lifecycle import _openai_error
 from .observability import structured_empty_rates
 from .sse_hub import DROP_SENTINEL
@@ -473,6 +474,53 @@ class ProxyHttpHandlers:
                 # the history; the standing alert is the page. Only emitted when
                 # the endpoint cleared the sample floor — an unevaluated
                 # endpoint must not publish a 0/0 that reads as "healthy".
+                # Endpoint goodput collapse (goodput.py). 🚨 THE SERIES SPLIT IS
+                # THE INVARIANT, not a style choice. The rule is a CONJUNCTION, so
+                # a clause it cannot evaluate makes firing EASIER — which means
+                # "we could not tell" has to be publishable as its own fact.
+                # Encoding three outcomes in one 0/1 gauge would force UNKNOWN to
+                # borrow a value from one of the other two, and an endpoint whose
+                # instrument is missing would then read as verified-healthy.
+                #
+                # Same sample-floor rule as the structured-empty pair below: an
+                # endpoint with no thresholds declared publishes NOTHING here, so
+                # absence means "not watched", never "watched and fine".
+                _gp = self.state.goodput_verdicts.get(ep_name)
+                if _gp is not None:
+                    if _gp.evaluable:
+                        out.append(Metric(
+                            "roadstead_endpoint_goodput_collapsed",
+                            1 if _gp.outcome is GoodputVerdictOutcome.COLLAPSED else 0,
+                            lbl, "gauge",
+                            help="1 if the engine is occupied and producing almost "
+                                 "nothing; ABSENT when the verdict is unknown"))
+                    out.append(Metric(
+                        "roadstead_endpoint_goodput_unknown",
+                        0 if _gp.evaluable else 1, lbl, "gauge",
+                        help="1 if the goodput rule could not be evaluated "
+                             "(blind) — never folded into healthy or collapsed"))
+                    out.append(Metric(
+                        "roadstead_endpoint_goodput_tripped",
+                        1 if ep_name in self.state.collapsed_endpoints else 0,
+                        lbl, "gauge",
+                        help="1 if the goodput breaker is latched (shadow or "
+                             "enforce — see the goodput_collapse_enforce flag)"))
+                    out.append(Metric(
+                        "roadstead_endpoint_goodput_trips_total",
+                        self.state.goodput.trips(ep_name), lbl, "counter",
+                        help="since-boot goodput breaker trips"))
+                    for _field, _name in (
+                        ("running_min", "roadstead_endpoint_goodput_running"),
+                        ("iteration_rate",
+                         "roadstead_endpoint_goodput_iteration_rate"),
+                        ("generation_tps_per_request",
+                         "roadstead_endpoint_goodput_generation_tps_per_request"),
+                        ("prefill_tps", "roadstead_endpoint_goodput_prefill_tps"),
+                    ):
+                        _v = getattr(_gp, _field)
+                        if _v is not None:
+                            out.append(Metric(_name, _v, lbl, "gauge",
+                                              help="goodput rule input"))
                 se = _se_rates.get(ep_name)
                 if se and se.get("evaluated"):
                     out.append(Metric("roadstead_structured_empty_rate",
@@ -647,6 +695,16 @@ class ProxyHttpHandlers:
             _cache = self.state.endpoint_cache_hit_rate.get(ep_name)
             if _cache and _cache.get("hit_rate") is not None:
                 snap["cache_hit_rate"] = _cache["hit_rate"]
+            # Endpoint-level goodput collapse (goodput.py). Its OWN field, not
+            # folded into `healthy`/`paused`/`admin_paused` — ⚠️ `paused` here
+            # already means `not healthy` rather than "in paused_endpoints", and
+            # overloading either of two fields that already disagree with their
+            # names is how the operator ends up with three things to disbelieve.
+            # Omitted entirely for an endpoint with no thresholds declared, so the
+            # payload stays quiet on every endpoint that does not run the detector.
+            _gp = self.health.goodput_snapshot(ep_name, now)
+            if _gp is not None:
+                snap["goodput"] = _gp
             endpoints[ep_name] = snap
 
         agents = {

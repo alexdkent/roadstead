@@ -352,6 +352,38 @@ class EndpointConfig:
     # comment and the failover target silently becomes nothing.
     # Guard: test_failover.py::test_declared_fallbacks_resolve_to_live_endpoints.
     failover_to: str = ""
+    # --- endpoint-level goodput collapse (goodput.py) ------------------------
+    #
+    # 🚨 EVERY ONE OF THESE IS 0 BY DEFAULT, AND 0 MEANS THE DETECTOR DOES NOT
+    # RUN. The rule's five numbers are FLEET-HARDWARE MEASUREMENTS — occupancy,
+    # three rate ceilings and a sustain count, derived from 4,264 minutes of one
+    # fleet's engine counters — and this repository ships mechanism, not one
+    # fleet's constants. Declaring them per endpoint in `models.yaml`
+    # (`policy.goodput_*`) is the ONLY way the detector arms, which is also what
+    # makes "we never configured it" indistinguishable from "it is off" rather
+    # than from "it is watching".
+    #
+    # `goodput.GoodputThresholds.armed` is the predicate: occupancy AND sustain
+    # AND at least one progress clause. Occupancy is the only term ablation
+    # showed to be load-bearing (precision 1.000 -> 0.425 without it), so it is
+    # required rather than optional.
+    #
+    # Which progress clauses an endpoint evaluates is decided HERE and not by the
+    # engine: a llama.cpp endpoint publishes no iteration counter, so it must
+    # leave `goodput_max_iteration_rate` at 0 — declaring a threshold whose
+    # counter the engine never publishes makes every verdict UNKNOWN rather than
+    # making the detector stricter.
+    goodput_min_running: int = 0
+    goodput_sustain_evaluations: int = 0
+    goodput_max_iteration_rate: float = 0.0
+    goodput_max_generation_tps: float = 0.0
+    goodput_max_prefill_tps: float = 0.0
+    # Recovery bounds. Unlike the five above these DO carry module defaults
+    # (`goodput._RECOVERY_EVALUATIONS`, `_MAX_HOLD_S`), because they are not
+    # detection thresholds: no value here can make the detector fire, and a
+    # partially-specified config must still be unable to latch a trip forever.
+    goodput_recovery_evaluations: int = 0
+    goodput_max_hold_s: float = 0.0
     # Minimum time (s) spent in degraded mode before returning to this endpoint,
     # even once it is healthy again and the degraded cohort has drained. NOT
     # redundant with the drain: without it a backend flapping every 30s produces

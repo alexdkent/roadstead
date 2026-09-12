@@ -12,6 +12,94 @@ summary. The bullets below link in there where the long version is worth reading
 
 ## Unreleased
 
+### Added
+
+- **Endpoint-level goodput-collapse detection (`roadstead/goodput.py`), shipped DARK.** A backend
+  whose engine wedges keeps answering `/health` — the HTTP server is fine, only the engine is not —
+  so its slots fill with requests producing almost nothing, callers hit their deadlines, and the
+  retries refill the slots. Measured on a real incident: the scheduler step sat at ~7 s for two days,
+  226 timeout events, `healthy: true` throughout. The existing per-request stall watchdog worked and
+  could not help: its conclusion is always "THIS request is stuck", never "this endpoint is sick".
+
+  The signal is the backend's **own engine work counters**, sampled on the capacity poller: an
+  occupancy gate plus up to three progress clauses (scheduler iterations, generation tokens per busy
+  slot, prefill tokens), sustained over consecutive evaluations. Measured precision **1.000** (294
+  firings, none outside a real timeout window) and 60.7% harm-minute recall, firing 2 minutes after
+  the first timeout of the second day with 42 of that day's 43 events still to come.
+
+  🚨 **One term is measurably load-bearing and the other three are not.** Ablation over the same
+  4,264 minutes: removing the occupancy gate collapses precision to **0.425** (415 false positives);
+  removing any single progress clause leaves it at 0.997-1.000. The triple conjunction is justified
+  by MECHANISM — loop not turning / turning but emitting nothing / prefill-only — not by a measured
+  precision gain. `tests/test_goodput.py` sabotages each clause separately, because a compound guard
+  passes its own suite with a clause silently dropped.
+
+  Enforcement is behind the `goodput_collapse_enforce` runtime flag, **default False** — so today it
+  samples, evaluates, latches, counts, publishes and alerts, and changes nothing a caller can see.
+  Arming it later is a `POST /v1/admin/flags` flip, not a code change. Recovery is bounded in both
+  directions: consecutive healthy evaluations clear a trip, and an absolute maximum hold clears it
+  regardless, including while blind — there is deliberately no path that stays tripped forever.
+
+  🚨 **Thresholds ship as NOTHING.** The five numbers are one fleet's hardware measurements, and an
+  endpoint with no `policy.goodput_*` declared in `models.yaml` **runs no detector at all** — it does
+  not even pay the scrape. See `docs/api.md` §3.13 for the field reference and the worked example.
+
+- **`abort_reason` is populated on every timeout layer.** It was `stream`-only, so five call sites
+  defaulted to `NULL` — which is why **219 of one incident's 226 timeout events were unexplained**
+  and `GET /v1/timeouts`' `by_abort_reason` rollup was blind to 97% of the population. Each site now
+  names its own bound: `client_deadline`, `sse_consumer_deadline`, `admission_expiry`,
+  `queue_deadline_exhausted`, `backend_transport_deadline`. None of them is added to
+  `STALL_ABORT_REASONS` — every one is a bound we or the caller chose expiring, and counting them
+  would let a capacity decision masquerade as a backend failure. `goodput_collapse` IS added, because
+  a request refused at the door on measured evidence that the engine is broken is the substrate
+  dying under a caller who did nothing wrong. Full table in `docs/api.md` §3.4.
+
+- **Two engine counters on the `/metrics` scrape** (`backend.probe_progress_counters` now returns
+  `iterations` and `running` beside `prompt` and `generation`). 🚨 `vllm:iteration_tokens_total_count`
+  is matched on its FULL name: it is the `_count` of a histogram whose `_bucket`/`_sum`/`_created`
+  siblings share the family prefix, and a prefix match sums them into a number that rises
+  monotonically, graphs beautifully, and is garbage. The programmable fake backend lays that trap by
+  default rather than on request.
+
+  🚨 **Every absent counter is `None`, including `prompt` and `generation` — which were briefly
+  coalesced to integer `0`, and that was a latching break of the detector's central invariant.** The
+  prefill and generation clauses read exactly those two keys, so a counter the backend does not
+  publish *satisfied* them: the verdict came back `COLLAPSED` with an empty `reason`, the breaker
+  latched, and `roadstead_endpoint_goodput_unknown` read **0** — the metric whose only job is to make
+  blindness visible reported nothing. Reproduced end to end on the supported llama.cpp 3-clause
+  configuration against a body carrying only `llamacpp:requests_processing`. The same coalesce also
+  swallowed every **malformed line**, since the parser drops what it cannot parse: a trailing space, a
+  TAB separator, a `NaN`, or a body truncated mid-stream each became a zero — and a wedged engine is
+  exactly when `/metrics` is slowest and a body most likely to arrive short, so that failure was
+  *correlated with the condition being detected*. `lifecycle._stream_progress_probe`, the one caller
+  that wants integers, coalesces at its own call site, where "absent counts as no progress" is the
+  behaviour it has always had and deliberately wants.
+
+  **Why the unit suite could not see it:** every absent-counter test used `iterations` or `running` —
+  the two keys the scraper could already return as `None` — or stubbed the whole scrape to `None`.
+  Nothing passed an absent `prompt` or `generation` into the monitor. The monitor was correct
+  throughout; its producer was not. The regression tests now drive the real scraper into the real
+  monitor, which is the only reading that could have caught it.
+
+  **Three further exposition shapes now read as absence**, and the middle one is the same
+  "easier-to-fire" class as the coalesce: `Inf`/`+Inf`/`1e400` (`int(float("Inf"))` raises
+  `OverflowError`, which the per-line handler did not catch — it escaped and discarded the *whole*
+  scrape, contradicting the function's own documented promise that a bad line drops only its own
+  counter); **a repeated series with an identical label set** (summed, that inflated `running` 6 → 12,
+  pushing occupancy past its gate *and* shrinking the per-request denominator at once — summing across
+  *different* label sets remains correct and deliberate, because data parallelism publishes one series
+  per engine); and a **negative** value (impossible for a token counter or a concurrency gauge, and
+  its 0.0 rate satisfies every `<` clause). Absence is sticky per counter, so a body's meaning does
+  not depend on the order the engine emitted its lines. Table in `docs/api.md` §4.4.
+
+- **Two alert conditions**, on the existing `check_alerts` path so they are TSDB-visible for free:
+  `endpoint_goodput_collapse` (CRITICAL when enforcing, WARNING in shadow) and
+  `endpoint_goodput_blind` — a detector that is configured and cannot reach a verdict. The second is
+  not decoration: refusing a verdict is the SAFE behaviour on a missing clause, which means a
+  permanently blind endpoint otherwise looks exactly like a quiet healthy one. The pre-existing
+  `endpoint_stalled` alert is untouched and still fires on its own signature; it keys on completed
+  timeouts and requires `queued == 0`, which a collapse that fills every slot fails by construction.
+
 ### Breaking
 
 - **`models.yaml` endpoint field `token_speed` renamed to `decode_tok_s`.** Nothing outside this

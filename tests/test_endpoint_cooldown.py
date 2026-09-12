@@ -46,6 +46,7 @@ backend_mod = importlib.import_module("roadstead.backend")
 LIFECYCLE_SRC = Path(importlib.import_module("roadstead.lifecycle").__file__)
 
 Health = health_mod.Health
+RuntimeFlags = importlib.import_module("roadstead.flags").RuntimeFlags
 BackendError = backend_mod.BackendError
 BackendTimeout = backend_mod.BackendTimeout
 BackendUnavailable = backend_mod.BackendUnavailable
@@ -74,6 +75,14 @@ def _state():
         # ProxyState always has a Failover; a stub declaring it None is an
         # explicit choice, not an accident of the stub being thin.
         failover=None,
+        # Goodput collapse (2026-09-12): `endpoint_healthy` reads both, so a stub
+        # missing them models a ProxyState that cannot exist. Empty set + the
+        # real DEFAULT_FLAGS means the goodput arm is inert here, which is what
+        # this suite wants — it exercises the COOLDOWN gate, and the two arms sit
+        # next to each other in the same method.
+        collapsed_endpoints=set(),
+        flags=RuntimeFlags(None),
+        goodput_verdicts={},
     )
 
 

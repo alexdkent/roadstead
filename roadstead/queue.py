@@ -1664,11 +1664,30 @@ class PersistentQueue:
     #: opposed to a bound WE chose. `stall` is the mid-stream watchdog: tokens
     #: were flowing and then stopped for `stall_s`. `ttft` is the same fault
     #: caught earlier — the backend accepted the request and never emitted a
-    #: first token. Both are the substrate dying under a caller who did nothing
-    #: wrong. `hard_cap` and `caller_deadline` are deliberately NOT here: those
-    #: are us cutting off work that was still healthy, which is a capacity
-    #: decision, not a backend failure.
-    STALL_ABORT_REASONS = ("stall", "ttft")
+    #: first token. `goodput_collapse` is the same fault caught EARLIEST, at the
+    #: door, from the engine's own counters: this request was refused because the
+    #: endpoint was measured occupied-and-producing-almost-nothing before it was
+    #: ever dispatched. All three are the substrate dying under a caller who did
+    #: nothing wrong, which is the one question this tuple answers.
+    #:
+    #: 🚨 The distinction is WHOSE FAULT, not WHO ACTED. `goodput_collapse` is a
+    #: proxy-initiated refusal, and so is `hard_cap`, and they fall on opposite
+    #: sides: a hard-cap abort cuts off work that was still HEALTHY (a capacity
+    #: decision), while a goodput refusal is us declining to add a caller to a
+    #: queue on a backend we have measured to be broken. A downstream consumer
+    #: asking "was my failure an upstream substrate failure?" must get yes here,
+    #: or the refusal reads to it as an unexplained proxy error and it retries.
+    #:
+    #: `hard_cap`, `caller_deadline` and the five deadline reasons added
+    #: 2026-09-12 (`client_deadline`, `sse_consumer_deadline`,
+    #: `admission_expiry`, `queue_deadline_exhausted`,
+    #: `backend_transport_deadline`) are deliberately NOT here. Each of those is
+    #: a bound WE or the CALLER chose expiring; the last is the closest call, and
+    #: stays out because its deadline is derived from the caller's own budget, so
+    #: a caller that under-budgets would otherwise manufacture backend-stall
+    #: evidence — the same argument that excludes best-effort timeouts from the
+    #: cooldown window.
+    STALL_ABORT_REASONS = ("stall", "ttft", "goodput_collapse")
 
     def stall_aborts(self, caller_prefix: str, since: float,
                      until: float) -> list[dict]:

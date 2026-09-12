@@ -703,12 +703,82 @@ class BackendClientPool:
     async def probe_progress_counters(self, ep_cfg: EndpointConfig) -> dict | None:
         """Scrape a backend's `/metrics` for CUMULATIVE work counters (C6).
 
-        Returns ``{"prompt": int, "generation": int}``, or ``None`` when the
-        backend exposes neither (an unreachable backend, a non-200, an engine
-        with no `/metrics`). ``None`` means "cannot discriminate", and every
-        caller must fall back to today's behaviour on it rather than treating it
-        as "no progress"; that distinction is the whole safety property of the
+        Returns ``{"prompt", "generation", "iterations", "running"}``, each
+        ``int | None``, or ``None`` for the whole dict when the backend exposes
+        none of them (an unreachable backend, a non-200, an engine with no
+        `/metrics`). ``None`` means "cannot discriminate", and every caller must
+        fall back to today's behaviour on it rather than treating it as "no
+        progress"; that distinction is the whole safety property of the
         progress-aware watchdog.
+
+        🚨 **ABSENCE IS PER KEY, AND NEVER ZERO.** All four keys are
+        independently absent-able and an absent one is ``None``. This is not a
+        style choice — it is the input contract `goodput.py`'s central invariant
+        rests on, and this function BROKE it for a day: `prompt` and `generation`
+        were coalesced with ``or 0`` (because `_stream_progress_probe` compares
+        them as ints), so for the prefill and generation clauses a MISSING counter
+        was indistinguishable from a STOPPED engine. `_missing_counters` found
+        nothing missing, the verdict came back COLLAPSED on the strength of two
+        clauses nobody had measured, and the breaker latched — with
+        `roadstead_endpoint_goodput_unknown` reading 0, so the metric that exists
+        to make blindness visible reported nothing. Reproduced end to end on a
+        llama.cpp 3-clause config against a `/metrics` body carrying only
+        `llamacpp:requests_processing`.
+
+        ⚠️ **The same coalesce also swallowed every MALFORMED LINE.** The parse
+        below drops a line it cannot read, so a trailing space, a TAB separator, a
+        ``NaN`` value or a body truncated mid-stream dropped that counter — and
+        ``or 0`` then reported the drop as a stopped engine. A wedged engine is
+        exactly when `/metrics` is slow and a body is most likely to arrive short,
+        so that failure was CORRELATED with the condition being detected.
+        Returning absence makes the same input read as UNKNOWN.
+
+        🚨 **THREE MORE SHAPES READ AS ABSENCE, EACH FOR ITS OWN REASON**, and the
+        second one is the same "easier to fire" class as the coalesce above:
+          * ``Inf``/``+Inf``/``1e400`` — ``int(float("Inf"))`` raises
+            ``OverflowError``, which is caught per line ALONGSIDE ``ValueError``.
+            Uncaught it discarded the entire scrape rather than one counter, which
+            contradicted the per-line promise this docstring makes.
+          * a DUPLICATED series with an identical label set — summed, that inflates
+            a gauge (``running`` 6 -> 12), which pushes occupancy past its gate and
+            shrinks the per-request denominator at once. Summing across DIFFERENT
+            label sets stays correct and deliberate (data parallelism); a repeat of
+            the same labels is malformed exposition.
+          * a NEGATIVE value — physically impossible for a cumulative token counter
+            or a concurrency gauge, and it yields a 0.0 rate, which satisfies every
+            ``<`` clause in the rule.
+        Each is sticky per key: a later well-formed line cannot revive a key already
+        judged malformed, or whether a body reads as malformed would depend on line
+        order.
+
+        The one caller that wants integers, `lifecycle._stream_progress_probe`,
+        coalesces at its own call site, where "absent counts as no progress" is
+        the behaviour it has always had and deliberately wants.
+
+        ``iterations`` and ``running`` exist for the ENDPOINT-level
+        goodput-collapse detector (`goodput.py`), which needs to know whether the
+        scheduler loop is turning and how many slots are busy — neither of which
+        the per-request watchdog above cares about.
+
+        🚨 **`vllm:iteration_tokens_total_count` is matched on its FULL name, and
+        that is load-bearing.** It is the `_count` member of a HISTOGRAM family
+        that also publishes `_bucket` (one line per `le=` boundary), `_sum` and
+        `_created`. Matching the family prefix the way the two token counters
+        below do would sum every bucket into a number that increases
+        monotonically, looks exactly like a working counter, and is garbage —
+        the shape of defect that passes review because the graph goes up.
+
+        ``running`` (`vllm:num_requests_running` /
+        `llamacpp:requests_processing`) is a GAUGE, not a counter: it is summed
+        across data-parallel engines like the others, but the caller reads it as
+        a level, never as a delta.
+
+        ON llama.cpp THERE IS NO ITERATION COUNTER. `n_decode_total` is the
+        generation counter and also the closest thing to an iteration count, and
+        it is deliberately NOT mapped to both: one number wearing two clause
+        names would make the iteration clause a duplicate of the generation
+        clause while reading as independent evidence. ``iterations`` stays absent
+        there and config decides which clauses that endpoint evaluates.
 
         BOTH engine families are covered, because the stall this exists for is
         not vLLM-specific — `creative`/`tier2`/the classify family are llama.cpp
@@ -746,7 +816,51 @@ class BackendClientPool:
             resp = await asyncio.wait_for(client.get("/metrics"), timeout=3.0)
             if resp.status_code != 200:
                 return None
-            prompt = generation = None
+            totals: dict[str, int] = {}
+            #: Label sets already counted per key, so a REPEATED series can be told
+            #: from a data-parallel sibling.
+            seen: dict[str, set[str]] = {}
+            #: Keys whose exposition we do not trust. STICKY: a later well-formed
+            #: line must not revive one, or whether a malformed body reads as
+            #: malformed depends on line ORDER.
+            malformed: set[str] = set()
+
+            def take(key: str, labels: str, v: int) -> None:
+                """Accumulate one sample for one counter key.
+
+                Summing across DIFFERENT label sets is correct and deliberate: a
+                data-parallel backend publishes one series per engine, and taking
+                the last would silently track whichever sorted last.
+
+                🚨 Summing a REPEAT of the SAME series with the SAME labels is not
+                that — it is a malformed exposition, and it fails in the dangerous
+                direction. Two identical `requests_processing 6` lines read as
+                `running: 12`, which pushes occupancy PAST its gate and shrinks the
+                `generation_tps / running_mean` denominator at the same time,
+                making `goodput.py` EASIER to fire on an endpoint nobody measured
+                correctly. Same class as the `or 0` coalesce this function carried
+                for a day, so it gets the same answer: absence.
+                """
+                if key in malformed:
+                    return
+                if v < 0:
+                    # A cumulative token counter and a concurrency gauge are both
+                    # physically non-negative, and a negative one yields a 0.0 rate
+                    # — which satisfies every `<` clause in the rule. Not a
+                    # measurement worth reasoning about; absence, same as a
+                    # duplicate. (`goodput.py` handles a counter going BACKWARDS
+                    # across samples separately: that is a restart, not nonsense.)
+                    malformed.add(key)
+                    totals.pop(key, None)
+                    return
+                labels_seen = seen.setdefault(key, set())
+                if labels in labels_seen:
+                    malformed.add(key)
+                    totals.pop(key, None)
+                    return
+                labels_seen.add(labels)
+                totals[key] = totals.get(key, 0) + v
+
             for line in resp.text.splitlines():
                 if line.startswith("#"):
                     continue
@@ -755,21 +869,42 @@ class BackendClientPool:
                 try:
                     name, val = line.rsplit(" ", 1)
                     v = int(float(val))
-                except ValueError:
+                # 🚨 `OverflowError` as well as `ValueError`, and it is not
+                # theoretical: `int(float("Inf"))` raises OverflowError, and `+Inf`
+                # is ordinary Prometheus exposition — every histogram publishes an
+                # `le="+Inf"` bucket. Uncaught it escaped to the function-level
+                # handler and discarded the WHOLE scrape, `running` and every
+                # counter already parsed included, which contradicted this
+                # function's own documented promise that a bad line drops only its
+                # own counter. Safe direction (absence), wrong blast radius.
+                except (ValueError, OverflowError):
                     continue
-                # Summed, not replaced: a data-parallel backend publishes one
-                # series per engine and taking the last would silently track
-                # only whichever engine sorted last.
+                # The metric name WITHOUT its label set, so an exact-name match
+                # works on a labelled series. `startswith` is right for the token
+                # counters (no sibling shares their prefix) and WRONG for the
+                # iteration histogram, whose `_bucket`/`_sum` siblings do.
+                bare, _, labels = name.partition("{")
                 if name.startswith("vllm:prompt_tokens_total"):
-                    prompt = v if prompt is None else prompt + v
+                    take("prompt", labels, v)
                 elif name.startswith("vllm:generation_tokens_total"):
-                    generation = v if generation is None else generation + v
+                    take("generation", labels, v)
+                elif bare == "vllm:iteration_tokens_total_count":
+                    take("iterations", labels, v)
+                elif bare == "vllm:num_requests_running":
+                    take("running", labels, v)
                 elif name.startswith("llamacpp:prompt_tokens_total"):
-                    prompt = v if prompt is None else prompt + v
+                    take("prompt", labels, v)
                 elif name.startswith("llamacpp:n_decode_total"):
-                    generation = v if generation is None else generation + v
-            if prompt is not None or generation is not None:
-                return {"prompt": prompt or 0, "generation": generation or 0}
+                    take("generation", labels, v)
+                elif bare == "llamacpp:requests_processing":
+                    take("running", labels, v)
+            if totals:
+                # 🚨 NOT COALESCED. Every absent counter is `None` — see
+                # "ABSENCE IS PER KEY, AND NEVER ZERO" in the docstring. The `or 0`
+                # that used to be here on `prompt`/`generation` was a real, latching
+                # break of `goodput.py`'s invariant.
+                return {key: totals.get(key)
+                        for key in ("prompt", "generation", "iterations", "running")}
         except Exception:
             pass
         return None

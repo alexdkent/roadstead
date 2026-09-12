@@ -178,6 +178,17 @@ STUBBED_PROBES = {
     # A probe that reads as "cannot tell" is the safe stub; the e2e suite
     # restores the real one on the instance, where it points at a local fake.
     "probe_prefix_cache": None,
+    # 🚨 Added 2026-09-12, for the reason the entry above records: it is now
+    # reached from the POLLER (`health.sample_goodput` scrapes the engine work
+    # counters every tick for an endpoint with `policy.goodput_*` declared).
+    # Nothing in the shipped catalog declares those, so no unit test arms it
+    # today — but the note on `probe_prefix_cache` said "if it ever starts being
+    # called from the poller" and it always had been, which is exactly how a
+    # blackhole address turned into a 61-181s teardown. A probe reachable from a
+    # background loop is stubbed BEFORE the first caller arms it, not after.
+    # The e2e suite restores the real one on the INSTANCE, where every endpoint
+    # points at a local fake; the parsing tests capture it unbound at import.
+    "probe_progress_counters": None,
     "probe_props": None,
     "probe_models": None,
     "probe_vllm_capacity": None,

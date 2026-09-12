@@ -307,6 +307,29 @@ Query: `hours` (default 24, clamped to **0.1–168**).
 | `backend` | the backend failed or its transport deadline fired. |
 | `stream` | mid-stream, and `by_abort_reason` says which bound: `ttft` (accepted, never emitted a first token), `stall` (was emitting, then stopped), `hard_cap` (still healthy, cut for capacity) or `caller_deadline`. The first two are the substrate dying under a caller that did nothing wrong; the last two are Roadstead deciding to stop. |
 
+**`abort_reason` is populated on every layer** as of 2026-09-12. 🚨 It was previously
+`stream`-only, and everywhere else defaulted to `NULL` — which is why one real endpoint wedge left
+**219 of its 226 timeout events unexplained** and the `by_abort_reason` rollup blind to 97% of the
+population. A `NULL` from a pre-2026-09-12 row still means "not recorded"; going forward it means a
+path nobody has named yet, and the count should be ~0.
+
+| `abort_reason` | layer | what gave up | backend fault? |
+|---|---|---|---|
+| `ttft` | `stream` | the backend accepted and never emitted a first token | **yes** |
+| `stall` | `stream` | tokens were flowing and stopped for the inter-token gap | **yes** |
+| `goodput_collapse` | `admission` | refused at the door: the endpoint's own engine counters said it was occupied and producing almost nothing (§3.13) | **yes** |
+| `hard_cap` | `stream` | a still-progressing stream cut off at the absolute cap | no — capacity |
+| `caller_deadline` | `stream` | the caller's own explicit wall, mid-stream | no — the caller's bound |
+| `sse_consumer_deadline` | `stream` | our SSE reader ran out of time waiting for the next frame. Distinct from every other `stream` reason, which are the producer's verdict about the backend | no |
+| `client_deadline` | `client_wait` | the caller's applied deadline expired while work may still be in flight. **The largest population** | no |
+| `admission_expiry` | `admission` | expired in the queue, never dispatched — it never got a slot | no — capacity |
+| `queue_deadline_exhausted` | `backend` | a slot opened and the deadline was already gone, so it was never sent | no — capacity |
+| `backend_transport_deadline` | `backend` | the transport deadline fired on a dispatched sync call. The closest call in the table, and deliberately **not** a backend fault: the deadline is derived from the caller's own budget, so a caller that under-budgets would otherwise manufacture stall evidence | no |
+
+The "backend fault?" column is `QueueDB.STALL_ABORT_REASONS`, which `GET /v1/timeouts/stalls`
+answers from — it exists so a downstream consumer can tell an upstream substrate failure from its
+own hang, and a reason in the wrong column inverts exactly that.
+
 ⚠️ **With no DB the envelope is narrower**, the same trap §3.6 documents for the fleet analytics: the
 producer early-outs to `{total, premature, rows}`, so the response is `hours`, those three and
 `stream_extensions` — **no `by_abort_reason`, no `planned`, no `premature_unplanned`, no
@@ -1023,6 +1046,7 @@ published: `{"status":"error","request_id":…,"error":…,"code":…}`.
 | 422 | `context_overflow` | `context_gate_enforce` is on and the request does not fit |
 | 503 | `on_demand_unavailable` | an on-demand backend could not be loaded |
 | 503 + `Retry-After` | `circuit_open` | the backend is unhealthy (`degraded_refusal` appended when a failover was refused) |
+| 503 + `Retry-After` | `goodput_collapse` | the backend is reachable but its engine is occupied and producing almost nothing (§3.13), and enforcement is armed |
 | 429 + `Retry-After` | `backpressure` | a non-interactive band's queue is saturated |
 | 502 | `backend_error` | the backend failed after dispatch |
 | 504 | `proxy_timeout` | the deadline fired |
@@ -1074,13 +1098,13 @@ per caller — both are fleet-wide, ASGI/transport-level bounds.
 
 ### 2.1 Codes
 
-Every error envelope carries a machine-readable `code`. **Seventeen exist** (a common under-count is
+Every error envelope carries a machine-readable `code`. **Eighteen exist** (a common under-count is
 eight):
 
-`backpressure` · `circuit_open` · `draining` · `unknown_endpoint` · `invalid_grammar` ·
-`proxy_timeout` · `backend_error` · `context_overflow` · `access_denied` · `invalid_api_key` ·
-`invalid_messages` · `invalid_request_error` · `vision_not_supported` · `on_demand_unavailable` ·
-`structured_invalid_json` · `schema_invalid` · `toolcall_truncated`
+`backpressure` · `circuit_open` · `goodput_collapse` · `draining` · `unknown_endpoint` ·
+`invalid_grammar` · `proxy_timeout` · `backend_error` · `context_overflow` · `access_denied` ·
+`invalid_api_key` · `invalid_messages` · `invalid_request_error` · `vision_not_supported` ·
+`on_demand_unavailable` · `structured_invalid_json` · `schema_invalid` · `toolcall_truncated`
 
 🚨 **The last two were emitted for months before this list named them, and one of them cost real
 work.** The correction layer mints both, and `lifecycle.py` forwards whatever a correction rule
@@ -1097,6 +1121,7 @@ discarded rather than retried. `tests/test_error_codes_published.py` now walks t
 |---|---|---|---|---|
 | `schema_invalid` | `502` | A structured response parsed as JSON but violated the declared schema, and the proxy's own repair **and** its one bounded retry-with-the-error-fed-back both failed (`correction.py`, `_schema_retry` — "never retries more than once"). The body is dropped rather than served, and never cached. | **No** | **Change something.** The model has now failed this schema twice with the validation error in front of it; a third identical attempt is a third billed call for the same answer. Simplify the schema, or send the request to a model that can hold it. |
 | `toolcall_truncated` | `502` | A tool call whose `function.arguments` were cut mid-JSON while the backend labelled the response `finish_reason=tool_calls` — the same fault as a `finish_reason=length` truncation, wearing the wrong label. Emitted only for backends whose `ProviderDescriptor` declares `mislabels_truncated_tool_calls`; llama.cpp labels it `length` correctly and never reaches this rule. | **Yes** | **Raise the output budget and retry** — exactly as §2.2's `truncated structured output` row says, because it is that fault. The answer did not fit; it was not refused. |
+| `goodput_collapse` | `503` + `Retry-After` | The endpoint's own engine counters say it is OCCUPIED and producing almost nothing, sustained (§3.13), and `goodput_collapse_enforce` is armed. Distinct from `circuit_open`: that one means the backend is UNREACHABLE, this one means it is reachable and broken, and the two call for opposite operator responses. | **Yes** | **Retry later** — the refusal is immediate and cheap, and the endpoint recovers automatically (bounded in both directions). 🚨 Treating this as non-deferrable inverts the feature: the refusal exists to break a retry amplifier, and discarding the work instead of re-offering it trades a retry storm for silent data loss. |
 
 `schema_invalid` is non-deferrable for the reason §2.2 gives `backend_error` below: **the proxy
 already declined to retry**, and a caller that retries on its behalf loops against a schema the model
@@ -1322,6 +1347,14 @@ restart; it is kept rather than corrected because the name is the contract.
 | `roadstead_endpoint_healthy` | gauge | `endpoint` | 1 if the endpoint is healthy (not paused), else 0. |
 | `roadstead_structured_empty_rate` | gauge | `endpoint` | Fraction of structured responses carrying no answer (30m window). 🚨 **Emitted only once the endpoint clears the sample floor** — an unevaluated endpoint must not publish a 0/0 that reads as "healthy", so absence here is not zero. |
 | `roadstead_structured_samples_30m` | gauge | `endpoint` | Structured responses in that window; same sample-floor rule. |
+| `roadstead_endpoint_goodput_collapsed` | gauge | `endpoint` | 1 if the endpoint's engine is occupied and producing almost nothing (§3.13). 🚨 **ABSENT when the verdict is `unknown`** — the rule is a conjunction, so "could not evaluate" cannot borrow a value from either outcome; read `roadstead_endpoint_goodput_unknown` beside it. Absent for an endpoint with no `policy.goodput_*` thresholds: absence means "not watched", never "watched and fine". |
+| `roadstead_endpoint_goodput_unknown` | gauge | `endpoint` | 1 if the goodput rule could not be evaluated — a configured counter missing from the backend's `/metrics`, a failed scrape, a counter reset, too few samples. The blindness signal, and the reason a missing instrument cannot read as verified-healthy. |
+| `roadstead_endpoint_goodput_tripped` | gauge | `endpoint` | 1 if the goodput breaker is latched. Latches in shadow too — `roadstead_endpoint_goodput_tripped` at 1 with the `goodput_collapse_enforce` flag off is the dark-soak report, not an outage. |
+| `roadstead_endpoint_goodput_trips_total` | counter | `endpoint` | Since-boot goodput breaker trips. |
+| `roadstead_endpoint_goodput_running` | gauge | `endpoint` | Minimum concurrent requests the ENGINE reported running across the evaluation window — the occupancy gate's input, and not the same quantity as `roadstead_endpoint_inflight` (which is what Roadstead dispatched). |
+| `roadstead_endpoint_goodput_iteration_rate` | gauge | `endpoint` | Scheduler iterations per second (vLLM `iteration_tokens_total_count`). Absent on an engine that publishes no iteration counter. |
+| `roadstead_endpoint_goodput_generation_tps_per_request` | gauge | `endpoint` | Generation tokens per second per busy slot. ⚠️ **A low value alone is not a fault** — a prefill-heavy caller reads 0.42 here while perfectly healthy; the prefill series is what separates them. |
+| `roadstead_endpoint_goodput_prefill_tps` | gauge | `endpoint` | Prompt tokens per second. The clause that keeps huge-prompt/tiny-output callers out of the wedge band. |
 | `roadstead_empty_completion_total` | gauge | `endpoint` | Empty (position-0-EOS) completions, counted each time the fail-loud gate trips. |
 | `roadstead_truncations_total` | gauge | `endpoint`, `caller`, `structured` | Output-cap (`finish_reason=length`) hits, split `structured="true"`/`"false"` so a rule can alert on structured truncations alone — a climbing structured series is a caller's `max_tokens` set too low. |
 | `roadstead_dispatched_total` | counter | — | Since-boot scheduler dispatches. |
@@ -2331,6 +2364,66 @@ The same trap §3.6 documents, in four more places. With no DB connection:
 `/v1/inflight` and `/v1/metrics/cost-model` read no DB at all and are unaffected — though the cost
 model is `{}` until startup registers the endpoints, which is the same "empty is not zero" reading.
 
+### 3.13 Goodput collapse — `endpoints[].goodput` on `/v1/status`
+
+**"The ENDPOINT is sick", which no per-request watchdog can conclude.** A backend whose engine wedges
+keeps answering `/health` — the HTTP server is fine, only the engine is not — so its slots fill with
+requests producing almost nothing, callers hit their deadlines, and the retries refill the slots.
+Roadstead samples each endpoint's **own engine work counters** on the capacity poller and publishes a
+verdict per endpoint.
+
+The rule is a conjunction of an occupancy gate and up to three progress clauses, sustained over
+consecutive evaluations:
+
+```
+occupancy:   running                      >= N     slots are BUSY
+iterations:  d(iterations)/dt             <  R     the scheduler loop is not turning
+generation:  d(generation)/dt / running   <  G     turning, and emitting nothing
+prefill:     d(prompt)/dt                <  P     and not doing prefill either
+```
+
+🚨 **Roadstead ships NO default for N, R, G, P or the sustain count.** They are hardware
+measurements, and an endpoint with no `policy.goodput_*` declared in `models.yaml` **runs no detector
+at all** — absent means off, and `goodput` is then absent from its `/v1/status` entry. Which progress
+clauses an endpoint evaluates is also a configuration choice, not an engine one: a llama.cpp backend
+publishes no iteration counter, so it must leave `goodput_max_iteration_rate` unset. Declaring a
+threshold whose counter the engine never publishes does not make the detector stricter — it makes
+every verdict `unknown`.
+
+| field | type | meaning |
+|---|---|---|
+| `verdict` | string | `healthy` \| `collapsed` \| `unknown`. 🚨 **Three-valued, and `unknown` is never folded into either other value.** The rule is a conjunction, so a clause that cannot be evaluated makes firing EASIER — an endpoint whose instrument is missing must not be able to trip the breaker, and must not read as verified-healthy either. |
+| `reason` | string | Present on `unknown`, and it names WHICH blindness: `no_samples`, `too_few_samples`, `window_too_short`, `counter_reset`, `counters_absent:<keys>`, `rate_unavailable:<clause>`. "A counter the engine never publishes" and "the ring is still filling after a restart" call for opposite responses. |
+| `tripped` | bool | The breaker is latched. **Latches in shadow too** — this is an observation, not an enforcement decision. |
+| `enforced` | bool | Whether a latched trip has any caller-visible effect, i.e. the `goodput_collapse_enforce` runtime flag. `tripped: true, enforced: false` is the dark soak working as designed. |
+| `trips` | int | Since-boot trip count. Accrues in shadow, which is what the arming decision is read from. |
+| `tripped_for_s` | float | How long the current hold has run. Absent when not tripped. |
+| `clauses_held` | list | Clause names whose collapse condition held: `occupancy`, `iterations`, `generation`, `prefill`. |
+| `clauses_cleared` | list | Clauses that did not. On a `healthy` verdict this is the evidence of health — usually `prefill`. |
+| `samples`, `window_s` | int, float | How many samples the verdict came from, and the seconds they actually spanned. A verdict with no window behind it is arithmetic, not observation. |
+| `running_min`, `running_mean` | float | Engine-reported concurrency across the window: `min` gates occupancy (so a spike cannot arm it), `mean` is the denominator for tokens produced over the interval. |
+| `iteration_rate`, `generation_tps`, `generation_tps_per_request`, `prefill_tps` | float | The computed rates. Absent individually when the counter behind one is not published. |
+
+**Recovery is automatic and bounded in both directions.** A trip clears after consecutive `healthy`
+verdicts, and an **absolute maximum hold** clears it regardless of the verdict — including while
+blind. There is deliberately no path that stays tripped forever: a wedge that is still wedged
+re-trips within a few poller ticks, whereas a hold nobody has re-confirmed is an outage Roadstead
+caused. Both the trip and the clear log the numbers that produced them
+(`ROADSTEAD_GOODPUT_COLLAPSE`, `ROADSTEAD_GOODPUT_RECOVERED` — log markers, not contract).
+
+**What a trip does when armed.** The endpoint reads unhealthy in the one place admission already
+asks, so non-background submits fast-fail with a deferrable 503 (`code: "goodput_collapse"`,
+`abort_reason` likewise), the queued interactive cohort is released, the scheduler defers, and
+failover reroutes if a target is declared. ⚠️ **BACKGROUND requests still QUEUE**, by the existing
+band policy — see the caveat under `POST /v1/admin/endpoints/{ep}/pause`. Two alerts ride the
+existing condition set: `endpoint_goodput_collapse` (CRITICAL when enforcing, WARNING in shadow) and
+`endpoint_goodput_blind` (a configured detector that cannot reach a verdict — the failure mode that
+otherwise looks exactly like a quiet healthy endpoint).
+
+This is **not** `endpoint_stalled`, which stays: that alert keys on COMPLETED timeouts and requires
+`queued == 0`, so a collapse that fills every slot makes requests queue and the condition is false
+for the whole incident.
+
 ---
 
 ## 4. South face — what Roadstead requires *of a backend*
@@ -2411,10 +2504,36 @@ catalogue does not.
 | `usage.prompt_tokens_details.cached_tokens` | per-request cache attribution falls back to an endpoint-level rate |
 | `GET /metrics` (see prefixes below) | no prefix-cache visibility; treated as *n/a*, never as 0% |
 | decode-progress counters | streaming deadlines cannot be extended on progress; the soft deadline becomes hard |
+| engine work counters (`iterations`, `running`, and the two above) | the goodput detector (§3.13) cannot evaluate any clause that reads a missing counter, so it reports `unknown` and **cannot trip**. An endpoint should simply not declare a threshold whose counter its engine does not publish |
 
 **Load-bearing metric name prefixes** (matched by prefix):
 `vllm:prefix_cache_hits_total` · `vllm:prefix_cache_queries_total` · `vllm:prompt_tokens_total` ·
 `vllm:generation_tokens_total` · `llamacpp:prompt_tokens_total` · `llamacpp:n_decode_total`
+
+**Matched on the FULL name, not a prefix** — each has siblings sharing its prefix, or is a gauge
+rather than a counter:
+`vllm:iteration_tokens_total_count` · `vllm:num_requests_running` · `llamacpp:requests_processing`
+
+🚨 **A counter Roadstead cannot read is ABSENT, never zero.** That covers a series the backend does
+not publish *and* every exposition Roadstead will not trust:
+
+| shape | why it reads as absence |
+|---|---|
+| a truncated body, an unexpected separator (TAB), a missing value | the line cannot be parsed |
+| `NaN`, `Inf`/`+Inf`, an overflowing exponent (`1e400`) | not a quantity a rate can be taken from. Dropped **per line** — one such value must not discard the rest of the scrape |
+| the **same** series repeated with an **identical** label set | malformed exposition. Summed it inflates the value, and for `running` that raises occupancy past its gate *and* shrinks the per-request denominator — both towards firing |
+| a **negative** value | physically impossible for a cumulative token counter or a concurrency gauge, and it yields a 0.0 rate, which satisfies every `<` clause |
+
+Absence is **sticky per counter**: a later well-formed line does not revive one already judged
+malformed, or the same body would mean different things depending on the order the engine emitted it.
+
+⚠️ Summing across **different** label sets is correct and deliberate — data parallelism publishes one
+series per engine — so only an exact label-set repeat is malformed.
+
+The distinction is load-bearing for §3.13, where "the instrument is missing" and "the engine has
+stopped" are opposite conclusions and only the second one sheds traffic. A wedged engine is also
+exactly when `/metrics` is slowest and a body most likely to arrive short, so reading a dropped line
+as zero would make the detector most confidently wrong precisely when it fires.
 
 ### 4.5 Health
 

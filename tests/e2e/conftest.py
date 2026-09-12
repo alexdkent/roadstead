@@ -37,6 +37,11 @@ from roadstead.testing import FakeBackend, FakeBackendServer
 
 #: Captured at import, before the parent conftest's autouse fixture replaces it.
 _REAL_PREFIX_CACHE = BackendClientPool.probe_prefix_cache
+#: Same, for the engine work-counter scrape. Stubbed at the class level since
+#: 2026-09-12 because the POLLER reaches it now (`health.sample_goodput`); the
+#: journeys need the real thing, and here every endpoint points at a local fake
+#: that publishes the counters.
+_REAL_PROGRESS_COUNTERS = BackendClientPool.probe_progress_counters
 
 
 # Loopback client for the ASGI transport → ACL "internal" identity.
@@ -177,6 +182,8 @@ async def proxy(fake: FakeBackendServer) -> AsyncIterator[ProxyHarness]:
         # exercised end to end rather than mocked away.
         svc._backend.probe_prefix_cache = types.MethodType(
             _REAL_PREFIX_CACHE, svc._backend)
+        svc._backend.probe_progress_counters = types.MethodType(
+            _REAL_PROGRESS_COUNTERS, svc._backend)
 
         # The admin plane requires a credential as of 2026-09-01. Minted as a
         # BOOTSTRAP key so `KeyRegistry.configured` stays False and the e2e

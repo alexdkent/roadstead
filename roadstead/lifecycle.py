@@ -879,6 +879,33 @@ class Lifecycle:
                 if src_ep in self.state.paused_endpoints:
                     err = f"backend {req.endpoint} paused for maintenance (drain) — backpressure"
                     code = "draining"
+                elif (src_ep in self.state.collapsed_endpoints
+                      and self.state.flags.get("goodput_collapse_enforce")):
+                    # Goodput collapse. Named separately from `circuit_open`
+                    # because the two call for opposite operator responses: a
+                    # circuit trip means the backend is unreachable, this means it
+                    # is reachable, occupied, and producing almost nothing. Both
+                    # carry the "backpressure" deferrability marker the fleet's
+                    # clients sniff for, so the caller retries either way.
+                    #
+                    # Order matters: an operator pause wins (it is an intention,
+                    # not an observation), and this wins over `circuit_open`
+                    # because when both hold, the wedge is the more specific fact.
+                    err = (f"backend {req.endpoint} is occupied and producing "
+                           f"almost nothing (goodput collapse) — backpressure")
+                    code = "goodput_collapse"
+                    # 🚨 THE HOLE THIS FILLS IS WHY THE INCIDENT WAS INVISIBLE.
+                    # 219 of 226 real timeout events carried no abort_reason, so
+                    # the forensic table could not distinguish a wedge from load.
+                    # A refusal writes its own row — DB + WARNING only
+                    # (`emit_metrics_and_log=False`), because a fast 503 is not a
+                    # timeout and must not inflate the rolling timeout counter
+                    # that `endpoint_stalled` and the cooldown window read.
+                    self.record_timeout_event(
+                        req, layer="admission", elapsed_s=0.0,
+                        emit_metrics_and_log=False, proxy_initiated=True,
+                        abort_reason="goodput_collapse",
+                    )
                 else:
                     err = f"backend {req.endpoint} unavailable (circuit open)"
                     code = "circuit_open"
@@ -990,7 +1017,16 @@ class Lifecycle:
             self.state.pending_futures.pop(req.request_id, None)
             self.state.thinking_active.pop(req.request_id, None)
             # The caller's deadline fired — work may still be in flight.
-            self.record_timeout_event(req, layer="client_wait", elapsed_s=req.timeout_s)
+            # 🚨 This site passed NO abort_reason until 2026-09-12, and it is the
+            # single largest reason the tier3 wedge was invisible: 219 of that
+            # incident's 226 timeout events were `client_wait` rows with
+            # abort_reason NULL, so `/v1/timeouts`' by_abort_reason rollup had
+            # nothing to say about 97% of the population. NOT a stall reason —
+            # this is the caller's own applied deadline expiring, which is exactly
+            # the `caller_deadline` class `STALL_ABORT_REASONS` excludes.
+            self.record_timeout_event(req, layer="client_wait",
+                                      elapsed_s=req.timeout_s,
+                                      abort_reason="client_deadline")
             if wire == WIRE_OPENAI:
                 return _openai_error(
                     f"proxy timeout after {req.timeout_s:.0f}s", "proxy_timeout", 504,
@@ -1292,7 +1328,16 @@ class Lifecycle:
                     )
                 else:
                     yield f"data: {json.dumps({'type': 'error', 'error': 'timeout'})}\n\n"
-                self.record_timeout_event(req, layer="stream", elapsed_s=req.timeout_s)
+                # The SSE CONSUMER ran out of time waiting for the next frame —
+                # distinct from every other `stream` reason, all of which are the
+                # PRODUCER's verdict about the backend. Named so a wall of stream
+                # timeouts can be split into "the backend stopped" (`ttft`,
+                # `stall`) and "our own reader gave up" (this), which the
+                # unqualified NULL could not express. Not a stall reason: the
+                # deadline that fired is the caller's.
+                self.record_timeout_event(req, layer="stream",
+                                          elapsed_s=req.timeout_s,
+                                          abort_reason="sse_consumer_deadline")
             finally:
                 # Phase 5B.1: the SSE consumer is gone (client disconnect, our
                 # own timeout, or normal completion). Cancel the producer
@@ -1478,6 +1523,13 @@ class Lifecycle:
                 self.record_timeout_event(
                     req, layer="backend", elapsed_s=0.0,
                     queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
+                    # The deadline was already gone when the slot opened — the
+                    # request never reached the backend at all. Distinct from the
+                    # transport deadline below, and pointedly NOT a stall: a
+                    # cohort of these means the queue was too long or the caller's
+                    # budget too short, and blaming the backend for them is the
+                    # inversion `STALL_ABORT_REASONS` exists to prevent.
+                    abort_reason="queue_deadline_exhausted",
                 )
                 return
 
@@ -1494,6 +1546,16 @@ class Lifecycle:
                 self.record_timeout_event(
                     req, layer="backend", elapsed_s=duration,
                     queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
+                    # The transport deadline fired on a dispatched SYNC call: the
+                    # backend accepted it and had not answered. That is the
+                    # closest sync analogue of the streaming `ttft`/`stall`
+                    # reasons — and it is still deliberately NOT in
+                    # `STALL_ABORT_REASONS`, because the deadline is
+                    # `max(1.0, remaining)`, i.e. OURS, derived from the caller's
+                    # own budget. A best-effort sub-floor caller lands here having
+                    # given the backend no fair chance, which is the same argument
+                    # that keeps those callers out of the cooldown window.
+                    abort_reason="backend_transport_deadline",
                 )
                 # Step 4b. best_effort: a caller that never gave the backend a
                 # fair chance must not cool it for everyone else (tier1 greeter
@@ -1791,9 +1853,19 @@ class Lifecycle:
             if (time.monotonic() - get_last_chunk_at()) < check_s:
                 prev = None  # flowing — any baseline we held is stale
                 continue
-            counters = await self.state.backend.probe_progress_counters(ep_cfg)
-            if counters is None:
+            raw = await self.state.backend.probe_progress_counters(ep_cfg)
+            if raw is None:
                 return
+            # 🚨 THE COALESCE LIVES HERE, not in the probe. `probe_progress_counters`
+            # returns `None` for an absent counter because `goodput.py` MUST be able
+            # to tell a missing instrument from a stopped engine — for the
+            # endpoint-level breaker those are opposite conclusions, and conflating
+            # them latched the breaker on an unmeasured endpoint. THIS caller wants
+            # the opposite reading: "the counter is not there" is not evidence of
+            # progress, so it counts as no progress and the stall abort proceeds
+            # exactly as it did before C6. Same number, opposite default, and each
+            # site now states which one it needs.
+            counters = {k: (v or 0) for k, v in raw.items()}
             if prev is None:
                 prev = counters
                 continue
@@ -2324,7 +2396,13 @@ class Lifecycle:
         it and release the caller promptly with a timeout result (instead
         of letting it wait out its own — identical — deadline)."""
         elapsed = time.monotonic() - req.enqueued_at
-        self.record_timeout_event(req, layer="admission", elapsed_s=elapsed)
+        # It expired IN THE QUEUE, never dispatched — a capacity outcome, and the
+        # one `layer` the abort_reason vocabulary had no word for. Distinct from
+        # `queue_deadline_exhausted` (which is discovered at dispatch, when a slot
+        # finally opened) because the two point at different halves of the same
+        # problem: this one never got a slot at all.
+        self.record_timeout_event(req, layer="admission", elapsed_s=elapsed,
+                                  abort_reason="admission_expiry")
         future = self.state.pending_futures.get(req.request_id)
         if future and not future.done():
             future.set_result({

@@ -264,18 +264,27 @@ def test_every_backend_probe_is_stubbed_in_the_unit_suite():
     """
     from tests.conftest import STUBBED_PROBES
 
-    # Deliberately NOT stubbed: driven only by tests that supply their own fake
-    # client to exercise the real parsing, and stubbing it would break exactly
-    # those. Recorded here so the gap is a DECISION rather than an omission that
-    # looks identical to one.
+    # 🚨 EMPTY, AND THAT IS THE POINT — every probe on the pool is stubbed.
     #
-    # `probe_prefix_cache` used to be on this list with a note saying to stub it
-    # "if it ever starts being called from the poller". It always was — the
-    # cache-stats tick scrapes it — and only a LAN that refused connections fast
-    # kept that invisible. It moved to STUBBED_PROBES on 2026-08-31. A probe
-    # reached from a background loop does not belong here, whatever the parsing
-    # tests would prefer.
-    deliberately_unstubbed = {"probe_progress_counters"}
+    # This set held exactly one entry twice, and both times the justification was
+    # the same: "driven only by tests that supply their own fake client, and
+    # stubbing it would break exactly those."
+    #   * `probe_prefix_cache` left 2026-08-31. Its note said to stub it "if it
+    #     ever starts being called from the poller"; it always had been (the
+    #     cache-stats tick), and only a LAN that refused connections fast kept
+    #     that invisible — against blackhole addresses it cost 61-181s teardowns.
+    #   * `probe_progress_counters` left 2026-09-12, when `health.sample_goodput`
+    #     started scraping engine work counters on the poller cadence. Nothing in
+    #     the shipped catalog arms it, so the hang had not happened yet. It was
+    #     stubbed anyway: "no caller arms it today" is a fact about the CATALOG,
+    #     not about the code, and the previous entry is the measure of how long
+    #     such a fact survives unnoticed after it stops being true.
+    #
+    # A parsing test that needs the real method captures it UNBOUND at import
+    # (see `tests/test_stream_progress_probe.py`), which costs one line and leaves
+    # nothing reachable from a background loop unstubbed. If you are about to add
+    # an entry here, that is the alternative.
+    deliberately_unstubbed: set[str] = set()
 
     actual = {n for n in dir(backend.BackendClientPool)
               if n.startswith("probe_")

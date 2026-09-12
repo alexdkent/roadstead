@@ -73,7 +73,7 @@ PAYLOAD_TYPES: frozenset[str] = frozenset({
 # Error codes — docs/api.md §2.1
 # ---------------------------------------------------------------------------
 
-#: Every code the proxy emits. Seventeen (a common under-count is eight, and
+#: Every code the proxy emits. Eighteen (a common under-count is eight, and
 #: this file itself under-counted at fifteen until 2026-09-05: the correction
 #: layer's two codes reach the wire through a passthrough in ``lifecycle.py``
 #: rather than a handler that names them, so no reading of the server's error
@@ -82,6 +82,12 @@ PAYLOAD_TYPES: frozenset[str] = frozenset({
 ERROR_CODES: frozenset[str] = frozenset({
     "backpressure",
     "circuit_open",
+    # Refused at the door because the endpoint's own engine counters say it is
+    # occupied and producing almost nothing (docs/api.md §3.13). Distinct from
+    # `circuit_open` on purpose: that one means the backend is UNREACHABLE, this
+    # one means it is reachable and broken, and they call for opposite operator
+    # responses. Both are deferrable — see DEFERRABLE_CODES below.
+    "goodput_collapse",
     "draining",
     "unknown_endpoint",
     "invalid_grammar",
@@ -109,6 +115,14 @@ ERROR_CODES: frozenset[str] = frozenset({
 DEFERRABLE_CODES: frozenset[str] = frozenset({
     "backpressure",
     "circuit_open",
+    # 🚨 Deferrable, and getting this wrong would INVERT the whole point of the
+    # feature. The refusal exists to break a RETRY AMPLIFIER: during the incident
+    # it was built for, callers hit their deadlines and retried into the wedged
+    # slots, which is what made the collapse self-sustaining. Read as
+    # NON-deferrable, the work would be DISCARDED rather than re-offered once the
+    # endpoint recovers — trading a retry storm for silent data loss. The refusal
+    # is cheap and immediate; retrying later is exactly right.
+    "goodput_collapse",
     "draining",
     "proxy_timeout",
     "backend_error",

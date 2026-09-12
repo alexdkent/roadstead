@@ -29,6 +29,7 @@ from .config import (
     thinking_canary_enabled,
     thinking_canary_interval_s,
 )
+from .goodput import GoodputThresholds, LatchAction, Verdict
 from .observability import (
     AlertCondition,
     check_alerts,
@@ -131,6 +132,40 @@ class Health:
             until = self.state.endpoint_cooldown_until.get(ep, 0.0)
             if until and time.monotonic() < until:
                 return False
+        # Goodput collapse (goodput.py): the engine is OCCUPIED and producing
+        # almost nothing. Same shape as the cooldown arm above, and the same one
+        # insertion buys the whole enforcement surface — fast-fail 503 at the
+        # admission site, scheduler deferral, `fast_fail_interactive` of the
+        # queued cohort, and failover-if-armed — with no new admission code.
+        #
+        # 🚨 THIS IS THE ONLY PLACE THAT DECIDES WHETHER TRAFFIC IS REFUSED.
+        # `collapsed_endpoints` is populated in shadow too (it is an OBSERVATION,
+        # see state.py), so the flag has to bite on a read of it, and this is the
+        # read every admission path already funnels through.
+        #
+        # ⚠️ It is NOT the only place the flag is read, and an earlier version of
+        # this comment claimed it was — which is exactly the kind of unguarded
+        # assertion-in-prose this repo keeps paying for. There are SIX reads, and
+        # `tests/test_goodput_wiring.py::test_the_enforce_flag_is_read_only_in_named_
+        # places` pins the set AND the per-function counts, so neither a new read
+        # nor an extra one in a listed function can appear quietly:
+        #
+        #   health.py  endpoint_healthy   THIS — the refusal decision
+        #   health.py  sample_goodput     gates `fast_fail_interactive`, releasing
+        #                                 the already-queued cohort
+        #   health.py  sample_goodput     gates the post-recovery
+        #                                 `dispatch_event.set()`
+        #   health.py  sample_goodput     the SHADOW/armed suffix on the trip log
+        #   health.py  goodput_snapshot   the `enforced` field on /v1/status
+        #   lifecycle.py handle_submit    re-words a refusal ALREADY decided here
+        #                                 (nested inside `if not endpoint_healthy`)
+        #
+        # Only the first three can change what a caller gets, and the second and
+        # third are downstream of a trip this same tick recorded. The last three
+        # are reporting, or already behind this gate.
+        if (ep in self.state.collapsed_endpoints
+                and self.state.flags.get("goodput_collapse_enforce")):
+            return False
         # On-demand endpoints are intentionally unloaded when idle; availability
         # is gated by OnDemandManager.ensure_loaded (loads on demand or raises),
         # not the always-on poller probe. Don't let a probe of an unloaded
@@ -197,10 +232,16 @@ class Health:
             else:
                 # Backend answers /health → up but discovery is flaky; don't trip.
                 h["consecutive_failures"] = 0
-    def fast_fail_interactive(self, ep_name: str) -> None:
+    def fast_fail_interactive(self, ep_name: str,
+                              reason: str = "circuit open") -> None:
         """On the unhealthy transition, release queued INTERACTIVE/FOREGROUND
         requests for this endpoint with a deferrable error so they don't wait out
         their full deadline; BACKGROUND stays queued to defer until recovery.
+
+        ``reason`` is the parenthetical in the released error message, and its
+        default is the historical string BYTE-FOR-BYTE: the fleet's clients sniff
+        that message for deferrability markers, so the only thing a caller may
+        see change here is which cause is named.
 
         § 9.2 — with a failover target armed, an eligible request is REROUTED
         here instead of released. This is the one pre-existing behaviour the
@@ -235,7 +276,7 @@ class Health:
             # message carries the deferrability marker the fleet's clients sniff
             # for, so replacing it would turn a retryable deferral into a hard
             # error for every caller that could not be degraded.
-            err = f"backend {ep_name} unavailable (circuit open)"
+            err = f"backend {ep_name} unavailable ({reason})"
             if plan is not None and plan.refusal_code:
                 err += plan.refusal_detail
                 self.state.failover.record_refusal(req, plan)
@@ -310,6 +351,47 @@ class Health:
             logger.warning(
                 "endpoint %s WOULD cool %.0fs (SHADOW) — %d backend-fault failures "
                 "within %.0fs", ep, dur, cooldown_allowed_fails(), window)
+    def goodput_snapshot(self, ep_name: str, now: float) -> dict | None:
+        """The goodput view of one endpoint, or ``None`` when the detector is not
+        configured for it.
+
+        ONE builder for both consumers — ``/v1/status`` and the alert evaluator —
+        because two copies of "what the operator is told" drift, and this
+        particular payload is the whole readable surface of a feature shipped
+        dark. ``None`` rather than a zeroed dict, following the sample-floor
+        precedent on `/metrics`: an unevaluated endpoint must not publish
+        something that reads as verified-healthy.
+        """
+        verdict = self.state.goodput_verdicts.get(ep_name)
+        if verdict is None:
+            return None
+        out: dict = {
+            "verdict": verdict.outcome.value,
+            "tripped": ep_name in self.state.collapsed_endpoints,
+            # Whether the trip has any caller-visible effect. During the dark
+            # soak this is False while `tripped` can be True, and that pair IS
+            # the soak report.
+            "enforced": bool(self.state.flags.get("goodput_collapse_enforce")),
+            "trips": self.state.goodput.trips(ep_name),
+            "samples": verdict.samples,
+            "window_s": verdict.window_s,
+        }
+        if verdict.reason:
+            out["reason"] = verdict.reason
+        if verdict.clauses_held:
+            out["clauses_held"] = list(verdict.clauses_held)
+        if verdict.clauses_cleared:
+            out["clauses_cleared"] = list(verdict.clauses_cleared)
+        for key in ("running_min", "running_mean", "iteration_rate",
+                    "generation_tps", "generation_tps_per_request", "prefill_tps"):
+            value = getattr(verdict, key)
+            if value is not None:
+                out[key] = value
+        held_for = self.state.goodput.tripped_for_s(ep_name, now)
+        if held_for is not None:
+            out["tripped_for_s"] = round(held_for, 1)
+        return out
+
     def evaluate_alerts(self, now: float) -> None:
         """Evaluate proxy-internal alert conditions (Phase 2.5) and surface them
         to logs (log_scan/health-verifier) + /v1/status. Never restarts a backend — a dead
@@ -322,6 +404,9 @@ class Health:
             # pause doesn't page as an outage — those surface as a separate
             # informational endpoint_drained alert below.
             s["paused"] = (not self.endpoint_healthy(ep)) and ep not in self.state.paused_endpoints
+            gp = self.goodput_snapshot(ep, now)
+            if gp is not None:
+                s["goodput"] = gp
             snaps[ep] = s
         alerts = check_alerts(
             endpoint_snapshots=snaps,
@@ -493,6 +578,128 @@ class Health:
             await self.update_endpoint_health(ep_name, ep_cfg, probe_ok)
         except Exception as exc:  # noqa: BLE001
             logger.debug("health update %s failed: %s", ep_name, exc)
+        # Endpoint-level goodput collapse. Guarded the same way, and for the same
+        # reason the counter probe it uses is: a detector that can wedge the
+        # poller is worse than no detector.
+        try:
+            await self.sample_goodput(ep_name, ep_cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("goodput sample %s failed: %s", ep_name, exc)
+
+    def goodput_thresholds(self, ep_cfg: EndpointConfig) -> GoodputThresholds:
+        """Read this endpoint's declared detector configuration.
+
+        Built per call rather than cached on the config: it is a frozen
+        dataclass of seven scalars, and an operator editing the catalog through
+        the admin plane must not have to bounce the process for the change to
+        bite. 0 -> ``None`` on the three rate ceilings because 0 is how
+        `models.yaml` spells "undeclared" everywhere else in this file, and a
+        rate below 0.0 is not a condition any engine can satisfy.
+        """
+        return GoodputThresholds(
+            min_running=int(getattr(ep_cfg, "goodput_min_running", 0) or 0),
+            sustain_evaluations=int(
+                getattr(ep_cfg, "goodput_sustain_evaluations", 0) or 0),
+            max_iteration_rate=(
+                float(ep_cfg.goodput_max_iteration_rate)
+                if getattr(ep_cfg, "goodput_max_iteration_rate", 0) else None),
+            max_generation_tps_per_request=(
+                float(ep_cfg.goodput_max_generation_tps)
+                if getattr(ep_cfg, "goodput_max_generation_tps", 0) else None),
+            max_prefill_tps=(
+                float(ep_cfg.goodput_max_prefill_tps)
+                if getattr(ep_cfg, "goodput_max_prefill_tps", 0) else None),
+            recovery_evaluations=int(
+                getattr(ep_cfg, "goodput_recovery_evaluations", 0) or 0),
+            max_hold_s=float(getattr(ep_cfg, "goodput_max_hold_s", 0.0) or 0.0),
+        )
+
+    async def sample_goodput(self, ep_name: str, ep_cfg: EndpointConfig,
+                             now: float | None = None) -> None:
+        """One goodput observation + verdict + latch step for one endpoint.
+
+        Rides the capacity poller rather than opening a background loop, for the
+        reason the thinking canary gives: a new task would need its own liveness
+        bit and its own poisoned-tick guard, and no check here is important enough
+        to earn another way for the proxy to die.
+
+        Costs one `/metrics` GET on an endpoint the poller already probed, with
+        `probe_progress_counters`' own 3 s cap; a failed scrape is recorded as an
+        ABSENT sample, which pushes the verdict towards UNKNOWN rather than
+        leaving a stale healthy window standing.
+
+        ``now`` is injectable for the same reason `goodput.py` takes it: the rule
+        needs a MEASURED window (a span floor, and consecutive evaluations), and
+        no test can produce one at wall-clock speed. 🚨 The alternative — patching
+        `time.monotonic` — patches it for the EVENT LOOP too, which is how a first
+        cut of the e2e journey silently got a failed scrape on every tick and read
+        it as a blind backend. Production passes nothing.
+        """
+        thresholds = self.goodput_thresholds(ep_cfg)
+        if not thresholds.armed:
+            # Not configured -> no detector, no samples retained, nothing
+            # published. `absent means off` is the whole reason no threshold in
+            # this repository carries a fleet measurement as its default.
+            return
+        ep = normalize_endpoint(ep_name)
+        now = time.monotonic() if now is None else now
+        counters = await self.state.backend.probe_progress_counters(ep_cfg)
+        self.state.goodput.observe(ep, now, counters)
+        verdict = self.state.goodput.evaluate(ep, thresholds, now)
+        self.state.goodput_verdicts[ep] = verdict
+        tripped = ep in self.state.collapsed_endpoints
+        action = self.state.goodput.step(
+            ep, verdict, tripped=tripped, thresholds=thresholds, now=now)
+        if action is LatchAction.TRIP:
+            self.state.collapsed_endpoints.add(ep)
+            logger.critical(
+                "ROADSTEAD_GOODPUT_COLLAPSE endpoint=%s TRIPPED%s — running_min=%s "
+                "iterations/s=%s generation_tps_per_req=%s prefill_tps=%s "
+                "window=%.1fs samples=%d clauses=%s (sustained %d evaluations; "
+                "thresholds running>=%d iter<%s gen<%s prefill<%s)",
+                ep,
+                "" if self.state.flags.get("goodput_collapse_enforce")
+                else " (SHADOW — no caller effect)",
+                verdict.running_min, verdict.iteration_rate,
+                verdict.generation_tps_per_request, verdict.prefill_tps,
+                verdict.window_s, verdict.samples, ",".join(verdict.clauses_held),
+                thresholds.sustain_evaluations, thresholds.min_running,
+                thresholds.max_iteration_rate,
+                thresholds.max_generation_tps_per_request,
+                thresholds.max_prefill_tps,
+            )
+            if self.state.flags.get("goodput_collapse_enforce"):
+                # Release the already-queued interactive cohort now, exactly as
+                # the circuit and the cooldown do. They are the one cohort that
+                # would otherwise wait out a full deadline on a backend we have
+                # just concluded is producing nothing.
+                self.fast_fail_interactive(ep, reason="goodput collapse")
+        elif action is LatchAction.CLEAR:
+            self.state.collapsed_endpoints.discard(ep)
+            held = self.state.goodput.tripped_for_s(ep, now)
+            logger.warning(
+                "ROADSTEAD_GOODPUT_RECOVERED endpoint=%s CLEARED after %ss — "
+                "verdict=%s running_min=%s iterations/s=%s "
+                "generation_tps_per_req=%s prefill_tps=%s cleared_clauses=%s%s",
+                ep, "?" if held is None else f"{held:.0f}",
+                verdict.outcome.value, verdict.running_min,
+                verdict.iteration_rate, verdict.generation_tps_per_request,
+                verdict.prefill_tps, ",".join(verdict.clauses_cleared),
+                "" if verdict.outcome is Verdict.HEALTHY
+                else " (ABSOLUTE MAX HOLD expired — the rule was not re-confirmed, "
+                     "so the hold was released rather than latched; it will "
+                     "re-trip if the wedge is still there)",
+            )
+            if self.state.flags.get("goodput_collapse_enforce"):
+                # Drain the queue this trip was deferring. ⚠️ GATED, and it had to
+                # be: in SHADOW the trip deferred nothing (`endpoint_healthy` never
+                # returned False), so there is no queue to drain and this would be
+                # a bare wakeup of the dispatch loop caused by a feature that is
+                # supposed to be observation-only. Small, but it is a caller-
+                # visible timing change, and "shadow changes nothing" has to be
+                # true rather than nearly true — otherwise the dark soak is not
+                # measuring the same system the flag flip will arm.
+                self.state.dispatch_event.set()
     async def _maybe_run_thinking_canary(self, ep_name, ep_cfg) -> None:
         """Prove the DECLARED thinking switch still works on the model that is
         actually loaded, by making one real call.

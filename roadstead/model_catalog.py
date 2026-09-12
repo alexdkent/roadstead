@@ -557,6 +557,20 @@ _POLICY_PASSTHROUGH = (
     # Minimum dwell in degraded mode before flipping back. Guarded by
     # test_failover.py::test_dwell_reaches_endpoint_config.
     "failover_dwell_s",
+    # Endpoint-level goodput-collapse detector (goodput.py). All seven are
+    # absent/0 by default and absent means the detector does not run — the five
+    # detection numbers are fleet-hardware measurements this repository does not
+    # ship. Guarded by
+    # test_goodput_wiring.py::test_every_goodput_policy_key_reaches_endpoint_config,
+    # which parametrizes over this block so a key added here without a
+    # passthrough entry, or vice versa, fails.
+    "goodput_min_running",
+    "goodput_sustain_evaluations",
+    "goodput_max_iteration_rate",
+    "goodput_max_generation_tps",
+    "goodput_max_prefill_tps",
+    "goodput_recovery_evaluations",
+    "goodput_max_hold_s",
 )
 
 

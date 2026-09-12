@@ -30,6 +30,7 @@ from .coalesce import DeterministicCache
 from .config import ProxyConfig, normalize_endpoint
 from .cost_model import CostModel
 from .flags import RuntimeFlags
+from .goodput import GoodputMonitor, GoodputVerdict
 from .identity import IdentityResolver, KeyRegistry
 from .management import AdminOverlay
 from .observability import RequestLogger, RollingMetrics
@@ -311,6 +312,36 @@ class ProxyState:
         # so a planned drain never fires the endpoint_paused ERROR alert. The
         # poller skips paused endpoints; /resume hands them back to the poller.
         self.paused_endpoints: set[str] = set()
+        # Endpoint-level GOODPUT COLLAPSE (goodput.py, 2026-09-12) — endpoints
+        # whose engine is OCCUPIED and producing almost nothing. The breaker the
+        # /health probe cannot arm: during the 2026-09-11/12 wedge the backend
+        # answered `healthy: true` throughout while its scheduler step sat at
+        # ~7 s, and callers retried into the stuck slots, which is what made it
+        # self-sustaining.
+        #
+        # 🚨 A SET, mirroring `paused_endpoints` and `degraded_endpoints` above,
+        # and deliberately NOT a per-endpoint bool — the `paused` bool on
+        # /v1/status is already known-unreliable (observed False for an endpoint
+        # that WAS in `paused_endpoints`) and a third bool with the same bug would
+        # give the operator a third thing to disbelieve.
+        #
+        # 🚨 MEMBERSHIP HERE IS AN OBSERVATION, NOT AN ENFORCEMENT DECISION. It is
+        # populated whether or not the `goodput_collapse_enforce` flag is armed,
+        # so a dark soak can read exactly what enforcement WOULD have shed;
+        # `Health.endpoint_healthy` is the single place the flag is consulted.
+        # Two gates would mean a sabotage of either one leaves a green suite.
+        #
+        # NOT persisted across a restart, for the same reason `degraded_endpoints`
+        # is not: it is a derived observation with a sample window behind it, and
+        # a fresh process re-derives it within `sustain` poller ticks. Re-seeding
+        # it would assert a wedge that may be over.
+        self.collapsed_endpoints: set[str] = set()
+        #: Per-endpoint sample rings + the trip latch. Holds no enforcement state.
+        self.goodput = GoodputMonitor()
+        #: Last verdict per endpoint, for /v1/status, /metrics and the alert.
+        #: Absent for an endpoint that has never been evaluated — a 0/0 that
+        #: reads as healthy is the thing the sample-floor precedent forbids.
+        self.goodput_verdicts: dict[str, GoodputVerdict] = {}
         # § 9 tier3 failover — endpoints currently serving their traffic from a
         # declared fallback because they are unhealthy.
         #

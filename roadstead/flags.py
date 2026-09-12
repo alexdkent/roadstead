@@ -84,6 +84,30 @@ DEFAULT_FLAGS: dict[str, bool] = {
     # into a loop that cannot terminate. Ship dark until the shadow tally has
     # soaked — flip live via POST /v1/admin/flags, no redeploy.
     "degenerate_length_enforce": False,
+    # Endpoint-level goodput collapse (2026-09-12, goodput.py): an endpoint whose
+    # engine is OCCUPIED and producing almost nothing — the shape a `/health`
+    # probe cannot see, because the HTTP server is fine and only the engine is
+    # wedged. False = SHADOW: sample the engine counters, evaluate the rule,
+    # latch `collapsed_endpoints`, count the trips, publish the verdict on
+    # /v1/status and /metrics, raise the alert — and change NOTHING a caller can
+    # see. True = ENFORCE: a latched endpoint reads unhealthy in
+    # `Health.endpoint_healthy`, which fast-fails non-background submits with a
+    # deferrable 503 and defers the rest, breaking the retry amplifier that made
+    # the 2026-09-11/12 incident self-sustaining.
+    #
+    # 🚨 KEEP THIS OFF until the shadow tally has soaked, and read `goodput` on
+    # /v1/status per endpoint before flipping it. Measured precision on the
+    # incident data is 1.000 (294 firings, none outside a real timeout window),
+    # but that was measured on ONE fleet's thresholds against ONE incident; the
+    # trip sheds an endpoint's interactive traffic, so the failure mode of a
+    # false positive is an outage we caused. The recovery path is bounded in both
+    # directions (N consecutive healthy evaluations, and an absolute maximum
+    # hold that clears regardless) precisely so a bad flip cannot latch.
+    #
+    # Runtime-flippable via POST /v1/admin/flags on purpose: arming this is an
+    # operator decision to be taken and REVERSED in seconds, and an env kill
+    # switch would need a container recreate to undo.
+    "goodput_collapse_enforce": False,
 }
 
 

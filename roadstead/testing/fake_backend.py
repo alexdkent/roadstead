@@ -210,6 +210,28 @@ class FakeBackend:
     # prefix-cache counters exposed on /metrics (vLLM shape)
     prefix_cache_hits: int = 0
     prefix_cache_queries: int = 0
+    # --- engine WORK counters on /metrics ---------------------------------- #
+    # Drive the per-request progress probe AND the endpoint-level
+    # goodput-collapse detector. ``None`` = do not publish that series at all,
+    # which is the shape that must read as "cannot discriminate" rather than as a
+    # zero: a real llama.cpp backend publishes no iteration counter, and a
+    # detector that reads its absence as 0 concludes the engine has stopped.
+    #
+    # Names emitted depend on ``engine``: vLLM's ``vllm:*`` set, or llama.cpp's
+    # ``llamacpp:*`` set (where there is no iteration counter to publish, so
+    # ``iteration_tokens_count`` is ignored).
+    prompt_tokens_total: Optional[int] = None
+    generation_tokens_total: Optional[int] = None
+    iteration_tokens_count: Optional[int] = None
+    num_requests_running: Optional[int] = None
+    # 🚨 When True (and the counter above is set), publish the OTHER members of
+    # vLLM's ``vllm:iteration_tokens_total`` HISTOGRAM family — the ``_bucket``
+    # lines with their ``le=`` labels, ``_sum``, ``_created`` — with values far
+    # larger than ``_count``. A parser that matches the family by prefix sums
+    # them into a number that rises monotonically and looks exactly like a
+    # working counter. Default True so the trap is armed by default rather than
+    # opted into by whoever remembered it.
+    emit_iteration_histogram_siblings: bool = True
 
     default_fault: str = FAULT_NONE
     fault_arg: float = 0.0
@@ -727,6 +749,55 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
             'vllm:prefix_cache_queries_total{model_name="%s"} %d.0' % (
                 controller.served_model_id, controller.prefix_cache_queries),
         ]
+        model = controller.served_model_id
+        if controller.engine == "vllm":
+            if controller.prompt_tokens_total is not None:
+                lines.append('vllm:prompt_tokens_total{engine="0",model_name="%s"} %d.0'
+                             % (model, controller.prompt_tokens_total))
+            if controller.generation_tokens_total is not None:
+                lines.append('vllm:generation_tokens_total{engine="0",model_name="%s"} %d.0'
+                             % (model, controller.generation_tokens_total))
+            if controller.num_requests_running is not None:
+                lines.append('vllm:num_requests_running{engine="0",model_name="%s"} %d.0'
+                             % (model, controller.num_requests_running))
+            if controller.iteration_tokens_count is not None:
+                if controller.emit_iteration_histogram_siblings:
+                    # The trap, as the real engine lays it: same family prefix,
+                    # values an order of magnitude larger, emitted BEFORE the
+                    # `_count` line so a prefix matcher has already been poisoned
+                    # by the time the right series arrives.
+                    lines.append("# TYPE vllm:iteration_tokens_total histogram")
+                    for le in ("1.0", "8.0", "64.0", "+Inf"):
+                        lines.append(
+                            'vllm:iteration_tokens_total_bucket{engine="0",'
+                            'le="%s",model_name="%s"} %d.0'
+                            % (le, model, controller.iteration_tokens_count * 7))
+                    lines.append('vllm:iteration_tokens_total_sum{engine="0",'
+                                 'model_name="%s"} %d.0'
+                                 % (model, controller.iteration_tokens_count * 113))
+                    lines.append('vllm:iteration_tokens_total_created{engine="0",'
+                                 'model_name="%s"} 1.757e+09' % model)
+                lines.append('vllm:iteration_tokens_total_count{engine="0",'
+                             'model_name="%s"} %d.0'
+                             % (model, controller.iteration_tokens_count))
+        else:
+            # llama.cpp: unlabelled series, and NO iteration counter exists — see
+            # `backend.probe_progress_counters` on why `n_decode_total` is not
+            # mapped to both the generation and the iteration clause.
+            if controller.prompt_tokens_total is not None:
+                lines.append("llamacpp:prompt_tokens_total %d"
+                             % controller.prompt_tokens_total)
+            if controller.generation_tokens_total is not None:
+                # `tokens_predicted_total` is published too, FROZEN at 0 — the
+                # measured trap: it is credited only at request completion, so a
+                # parser that takes it by name reads "no progress" throughout the
+                # window the watchdog judges.
+                lines.append("llamacpp:tokens_predicted_total 0")
+                lines.append("llamacpp:n_decode_total %d"
+                             % controller.generation_tokens_total)
+            if controller.num_requests_running is not None:
+                lines.append("llamacpp:requests_processing %d"
+                             % controller.num_requests_running)
         return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain")
 
     async def health(request: Request) -> Response:

@@ -43,6 +43,7 @@ PURE_MODULES = (
     "spend",         # prices, per-caller spend, thresholds
     "intent",        # a declared capability -> an endpoint
     "rate",          # per-caller request rate, and the same threshold shape
+    "goodput",       # engine work counters -> "this ENDPOINT is sick"
 )
 
 #: Top-level packages that mean I/O. Network, disk, process, framework.
@@ -82,7 +83,7 @@ def test_the_list_is_not_empty_and_every_module_exists():
     """🚨 An empty or stale list would make every parametrized test below
     collect nothing and pass — the failure mode this file exists to prevent,
     reproduced in the guard itself."""
-    assert len(PURE_MODULES) == 6
+    assert len(PURE_MODULES) == 7
     for module in PURE_MODULES:
         assert (_ROOT / "roadstead" / f"{module}.py").exists(), module
 

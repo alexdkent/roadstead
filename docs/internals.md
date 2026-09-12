@@ -204,6 +204,7 @@ roadstead/          the package (38 modules + providers/ + client/ + ui/)
   spend.py          prices, per-caller spend, thresholds    — pure computation, no I/O
   rate.py           per-caller request rate, same shape     — pure computation, no I/O
   intent.py         a declared capability → an endpoint     — pure computation, no I/O
+  goodput.py        engine counters → "this ENDPOINT is sick" — pure computation, no I/O
   correction.py     the output-integrity layer
   lifecycle.py      admission → dispatch → streaming → timeout recording
   enriched.py       north face TWO: /rs/v1 (see below)

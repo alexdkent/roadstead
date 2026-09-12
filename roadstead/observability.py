@@ -665,6 +665,65 @@ def check_alerts(
                 f"not saturated",
             ))
 
+    # Endpoint GOODPUT COLLAPSE (2026-09-12, goodput.py). The endpoint's own
+    # engine counters say it is OCCUPIED and producing almost nothing. Raised as
+    # an alert so the verdict is TSDB-visible for free, on the same path every
+    # other condition here already takes.
+    #
+    # 🚨 NOT A DUPLICATE OF `endpoint_stalled` ABOVE, and the differences are
+    # exactly why that alert could not see the 2026-09-11/12 wedge:
+    #   * it keys on COMPLETED timeouts, so it cannot speak until callers have
+    #     already spent their deadlines — this keys on the engine's counters and
+    #     fired 2 minutes after the first timeout, with 42 of 43 still to come;
+    #   * it requires `queued == 0`, and a collapse that fills every slot makes
+    #     requests QUEUE, so the condition is false for the whole incident;
+    #   * it is deliberately alert-only because the backend it was built for is
+    #     usually only PARTIALLY degraded. A goodput collapse is not partial —
+    #     the whole engine is producing nothing — which is what earns this one a
+    #     breaker at all.
+    # Both stay: they detect different faults from different evidence.
+    #
+    # Severity splits on ENFORCEMENT because the two states need different
+    # operator responses. Tripped-and-enforcing is an endpoint actively shedding
+    # traffic (CRITICAL). Tripped-in-shadow is the dark soak producing the
+    # evidence the arming decision needs (WARNING) — it must be visible, and it
+    # must not page.
+    for ep, snap in endpoint_snapshots.items():
+        gp = snap.get("goodput")
+        if not isinstance(gp, dict):
+            continue  # detector not configured for this endpoint
+        if gp.get("tripped"):
+            enforced = bool(gp.get("enforced"))
+            alerts.append(AlertCondition(
+                "endpoint_goodput_collapse",
+                "CRITICAL" if enforced else "WARNING", True,
+                f"endpoint {ep}: engine occupied and producing almost nothing — "
+                f"running_min={gp.get('running_min')} "
+                f"iterations/s={gp.get('iteration_rate')} "
+                f"generation_tps_per_req={gp.get('generation_tps_per_request')} "
+                f"prefill_tps={gp.get('prefill_tps')} over {gp.get('window_s')}s / "
+                f"{gp.get('samples')} samples; clauses={','.join(gp.get('clauses_held') or ())}; "
+                f"held {gp.get('tripped_for_s')}s"
+                + (" — SHEDDING non-background traffic" if enforced else
+                   " — SHADOW ONLY, no caller effect (goodput_collapse_enforce is off)"),
+            ))
+        elif gp.get("verdict") == "unknown":
+            # 🚨 THE BLINDNESS ALERT, and it is not decoration. The rule is a
+            # CONJUNCTION, so the safe behaviour on a missing clause is to refuse
+            # a verdict — which means a permanently-blind endpoint looks EXACTLY
+            # like a quiet, healthy one from every other surface. An endpoint that
+            # declares a threshold whose counter its engine never publishes (a
+            # llama.cpp endpoint given `goodput_max_iteration_rate`, say) is a
+            # detector that will never fire and never complain. This is the
+            # complaint.
+            alerts.append(AlertCondition(
+                "endpoint_goodput_blind", "WARNING", True,
+                f"endpoint {ep}: goodput detector is CONFIGURED but cannot reach a "
+                f"verdict ({gp.get('reason') or 'unknown'}) — it is neither "
+                f"healthy nor collapsed, it is unmeasured, and a conjunction that "
+                f"cannot be evaluated must never read as either",
+            ))
+
     # Too-tight background timeout (2026-07-12). The complement of endpoint_stalled:
     # a BACKGROUND-band call-site giving up below the model's recommended deadline
     # (premature) in bulk is abandoning work it will re-attempt on the next trigger
