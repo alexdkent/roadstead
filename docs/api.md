@@ -883,7 +883,7 @@ The OpenAI body stays byte-identical (§1.7). What can be said in headers is:
 | `X-Roadstead-Endpoint` | The endpoint admission chose. |
 | `X-Roadstead-Deadline-S` | The deadline actually applied. |
 | `X-Roadstead-Deadline-Source` | `caller` \| `computed` — see §1.7.3. |
-| `X-Roadstead-Corrected` | Comma-separated tokens naming what the correction layer rewrote (or silently could not fix) before this response was served — `json_object_stripped`, `schema_repaired`, `schema_retried`, `schema_unrecoverable`, `degenerate_unrecovered`, `toolcall_truncated`. Absent when nothing fired. On a STREAMING response this can only ever carry `json_object_stripped` — the rest are decided after the backend has answered, past the point headers go on the wire (see the note below). |
+| `X-Roadstead-Corrected` | Comma-separated tokens naming what the correction layer rewrote (or silently could not fix) before this response was served — `json_object_stripped`, `forced_tool_schema`, `schema_repaired`, `schema_retried`, `schema_unrecoverable`, `degenerate_unrecovered`, `toolcall_truncated`. Absent when nothing fired. On a STREAMING response this can only ever carry `json_object_stripped` — the rest are decided after the backend has answered, past the point headers go on the wire (see the note below). |
 
 🚨 **`toolcall_truncated` is also an envelope `code` (§2.1).** It is the one token
 above that names a call which FAILED: the rule that detects it sets
@@ -891,6 +891,20 @@ above that names a call which FAILED: the rule that detects it sets
 that code, so the two always appear together. The other five annotate a response
 that was still served. A client classifying on `error.code` therefore sees this
 one whether or not it reads headers.
+
+🚨 **`forced_tool_schema` means the body you are reading came out of a tool call
+the proxy synthesized.** That backend's own `/health` declares `response_format`
+among the things it does not implement — it has no constrained decoding and
+refuses the field outright — so the schema was sent as a forced function's
+`parameters` and the answer moved back into `message.content` before you saw it.
+Nothing about the request or the response you wrote changes: you still send
+`response_format`, you still parse `content`, and `finish_reason` is still
+`stop`. What it tells you is WHERE the guarantee came from — the tool-argument
+path rather than a grammar — and that this endpoint is one to think about before
+you send it a `tools` array of your own, because a request that already carries
+one is left untranslated and refused by the backend. Absence of the token says
+nothing was translated, which is the case for every backend that implements
+`response_format` itself.
 
 🚨 **Only what is known before the body starts.** A streaming response's headers
 are on the wire before the first token, so a later failover or spill cannot be

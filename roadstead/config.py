@@ -331,6 +331,30 @@ class EndpointConfig:
     # --- discovered at runtime (mutable), for the drift + canary alerts ------
     #: What the backend actually reports now (None/"" = could not tell).
     discovered_model_fingerprint: str = ""
+    #: Wire fields the BACKEND'S OWN ``/health`` says it does not implement
+    #: (``"not_implemented": ["response_format", "text.format"]``). Discovered
+    #: every poll pass by ``backend.probe_not_implemented``; the one consumer is
+    #: ``Correction.apply_forced_tool_schema``.
+    #:
+    #: 🚨 EMPTY MEANS "DO NOT ACT", AND IT HAS TO COVER BOTH REASONS IT CAN BE
+    #: EMPTY. A build that publishes nothing (llama.cpp, vLLM — i.e. every
+    #: incumbent) and a probe that could not answer (unreachable, non-200,
+    #: non-JSON, malformed value) are one value here, deliberately: neither is
+    #: the backend saying it lacks a feature, and a correction that fires on
+    #: "I don't know" would rewrite payloads for endpoints nobody described.
+    #: That is the difference between safe BY CONSTRUCTION and safe because
+    #: somebody remembered to declare a capability — which a live classifier
+    #: endpoint, whose stanza omits `structured_output` while the backend
+    #: implements it perfectly well, showed is not a safe assumption.
+    #:
+    #: 🚨 IT IS ALSO CLEARED BY A FAILED READ, not just narrowed. That is the
+    #: correct direction for staleness: if the backend restarts into a build
+    #: that no longer publishes this, the proxy stops translating and the
+    #: caller gets that backend's own 400 — loud, accurate and recoverable on
+    #: the next poll — instead of the proxy quietly continuing to rewrite
+    #: against a reading that is no longer true. The cost is that a transient
+    #: ``/health`` blip can withdraw the translation for one poll interval.
+    not_implemented: frozenset[str] = frozenset()
     #: Last thinking-canary verdict: "" = not yet probed / could not tell,
     #: "ok" = the declared switch really turned reasoning on, otherwise a short
     #: human-readable failure detail. Set by the poller, read by the alert

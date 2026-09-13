@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+
 def model_swap_alerts(endpoints: dict) -> list["AlertCondition"]:
     """The two model-swap guards, as a PURE function so they can be TESTED.
 
@@ -578,6 +579,63 @@ class Health:
             await self.update_endpoint_health(ep_name, ep_cfg, probe_ok)
         except Exception as exc:  # noqa: BLE001
             logger.debug("health update %s failed: %s", ep_name, exc)
+        # What the backend says it does NOT implement. Its OWN guarded block,
+        # not a step inside the discovery try above: an unrelated capacity-probe
+        # failure must not skip this and leave the previous reading standing,
+        # which is the one outcome that keeps a correction armed on evidence
+        # that may no longer be true.
+        #
+        # Only a CHAT endpoint can ever be sent the field this disclaims, so
+        # only a chat endpoint is asked — `kind` is literally that question, not
+        # a proxy for it. An embed/rerank shim never sees `response_format`, and
+        # probing it would spend a poll slot to learn something no code path can
+        # use.
+        if ep_cfg.kind == "chat":
+            try:
+                # One small GET of the backend's own /health per endpoint per
+                # pass, on the POLLER — never on the request path: asking per
+                # request would add a round-trip to every structured call and a
+                # new way for a healthy backend to fail one. It rides here
+                # rather than in `update_endpoint_health` because that only
+                # reads /health on the FAILURE path, and this is a fact about a
+                # perfectly healthy backend. (An unloaded on-demand endpoint
+                # returns before this and keeps its last reading: it reloads the
+                # same BUILD, and clearing would 400 every caller for the poll
+                # interval after each load.)
+                #
+                # 🚨 A failed read CLEARS the set rather than leaving the last
+                # one standing. `not_implemented` describes a BUILD, so a stale
+                # reading survives a restart into a different build; clearing
+                # fails toward not-correcting, which costs the caller that
+                # backend's own 400 — loud and recoverable next poll — instead
+                # of silently rewriting payloads against a reading that is no
+                # longer true. See EndpointConfig.not_implemented.
+                reported = await self.state.backend.probe_not_implemented(ep_cfg)
+                reported = reported if reported is not None else frozenset()
+                if reported != ep_cfg.not_implemented:
+                    logger.info(
+                        "endpoint %s: backend reports not_implemented = %s (was %s)",
+                        ep_name, sorted(reported) or "<none>",
+                        sorted(ep_cfg.not_implemented) or "<none>")
+                ep_cfg.not_implemented = reported
+            except Exception as exc:  # noqa: BLE001
+                # 🚨 CLEAR HERE TOO. `probe_not_implemented` returns None on every
+                # failure it anticipates and the line above turns that into an
+                # empty set — but a RAISE is the OTHER way a read can fail, and
+                # leaving this branch as a bare log meant the previous reading
+                # survived it. That is precisely the outcome the comment above
+                # forbids: the correction stays armed on evidence that may no
+                # longer be true. Both failure modes must land on the same value
+                # or the invariant is only half-held.
+                # (Pinned by `test_a_RAISING_probe_also_clears_the_reading`.)
+                if ep_cfg.not_implemented:
+                    logger.info(
+                        "endpoint %s: not_implemented probe raised — CLEARING the "
+                        "previous reading %s rather than correcting against it",
+                        ep_name, sorted(ep_cfg.not_implemented))
+                ep_cfg.not_implemented = frozenset()
+                logger.debug("not_implemented probe %s failed: %s", ep_name, exc)
+
         # Endpoint-level goodput collapse. Guarded the same way, and for the same
         # reason the counter probe it uses is: a detector that can wedge the
         # poller is worse than no detector.

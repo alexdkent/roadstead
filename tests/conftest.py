@@ -189,6 +189,17 @@ STUBBED_PROBES = {
     # The e2e suite restores the real one on the INSTANCE, where every endpoint
     # points at a local fake; the parsing tests capture it unbound at import.
     "probe_progress_counters": None,
+    # 🚨 Added 2026-09-13 with the probe itself, for the reason the two entries
+    # above record — it is reached from the POLLER on every pass for every chat
+    # endpoint (`health.poll_endpoint_once` reads the backend's own /health
+    # `not_implemented` list). The example catalog's RFC 5737 addresses
+    # BLACKHOLE, so unstubbed it would pay its full 3s connect timeout per
+    # endpoint per tick. `None` is the value that means "cannot tell", which the
+    # poller stores as an empty set — i.e. the unit suite behaves as if no
+    # backend disclaims anything, which is what every incumbent engine does.
+    # A test that needs the real parsing captures it unbound and restores it on
+    # the INSTANCE (see test_forced_tool_schema.py).
+    "probe_not_implemented": None,
     "probe_props": None,
     "probe_models": None,
     "probe_vllm_capacity": None,

@@ -982,6 +982,27 @@ class Lifecycle:
         # both the streaming and the sync path.
         self.correction.apply_json_object_guard(req)
 
+        # A backend whose own /health lists `response_format` under
+        # `not_implemented` has no constrained decoding, and 400s a
+        # `response_format` json_schema rather than returning prose (the poller
+        # reads that list; the catalog's `capabilities:` block is deliberately
+        # NOT the gate — an omission there is indistinguishable from an
+        # incapacity, and one live classifier proved it). Hand it the same schema
+        # as a forced tool call, which its tool-argument path DOES enforce, and
+        # translate the answer back into `message.content` after
+        # (finalize_forced_tool_schema, first in Correction.apply). Above the
+        # branch like the two guards before it — but it declines a streaming
+        # request itself, because the response half cannot rewrite a body that is
+        # already on the wire.
+        #
+        # Ordering: BEFORE apply_thinking, so a thinking request sees the payload
+        # as the tool turn it now is. The reasoning-budget injection branches on
+        # `tools` (providers/payload.py) and takes its reserve-based path there
+        # precisely because a budget that cuts reasoning short corrupts the
+        # tool-call channel — which is the channel this request's ANSWER now
+        # rides.
+        self.correction.apply_forced_tool_schema(req)
+
         # Thinking option: honor a per-request `thinking:true` opt-in (enable
         # native <think> on vLLM + generous budget bump + system fold). No-op
         # otherwise. Sits HERE, above the branch, alongside the two guards above:

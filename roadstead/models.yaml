@@ -107,6 +107,17 @@
 #                     discovery, then to usage_rates.py's imputed avoided cost.
 #   capabilities.*    vision | reasoning | streaming | tool_calling |
 #                     structured_output
+#                     🚨 DESCRIPTIVE, and an omission here is indistinguishable
+#                     from an incapacity — so nothing that REWRITES a payload may
+#                     key off one. `Correction.apply_forced_tool_schema` (which
+#                     re-homes a json_schema into a forced tool call for a
+#                     backend with no constrained decoding) deliberately reads
+#                     the BACKEND's own `/health` `not_implemented` list instead,
+#                     because a live classifier endpoint that omits
+#                     `structured_output` while implementing it perfectly well is
+#                     the normal case, not an edge one. Intent RESOLUTION still
+#                     matches on this block — that only picks who serves, and a
+#                     caller can always name an endpoint instead.
 #   policy.*          EndpointConfig knobs — see _POLICY_PASSTHROUGH in
 #                     model_catalog.py. ⚠️ A policy key that is not in that
 #                     tuple is SILENTLY DROPPED.

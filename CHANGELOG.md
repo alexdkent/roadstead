@@ -14,6 +14,62 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Added
 
+- **A `response_format` json_schema is served as a FORCED TOOL CALL on a backend that declares no
+  constrained decoding (`Correction.apply_forced_tool_schema` + `finalize_forced_tool_schema`).**
+  Some builds ship without a grammar engine, and the honest ones REFUSE the field: a candidate
+  backend evaluated 2026-09-13 answers both `{"type":"json_object"}` and a strict
+  `{"type":"json_schema", …}` with an immediate HTTP 400 naming `json_schema` as not implemented by
+  that build. The refusal is right — a schema it cannot enforce would return prose the caller then
+  fails to parse — and it is also fatal to every caller that declares a schema, which on a fleet
+  that took "always declare a schema" seriously is most of them.
+
+  The capability is present on such a build; it is reached through the tool-argument path. Same
+  model, same schema as a forced tool call (schema as the function's `parameters`, `tool_choice`
+  naming the function): **29/29 fully schema-valid** on the hardest schema to hand — nested objects,
+  `["string","null"]` unions, `maxLength` rails, objects inside an array's `items`,
+  `additionalProperties: false` closed objects, `minItems == maxItems == n` exact counts (14/14 on
+  the count checks), zero empty tool calls, integers typed as integers. On one incumbent mid-tier
+  backend the forced tool call was also the faster path (4.7 s median vs 7.5 s, 8/8 either way) — but
+  on a small classifier endpoint it was **2.2x SLOWER** (9.1 s vs 4.1 s, 8/8 either way). Which path
+  is faster is a property of the BACKEND, not of the mechanism, so it is never a reason to translate
+  an endpoint that can already do this itself.
+
+  🚨 **The response half is the whole point.** A caller that sent `response_format` parses
+  `choices[0].message.content`. Rewriting only the request hands every such call site `content: null`
+  beside a `tool_calls` array it does not read — a loud 400 converted into a silent empty parse,
+  which is strictly worse than the incompatibility. So the forced call's `arguments` become
+  `content`, the synthesized tool is removed, and `finish_reason` becomes `stop` (a `length` finish
+  is preserved: a truncation must stay visible). `tests/test_forced_tool_schema.py` drives a real
+  `ProxyService` for both directions, because two units that agree can both be unreached.
+
+  🚨 **Gated on the BACKEND'S OWN `/health`, not on the catalog.** Such a build publishes
+  `"not_implemented": ["response_format", "text.format"]`; the capacity poller reads it every pass
+  into `EndpointConfig.not_implemented` (`backend.probe_not_implemented` — one small GET per CHAT
+  endpoint per pass, never on the request path) and the translation fires only on that positive
+  statement. **Absence never fires**: a build publishing no such field (every incumbent engine), an
+  unreachable `/health`, a non-200, a non-JSON body and a malformed value are one answer — "not the
+  backend saying it lacks the feature". A failed read CLEARS the reading rather than leaving it
+  standing, because it describes a BUILD and a build changes across a restart; that fails toward the
+  caller getting the backend's own 400, which is loud and recoverable on the next poll.
+
+  The first cut of this gate read the CATALOG instead — `tool_calling` declared, `structured_output`
+  absent — and it was wrong in a way worth recording. Against a live fleet catalog that conjunction
+  matched exactly ONE endpoint: a production classifier on the prompt-injection/PII path whose stanza
+  merely omits `structured_output` while the backend implements it fine. It would have bought 2.2x
+  latency there for zero correctness gain. **An omission in a catalog is indistinguishable from an
+  incapacity**, so nothing that REWRITES a payload may key off one — now written next to the
+  `capabilities:` legend in `models.yaml`, since intent RESOLUTION legitimately does read that block.
+
+  A request carrying its own `tools`/`tool_choice` is left untranslated and takes the backend's 400,
+  because forcing the schema function would suppress the caller's tool call. Streaming is declined
+  outright for the same reason the response half exists: the body is already on the wire.
+
+  What the removed `response_format` also bought is re-asserted rather than dropped — the
+  truncation-integrity gate, the JSON parse floor and the declared schema every response-side guard
+  validates against, now reached through `QueuedRequest.forced_tool_schema`. New disclosure token
+  `forced_tool_schema` in `X-Roadstead-Corrected` / `corrections` (docs/api.md §1.8); no new error
+  code (an unusable forced call is the published `toolcall_truncated`, which is what it is).
+
 - **Endpoint-level goodput-collapse detection (`roadstead/goodput.py`), shipped DARK.** A backend
   whose engine wedges keeps answering `/health` — the HTTP server is fine, only the engine is not —
   so its slots fill with requests producing almost nothing, callers hit their deadlines, and the

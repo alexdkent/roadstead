@@ -82,6 +82,28 @@ class QueuedRequest:
     # treating it as such. Without this the strip would silently drop those
     # guarantees and hand a truncated half-object back to a caller that parses it.
     json_object_stripped: bool = False
+    # Correction.apply_forced_tool_schema rewrote a `response_format` json_schema
+    # into a FORCED TOOL CALL because this endpoint's BACKEND says on its own
+    # /health that it does not implement `response_format` (a build with no
+    # constrained decoding refuses the field outright). This is the SCHEMA it
+    # moved into the tool's `parameters`, and it is what makes the rewrite
+    # reversible: the response half puts the tool call's arguments back into
+    # `message.content`, and every response-side guard that used to read the
+    # schema out of the payload reads it from here instead (_declared_schema).
+    # None = not translated, which is every request to every backend that did not
+    # say that — including every backend that said nothing at all.
+    #
+    # Not persisted to the WAL, on purpose: the payload IS persisted, already
+    # translated, so a recovered request dispatches correctly — it is the
+    # response-side translation of a request whose caller is long gone that does
+    # not happen, and re-deriving state for a recorded row nobody is waiting on
+    # buys nothing. Same reasoning as `degraded_from`.
+    forced_tool_schema: dict | None = None
+    # The function name that rewrite used, derived from the caller's
+    # `json_schema.name` (sanitized to the wire's `[A-Za-z0-9_-]{1,64}`). The
+    # response half matches the tool call BY NAME rather than taking whatever
+    # arrived first — a tool call the proxy did not synthesize is not an answer.
+    forced_tool_name: str = ""
     # True when ``timeout_deadline`` is a deadline the PROXY chose (the
     # default/adaptive resolve_default_timeout path), False when the CALLER
     # supplied one explicitly (body ``timeout_s`` / ``X-Timeout-S``).

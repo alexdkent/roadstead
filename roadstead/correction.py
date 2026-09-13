@@ -310,6 +310,27 @@ def _extract_declared_schema(payload: dict) -> dict | None:
     return None
 
 
+def _declared_schema(req) -> dict | None:
+    """The JSON Schema a REQUEST declared, wherever it now lives.
+
+    ``_extract_declared_schema`` above reads the PAYLOAD, and
+    ``Correction.apply_forced_tool_schema`` moves the schema out of the payload's
+    ``response_format`` and into a tool's ``parameters``. Without this seam every
+    response-side schema check would silently degrade to parses-only on a
+    translated request — a guarantee dropped by the replacement rather than
+    re-asserted, which is the failure mode docs/internals.md names.
+
+    A module-level function rather than a method ON PURPOSE: every caller sits
+    inside a fail-open ``except``, so a method is one more thing a mock ``self``
+    must remember to bind, and a missing binding would turn a guard off in
+    silence instead of failing."""
+    forced = getattr(req, "forced_tool_schema", None)
+    if isinstance(forced, dict):
+        return forced
+    payload = getattr(req, "payload", None)
+    return _extract_declared_schema(payload if isinstance(payload, dict) else {})
+
+
 def _schema_valid(obj, schema: dict | None) -> bool:
     """True iff obj satisfies schema. No schema / no jsonschema lib / a MALFORMED
     declared schema (north-face caller bug) all → True (we cannot judge, so treat
@@ -508,6 +529,145 @@ def _conform_body(
             return ("failed", None)
         new_body = fixed
     return ("repaired", new_body if new_body is not None else body)
+
+
+# --- Forced-tool-call translation of a json_schema constraint ---------------
+# A backend build with NO constrained decoding cannot honour
+# ``response_format: json_schema`` and the honest ones say so with a 400 rather
+# than returning prose. The SAME schema handed over as a FORCED TOOL CALL —
+# the schema as the function's ``parameters``, ``tool_choice`` naming that
+# function — is enforced by the tool-argument path instead, which such builds
+# do implement. See ``Correction.apply_forced_tool_schema`` for the measurement.
+
+#: Function name used when the caller's ``json_schema.name`` is missing or
+#: sanitizes away to nothing. A name is mandatory on the wire, so there has to
+#: be one; it is never shown to the caller (the synthesized tool is removed on
+#: the way back).
+_FORCED_TOOL_FALLBACK_NAME = "structured_response"
+
+#: The wire field a backend disclaims on its own ``/health`` when it has no
+#: constrained decoding (``"not_implemented": ["response_format", …]``). The
+#: gate is a membership test against ``EndpointConfig.not_implemented``, which
+#: is EMPTY unless the backend said this itself — see that field for why "empty"
+#: has to cover both "published nothing" and "could not ask".
+_NOT_IMPLEMENTED_RESPONSE_FORMAT = "response_format"
+
+#: What a function name may contain (OpenAI's tool-name rule, which every
+#: OpenAI-compatible engine copies): ``[a-zA-Z0-9_-]``, 1-64 characters. A
+#: caller's schema name is free text, so it is sanitized rather than trusted.
+_TOOL_NAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+def _forced_tool_name(schema_name) -> str:
+    """A legal tool name derived from the caller's ``json_schema.name``."""
+    cleaned = "".join(
+        c if c in _TOOL_NAME_CHARS else "_" for c in str(schema_name or "")
+    )[:64].strip("_")
+    return cleaned or _FORCED_TOOL_FALLBACK_NAME
+
+
+def _json_schema_response_format(rf: object) -> dict | None:
+    """The ``json_schema`` block of a ``response_format: json_schema``, or None
+    for any other shape. Total — an unrecognized shape is None, never a guess."""
+    if not isinstance(rf, dict):
+        return None
+    if str(rf.get("type") or "").strip() != "json_schema":
+        return None
+    js = rf.get("json_schema")
+    if not isinstance(js, dict):
+        return None
+    schema = js.get("schema")
+    # An empty schema carries no constraint to translate: a forced tool call
+    # with no `parameters` asks the model for nothing, which is strictly worse
+    # than the backend's own 400.
+    if not isinstance(schema, dict) or not schema:
+        return None
+    # A tool's `parameters` is an ARGUMENT OBJECT — the one shape a function
+    # signature can express. A caller whose schema roots at an array or a
+    # scalar is not translatable into this mechanism at all, and guessing a
+    # wrapper object would change the document the caller parses. Hands off:
+    # the backend's own 400 is the honest answer for that request.
+    if str(schema.get("type") or "") != "object":
+        return None
+    return js
+
+
+def _forced_tool_arguments(tool_call: dict) -> str | None:
+    """The JSON text of a forced tool call's ``arguments``, or None when there
+    is no usable answer in it (absent, empty, non-JSON, or a JSON scalar where
+    an argument object is required).
+
+    Engines disagree about the type of ``arguments``: the OpenAI wire says a
+    JSON *string*, and some builds hand back the decoded object instead. Both
+    are accepted and normalized to text, because the caller is about to
+    ``json.loads`` it."""
+    try:
+        args = (tool_call.get("function") or {}).get("arguments")
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(args, dict):
+        try:
+            return json.dumps(args, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            return None
+    if not isinstance(args, str) or not args.strip():
+        return None
+    try:
+        obj = json.loads(args)
+    except Exception:  # noqa: BLE001
+        return None
+    # `arguments` is an argument OBJECT by definition. A bare scalar means the
+    # tool-call channel produced something that is not the schema's root, and
+    # handing it to a caller that expects an object is the silent-empty-parse
+    # failure this translation exists to avoid.
+    if not isinstance(obj, dict):
+        return None
+    return args
+
+
+def _apply_forced_tool_answer(body: dict, name: str) -> str:
+    """Move a forced tool call's ``arguments`` into ``choices[0].message.content``
+    and delete the synthesized call, in place.
+
+    Returns what it found: ``"translated"``, ``"absent"`` (no call by that name —
+    the backend ignored ``tool_choice`` and answered in the content channel),
+    ``"unusable"`` (a call whose arguments carry no JSON object), or
+    ``"malformed"`` (a body with no message to translate). Only ``"translated"``
+    mutates anything.
+
+    Shared by ``Correction.finalize_forced_tool_schema`` and the schema
+    backstop's retry: that retry re-dispatches the TRANSLATED payload, so its
+    reply is a tool call too, and conforming it without this would fail every
+    time — a retry that cannot succeed is worse than no retry, because it is
+    billed."""
+    try:
+        choice = (body.get("choices") or [None])[0]
+        if not isinstance(choice, dict):
+            return "malformed"
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            return "malformed"
+        ours = [tc for tc in _response_tool_calls(body)
+                if isinstance(tc, dict)
+                and str((tc.get("function") or {}).get("name") or "") == name]
+        if not ours:
+            return "absent"
+        args = _forced_tool_arguments(ours[0])
+        if args is None:
+            return "unusable"
+        message["content"] = args
+        # The synthesized tool must not leak. Any OTHER call in the list is
+        # synthetic too — the caller declared no tools at all (the request side
+        # refuses to translate when it did), so nothing here is theirs.
+        message.pop("tool_calls", None)
+        # A `length` finish is a real truncation and stays visible: overwriting
+        # it with `stop` would hide a cut answer from the gate that reads it.
+        if choice.get("finish_reason") in (None, "", "tool_calls"):
+            choice["finish_reason"] = "stop"
+        return "translated"
+    except Exception:  # noqa: BLE001 — total, like every helper here
+        return "malformed"
 
 
 def _validation_error(body: dict, schema: dict | None) -> str:
@@ -736,7 +896,18 @@ class Correction:
         """Uniform non-streaming correction entrypoint (Step 4a). Runs, in the
         LOAD-BEARING order, every guard applicable to a completed sync result:
 
-            finalize_thinking → maybe_correct_degenerate → shadow_egress_detect
+            finalize_forced_tool_schema → finalize_thinking →
+            maybe_correct_degenerate → shadow_egress_detect
+
+        ``finalize_forced_tool_schema`` is FIRST, and ahead of everything the
+        consolidation inherited: it is the half that puts a forced tool call's
+        arguments back into ``message.content`` (see
+        ``apply_forced_tool_schema``). Until it has run, a translated request's
+        answer is not where any other guard looks — content is null — so every
+        one of them would pass it in silence. Running it first is what makes a
+        request on a backend with no constrained decoding carry the same
+        response-side coverage as one on a backend that has it. It is a no-op on
+        every request the request side did not translate.
 
         This is a behavior-preserving consolidation of the inline sequence that
         lived in ``Lifecycle.handle_sync_submit`` — SAME methods, SAME order, so
@@ -759,6 +930,7 @@ class Correction:
         a vLLM tool_call argument cut mid-JSON (finish mislabeled
         "tool_calls") is TRUNCATION, and json-repair would otherwise close it
         into valid-but-fabricated JSON — a silent wrong command."""
+        self.finalize_forced_tool_schema(req, result)
         self.finalize_thinking(req, result)
         await self.maybe_correct_degenerate(req, result)
         self.enforce_toolcall_truncation(req, result)
@@ -787,7 +959,11 @@ class Correction:
         ``req.json_object_stripped`` (``apply_json_object_guard`` — the one
         marker known at ADMISSION, before dispatch, which is why it is also
         the only one a STREAMING response's headers can carry; see
-        ``enrichment_headers``).
+        ``enrichment_headers``), and ``result["_forced_tool_translated"]``
+        (``finalize_forced_tool_schema`` — the body the caller is reading came
+        out of a tool call the proxy synthesized, which is exactly the kind of
+        rewrite this disclosure exists for; never on a stream, because that
+        translation declines streaming requests outright).
 
         The empty-completion rescue and the degeneration guard's RECOVERED
         (non-degenerate) outcome are deliberately absent: both are fleet-wide
@@ -799,6 +975,8 @@ class Correction:
         tokens: list[str] = []
         if getattr(req, "json_object_stripped", False):
             tokens.append("json_object_stripped")
+        if result.get("_forced_tool_translated"):
+            tokens.append("forced_tool_schema")
         if result.get("_schema_repaired"):
             tokens.append("schema_repaired")
         if result.get("_schema_retried"):
@@ -852,7 +1030,7 @@ class Correction:
             if (schema_backstop_enabled() and content
                     and self.request_is_structured(req)):
                 payload = req.payload if isinstance(req.payload, dict) else {}
-                if not _content_valid(content, _extract_declared_schema(payload)):
+                if not _content_valid(content, _declared_schema(req)):
                     self.state.schema_invalid_stream += 1
                     cs = req.call_site or "?"
                     tally = self.state.schema_by_call_site.setdefault(
@@ -1142,7 +1320,7 @@ class Correction:
             if not (is_struct or has_tools):
                 return
 
-            schema = _extract_declared_schema(payload)
+            schema = _declared_schema(req)
             # ⚠️ expect_json_content must be the NARROW predicate, not `is_struct`.
             # `request_is_structured()` is true for ANY constrained output, but a
             # GBNF grammar constrains to an ARBITRARY language — `root ::= "yes" |
@@ -1264,8 +1442,17 @@ class Correction:
                 queue_wait_ms=0.0,
                 backend_latency_ms=resp.duration_s * 1000.0,
                 status="schema_retry", slot_seconds=resp.duration_s))
+            retry_body = resp.body
+            forced_name = getattr(req, "forced_tool_name", "") or ""
+            if getattr(req, "forced_tool_schema", None) is not None and forced_name:
+                # This request was translated into a forced tool call at
+                # admission (apply_forced_tool_schema), so the retry payload is
+                # a tool request and its reply is a tool call. Translate it the
+                # same way the first reply was, or `_conform_body` reads a null
+                # content and the retry can only ever fail.
+                _apply_forced_tool_answer(retry_body, forced_name)
             status, conformed = _conform_body(
-                resp.body, schema, expect_json_content=expect_json_content)
+                retry_body, schema, expect_json_content=expect_json_content)
             if status in ("ok", "repaired"):
                 return conformed
             return None
@@ -1473,6 +1660,288 @@ class Correction:
             )
         except Exception:  # noqa: BLE001 — a compensation must never break a request
             logger.debug("json_object guard failed", exc_info=True)
+    def apply_forced_tool_schema(self, req: QueuedRequest) -> None:
+        """Request-side: hand a ``response_format`` json_schema to a backend that
+        declares NO constrained decoding as a FORCED TOOL CALL instead.
+
+        WHY. Some builds ship without a grammar/constrained-decoding engine, and
+        the honest ones REFUSE the field rather than returning prose: a candidate
+        backend evaluated 2026-09-13 answers both ``{"type":"json_object"}`` and a
+        strict ``{"type":"json_schema", …}`` with an immediate HTTP 400 naming
+        ``json_schema`` as not implemented by that build. The refusal is correct —
+        a schema it cannot enforce would have produced prose the caller then fails
+        to parse — but it is also fatal to every caller that declares a schema,
+        which on a mature fleet is most of them.
+
+        The capability is nonetheless PRESENT on such a build; it is reached
+        through the tool-argument path rather than through ``response_format``.
+        Measured 2026-09-13 on that candidate, same model, same schema handed over
+        as a forced tool call (schema as the function's ``parameters``,
+        ``tool_choice`` naming the function): **29/29 fully schema-valid** on the
+        hardest schema available — nested objects, ``["string","null"]`` unions,
+        ``maxLength`` rails, objects inside an array's ``items``,
+        ``additionalProperties:false`` closed objects, and
+        ``minItems == maxItems == n`` exact counts (14/14 on the count checks).
+        Zero empty tool calls, and integers typed as integers because the schema
+        drives typing. On one incumbent mid-tier backend that supports both paths
+        the same comparison made the forced tool call the faster one (4.7s median
+        vs 7.5s, 8/8 schema-valid either way) — but on a small classifier
+        endpoint it was 2.2x SLOWER. Which path is faster is a property of the
+        BACKEND, not of the mechanism, so it is never a reason to translate an
+        endpoint that can already do this itself.
+
+        GATING — THE BACKEND'S OWN WORDS, and only ever a POSITIVE statement.
+        A build like this publishes the answer itself on ``GET /health``::
+
+            "not_implemented": ["response_format", "text.format"]
+
+        The poller reads it every pass into ``EndpointConfig.not_implemented``
+        (``backend.probe_not_implemented``), and this translation fires only when
+        ``response_format`` is in that set. ABSENCE NEVER FIRES: a build that
+        publishes no such field (every incumbent engine), an unreachable
+        ``/health``, a non-200, a body that is not JSON and a malformed value are
+        one answer here — "not the backend saying it lacks the feature" — and
+        none of them may license a payload rewrite.
+
+        🚨 THE CATALOG'S ``capabilities:`` BLOCK IS THE WRONG GATE FOR THIS, AND
+        NOT HYPOTHETICALLY. An earlier cut of this correction read the catalog:
+        ``tool_calling`` declared, ``structured_output`` absent. Run against a
+        live fleet catalog, that conjunction matched exactly ONE endpoint — a
+        production classifier on the prompt-injection/PII path, whose stanza
+        simply omits ``structured_output`` while the backend implements it
+        perfectly well. Measured on that endpoint through the proxy with its real
+        schema (4 spans, 8 trials per path, temperature 0, cache-busted): native
+        ``response_format`` 8/8 schema-valid at a 4.1s median, the forced tool
+        call 8/8 schema-valid at 9.1s. The catalog gate would have bought 2.2x
+        latency on a live security path for zero correctness gain.
+
+        A catalog block records what somebody WROTE DOWN, and an omission in it is
+        indistinguishable from an incapacity. ``/health`` is ground truth from the
+        thing being described, which is what makes every other endpoint safe BY
+        CONSTRUCTION here rather than safe because somebody remembered to declare
+        a capability.
+
+        🚨 A REQUEST THAT ALREADY CARRIES ``tools``/``tool_choice`` IS LEFT
+        UNTRANSLATED. A real tool call is the caller's own control flow, and the
+        forcing this needs (``tool_choice`` pinned to one function) would
+        SUPPRESS it — the caller would get a schema-shaped answer and none of the
+        side effects it asked for. Adding one more tool beside theirs without
+        forcing it is not an option either, because nothing would then make the
+        model choose it. Such a request keeps its ``response_format`` and takes
+        the backend's 400, which is loud, immediate, and accurate: the proxy
+        cannot serve both intents on a backend with one channel for them.
+
+        🚨 STREAMING IS DELIBERATELY NOT TRANSLATED. The response half of this
+        pair rewrites a completed body; a stream is already on the wire by the
+        time the tool call is whole, and the caller subscribed to ``content``
+        deltas it would never receive. Half-supporting it would turn a 400 into a
+        stream that ends with nothing in it — the exact trade this correction
+        exists to refuse. A streaming structured request to such a backend keeps
+        its ``response_format`` and takes the 400.
+
+        The mirror is :meth:`finalize_forced_tool_schema`, and the pair is only
+        ever correct together: the caller sent ``response_format`` and therefore
+        parses ``choices[0].message.content``. Rewriting only the request would
+        hand every one of those call sites ``content: null`` beside a
+        ``tool_calls`` array it does not read — a loud 400 converted into a silent
+        empty parse, which is strictly worse than the incompatibility.
+
+        What the removed ``response_format`` was ALSO buying is re-asserted via
+        ``QueuedRequest.forced_tool_schema`` rather than lost with it (the
+        enumerate-and-re-assert rule in docs/internals.md, same as
+        ``json_object_stripped``): the truncation-integrity gate
+        (:meth:`request_is_structured`), the JSON parse floor
+        (:meth:`request_expects_json`), and the declared schema every
+        response-side guard validates against (``_declared_schema``).
+
+        Total / fail-open: never raises, never breaks a request.
+        """
+        try:
+            p = req.payload
+            if not isinstance(p, dict) or req.payload_type != "chat_completion":
+                return
+            if getattr(req, "stream", False):
+                return                      # see the streaming note above
+            ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
+            if ep is None:
+                return
+            disclaimed = getattr(ep, "not_implemented", frozenset()) or frozenset()
+            if _NOT_IMPLEMENTED_RESPONSE_FORMAT not in disclaimed:
+                return
+
+            eb = p.get("extra_body")
+            eb = eb if isinstance(eb, dict) else None
+
+            # Any OTHER structured constraint anywhere in the payload -> hands
+            # off, exactly as apply_json_object_guard does: the caller pinned a
+            # grammar we have no translation for, and half-translating a payload
+            # with two constraints in it would leave the backend to pick.
+            for container in (p, eb):
+                if not isinstance(container, dict):
+                    continue
+                for key in ("grammar", "guided_grammar", "guided_json",
+                            "guided_choice", "guided_regex", "structured_outputs"):
+                    if container.get(key):
+                        return
+
+            # The caller's own tool call — never clobbered. Logged, because the
+            # 400 they are about to get is the one case where this correction
+            # sees the fault and declines to fix it.
+            for container in (p, eb):
+                if isinstance(container, dict) and (
+                        container.get("tools") or container.get("tool_choice")):
+                    logger.warning(
+                        "forced_tool_schema: NOT translating response_format for "
+                        "endpoint=%s agent=%s call_site=%s request_id=%s — the "
+                        "request already declares its own tools/tool_choice, and "
+                        "forcing the schema function would suppress the caller's "
+                        "tool call. This backend declares no structured_output, so "
+                        "the request will be refused by it; split the schema turn "
+                        "from the tool turn, or send it to an endpoint that "
+                        "declares structured_output.",
+                        req.endpoint, getattr(req, "agent_id", "?"),
+                        getattr(req, "call_site", "?"), getattr(req, "request_id", "?"))
+                    return
+
+            target = None
+            for container in (p, eb):
+                if isinstance(container, dict) and _json_schema_response_format(
+                        container.get("response_format")) is not None:
+                    target = container
+                    break
+            if target is None:
+                return
+            js = _json_schema_response_format(target["response_format"])
+            schema = js["schema"]
+            name = _forced_tool_name(js.get("name"))
+
+            function: dict = {"name": name, "parameters": schema}
+            desc = js.get("description")
+            if isinstance(desc, str) and desc.strip():
+                # The caller's own words about the schema, carried across rather
+                # than dropped. Nothing else is invented: the wire shape below is
+                # exactly the one that was measured, and an unmeasured extra
+                # field on a backend we are adapting TO is how an adapter starts
+                # failing in a way nobody can attribute.
+                function["description"] = desc
+            target.pop("response_format", None)
+            p["tools"] = [{"type": "function", "function": function}]
+            p["tool_choice"] = {"type": "function", "function": {"name": name}}
+
+            # Re-assert what the constraint also bought (see the docstring).
+            try:
+                req.forced_tool_schema = schema
+                req.forced_tool_name = name
+            except Exception:  # noqa: BLE001 — a mock/namespace req must not break
+                pass
+            logger.info(
+                "forced_tool_schema: response_format json_schema %r translated to a "
+                "forced tool call for endpoint=%s agent=%s call_site=%s "
+                "request_id=%s — this endpoint declares tool_calling and no "
+                "structured_output, so the schema is enforced as the function's "
+                "parameters. The response is translated back to content.",
+                name, req.endpoint, getattr(req, "agent_id", "?"),
+                getattr(req, "call_site", "?"), getattr(req, "request_id", "?"))
+        except Exception:  # noqa: BLE001 — a correction must never break a request
+            logger.debug("forced tool schema translation failed", exc_info=True)
+
+    def finalize_forced_tool_schema(self, req: "QueuedRequest", result: dict) -> None:
+        """Response-side mirror of :meth:`apply_forced_tool_schema`: put the
+        forced tool call's ``arguments`` back where the caller is looking.
+
+        🚨 THIS HALF IS THE WHOLE POINT. The caller sent ``response_format`` and
+        parses ``choices[0].message.content``. Left alone, a translated request
+        returns ``content: null`` plus a ``tool_calls`` array the caller never
+        reads — a well-formed 200 carrying nothing, which is the silent failure
+        this codebase treats as worse than the loud one it replaced. So the
+        arguments JSON becomes ``content``, the synthesized tool call is removed
+        (the caller never declared it and must not see it), and ``finish_reason``
+        becomes what a content response carries.
+
+        Runs FIRST in :meth:`apply`, before every other response-side guard, so
+        that thinking-finalize, the degeneration guard, the schema backstop, the
+        always-on JSON floor and the empty-structured detector all see the answer
+        in the place they were written to look — the same coverage the request
+        would have had on a backend with constrained decoding.
+
+        ``finish_reason`` is rewritten ONLY from ``tool_calls`` (or nothing). A
+        ``length`` finish is a real truncation and stays visible: overwriting it
+        with ``stop`` would hide a cut answer from the truncation gate that reads
+        it.
+
+        THE TWO WAYS IT MUST NOT FABRICATE:
+
+        * **No forced tool call in the reply** — the backend ignored
+          ``tool_choice`` and answered in prose. The body is left EXACTLY as it
+          came, loudly logged, and the always-on structured-validity floor
+          decides: content that parses as JSON reaches the caller (it is the
+          model's own answer, unvalidated against the schema — precisely what a
+          backend with no constrained decoding can offer), and content that does
+          not parse becomes the established ``structured_invalid_json`` 502.
+          Nothing here synthesizes an answer.
+        * **Arguments that carry no usable JSON object** — absent, empty, cut
+          mid-JSON, or a bare scalar. Failed loud with the pinned
+          ``toolcall_truncated`` shape, the same one the sync tool-call rule uses,
+          because it is the same fault: the answer channel was cut. Repairing it
+          is explicitly not on the table — json-repair would close a truncated
+          argument object into valid-but-fabricated JSON, and on a schema turn
+          that is a confidently wrong answer.
+
+        Total / fail-open: never raises.
+        """
+        try:
+            schema = getattr(req, "forced_tool_schema", None)
+            if schema is None:
+                return
+            if result.get("status") != "ok" or req.payload_type != "chat_completion":
+                return
+            response = result.get("response")
+            if not isinstance(response, dict):
+                return
+            name = getattr(req, "forced_tool_name", "") or ""
+            calls = [tc for tc in _response_tool_calls(response) if isinstance(tc, dict)]
+            outcome = _apply_forced_tool_answer(response, name)
+            if outcome == "malformed":
+                return
+            if outcome == "absent":
+                logger.warning(
+                    "forced_tool_schema: backend %s returned NO forced tool call %r "
+                    "(agent=%s call_site=%s request_id=%s) — it ignored tool_choice "
+                    "and answered in the content channel. The body is passed through "
+                    "untouched and the structured-validity floor judges it; the "
+                    "schema was NOT enforced on this answer. If this repeats, the "
+                    "endpoint's declared tool_calling capability is wrong.",
+                    req.endpoint, name, getattr(req, "agent_id", "?"),
+                    getattr(req, "call_site", "?"), getattr(req, "request_id", "?"))
+                return
+            if outcome == "unusable":
+                usage = response.get("usage") if isinstance(
+                    response.get("usage"), dict) else {}
+                out_tok = int(usage.get("completion_tokens") or 0)
+                self.record_truncation_event(
+                    req, structured=True, stream=False,
+                    output_tokens=out_tok, status="truncated")
+                result["status"] = "error"
+                # The pinned deferrable marker ("truncated structured output",
+                # docs/api.md §2.2) and the published `toolcall_truncated` code,
+                # so existing client retry classification engages unchanged.
+                result["error"] = (
+                    f"backend {req.endpoint} truncated structured output (the "
+                    f"forced tool call carried no parseable JSON object in its "
+                    f"arguments, output_tokens={out_tok})")
+                result["code"] = "toolcall_truncated"
+                result.pop("response", None)
+                return
+            result["_forced_tool_translated"] = True
+            if len(calls) > 1:
+                logger.warning(
+                    "forced_tool_schema: backend %s returned %d tool calls for one "
+                    "forced function (request_id=%s) — the first %r was used as the "
+                    "answer and the rest dropped.",
+                    req.endpoint, len(calls), getattr(req, "request_id", "?"), name)
+        except Exception:  # noqa: BLE001 — a correction must never break a response
+            logger.debug("forced tool schema finalize failed", exc_info=True)
+
     def apply_thinking(self, req: QueuedRequest) -> None:
         """Request-side: honor a per-request ``thinking:`` opt-in. On an endpoint
         whose model DECLARES its thinking switch (``policy.thinking_kwargs`` in
@@ -1704,6 +2173,11 @@ class Correction:
         # Stripped bare json_object still implies JSON content (same reasoning as
         # in request_is_structured) — keep the parse gate armed.
         if getattr(req, "json_object_stripped", False):
+            return True
+        # …and so does a json_schema translated into a forced tool call: the
+        # answer arrives as tool arguments and `finalize_forced_tool_schema`
+        # puts it back in content, where this gate reads it.
+        if getattr(req, "forced_tool_schema", None) is not None:
             return True
         containers = [p]
         eb = p.get("extra_body")
@@ -1947,8 +2421,7 @@ class Correction:
                 obj = json.loads(content)
             except ValueError:
                 return  # not parseable → enforce_structured_validity's domain
-            payload = req.payload if isinstance(req.payload, dict) else {}
-            schema = _extract_declared_schema(payload)
+            schema = _declared_schema(req)
             st = self.state
             answerless = _is_answerless_object(obj, schema)
             if answerless and schema is not None and not _schema_valid(obj, schema):
@@ -2020,6 +2493,11 @@ class Correction:
         # apply_json_object_guard) — the caller's EXPECTATION is unchanged, so
         # the gate must not lapse just because the payload no longer shows it.
         if getattr(req, "json_object_stripped", False):
+            return True
+        # Same reasoning for a json_schema the proxy moved into a forced tool
+        # call (apply_forced_tool_schema): the payload now reads as a plain tool
+        # request, and a truncated answer is no less broken for it.
+        if getattr(req, "forced_tool_schema", None) is not None:
             return True
         if self.extract_grammar(p)[0]:
             return True

@@ -666,6 +666,40 @@ class BackendClientPool:
             pass
         return None
 
+    async def probe_not_implemented(
+        self, ep_cfg: EndpointConfig,
+    ) -> frozenset[str] | None:
+        """What the backend's own ``/health`` says it does NOT implement.
+
+        Some builds publish an explicit ``"not_implemented": ["response_format",
+        "text.format"]`` — ground truth from the thing being described, rather
+        than a hand-maintained copy of it in a catalog. Read by the poller and
+        stored on ``EndpointConfig.not_implemented``; the one consumer today is
+        ``Correction.apply_forced_tool_schema``, which translates a json_schema
+        into a forced tool call only for a backend that says it cannot honour
+        ``response_format``.
+
+        Returns a frozenset of the names it published, or **None on any failure
+        or on a build that publishes no such field** — which is every incumbent
+        engine (llama.cpp, vLLM publish nothing of the kind). The caller must
+        treat None as "cannot tell", and "cannot tell" must never license a
+        payload rewrite: an unreachable backend, a non-200, a body that is not
+        JSON, a missing key and a malformed value are all the same answer here,
+        deliberately, because none of them is the backend saying it lacks the
+        feature.
+
+        A non-string member is dropped rather than stringified: the field is a
+        list of wire-field NAMES, and coercing `{"response_format": true}` into
+        a name would invent a declaration the backend did not make.
+        """
+        body = await self.probe_json(ep_cfg, "/health", timeout_s=3.0)
+        if not isinstance(body, dict):
+            return None
+        raw = body.get("not_implemented")
+        if not isinstance(raw, (list, tuple, set, frozenset)):
+            return None
+        return frozenset(x for x in raw if isinstance(x, str) and x)
+
     async def probe_prefix_cache(self, ep_cfg: EndpointConfig) -> dict | None:
         """Scrape a backend's Prometheus `/metrics` for prefix-cache counters.
 
