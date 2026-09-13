@@ -115,6 +115,34 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Fixed
 
+- **`/v1/fleet/savings` reported a rolling 30-day window under the word "total".** `savings_summary`
+  summed `proxy_completions` with no lower bound, and `cleanup_old_completions` prunes that table at
+  `completions_retention_s` — so the figure a dashboard labels "saved total" stopped growing once the
+  retention window filled. Measured against a live deployment: the endpoint returned `total_usd`
+  554.31 and the sum of its last 31 daily buckets was 554.32. The total is now composed with a new
+  never-pruned `proxy_savings_daily` table (endpoint x UTC day, one row each), finalised out of
+  `proxy_completions` by the retention sweep before it deletes anything; existing databases are
+  backfilled once from whatever completions they still hold, so the oldest bucket starts short by
+  however much a previous prune already took. `today_*` is untouched — same local-midnight boundary,
+  same code path.
+
+  It stores TOKENS, never USD. The rates in `usage_rates.py` change (the thinker anchor was repriced
+  on a model cutover) and the unpruned half of the figure is already priced at CURRENT rates, so
+  freezing each day at whatever rate applied when it was finalised would mix pricing regimes inside
+  one number and make the total impossible to recompute.
+
+  🚨 **The finalisation and the DELETE are not a transaction, and cannot be made into one:** `_w`
+  drops a write when its bounded queue is full — deliberately, so DB I/O never blocks the event loop.
+  A dropped finalisation followed by a landed DELETE would destroy those tokens permanently, which
+  for a lifetime counter is unrecoverable. So neither statement assumes the other ran. Finalisation
+  is a MONOTONE upsert (`MAX` of stored and recomputed), which makes it idempotent and makes a
+  partially-pruned bucket's low recompute a no-op rather than a clobber; the DELETE carries an
+  `EXISTS` against the rollup, evaluated inside the statement on the writer thread, so a row whose
+  bucket never reached the rollup survives the sweep and is pruned by the next one. Both properties
+  are sabotage-verified in `tests/test_savings_lifetime.py`: reverting the upsert to a plain
+  overwrite shrinks a straddling bucket 2M → 1M tokens, and dropping the `EXISTS` loses two rows'
+  tokens the moment a finalisation write is dropped.
+
 - **A reasoning cap on a tool-calling turn is now derived from the top of the allowance
   (`max_tokens` minus a fixed answer reserve) rather than from the ratio or the operator-declared
   absolute.** A cap that cuts reasoning SHORT on a tool turn corrupts the tool-call channel: the

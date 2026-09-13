@@ -1797,7 +1797,10 @@ All three run **off the event loop** via `asyncio.to_thread` (§5c): a heavy `GR
 whole-fleet completions table must never stall scheduling under a hot dashboard.
 
 🚨 **These read `proxy_completions`, so every window is bounded by `completions_retention_s`**
-(default 30 days). "Total" means *total retained*, not total ever.
+(default 30 days) — with ONE exception, added 2026-09-12: the `total_*` fields of
+`/v1/fleet/savings` are a true LIFETIME figure, composed with the never-pruned
+`proxy_savings_daily` rollup. Everywhere else in this section, "total" still means *total
+retained*, not total ever.
 
 #### `GET /v1/fleet/activity` → `fleet_activity(window_s, bin_s)`
 
@@ -1839,10 +1842,16 @@ Query: `since` (epoch seconds; digits only, else the local midnight is used).
 **Cloud-equivalent cost avoided by running locally** — money *not spent*, not money spent. The proxy
 only sees local traffic.
 
+`today_*` is the live completions since `today_start` (LOCAL midnight). `total_*` is every token the
+proxy has ever served: the retention prune folds each UTC day into `proxy_savings_daily` before it
+deletes the rows, so the total outlives the window instead of plateauing at 30 days. The rollup
+stores TOKENS, not dollars, so the whole figure is priced at one current set of rates and is
+recomputed — not frozen — when a rate in `usage_rates.py` changes.
+
 | field | type | meaning |
 |---|---|---|
 | `today_usd` | float | Summed across endpoints, 2dp. |
-| `total_usd` | float | All retained completions, 2dp. |
+| `total_usd` | float | LIFETIME, 2dp — retained completions plus the pruned ones, whose tokens live on in `proxy_savings_daily`. |
 | `today_tokens_in` | int | |
 | `today_tokens_out` | int | |
 | `total_tokens_in` | int | |
@@ -1857,8 +1866,8 @@ only sees local traffic.
 | `endpoint` | string | |
 | `today_usd` | float | 4dp — the per-row precision is finer than the 2dp totals. |
 | `total_usd` | float | 4dp. |
-| `tokens_in` | int | **Total** retained, not today. |
-| `tokens_out` | int | **Total** retained, not today. |
+| `tokens_in` | int | **Lifetime**, not today. |
+| `tokens_out` | int | **Lifetime**, not today. |
 
 #### `GET /v1/usage` → `usage_rollup(dimension, hours)`
 

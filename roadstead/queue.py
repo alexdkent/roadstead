@@ -193,6 +193,26 @@ CREATE TABLE IF NOT EXISTS proxy_kv (
     value TEXT NOT NULL       -- JSON blob
 );
 
+-- Lifetime savings rollup: the ONLY table here that is never pruned, so that
+-- `savings_summary`'s total outlives `completions_retention_s` instead of being
+-- a rolling 30-day window wearing the word "total". It is tiny by construction
+-- (endpoints x days, one row each) and finalised out of proxy_completions by
+-- cleanup_old_completions BEFORE the prune deletes those rows.
+--
+-- 🚨 It stores TOKENS, never USD, and that is load-bearing. The rates in
+-- usage_rates.py change over time (the thinker anchor was repriced on a model
+-- cutover), and the CURRENT half of the figure is priced at today's rates — so
+-- freezing each day at whatever rate happened to apply when it was finalised
+-- would mix pricing regimes inside one number and make the total impossible to
+-- recompute. Tokens keep ONE pricing regime and stay reproducible.
+CREATE TABLE IF NOT EXISTS proxy_savings_daily (
+    endpoint    TEXT NOT NULL,
+    day         INTEGER NOT NULL,   -- UTC midnight epoch seconds of the bucket
+    tokens_in   INTEGER NOT NULL DEFAULT 0,
+    tokens_out  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (endpoint, day)
+);
+
 CREATE INDEX IF NOT EXISTS idx_pq_status ON proxy_queue(status);
 CREATE INDEX IF NOT EXISTS idx_pc_completed ON proxy_completions(completed_at);
 CREATE INDEX IF NOT EXISTS idx_pts_completed ON proxy_timeout_shadow(completed_at);
@@ -200,6 +220,35 @@ CREATE INDEX IF NOT EXISTS idx_pto_occurred ON proxy_timeouts(occurred_at);
 CREATE INDEX IF NOT EXISTS idx_pm_endpoint_started ON proxy_maintenance(endpoint, started_at);
 CREATE INDEX IF NOT EXISTS idx_pcs_endpoint_snap ON proxy_cache_stats(endpoint, snapshot_at);
 """
+
+
+def _day_bucket_sql(col: str = "completed_at") -> str:
+    """The UTC-midnight day bucket of a completion timestamp, as SQL.
+
+    The rollup's primary key, the finalisation's GROUP BY and the prune's guard
+    must agree on this expression EXACTLY — a drifted copy stops matching
+    silently, which either wedges the prune or loses a bucket. Epoch seconds are
+    UTC-anchored, so integer division by a day IS UTC midnight; completed_at is
+    never negative, so CAST-truncation is a floor.
+    """
+    return f"CAST({col} / 86400 AS INTEGER) * 86400"
+
+
+#: Fold every (endpoint, day) bucket in proxy_completions into the lifetime
+#: rollup. MONOTONE by construction: a bucket's stored tokens can only ever go
+#: UP. That is the whole safety property. A bucket the prune has already eaten
+#: into recomputes LOW from the live table, and the MAX refuses that write —
+#: the correct value an earlier sweep stored stands. A never-finalised bucket
+#: (dropped write) still gets whatever survives, which beats nothing.
+_FINALISE_SAVINGS_SQL = (
+    "INSERT INTO proxy_savings_daily (endpoint, day, tokens_in, tokens_out) "
+    "SELECT COALESCE(endpoint,'') AS ep, " + _day_bucket_sql() + " AS day, "
+    "       SUM(COALESCE(input_tokens,0)), SUM(COALESCE(output_tokens,0)) "
+    "  FROM proxy_completions GROUP BY ep, day "
+    "ON CONFLICT(endpoint, day) DO UPDATE SET "
+    "  tokens_in  = MAX(tokens_in,  excluded.tokens_in), "
+    "  tokens_out = MAX(tokens_out, excluded.tokens_out)"
+)
 
 
 class PersistentQueue:
@@ -255,6 +304,7 @@ class PersistentQueue:
         self._migrate_completions(conn)
         self._migrate_timeouts(conn)
         self._migrate_queue(conn)
+        self._migrate_savings_daily(conn)
         return conn
 
     @staticmethod
@@ -287,6 +337,26 @@ class PersistentQueue:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pc_endpoint_completed "
             "ON proxy_completions(endpoint, completed_at)")
+
+    @classmethod
+    def _migrate_savings_daily(cls, conn: sqlite3.Connection) -> None:
+        """Backfill the lifetime rollup, once, from whatever completions survive.
+
+        Only ever on a genuinely EMPTY rollup. From the second open onward the
+        table already carries finalised buckets, and re-deriving those from a
+        table that has since been pruned is exactly the under-count the monotone
+        upsert refuses — this runs on every open, so a cheap existence check is
+        what keeps it a migration rather than a nightly clobber.
+
+        The OLDEST bucket present has usually already lost rows to a previous
+        prune, so the backfilled lifetime starts short by that much. Accepted:
+        it is one partial day, there is nowhere left to recover those tokens
+        from, and every day after this point is complete.
+        """
+        if conn.execute(
+                "SELECT 1 FROM proxy_savings_daily LIMIT 1").fetchone() is not None:
+            return
+        conn.execute(_FINALISE_SAVINGS_SQL)
 
     @classmethod
     def _migrate_timeouts(cls, conn: sqlite3.Connection) -> None:
@@ -1056,11 +1126,38 @@ class PersistentQueue:
 
     def cleanup_old_completions(self, max_age_s: float = 86400 * 7) -> None:
         """Trim completions / timeout-shadow / timeouts past the retention
-        window. Enqueued to the writer thread (off the event loop)."""
+        window. Enqueued to the writer thread (off the event loop).
+
+        🚨 Completions are FINALISED into the lifetime rollup before they are
+        pruned, and the two statements are NOT a transaction. `_w` DROPS a write
+        when its bounded queue is full — by design, so it never blocks the loop —
+        so a dropped finalisation followed by a landed DELETE would destroy those
+        tokens permanently and shrink a counter nothing can rebuild. Neither
+        statement may therefore assume the other ran. Both properties below are
+        what make that safe, and both are load-bearing:
+
+          * finalisation is IDEMPOTENT and MONOTONE, so a dropped write costs
+            nothing but a delay — the next sweep simply redoes it;
+          * the DELETE is bounded by what is ACTUALLY PERSISTED in the rollup,
+            evaluated inside the statement, so a row whose bucket never reached
+            the rollup survives this sweep and is pruned by the next one.
+
+        Writes execute on the writer thread in submission order, so the DELETE
+        reads the committed state the finalisation left; that ordering is all
+        this relies on, never a transaction spanning two `_w` calls.
+        """
         if not self._conn:
             return
         cutoff = time.time() - max_age_s
-        self._w("DELETE FROM proxy_completions WHERE completed_at < ?", (cutoff,))
+        self._w(_FINALISE_SAVINGS_SQL)
+        self._w(
+            "DELETE FROM proxy_completions WHERE completed_at < ? AND EXISTS ("
+            "  SELECT 1 FROM proxy_savings_daily d "
+            "   WHERE d.endpoint = COALESCE(proxy_completions.endpoint,'') "
+            "     AND d.day = " + _day_bucket_sql("proxy_completions.completed_at")
+            + ")",
+            (cutoff,),
+        )
         self._w("DELETE FROM proxy_timeout_shadow WHERE completed_at < ?", (cutoff,))
         self._w("DELETE FROM proxy_timeouts WHERE occurred_at < ?", (cutoff,))
 
@@ -1511,10 +1608,21 @@ class PersistentQueue:
         return out
 
     def savings_summary(self, today_start: float | None = None) -> dict:
-        """Cloud-equivalent cost avoided by running locally, within the
-        completion-retention window. Returns today + total (all retained)
-        USD and token totals, plus a per-endpoint breakdown. Ported from the
-        host daemon's ``fleet_savings`` (now proxy-authoritative)."""
+        """Cloud-equivalent cost avoided by running locally. Returns today +
+        LIFETIME USD and token totals, plus a per-endpoint breakdown. Ported
+        from the host daemon's ``fleet_savings`` (now proxy-authoritative).
+
+        The total is composed from TWO sources describing ONE timeline: the
+        never-pruned `proxy_savings_daily` rollup and the live completions,
+        reconciled per UTC day bucket (see below). Before the rollup existed
+        this was a bare SUM over proxy_completions, which the retention prune
+        silently turned into a rolling 30-day window labelled "total" — it
+        plateaued once the window filled.
+
+        `today_*` is deliberately NOT part of that composition: it keeps its own
+        LOCAL-midnight boundary and its own code path, because "today" is a
+        question about the operator's day, not about a storage bucket.
+        """
         if not self._conn:
             return {"today_usd": 0.0, "total_usd": 0.0, "by_endpoint": []}
         from .usage_rates import cloud_cost_usd
@@ -1522,25 +1630,49 @@ class PersistentQueue:
             lt = time.localtime()
             today_start = time.mktime((
                 lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+        day_sql = _day_bucket_sql()
         rows = self._reader().execute(
-            "SELECT endpoint, "
+            "SELECT COALESCE(endpoint,'') AS ep, " + day_sql + " AS day, "
+            "  SUM(COALESCE(input_tokens,0)) AS in_live, "
+            "  SUM(COALESCE(output_tokens,0)) AS out_live, "
             "  SUM(CASE WHEN completed_at >= ? THEN COALESCE(input_tokens,0) ELSE 0 END) AS in_today, "
-            "  SUM(CASE WHEN completed_at >= ? THEN COALESCE(output_tokens,0) ELSE 0 END) AS out_today, "
-            "  SUM(COALESCE(input_tokens,0)) AS in_total, "
-            "  SUM(COALESCE(output_tokens,0)) AS out_total "
-            "FROM proxy_completions GROUP BY endpoint",
+            "  SUM(CASE WHEN completed_at >= ? THEN COALESCE(output_tokens,0) ELSE 0 END) AS out_today "
+            "FROM proxy_completions GROUP BY ep, day",
             (today_start, today_start),
         ).fetchall()
+        today_by_ep: dict[str, list[int]] = {}
+        # (endpoint, day) -> [tokens_in, tokens_out]. The rollup and the live
+        # table are two VIEWS of one bucket, never two halves to add up, so they
+        # compose by MAX — which cannot double-count whatever the two disagree
+        # about, and needs no boundary between them. Which side wins says
+        # something real: the live rows win on a day the prune has not reached
+        # (including today, whose rollup row is only ever a partial snapshot,
+        # and any day whose finalisation is stale or was dropped), the rollup
+        # wins the moment rows start disappearing from under it.
+        buckets: dict[tuple[str, int], list[int]] = {}
+        for ep, day, in_live, out_live, in_today, out_today in rows:
+            buckets[(ep, int(day))] = [int(in_live or 0), int(out_live or 0)]
+            t = today_by_ep.setdefault(ep, [0, 0])
+            t[0] += int(in_today or 0); t[1] += int(out_today or 0)
+        for ep, day, tin, tout in self._reader().execute(
+                "SELECT endpoint, day, tokens_in, tokens_out "
+                "FROM proxy_savings_daily").fetchall():
+            b = buckets.setdefault((ep, int(day)), [0, 0])
+            b[0] = max(b[0], int(tin or 0)); b[1] = max(b[1], int(tout or 0))
+        lifetime_by_ep: dict[str, list[int]] = {}
+        for (ep, _day), (tin, tout) in buckets.items():
+            a = lifetime_by_ep.setdefault(ep, [0, 0])
+            a[0] += tin; a[1] += tout
         today_usd = total_usd = 0.0
         today_in = today_out = total_in = total_out = 0
         by_endpoint: list[dict] = []
-        for ep, in_today, out_today, in_total, out_total in rows:
-            in_today, out_today = int(in_today or 0), int(out_today or 0)
-            in_total, out_total = int(in_total or 0), int(out_total or 0)
+        for ep in sorted(set(lifetime_by_ep) | set(today_by_ep)):
+            in_total, out_total = lifetime_by_ep.get(ep, [0, 0])
+            in_today, out_today = today_by_ep.get(ep, [0, 0])
             today_in += in_today; today_out += out_today
             total_in += in_total; total_out += out_total
-            t_today = cloud_cost_usd(ep or "", in_today, out_today)
-            t_total = cloud_cost_usd(ep or "", in_total, out_total)
+            t_today = cloud_cost_usd(ep, in_today, out_today)
+            t_total = cloud_cost_usd(ep, in_total, out_total)
             today_usd += t_today; total_usd += t_total
             by_endpoint.append({
                 "endpoint": ep, "today_usd": round(t_today, 4),
