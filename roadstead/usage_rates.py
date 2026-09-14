@@ -119,8 +119,29 @@ _ENDPOINT_CLASS: dict[str, str | None] = {
     "tier3": "tier3", "reasoner": "tier3", "thinker": "tier3", "composer": "tier3",
     "creative": "tier3", "vision": "tier3",
     "tier2": "tier2", "chat": "tier2", "analyst": "tier2",
+    # 🚨 THE SPLIT TIER-2 ENDPOINTS. A deployment that splits a tier across boxes
+    # gets NEW endpoint names, and the bare `tier2` above stops matching any of
+    # them — every call then books $0 while reading as a priced lane. Measured on
+    # the reference fleet 2026-09-14: `tier2-chat` (150.1M in / 2.5M out) and
+    # `tier2-analyst` (42.2M / 3.3M) had been booking nothing since the 2026-08-19
+    # split, ~$32 of the ~$119 total that was missing.
+    "tier2-chat": "tier2", "tier2-analyst": "tier2",
+    # `tier2-flash` is a genuinely different model from the other two (a
+    # vision+reasoning MoE on its own silicon), not a second copy of them.
+    # ⚠️ ANCHORED AT tier2 CONSERVATIVELY AND IT MAY UNDER-PRICE: its stanza
+    # deliberately publishes no parameter count (the build's /health does not
+    # expose one), so there is no measured basis for the higher `tier3` anchor.
+    # Under-claiming a saving is the safer error. Re-anchor if a parameter count
+    # is ever measured — do not re-anchor on vibes about checkpoint size.
+    "tier2-flash": "tier2", "halogen": "tier2", "flash": "tier2",
     "tier1": "tier1", "router": "tier1", "small": "tier1", "fast-chat": "tier1",
     "classify": "tier1", "classifier": "tier1",
+    # `gemma` is the tier1 router's own endpoint key and carries GENUINE LLM
+    # tokens — verified three ways on the reference fleet: it is a declared chat
+    # alias in the catalog, `/v1/calls/log` REFUSES a push under a configured
+    # endpoint name (409), and the push client drops proxy-native providers
+    # before queueing. So nothing but real router traffic can land here.
+    "gemma": "tier1", "gemma-router": "tier1", "gemma-greeter": "tier1",
     "embed": "embed", "embeddings": "embed",
     "rerank": "rerank",
     # --- remote spill: real money, and not this table's business. Explicitly
@@ -134,14 +155,75 @@ _ENDPOINT_CLASS: dict[str, str | None] = {
     "stt": "stt", "whisper-1": "stt", "transcribe": "stt",
     "diarize": "diarize",
     "stem": "stem",
+    # 🚨 The UNIT names a deployment actually pushes, which are not the
+    # capability names above. Each was verified at its producer's packing site
+    # before being priced here — the contract is `input_tokens = seconds*100`
+    # and a producer that pushed real tokens would be billed as though tokens
+    # were seconds, so this list is evidence-backed, not pattern-matched:
+    #   unraid-whisper / -lyrics : int(audio_seconds*100), out = transcript chars
+    #   unraid-diarize           : int(audio_seconds*100), out = segment count
+    #   unraid-htdemucs          : int(duration_s*100),    out = 4 (stem count)
+    # Cross-checked against real deployment totals: transcript-chars-per-
+    # audio-second lands in the expected range and differs between spoken and
+    # sung input, and stem output is a fixed count per track rather than a
+    # length-proportional one.
+    "unraid-whisper": "stt", "unraid-whisper-lyrics": "stt",
+    "unraid-diarize": "diarize",
+    "unraid-htdemucs": "stem",
     # --- per-unit: TTS (input_tokens = characters) ---
     "tts": "tts", "speak": "tts",
+    # 🚨 Both TTS producers pack `input_tokens = chars_in` and
+    # `output_tokens = int(audio_seconds_out*100)` — output is AUDIO
+    # CENTISECONDS, not tokens. The `tts` branch of cloud_cost_usd() ignores
+    # output entirely, which is what keeps that honest; do NOT give the tts
+    # class an output rate, or an ordinary backlog of synthesised speech gets
+    # priced as tens of millions of output tokens.
+    "orpheus-tts": "tts", "chatterbox-tts": "tts",
     # --- explicit $0 (no clean cloud analog, or would double-count) ---
     "stream": None,          # streaming audio mux; transcription counted under stt
     "ocr": None,             # folded into vision; no separate volume
     "musicgen": None, "imagegen": None, "video": None,  # media: not yet metered
     "probe": None,           # infra/no-op
+    # Deliberate $0 with a MEASURED reason, so nobody "fixes" them into a rate:
+    #  · `stream` re-counts audio already billed under the whisper units — two of
+    #    its call sites read `duration` straight off the whisper response.
+    #  · `asr` pushes NO token fields at all (rows exist only so the Inference
+    #    page's ASR card is not blank), so any rate on it still yields $0. The
+    #    producer must be taught to push seconds before a rate means anything.
+    #  · `got-ocr`'s producer was retired and its packing is UNKNOWN — unpriced
+    #    rather than guessed.
+    "asr": None, "cortex-asr": None,
+    "got-ocr": None,
 }
+
+#: Every key above is a DECIDED endpoint: priced, or zero for a stated reason.
+#: A name that is not here at all has been decided by nobody — see
+#: :func:`is_declared_endpoint`.
+_DECLARED_ENDPOINTS = frozenset(_ENDPOINT_CLASS)
+
+
+def is_declared_endpoint(endpoint: str) -> bool:
+    """Has this endpoint name been PRICED OR DELIBERATELY ZEROED?
+
+    🚨 THIS IS THE DISTINCTION THE TABLE COULD NOT MAKE, AND ITS ABSENCE COST
+    REAL MONEY. ``cloud_cost_usd`` returns 0.0 both for "this lane is genuinely
+    free" and for "nobody has ever priced this name", and those two are
+    indistinguishable in the output — a plausible number instead of a failure on
+    a key nothing recognises. So a rename or a host move silently zeroes a lane
+    and the total keeps looking reasonable.
+
+    Measured on the reference fleet 2026-09-14, years after the keys drifted:
+    ~$119 of ~$678 lifetime cloud-equivalent savings (17.5%) was unbooked across
+    ten endpoint names, the largest being a TTS unit at $61.64. Nothing alerted,
+    because every one of them returned a number rather than an error.
+
+    Callers that summarise savings should check this against the endpoints they
+    actually observe and report the misses LOUDLY. Pricing cannot be made to
+    fail closed here — a hard raise inside ``cloud_cost_usd`` would take down
+    the rollup for a typo — so the check belongs at the surface that can see the
+    whole endpoint set at once.
+    """
+    return (endpoint or "").strip().lower() in _DECLARED_ENDPOINTS
 
 
 def _capability(endpoint: str) -> str | None:
