@@ -524,6 +524,11 @@ _POLICY_PASSTHROUGH = (
     # whitespace-banned grammar and greedily returns `{}`. Guarded by
     # test_json_object_guard.py::test_models_yaml_flag_reaches_endpoint_config.
     "disable_any_whitespace",
+    # Per-endpoint reasoning headroom for a FORCED-reasoning endpoint, replacing
+    # the global forced_reasoning_budget() (1536, derived for creative/Trinity-
+    # Mini). Read by Correction.apply_forced_reasoning_budget. Guarded by
+    # test_forced_reasoning_effort.py::test_declared_budget_reaches_endpoint_config.
+    "forced_reasoning_budget",
     # Operator-declared token price, USD per MILLION tokens. Beats a
     # provider-published price (spend.PriceBook explains why) and is the only
     # way to price an endpoint whose backend publishes nothing. Guarded by

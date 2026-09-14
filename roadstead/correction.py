@@ -1527,13 +1527,81 @@ class Correction:
         case on BOTH streaming and sync, any engine — it's a property of the
         endpoint, not a per-request flag. Transparent when the endpoint doesn't force
         reasoning or the payload carries no positive ``max_tokens`` (no cap → the
-        model self-limits and there's nothing to protect)."""
+        model self-limits and there's nothing to protect).
+
+        ALSO INJECTS THE ENDPOINT'S DECLARED ``policy.reasoning_effort`` (2026-09-14),
+        together with its declared ``thinking_kwargs`` switch, in ONE
+        ``chat_template_kwargs`` object. On a forced-reasoning endpoint the effort
+        is a property of the ENDPOINT — there is no per-request opt-in to hang it
+        off, because the model reasons whether or not anyone asks. Before this,
+        the sole injection site was ``apply_thinking``'s opt-in path, so a
+        declared effort on a forced endpoint was inert and the model ran at its
+        template's own default. The budget above cannot compensate for that: an
+        endpoint reasoning at ``xhigh`` will spend any constant it is given.
+        Unlike the budget, this half runs even when the caller sent no
+        ``max_tokens`` — an uncapped request still reasons."""
         p = req.payload
         if not isinstance(p, dict) or req.payload_type != "chat_completion":
             return
         ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
         if ep is None or not getattr(ep, "forces_reasoning", False):
             return
+
+        # ── THE EFFORT, BEFORE THE BUDGET ──────────────────────────────────
+        # 🚨 A DECLARED `policy.reasoning_effort` WAS UNREACHABLE ON THIS PATH
+        # UNTIL 2026-09-14, and that is the defect this block exists for. The
+        # only injection site was `apply_thinking`, which returns early unless
+        # the CALLER sent `thinking:` — an opt-in that models the vLLM world,
+        # where reasoning is OFF until somebody asks for it. A forced-reasoning
+        # endpoint is the opposite world: the model reasons on EVERY request,
+        # nobody opts in, so the effort has to be an endpoint property or it is
+        # nothing at all. tier2-flash declared `low`, shipped, and ran every
+        # single request at its template default `xhigh` — the model's MAXIMUM.
+        # Measured cost: max_tokens 3,584 spent entirely on reasoning,
+        # finish_reason=length, ZERO content, 100.6 s. The catalog said `low`
+        # the whole time. (Ledger: `a-declared-reasoning-effort-no-code-path-reads`.)
+        #
+        # THE SWITCH MUST RIDE IN THE SAME OBJECT — same hard-won rule as
+        # `apply_thinking`, and it is not tidiness. Per-request
+        # `chat_template_kwargs` merge KEY-BY-KEY over the server's own launch
+        # default, so an effort sent ALONE can render against a template whose
+        # thinking switch then takes its default — silently dropping the effort,
+        # or worse, silently disabling reasoning on a reasoning tier. Building
+        # ONE dict from the catalog's own `thinking_kwargs` is what makes that
+        # unreachable from a declaration. An endpoint that declares an effort and
+        # NO switch is therefore skipped here and reported, rather than guessed
+        # at — that combination is the defect, and the reconcile gate now fails
+        # it instead of leaving it to be discovered in a truncation.
+        #
+        # A CALLER'S OWN PIN ALWAYS WINS, switch included: an explicit
+        # `enable_thinking: false` stays false. This is a per-endpoint DEFAULT
+        # for the callers that said nothing, never an override of one that did.
+        declared_effort = getattr(ep, "reasoning_effort", "") or ""
+        switch_keys = tuple(getattr(ep, "thinking_kwargs", ()) or ())
+        if declared_effort and switch_keys:
+            ck = p.get("chat_template_kwargs")
+            ck = dict(ck) if isinstance(ck, dict) else {}
+            for key in switch_keys:
+                ck.setdefault(key, True)
+            ck.setdefault("reasoning_effort", declared_effort)
+            p["chat_template_kwargs"] = ck
+        elif declared_effort:
+            logger.warning(
+                "ROADSTEAD_UNREACHABLE_REASONING_EFFORT endpoint=%s effort=%r — "
+                "declared but NOT injected: the stanza names no "
+                "`policy.thinking_kwargs`, so there is no switch for the effort "
+                "to travel with and a lone effort key can render against the "
+                "template's own switch default. The model runs at ITS default "
+                "effort, which on Qwen3.8 is `xhigh`. Fix the stanza, not this "
+                "call site.", req.endpoint, declared_effort)
+
+        # ── THE BUDGET ─────────────────────────────────────────────────────
+        # Deliberately AFTER the effort and gated separately: a caller with no
+        # `max_tokens` has nothing to pad (the backend applies its own default
+        # and self-limits), but it still reasons, so it still needs the effort
+        # above. Returning early here on an absent cap — which this method used
+        # to do for the whole body — is what kept the effort from uncapped
+        # callers too.
         cur = p.get("max_tokens")
         if not (isinstance(cur, int) and cur > 0):
             return
@@ -1543,7 +1611,15 @@ class Correction:
         # empty-completion path 502s and the warmer records a FALSE failure
         # (ok=0). Padding it makes the warm-up SUCCEED and, as a bonus, exercises
         # decode (a fuller warm) — the ~200 discarded tokens are cheap + rare.
-        p["max_tokens"] = cur + forced_reasoning_budget()
+        #
+        # The endpoint may DECLARE its own headroom, which then REPLACES the flat
+        # global. The global is 1536 and its docstring derives that from
+        # creative/Trinity-Mini at ~350-500 reasoning tokens; an endpoint whose
+        # model reasons an order of magnitude harder is not served by another
+        # model's constant. See `EndpointConfig.forced_reasoning_budget`.
+        declared_budget = getattr(ep, "forced_reasoning_budget", 0) or 0
+        p["max_tokens"] = cur + (declared_budget if declared_budget > 0
+                                 else forced_reasoning_budget())
     def apply_json_object_guard(self, req: QueuedRequest) -> None:
         """Request-side: drop a BARE ``response_format:{"type":"json_object"}`` when
         the target endpoint's backend was launched with structured-output whitespace

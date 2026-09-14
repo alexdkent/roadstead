@@ -505,6 +505,28 @@ class EndpointConfig:
     # endpoints where thinking is disablable (the proxy forces enable_thinking=False
     # by default, so no reasoning is emitted and the extra cap is never reached). ---
     forces_reasoning: bool = False
+    #: Per-endpoint override of the global ``forced_reasoning_budget()`` (1536)
+    #: headroom that ``Correction.apply_forced_reasoning_budget`` ADDS to
+    #: ``max_tokens`` on a FORCED-reasoning endpoint. 0 = undeclared, use the
+    #: global. From ``policy.forced_reasoning_budget``.
+    #:
+    #: 🚨 THE GLOBAL IS ONE NUMBER AND IT WAS SIZED FOR A DIFFERENT MODEL. Its
+    #: docstring derives 1536 from ``creative``/Trinity-Mini, which reasons
+    #: ~350-500 tokens — roughly 3x headroom there. On an endpoint whose model
+    #: reasons at its template's MAXIMUM effort that is not headroom at all:
+    #: measured on tier2-flash 2026-09-14, a caller cap of 3,584 returned
+    #: ``finish_reason=length`` with ZERO content after 100.6 s, the whole
+    #: budget spent on reasoning. Padding by a constant tuned elsewhere cannot
+    #: fix that, and a pad that never suffices looks exactly like a pad that is
+    #: working. Size this from what the endpoint actually emits AT ITS DECLARED
+    #: EFFORT — the two are one setting, not two, which is why
+    #: ``apply_forced_reasoning_budget`` now injects the effort as well.
+    #:
+    #: Deliberately mirrors ``thinking_reasoning_budget`` above (same shape, same
+    #: "0 = use the global" rule) rather than reusing it: that one overrides the
+    #: opt-in path's global, this one the forced path's, and an endpoint can sit
+    #: on either path with a different right answer.
+    forced_reasoning_budget: int = 0
 
     # --- the backend can actually SEE an image (mirrored from models.yaml
     # ``capabilities.vision``; true where an mmproj / vision tower is loaded).
