@@ -972,6 +972,13 @@ class Lifecycle:
         # =true) ALWAYS spend max_tokens on an un-disable-able CoT before the answer, so
         # small caller caps truncate mid-reasoning. Reserve answer headroom for BOTH the
         # streaming and sync paths (must precede the branch — apply_thinking is sync-only).
+        # THE BUDGET THE CALLER ASKED FOR, before any correction inflates it.
+        # The deadline was already resolved from this value (line ~606/620), so
+        # every token added below is decode time nobody budgeted — see
+        # `extend_deadline_for_granted_budget` after the corrections.
+        _mt_before = (req.payload.get("max_tokens")
+                      if isinstance(req.payload, dict) else None)
+
         self.correction.apply_forced_reasoning_budget(req)
 
         # A backend launched with structured-output whitespace BANNED
@@ -1011,6 +1018,9 @@ class Lifecycle:
         # half (finalize_thinking) is still sync-only — apply_thinking skips the
         # thinking_active registration when streaming.
         self.correction.apply_thinking(req)
+
+        # 🚨 THE PROXY MUST NOT GRANT TOKENS AND WITHHOLD THE CLOCK.
+        self.extend_deadline_for_granted_budget(req, _mt_before)
 
         # Streaming vs non-streaming
         if req.stream:
@@ -2612,6 +2622,70 @@ class Lifecycle:
 
         # Trigger scheduler (a slot freed up)
         self.state.dispatch_event.set()
+
+    def extend_deadline_for_granted_budget(self, req, mt_before) -> None:
+        """Re-derive the deadline when a CORRECTION raised ``max_tokens``.
+
+        🚨 THE DEFECT THIS EXISTS FOR. The deadline is resolved at admission
+        from the CALLER's ``max_tokens`` (``resolve_default_timeout`` /
+        ``apply_extend_only``), and ``apply_thinking`` +
+        ``apply_forced_reasoning_budget`` inflate that number AFTERWARDS. So the
+        proxy hands a request a budget it is structurally not given time to
+        spend. Measured on tier2-analyst, 2026-09-14, the Playground's default:
+
+            caller max_tokens           2,048
+            deadline sized from         2,048  -> floor 120 s
+            backend actually receives   4,048  (+2,000 thinking headroom)
+            decode at the declared 20 tok/s     ~202 s
+
+        A request that USES the budget the proxy granted it cannot finish inside
+        the deadline the proxy set. That is not a stingy number, it is an
+        inconsistent pair of numbers.
+
+        🔑 AND THE PREVIOUS FIX WENT THE WRONG WAY. `config.py` already documents
+        the wall-clock consequence, and the remedy applied was to SHRINK the
+        per-endpoint headroom (the 8,000 global down to 2,000) so it would fit
+        the deadline — solving a clock problem by taking tokens away, which is
+        exactly the truncation the headroom existed to prevent. Extending the
+        clock is the half that was missing; once it is here, the budgets can be
+        sized from what models actually emit.
+
+        EXTEND ONLY, NEVER SHRINK. A deadline already longer than the
+        recommendation stands — a caller that asked for more time keeps it, and
+        the per-class floor is a floor. Total: any failure leaves the deadline
+        exactly as it was, because a re-derivation fault must never shorten a
+        live request's clock.
+        """
+        try:
+            p = req.payload
+            if not isinstance(p, dict):
+                return
+            mt_after = p.get("max_tokens")
+            if not (isinstance(mt_after, int) and mt_after > 0):
+                return
+            if not (isinstance(mt_before, int) and mt_before > 0):
+                return
+            if mt_after <= mt_before:
+                return            # nothing was granted; nothing to pay for
+            priority = int(LLMPriority.coerce(
+                getattr(req, "priority", None),
+                default=LLMPriority.P1_TURN_SUPPORT))
+            rec = self.state.effective_timeout_advice(
+                req.endpoint, priority, estimate_input_tokens(p), mt_after,
+            )["recommended_timeout_s"]
+            if not rec or float(rec) <= float(req.timeout_s):
+                return
+            prior = float(req.timeout_s)
+            req.timeout_s = float(rec)
+            logger.info(
+                "ROADSTEAD_DEADLINE_EXTENDED endpoint=%s call_site=%s "
+                "max_tokens %d->%d deadline %.1fs->%.1fs — the correction "
+                "granted %d extra tokens and the deadline was sized before it",
+                req.endpoint, req.call_site or "?", mt_before, mt_after,
+                prior, req.timeout_s, mt_after - mt_before,
+            )
+        except Exception:  # noqa: BLE001 — never shorten or 500 on a re-derive
+            logger.debug("deadline re-derivation failed", exc_info=True)
 
     def resolve_default_timeout(self, endpoint: str, body: dict) -> float:
         """Deadline for a caller that supplied no ``timeout_s`` (the OpenAI door
