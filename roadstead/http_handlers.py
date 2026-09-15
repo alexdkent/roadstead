@@ -811,6 +811,15 @@ class ProxyHttpHandlers:
                 # backend template ignored enable_thinking. Non-zero here means
                 # the opt-in is silently doing nothing on that endpoint.
                 "thinking_noop": self.state.thinking_noop,
+                # Reasoning loop-break. THREE counters, not one, because the
+                # gaps between them are the measurement: `detected - broken` is
+                # what shadow mode suppressed, and `broken - answered` is the
+                # population that was interrupted and still returned nothing —
+                # the number that says whether the answer-now re-ask earns its
+                # second backend call. A single "loops" counter would hide both.
+                "reasoning_loops_detected": self.state.reasoning_loops_detected,
+                "reasoning_loops_broken": self.state.reasoning_loops_broken,
+                "reasoning_loops_answered": self.state.reasoning_loops_answered,
                 # WS-4 shadow egress detector — silent grammar-drop over ALL
                 # grammar-bearing responses (read-only/zero-risk). Per-call_site
                 # rate + a flat fleet rate (health-verifier thresholds the scalar).
