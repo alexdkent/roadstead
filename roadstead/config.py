@@ -226,6 +226,39 @@ class EndpointConfig:
     #: prompt size, and not a constant that is generous for one caller and starving
     #: for the next.
     thinking_budget_ratio: float = 0.0
+    #: --- Reasoning LOOP-BREAK thresholds (2026-09-15) ------------------------
+    #: All four must be POSITIVE for the detector to arm; absent or partial =>
+    #: no detector is constructed and behaviour is byte-identical to before it
+    #: existed (``ReasoningLoopDetector.armed``). Partial-declaration-is-inert is
+    #: deliberate: a half-configured guard firing on a default nobody chose is
+    #: worse than one that does not run.
+    #:
+    #: 🚨 THESE ARE MEASUREMENTS AND BELONG TO A DEPLOYMENT, NOT TO THIS REPO.
+    #: The public default is 0 (off) for exactly the reason the timeout floors
+    #: are: an invented number here is a tax on every model nobody profiled.
+    #: Calibrate against a LABELLED corpus from the endpoint in question before
+    #: declaring them — the shipped shape came from 14 traces (5 looping, 9
+    #: healthy) on one model at one rung.
+    #:
+    #: ``reasoning_loop_window_chars`` MUST EXCEED THE CYCLE PERIOD you mean to
+    #: catch, and that is the whole design. A loop whose period is longer than
+    #: the window reads as perfectly diverse inside it: the same statistic that
+    #: scores a measured loop 0.05-0.28 at a 20,000-char window scores it
+    #: 0.51-0.96 at 2,000. Too small a window is not a weak detector, it is a
+    #: confident wrong answer.
+    reasoning_loop_window_chars: int = 0
+    #: Minimum reasoning characters before any verdict. A SAFETY bound, not a
+    #: performance one — it puts ordinary traffic structurally out of reach.
+    reasoning_loop_min_chars: int = 0
+    #: Fire when the distinct-24-gram ratio over the window falls to or below
+    #: this. Set it nearer the LOOPING end of the measured gap than the midpoint:
+    #: a false positive destroys a caller's legitimate long deliberation, a false
+    #: negative costs one more runaway that ``max_tokens`` ends anyway.
+    reasoning_loop_max_distinct_ratio: float = 0.0
+    #: How often to re-evaluate, in characters of new reasoning. The ratio is
+    #: O(window); a per-delta recompute would be the most expensive thing on the
+    #: stream path.
+    reasoning_loop_check_every_chars: int = 0
     #: ABSOLUTE reasoning cap in tokens, from ``policy.reasoning_budget_tokens``.
     #: 0 = undeclared, inject nothing. Sent under the wire name the endpoint's
     #: provider publishes (``ProviderDescriptor.reasoning_budget_field``), which
@@ -788,6 +821,59 @@ def degeneration_shadow_only() -> bool:
     return os.environ.get("ROADSTEAD_PROXY_DEGENERATION_SHADOW", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+
+def reasoning_loop_break_enabled() -> bool:
+    """Reasoning LOOP-BREAK guard (2026-09-15): watch the REASONING channel of a
+    live stream for a long-period repetition cycle and stop a run that has
+    provably stopped making progress.
+
+    Distinct from ``degeneration_guard_enabled`` above in channel, shape and
+    timing: that one judges reassembled CONTENT after the fact; this one judges
+    REASONING while it is still being generated, which is the only point at
+    which the wasted hour can still be reclaimed. Measured on a reasoning tier
+    2026-09-15: 4 of 6 top-rung draws looped until max_tokens and returned zero
+    answer characters, the worst for 1h04m.
+
+    Default ON, but INERT unless the endpoint declares thresholds (see
+    ``EndpointConfig.reasoning_loop_*``) — absent declaration => no detector is
+    constructed at all. Env kill-switch ``ROADSTEAD_PROXY_REASONING_LOOP_BREAK``."""
+    return os.environ.get(
+        "ROADSTEAD_PROXY_REASONING_LOOP_BREAK", "1",
+    ).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def reasoning_loop_answer_now() -> bool:
+    """After a reasoning loop is interrupted, make ONE more non-thinking call
+    that writes the answer from the pre-loop notes, instead of returning the
+    loop-break error. Default OFF — it is opt-in because it issues a SECOND
+    backend call, which is a real cost and a real behavioural change, and
+    because the guard that precedes it should earn trust in shadow first.
+
+    Requires the break to be ACTING: with ``REASONING_LOOP_SHADOW`` on (its
+    default) nothing is ever interrupted, so there is nothing to re-ask and this
+    flag is inert. Env ``ROADSTEAD_PROXY_REASONING_LOOP_ANSWER_NOW``."""
+    return os.environ.get(
+        "ROADSTEAD_PROXY_REASONING_LOOP_ANSWER_NOW", "0",
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def reasoning_loop_break_shadow() -> bool:
+    """When set, the loop-break guard only DETECTS + logs + counts — it never
+    interrupts the stream. The shadow-measure phase, mirroring
+    ``degeneration_shadow_only``: prove on live traffic that it never flags a
+    legitimate long deliberation before letting it act.
+
+    🚨 Default ON (shadow), deliberately the OPPOSITE of the degeneration
+    guard's default. That guard was calibrated on 12,899 real completions; this
+    one on 14 traces from a single prompt shape. The calibration gap is 3x
+    (worst loop 0.289 vs lowest healthy 0.891) and the corpus is thin, so the
+    honest posture is measure-then-act. Flip via
+    ``ROADSTEAD_PROXY_REASONING_LOOP_SHADOW=0`` once live counters show the
+    detector firing only on real loops."""
+    return os.environ.get(
+        "ROADSTEAD_PROXY_REASONING_LOOP_SHADOW", "1",
+    ).strip().lower() in ("1", "true", "yes", "on")
 
 
 def uniform_correction_enabled() -> bool:

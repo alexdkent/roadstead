@@ -167,3 +167,14 @@ _PAYLOAD_KIND = {
     "embedding": "embed",
     "rerank": "rerank",
 }
+
+
+#: Ceiling on the ANSWER-NOW re-ask (lifecycle._answer_now_stream) — the second
+#: call made after a reasoning loop is interrupted. Sized from the measured
+#: corpus, not guessed: the healthy traces on the lane that motivated this wrote
+#: complete answers of 4,549-13,612 characters, i.e. roughly 1,100-3,400 tokens.
+#: 8,000 is ~2.4x the largest observed answer, which leaves room for a longer one
+#: while making it impossible for the rescue to buy a second runaway hour. The
+#: whole point of the re-ask is that it is BOUNDED in a way the call it replaces
+#: was not.
+_ANSWER_NOW_MAX_TOKENS = 8000

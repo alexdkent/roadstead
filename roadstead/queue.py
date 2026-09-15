@@ -1819,6 +1819,13 @@ class PersistentQueue:
     #: a caller that under-budgets would otherwise manufacture backend-stall
     #: evidence — the same argument that excludes best-effort timeouts from the
     #: cooldown window.
+    #: `reasoning_loop` (2026-09-15) is deliberately NOT here either, and for a
+    #: different reason than the deadline family above: during a loop-break the
+    #: backend is perfectly healthy — decoding steadily, every watchdog
+    #: satisfied. That is WHY nothing else catches it. Filing it as backend-stall
+    #: evidence would let a MODEL behaviour cool an endpoint that is serving
+    #: everyone else fine, and would corrupt the one signal this list exists to
+    #: carry.
     STALL_ABORT_REASONS = ("stall", "ttft", "goodput_collapse")
 
     def stall_aborts(self, caller_prefix: str, since: float,

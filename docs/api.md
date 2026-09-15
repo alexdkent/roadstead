@@ -265,7 +265,7 @@ Query: `hours` (default 24, clamped to **0.1–168**).
 | `premature_unplanned` | int | `premature` minus the events that fell inside an operator maintenance window. |
 | `premature_foreground_unplanned` | int | …and of those, the P0–P2 subset. Background work (P3/P4) defers and retries silently by design, so this is the number that answers "is the fleet under pressure a user can feel?". |
 | `planned` | int | Events inside a maintenance window. 🚨 `premature` and `planned` are **independent flags that overlap** — a drained backend can also sever a call below its recommendation, and that event is counted in both. Do not subtract one from the other. |
-| `by_abort_reason` | object | `{reason: count}` fleet-wide, over the `stream` layer's four reasons. |
+| `by_abort_reason` | object | `{reason: count}` fleet-wide, over the `stream` layer's reasons. |
 | `rows` | list | One entry per `(endpoint, priority, layer)` cell, descending by `count`. |
 | `stream_extensions` | object | Process-lifetime counters read straight off the loop — **not** windowed, and reset by a restart. |
 | `maintenance_windows` | list | The windows `planned` was computed against: `{id, endpoint, started_at, ended_at, reason, operator, source}`. `ended_at` is `null` while a window is still open; `endpoint` is `*` for one covering every class. |
@@ -305,7 +305,7 @@ Query: `hours` (default 24, clamped to **0.1–168**).
 | `admission` | waiting to be admitted — it never reached a backend. Capacity. |
 | `client_wait` | admitted, then out of time on the deadline in force for it. |
 | `backend` | the backend failed or its transport deadline fired. |
-| `stream` | mid-stream, and `by_abort_reason` says which bound: `ttft` (accepted, never emitted a first token), `stall` (was emitting, then stopped), `hard_cap` (still healthy, cut for capacity) or `caller_deadline`. The first two are the substrate dying under a caller that did nothing wrong; the last two are Roadstead deciding to stop. |
+| `stream` | mid-stream, and `by_abort_reason` says which bound: `ttft` (accepted, never emitted a first token), `stall` (was emitting, then stopped), `reasoning_loop` (emitting steadily but repeating itself), `hard_cap` (still healthy, cut for capacity) or `caller_deadline`. The first two are the substrate dying under a caller that did nothing wrong; the last two are Roadstead deciding to stop. |
 
 **`abort_reason` is populated on every layer** as of 2026-09-12. 🚨 It was previously
 `stream`-only, and everywhere else defaulted to `NULL` — which is why one real endpoint wedge left
@@ -318,6 +318,7 @@ path nobody has named yet, and the count should be ~0.
 | `ttft` | `stream` | the backend accepted and never emitted a first token | **yes** |
 | `stall` | `stream` | tokens were flowing and stopped for the inter-token gap | **yes** |
 | `goodput_collapse` | `admission` | refused at the door: the endpoint's own engine counters said it was occupied and producing almost nothing (§3.13) | **yes** |
+| `reasoning_loop` | `stream` | the reasoning channel entered a long-period repetition cycle and stopped making progress. 🚨 Deliberately **not** a backend fault and deliberately **not** deferrable: the backend was healthy and decoding steadily — that is precisely why no watchdog catches it — and retrying an unchanged prompt reproduces the loop rather than escaping it (§3.14) | no — the model |
 | `hard_cap` | `stream` | a still-progressing stream cut off at the absolute cap | no — capacity |
 | `caller_deadline` | `stream` | the caller's own explicit wall, mid-stream | no — the caller's bound |
 | `sse_consumer_deadline` | `stream` | our SSE reader ran out of time waiting for the next frame. Distinct from every other `stream` reason, which are the producer's verdict about the backend | no |
@@ -2386,6 +2387,46 @@ The same trap §3.6 documents, in four more places. With no DB connection:
 
 `/v1/inflight` and `/v1/metrics/cost-model` read no DB at all and are unaffected — though the cost
 model is `{}` until startup registers the endpoints, which is the same "empty is not zero" reading.
+
+### 3.14 Reasoning loop-break — `abort_reason: reasoning_loop`
+
+**"The MODEL is stuck", which no watchdog and no goodput verdict can conclude.** A model can decode
+steadily, at full speed, while repeating itself — every timing bound is satisfied, the engine
+counters advance, the endpoint is healthy for everyone else. Measured on a reasoning tier
+2026-09-15: 4 of 6 top-rung draws on one hard prompt entered a self-verification cycle in the
+REASONING channel, consumed the entire `max_tokens` (up to 131,072) and returned **zero** answer
+characters — the worst for 1h04m of wall clock. Nothing in the timing family can see that, because
+nothing about it is slow.
+
+Roadstead watches the reasoning channel of a live stream and fires when a long-period repetition
+cycle establishes. Detection is the distinct-*n*-gram ratio over a trailing window, and **the window
+must exceed the cycle period** — that is the design, not a tuning preference. A loop whose period is
+longer than the window reads as perfectly diverse inside it: the same five traces scored 0.51-0.96
+at a 2,000-character window and 0.05-0.28 at 20,000. Too small a window does not weaken the
+detector, it inverts it.
+
+Every threshold is per-endpoint and **absent ⇒ off**; the detector arms only on a COMPLETE
+declaration, because a partial one leaves it inert and an inert detector reports exactly what a
+working one reports on a healthy fleet — nothing. Endpoint policy keys:
+`reasoning_loop_window_chars`, `reasoning_loop_min_chars`,
+`reasoning_loop_max_distinct_ratio`, `reasoning_loop_check_every_chars`.
+
+**Two actions, both off by default**, and deliberately NOT named here: a shadow switch limits the
+guard to detect-and-count, and an opt-in answer-now switch makes one further bounded, non-thinking
+call that writes the answer from the **pre-loop** notes and streams it to the caller. Their env-var
+spellings live in `docs/configuration.md` and are **not** part of the stable contract — this feature
+ships in shadow on a deliberately thin calibration corpus, and freezing its toggles into the
+compatibility surface on day one would promise a stability it has not earned. What IS contract is
+the abort reason below and the four endpoint policy keys above.
+
+🚨 **The notes are the head of the reasoning, never the tail** — the tail is the loop, and handing it
+back seeds the failure just interrupted. And the re-ask is a fresh turn rather than a forced
+reasoning-end for a measured reason: injecting an end string stops the **parser**, not the model,
+which is mid-thought and continues. Measured on the same lane, 2 firings of a forced end produced
+zero content once and 309,758 characters of scratchpad relabelled as the answer once.
+
+`abort_reason: reasoning_loop` is **not** a backend fault and **not** deferrable. Retrying an
+unchanged prompt on a lane that loops reproduces it.
 
 ### 3.13 Goodput collapse — `endpoints[].goodput` on `/v1/status`
 

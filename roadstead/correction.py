@@ -165,19 +165,213 @@ def _blank_ratio(text) -> float:
         return 0.0
 
 
-def _distinct_gram_ratio(text) -> float:
-    """Distinct `_DEGEN_TAIL_GRAM`-char shingle ratio over the tail — 1.0
-    ("diverse", never degenerate) when the tail is shorter than the gram, and
-    on any failure (fail-open). Total: never raises."""
+def distinct_gram_ratio_over(text, window: int, gram: int = _DEGEN_TAIL_GRAM) -> float:
+    """Distinct `gram`-char shingle ratio over the last `window` characters —
+    1.0 ("diverse", never degenerate) when the window is shorter than the gram,
+    and on any failure (fail-open). Total: never raises.
+
+    🚨 THE WINDOW MUST EXCEED THE CYCLE PERIOD YOU ARE TRYING TO DETECT, and
+    that is not a tuning preference — it is the difference between an
+    instrument and a confident wrong answer. A loop whose period is LONGER than
+    the window looks perfectly diverse inside it, because no shingle repeats
+    within one window's worth of text. Measured 2026-09-15 on a reasoning loop
+    of period 2,292-2,957 chars: this ratio reads **0.709-0.956** at the
+    `_DEGEN_TAIL_CHARS` (2,000) window — i.e. indistinguishable from healthy —
+    and **0.050-0.281** at 20,000. Same text, same statistic, opposite verdict.
+    See `_REASONING_LOOP_*` below for the calibrated long-window arm."""
     try:
-        tail = _degen_tail(text)
-        n = len(tail) - _DEGEN_TAIL_GRAM + 1
+        tail = (text or "")[-window:]
+        n = len(tail) - gram + 1
         if n <= 0:
             return 1.0
-        grams = {tail[i:i + _DEGEN_TAIL_GRAM] for i in range(n)}
+        grams = {tail[i:i + gram] for i in range(n)}
         return len(grams) / n
     except Exception:  # noqa: BLE001 — the guard is fail-open
         return 1.0
+
+
+def _distinct_gram_ratio(text) -> float:
+    """Distinct `_DEGEN_TAIL_GRAM`-char shingle ratio over the `_DEGEN_TAIL_CHARS`
+    tail. Thin alias for `distinct_gram_ratio_over` at the original window, kept
+    so the egress degeneration arm is byte-identical in behaviour."""
+    return distinct_gram_ratio_over(text, _DEGEN_TAIL_CHARS)
+
+
+# --- Reasoning LOOP detection over a live stream ----------------------------
+# A SECOND loop shape, disjoint from the egress degeneration arms above and
+# invisible to every one of them. Measured on tier3 (DeepSeek-V4-Flash) 2026-09-15,
+# N=6 draws at the top reasoning rung: 4 of 6 entered an escalating
+# self-verification loop inside the REASONING channel, burned the entire
+# max_tokens (up to 131,072) and emitted ZERO answer characters — one of them for
+# 1h04m of wall clock. The trace degenerates into a verbatim cycle
+# ("...Good.\n\nNeed maybe "candidate transitions" in size 4 table..."), exactly
+# repeated 6-8 times at periods of 2,292-2,957 characters.
+#
+# 🚨 WHY THE EXISTING ARMS CANNOT SEE IT — all three, for three different reasons:
+#   * word_shingle:  reps DO clear `_DEGEN_MIN_REPS` (1,237 on one trace), but the
+#                    fraction is 1237/37167 = 0.033, under `_DEGEN_MIN_FRACTION`
+#                    (0.10). A long-period cycle inside a very long body never
+#                    DOMINATES the body, which is what that arm requires.
+#   * blank_ratio:   0.137-0.175. This is dense prose, not a whitespace loop.
+#   * distinct_gram: 0.709-0.956 — reads HEALTHY, because its 2,000-char window is
+#                    SMALLER THAN THE CYCLE PERIOD. Nothing repeats inside one
+#                    window, so the tail looks diverse. Same statistic at a
+#                    20,000-char window: 0.050-0.281.
+# They are not mis-tuned; they answer a different question. Hence a new arm
+# rather than a threshold change to an existing one.
+#
+# CALIBRATION (labelled corpus, 14 real traces captured 2026-09-15):
+#   RUNAWAY (5): 0.106 · 0.102 · 0.281 · 0.131 · 0.050
+#   HEALTHY (9): 0.885 · 0.932 · 0.918 · 0.938 · 0.925 · 0.932 · 0.899 · 0.970 · 0.901
+# Worst runaway 0.281, best healthy 0.885 — a 3.1x gap with nothing in between.
+# The default threshold sits at 0.40: deliberately NEAR THE RUNAWAY END of that
+# gap, not at its midpoint (0.58), following the same asymmetry the
+# `_DEGEN_TAIL_MIN_DISTINCT` block argues for — a false positive destroys a
+# caller's legitimate long deliberation, a false negative costs one more runaway
+# that the max_tokens ceiling would have ended anyway.
+#
+# 🔑 THE MINIMUM LENGTH IS A SAFETY PROPERTY, NOT A PERFORMANCE ONE. This arm
+# cannot judge a body under `min_chars` (default 20,000 ≈ 4,500 tokens). Real
+# production reasoning traffic on this lane averages 413 output tokens
+# (n=457, measured 2026-09-15) — roughly 1,800 characters — so ordinary calls are
+# STRUCTURALLY outside this detector's reach. It can only ever fire on a body
+# already an order of magnitude past normal.
+_REASONING_LOOP_WINDOW_CHARS = 20000
+_REASONING_LOOP_MIN_CHARS = 20000
+_REASONING_LOOP_MAX_DISTINCT = 0.40
+_REASONING_LOOP_CHECK_EVERY_CHARS = 4000
+#: How much of the EARLY reasoning to retain for an answer-now re-ask. Sized
+#: from the measured corpus: the healthy traces reached a complete answer off
+#: 37,000-61,000 chars of reasoning, and the runaways were still productive for
+#: roughly their first 20,000 before the cycle established (the detector does not
+#: fire until 52,000-68,000). 12,000 chars is ~2,700 tokens of notes — enough to
+#: carry the setup and the working, small enough that the re-ask prefill is
+#: negligible against the hour it replaces.
+_REASONING_LOOP_HEAD_CHARS = 12000
+
+
+class ReasoningLoopDetector:
+    """Streaming detector for a long-period repetition loop in the REASONING
+    channel. Fed reasoning deltas as they arrive; reports the first moment the
+    accumulated tail looks like a cycle.
+
+    Bounded memory by construction: only the last `window` characters are kept,
+    so a two-hour stream costs the same as a two-second one. Checks run every
+    `check_every` characters rather than per-delta — the ratio is O(window) and a
+    per-token recompute would be the most expensive thing on the stream path.
+
+    Total: every method is fail-open (never raises, never fires on error). A
+    detector fault must not abort a live stream that is doing fine.
+
+    DISARMED unless the caller passes positive thresholds — `armed` is False for
+    the default (all-zero) construction, so an endpoint that declares nothing
+    gets byte-identical behaviour to before this existed."""
+
+    __slots__ = ("_window", "_min_chars", "_max_distinct", "_check_every",
+                 "_buf", "_buf_len", "_seen", "_next_check", "_verdict",
+                 "_head", "_head_len", "_head_cap")
+
+    def __init__(self, *, window: int = 0, min_chars: int = 0,
+                 max_distinct: float = 0.0, check_every: int = 0) -> None:
+        self._window = int(window or 0)
+        self._min_chars = int(min_chars or 0)
+        self._max_distinct = float(max_distinct or 0.0)
+        # NO silent fallback to the module default here. An endpoint that
+        # declares three of the four thresholds has not configured this guard,
+        # and quietly supplying the fourth from a constant nobody chose is how a
+        # partial declaration becomes a live detector running on numbers that
+        # were never calibrated for it.
+        self._check_every = int(check_every or 0)
+        self._buf: list = []
+        # 🚨 TWO COUNTERS, DELIBERATELY. `_seen` is monotonic (every reasoning
+        # char ever fed); `_buf_len` is what the trimmed window currently holds.
+        # Conflating them is a real bug this class shipped with for one revision:
+        # the trim reset the single counter back to the window size, so it never
+        # again reached `_next_check` and the detector went permanently silent
+        # after the first trim. It caught 1 of 5 known loops and reported ZERO
+        # false positives — a guard that cannot fire is indistinguishable from a
+        # guard that is working, which is exactly what the corpus test exists to
+        # expose. Never let a scheduling counter share a variable with a buffer
+        # length.
+        self._buf_len = 0
+        self._seen = 0
+        self._next_check = max(self._min_chars, 1)
+        self._verdict: dict | None = None
+        # 🚨 THE HEAD, NOT THE TAIL, IS THE USABLE MATERIAL. Kept for the
+        # answer-now re-ask. The tail is the LOOP — handing the model back its
+        # own repeating cycle and asking it to conclude seeds the exact failure
+        # we just interrupted. The head is the productive deliberation from
+        # before the cycle established, which is what a person would keep.
+        # Bounded and write-once-full: a two-hour stream costs the same as a
+        # two-second one.
+        self._head: list = []
+        self._head_len = 0
+        self._head_cap = _REASONING_LOOP_HEAD_CHARS
+
+    @property
+    def armed(self) -> bool:
+        """True only when every threshold is positively declared. Absent or
+        partial declaration => inert, and `feed` short-circuits immediately."""
+        return (self._window > 0 and self._min_chars > 0
+                and self._check_every > 0
+                and 0.0 < self._max_distinct < 1.0)
+
+    @property
+    def head(self) -> str:
+        """The first `_REASONING_LOOP_HEAD_CHARS` of reasoning — the productive
+        deliberation from before the cycle established. The material an
+        answer-now re-ask should be given; see `_head` for why not the tail."""
+        try:
+            return "".join(self._head)
+        except Exception:  # noqa: BLE001 — fail-open
+            return ""
+
+    @property
+    def verdict(self) -> dict | None:
+        """The evidence dict from the first firing check, or None."""
+        return self._verdict
+
+    def feed(self, delta) -> dict | None:
+        """Accumulate one reasoning delta; return the verdict dict the first
+        time the tail looks like a cycle, else None. Idempotent after firing."""
+        if not self.armed or self._verdict is not None:
+            return None
+        try:
+            # Type-check AT THE DOOR, not in the try/except below. A non-str
+            # delta appended to the buffer poisons every later `"".join(...)`,
+            # so the detector would fail open FOREVER rather than for one call —
+            # permanently silent, and silence is this guard's success signal.
+            if not delta or not isinstance(delta, str):
+                return None
+            if self._head_len < self._head_cap:
+                room = self._head_cap - self._head_len
+                self._head.append(delta[:room])
+                self._head_len += min(len(delta), room)
+            self._buf.append(delta)
+            self._buf_len += len(delta)
+            self._seen += len(delta)
+            # Trim to the window, keeping the JOIN cost amortised: only collapse
+            # when the buffer has grown meaningfully past what we need.
+            if self._buf_len > self._window * 2:
+                tail = "".join(self._buf)[-self._window:]
+                self._buf = [tail]
+                self._buf_len = len(tail)
+            if self._seen < self._min_chars or self._seen < self._next_check:
+                return None
+            self._next_check = self._seen + self._check_every
+            text = "".join(self._buf)
+            ratio = distinct_gram_ratio_over(text, self._window)
+            if ratio > self._max_distinct:
+                return None
+            self._verdict = {
+                "distinct_gram_ratio": round(ratio, 4),
+                "window_chars": self._window,
+                "threshold": self._max_distinct,
+                "reasoning_chars_seen": self._seen,
+            }
+            return self._verdict
+        except Exception:  # noqa: BLE001 — a detector fault must never kill a stream
+            return None
 
 
 def _degeneracy_evidence(text) -> dict:

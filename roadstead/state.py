@@ -117,6 +117,17 @@ class ProxyState:
         # genuinely frozen backend; one that is tells you the watchdog saved a
         # turn it used to kill. Without it the fix is unobservable.
         self.stream_progress_extensions = 0
+        # Reasoning loop-break (correction.ReasoningLoopDetector). Counted
+        # separately from the action so shadow mode is legible: `detected` rises
+        # in both modes, `broken` only when the guard actually interrupted.
+        # A detected-but-never-broken gap IS the shadow measurement.
+        self.reasoning_loops_detected = 0
+        self.reasoning_loops_broken = 0
+        # Loops that were interrupted AND successfully re-asked into an
+        # answer. `broken - answered` is the population that still
+        # returned nothing, which is the number that says whether the
+        # rescue is worth its second call.
+        self.reasoning_loops_answered = 0
         self.budget_mgr = BudgetManager(starvation_timeout_s=config.starvation_timeout_s)
         # Money (roadmap Workstream D). The price book is seeded from the
         # catalog and then kept current by capacity discovery on any provider

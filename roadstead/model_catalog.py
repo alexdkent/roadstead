@@ -555,6 +555,14 @@ _POLICY_PASSTHROUGH = (
     # max_tokens on the `thinking:` opt-in. Absent/0 = use the global. Guarded by
     # test_reasoning_tuning.py::test_thinking_budget_override_reaches_endpoint_config.
     "thinking_reasoning_budget",
+    # Reasoning LOOP-BREAK thresholds (correction.ReasoningLoopDetector). All
+    # four must be positive for the detector to arm; absent/partial = inert.
+    # Guarded by
+    # test_reasoning_loop_policy.py::test_loop_thresholds_reach_endpoint_config.
+    "reasoning_loop_window_chars",
+    "reasoning_loop_min_chars",
+    "reasoning_loop_max_distinct_ratio",
+    "reasoning_loop_check_every_chars",
     # Marks the endpoint backing the conversational lane, which is what
     # `/readyz` fails closed on. Guarded by
     # test_readyz.py::test_readiness_critical_flag_reaches_endpoint_config.

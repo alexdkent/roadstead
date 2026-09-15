@@ -37,10 +37,14 @@ from .config import (
     LLMPriority,
     PriorityBand,
     normalize_endpoint,
+    reasoning_loop_answer_now,
+    reasoning_loop_break_enabled,
+    reasoning_loop_break_shadow,
     structured_validity_guard_enabled,
     uniform_correction_enabled,
 )
 from .constants import (
+    _ANSWER_NOW_MAX_TOKENS,
     _DEFAULT_TIMEOUT_S,
     _MIN_RETRY_BUDGET_S,
     _PAYLOAD_KIND,
@@ -57,6 +61,7 @@ from .constants import (
 )
 from .correction import (
     _EMPTY_RESCUE_MIN_TOKENS,
+    ReasoningLoopDetector,
     _ToolCallStreamSanitizer,
     _chat_completion_text,
     _degeneracy_evidence,
@@ -2002,6 +2007,22 @@ class Lifecycle:
             stream_structured and self.correction.request_expects_json(req))
         accumulate = uniform_on or stream_expects_json
         accumulated_content = ""
+        # Reasoning LOOP-BREAK (2026-09-15). Built from the ENDPOINT's declared
+        # thresholds; an endpoint that declares none builds an inert detector
+        # (`armed` False) and `feed` short-circuits on its first line, so an
+        # undeclared lane pays one attribute check per chunk and nothing else.
+        # Deliberately NOT gated on `accumulate`: that flag is about reassembling
+        # CONTENT for structured-output repair, and this watches REASONING, which
+        # is a different channel with a different failure. Tying them would make
+        # the loop guard silently depend on whether the caller wanted JSON.
+        loop_detector = ReasoningLoopDetector(
+            window=getattr(ep_cfg, "reasoning_loop_window_chars", 0),
+            min_chars=getattr(ep_cfg, "reasoning_loop_min_chars", 0),
+            max_distinct=getattr(ep_cfg, "reasoning_loop_max_distinct_ratio", 0.0),
+            check_every=getattr(ep_cfg, "reasoning_loop_check_every_chars", 0),
+        ) if reasoning_loop_break_enabled() else ReasoningLoopDetector()
+        loop_broken = False
+        answer_now = False
 
         # Phase 1.5: bound the stream to the caller's remaining deadline so an
         # abandoned stream can't hold its slot past the SLA.
@@ -2120,11 +2141,53 @@ class Lifecycle:
                                 fr = choices[0].get("finish_reason")
                                 if fr:
                                     last_finish_reason = fr
+                                delta = choices[0].get("delta")
                                 if accumulate:
-                                    delta = choices[0].get("delta")
                                     piece = delta.get("content") if isinstance(delta, dict) else None
                                     if isinstance(piece, str):
                                         accumulated_content += piece
+                                if loop_detector.armed and isinstance(delta, dict):
+                                    # BOTH spellings, always. vLLM's deepseek_v4
+                                    # parser emits `reasoning`; other lanes emit
+                                    # `reasoning_content`. Reading one is how a
+                                    # 23-minute trace measured as "no reasoning".
+                                    rc = delta.get("reasoning")
+                                    if not isinstance(rc, str):
+                                        rc = delta.get("reasoning_content")
+                                    verdict = loop_detector.feed(rc)
+                                    if verdict is not None:
+                                        self.state.reasoning_loops_detected += 1
+                                        shadow = reasoning_loop_break_shadow()
+                                        logger.warning(
+                                            "ROADSTEAD_REASONING_LOOP%s endpoint=%s "
+                                            "call_site=%s request_id=%s elapsed_s=%.1f "
+                                            "reasoning_chars=%d distinct_gram_ratio=%.4f "
+                                            "window=%d threshold=%.2f — the reasoning "
+                                            "channel is repeating a long cycle and is not "
+                                            "making progress",
+                                            "_SHADOW" if shadow else "_BROKEN",
+                                            req.endpoint, req.call_site or "?",
+                                            req.request_id, time.monotonic() - t0,
+                                            verdict["reasoning_chars_seen"],
+                                            verdict["distinct_gram_ratio"],
+                                            verdict["window_chars"], verdict["threshold"],
+                                        )
+                                        if not shadow:
+                                            self.state.reasoning_loops_broken += 1
+                                            loop_broken = True
+                                            # BREAK, don't raise, when a rescue is
+                                            # available: raising lands in the
+                                            # except block, which emits an error
+                                            # frame and returns — there is no path
+                                            # from there to an answer. Breaking
+                                            # leaves the stream open and falls
+                                            # through to the re-ask below, which
+                                            # itself falls back to the error if it
+                                            # cannot produce anything.
+                                            if reasoning_loop_answer_now():
+                                                answer_now = True
+                                                break
+                                            raise asyncio.TimeoutError
                         if not usage_only:
                             # Normalise a coalesced finish chunk into the
                             # canonical content-then-terminal pair. `None`
@@ -2170,7 +2233,25 @@ class Lifecycle:
             # cap is ALSO recognised by elapsed time. Without that second arm a
             # cap abort silently reports itself as a caller deadline — which is
             # exactly what the hard-cap test caught.
-            if ttft_ms is None and isinstance(exc, asyncio.TimeoutError):
+            # 🚨 MOST SPECIFIC OF ALL, AND IT MUST LEAD. A loop-break is the one
+            # abort here that is NOT a timing verdict: the stream was producing
+            # tokens steadily and every watchdog was satisfied — that is precisely
+            # why nothing else stops it. Let it fall through to the timing arms
+            # below and it reports as `stall` or `caller_deadline`, i.e. as a
+            # backend problem, and the operator loses the only signal that says
+            # the model was looping. A deferrable "backpressure" label would be
+            # actively wrong too: retrying an unchanged prompt on a lane that
+            # loops ~2 in 3 at this rung reproduces it.
+            if loop_broken:
+                abort_reason = "reasoning_loop"
+                err = ("backend reasoning entered a repeating cycle and stopped "
+                       "making progress; aborted after "
+                       f"{loop_detector.verdict['reasoning_chars_seen']} reasoning "
+                       "chars (distinct_gram_ratio "
+                       f"{loop_detector.verdict['distinct_gram_ratio']} over "
+                       f"{loop_detector.verdict['window_chars']} chars)")
+                watchdog = True
+            elif ttft_ms is None and isinstance(exc, asyncio.TimeoutError):
                 abort_reason = "ttft"
                 err = ("backend produced no output within "
                        f"{ttft_deadline_s:.0f}s (ttft timeout) — backpressure")
@@ -2219,6 +2300,35 @@ class Lifecycle:
             # already exited raises. Cancel is idempotent on a finished task.
             if progress_probe is not None:
                 progress_probe.cancel()
+
+        # ANSWER NOW. The reasoning loop was interrupted above and the stream
+        # deliberately left OPEN; make the one bounded re-ask that turns an
+        # interrupted loop into the answer it never reached. Placed here, after
+        # the try/except/finally, because by this point the progress probe is
+        # cancelled and the original timeout context is closed — the rescue must
+        # not run under a watchdog armed for the call it is replacing.
+        if answer_now:
+            remaining = hard_limit_s - (time.monotonic() - t0)
+            extra, rescued_done = await self._answer_now_stream(
+                req, ep_cfg, loop_detector.head, stream_q, remaining,
+            )
+            if extra or rescued_done:
+                output_tokens += extra
+                saw_backend_done = saw_backend_done or rescued_done
+                last_finish_reason = last_finish_reason or "stop"
+            else:
+                # The rescue produced nothing. Fail the way the break alone would
+                # have: a correctly-labelled loop error, never a silent clean
+                # 'done' over a stream that carries reasoning and no answer.
+                v = loop_detector.verdict or {}
+                await stream_q.put({"type": "error", "error": (
+                    "backend reasoning entered a repeating cycle and stopped "
+                    f"making progress after {v.get('reasoning_chars_seen', 0)} "
+                    "reasoning chars; the answer-now re-ask returned nothing")})
+                duration = time.monotonic() - t0
+                self.record_completion(req, decision, duration, input_tokens,
+                                       output_tokens, "error")
+                return
 
         duration = time.monotonic() - t0
         # A stream that COMPLETED past its soft budget is the whole point of the
@@ -2369,6 +2479,107 @@ class Lifecycle:
         # self-gated on the flag; no-op when uniform correction is off.
         if uniform_on:
             self.correction.finalize_stream(req, accumulated_content, last_finish_reason)
+    async def _answer_now_stream(
+        self, req: QueuedRequest, ep_cfg, notes: str, stream_q,
+        timeout_s: float,
+    ) -> tuple[int, bool]:
+        """ANSWER NOW: after a reasoning loop was interrupted, make ONE more
+        backend call that writes the answer the looping call never reached, and
+        relay its chunks into the SAME stream the client is already reading.
+
+        Returns ``(output_tokens, saw_done)``. **Never raises** — every failure
+        returns ``(0, False)`` so the caller falls back to emitting the
+        loop-break error. A rescue that can itself break the stream is not a
+        rescue.
+
+        WHY A SECOND CALL AND NOT A FORCED reasoning-end. vLLM can inject
+        ``reasoning_end_str`` at a token budget, and on this model that was
+        measured 2026-09-15 to produce, in 2 of 2 firings, either ZERO content or
+        309,758 characters of scratchpad prose relabelled as the answer — because
+        a forced end stops the PARSER, not the model, which was mid-thought and
+        simply continues. A fresh turn is not mid-thought: it is asked to write a
+        document from notes, which is a task it completes normally.
+
+        🚨 THE NOTES ARE THE HEAD OF THE REASONING, NEVER THE TAIL. The tail is
+        the loop; handing it back and asking for a conclusion seeds the failure
+        we just interrupted. See ``ReasoningLoopDetector.head``.
+
+        THINKING IS EXPLICITLY OFF on this turn. Leaving it on re-enters the
+        regime that just looped, and there is nothing left to deliberate about —
+        the deliberation is in the notes."""
+        try:
+            payload = req.payload
+            if not isinstance(payload, dict):
+                return 0, False
+            messages = list(payload.get("messages") or [])
+            if not messages or not notes.strip():
+                return 0, False
+            # Budget: the answer only. The looping call's allowance was sized for
+            # reasoning it will now not do, and an unbounded re-ask could loop in
+            # its own right — the one thing this must not do is buy a second hour.
+            answer_max = min(
+                int(payload.get("max_tokens") or _ANSWER_NOW_MAX_TOKENS),
+                _ANSWER_NOW_MAX_TOKENS,
+            )
+            second = {
+                **{k: v for k, v in payload.items()
+                   if k not in ("messages", "max_tokens", "chat_template_kwargs",
+                                "thinking_token_budget", "reasoning_budget_tokens")},
+                "messages": messages + [{
+                    "role": "user",
+                    "content": (
+                        "You already worked through this problem. Your working "
+                        "notes are below.\n\n<notes>\n" + notes.strip() +
+                        "\n</notes>\n\nWrite the final answer now, in full, using "
+                        "those notes. Do not deliberate further and do not "
+                        "explain your process — produce the answer itself."
+                    ),
+                }],
+                "max_tokens": answer_max,
+                "stream": True,
+                # Off on BOTH spellings: which key a template reads is per-model,
+                # and sending only one leaves reasoning on wherever the other is
+                # the live switch.
+                "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
+            }
+            out_tokens = 0
+            saw_done = False
+            relayed = 0
+            async for event in self.state.backend.stream(
+                ep_cfg, second, req.payload_type,
+                f"{req.request_id}-answernow", timeout_s=max(5.0, timeout_s),
+            ):
+                if event.event_type == "chunk":
+                    if event.parsed:
+                        usage = event.parsed.get("usage")
+                        if usage:
+                            out_tokens = coerce_token_count(
+                                usage.get("completion_tokens"), out_tokens)
+                    relayed += 1
+                    await stream_q.put({"type": "chunk", "data": event.data})
+                elif event.event_type == "done":
+                    saw_done = True
+                    break
+            logger.info(
+                "ROADSTEAD_ANSWER_NOW endpoint=%s call_site=%s request_id=%s "
+                "notes_chars=%d answer_max_tokens=%d chunks=%d output_tokens=%d "
+                "saw_done=%s — reasoning loop was interrupted and the answer "
+                "re-asked from the pre-loop notes",
+                req.endpoint, req.call_site or "?", req.request_id,
+                len(notes), answer_max, relayed, out_tokens, saw_done,
+            )
+            if relayed == 0:
+                return 0, False
+            self.state.reasoning_loops_answered += 1
+            return out_tokens, saw_done
+        except Exception:  # noqa: BLE001 — a rescue must never break the stream
+            logger.warning(
+                "ROADSTEAD_ANSWER_NOW_FAILED endpoint=%s request_id=%s — falling "
+                "back to the loop-break error",
+                req.endpoint, getattr(req, "request_id", "?"), exc_info=True,
+            )
+            return 0, False
+
     def _stream_hard_cap_s(self, req: QueuedRequest) -> float:
         """Absolute ceiling (seconds) on a PROXY-CHOSEN streaming deadline that
         token progress keeps extending.
