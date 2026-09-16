@@ -226,6 +226,42 @@ class EndpointConfig:
     #: prompt size, and not a constant that is generous for one caller and starving
     #: for the next.
     thinking_budget_ratio: float = 0.0
+    #: --- Thinking-mode SAMPLING (2026-09-16) ---------------------------------
+    #: Decode temperature / top_p to apply to a call that has REASONING ON, when
+    #: the caller expressed no sampling preference of its own. Negative =
+    #: undeclared = inject nothing, which is the behaviour every endpoint had
+    #: before this field existed. 0.0 is a LEGAL declared value (greedy), which
+    #: is why the sentinel is -1.0 and not 0.
+    #:
+    #: 🚨 WHY THIS IS A POLICY KNOB AND NOT A CALLER CONCERN. A reasoning model's
+    #: failure mode at low temperature is not a worse answer, it is NO answer: an
+    #: easy CYCLIC continuation out-competes a hard progress-making one, and that
+    #: competition is amplified as temperature falls (arXiv 2512.12895). Measured
+    #: on a DeepSeek-V4-Flash reasoner 2026-09-15, one hard prompt, greedy decode:
+    #: 4 of 6 draws entered a self-verification cycle inside the reasoning channel,
+    #: burned the entire max_tokens (up to 131,072) and returned ZERO answer
+    #: characters — worst case 1h04m of GPU for nothing. At the vendor's published
+    #: recipe (0.6 / 0.95) the same prompt converged 3 of 3 in 10-14 minutes. The
+    #: number that decides whether a long reasoning run produces an answer is
+    #: therefore a property of the ENDPOINT's weights, which is here, not of the
+    #: call site, which cannot know it.
+    #:
+    #: ⚠️ IT DOES NOT COME FROM THE WEIGHTS DIRECTORY, so do not "fix" this by
+    #: pointing the server at its own generation config. Verified 2026-09-16 on the
+    #: serving host: deepseek-v4-flash-0731/generation_config.json declares
+    #: temperature 1.0 / top_p 1.0 — byte-identical to vLLM's neutral defaults
+    #: (_DEFAULT_SAMPLING_PARAMS), so `--generation-config auto` and
+    #: `--generation-config vllm` produce the SAME decode. The 0.6/0.95 recipe
+    #: lives only in the model card's prose. An operator declaration is the only
+    #: place it can come from.
+    #:
+    #: A CALLER'S OWN PIN WINS, same rule as reasoning_effort: this is a default
+    #: for a caller that opted into thinking and said nothing about sampling, not
+    #: an override of one that did. That deliberately leaves a client which always
+    #: writes a temperature (even its own default) unreachable by this knob — the
+    #: fix for that belongs in the client, not in an override here.
+    thinking_temperature: float = -1.0
+    thinking_top_p: float = -1.0
     #: --- Reasoning LOOP-BREAK thresholds (2026-09-15) ------------------------
     #: All four must be POSITIVE for the detector to arm; absent or partial =>
     #: no detector is constructed and behaviour is byte-identical to before it

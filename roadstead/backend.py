@@ -294,7 +294,9 @@ class BackendClientPool:
                     model_id=ep_cfg.effective_model_id,
                     thinking_budget_ratio=ep_cfg.thinking_budget_ratio,
                     thinking_kwargs=ep_cfg.thinking_kwargs,
-                    reasoning_budget_tokens=ep_cfg.reasoning_budget_tokens)
+                    reasoning_budget_tokens=ep_cfg.reasoning_budget_tokens,
+                    thinking_temperature=ep_cfg.thinking_temperature,
+                    thinking_top_p=ep_cfg.thinking_top_p)
         except ProviderError as exc:
             raise BackendError(
                 400, f"backend {ep_cfg.role} ({provider.name}): {exc}")
@@ -399,7 +401,9 @@ class BackendClientPool:
                     model_id=ep_cfg.effective_model_id,
                     thinking_budget_ratio=ep_cfg.thinking_budget_ratio,
                     thinking_kwargs=ep_cfg.thinking_kwargs,
-                    reasoning_budget_tokens=ep_cfg.reasoning_budget_tokens)
+                    reasoning_budget_tokens=ep_cfg.reasoning_budget_tokens,
+                    thinking_temperature=ep_cfg.thinking_temperature,
+                    thinking_top_p=ep_cfg.thinking_top_p)
         except ProviderError as exc:
             raise BackendError(
                 400, f"backend {ep_cfg.role} ({provider.name}): {exc}")

@@ -161,6 +161,8 @@ class OpenRouterProvider(Provider):
         thinking_budget_ratio: float = 0.0,
         thinking_kwargs: tuple[str, ...] = (),
         reasoning_budget_tokens: int = 0,
+        thinking_temperature: float = -1.0,
+        thinking_top_p: float = -1.0,
     ) -> dict:
         """Reduce a payload shaped for our own engines to plain OpenAI chat.
 

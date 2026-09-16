@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 from .base import CapacityReport, Provider, ProviderDescriptor
 from .payload import (
     _apply_thinking_token_budget,
+    _apply_thinking_sampling,
     _has_anthropic_image_block,
     _needs_alternation_fix,
     _normalize_strict_alternation,
@@ -84,6 +85,8 @@ class LlamaCppProvider(Provider):
         thinking_budget_ratio: float = 0.0,
         thinking_kwargs: tuple[str, ...] = (),
         reasoning_budget_tokens: int = 0,
+        thinking_temperature: float = -1.0,
+        thinking_top_p: float = -1.0,
     ) -> dict:
         """Make an Anthropic/extra_body-shaped chat payload wire-correct for
         llama-server.
@@ -124,6 +127,11 @@ class LlamaCppProvider(Provider):
             # `reasoning_budget_tokens` silently never reaches the wire —
             # the same shape of no-op the declaration exists to fix.
             and not (reasoning_budget_tokens > 0)
+            # Same trap, third instance: a declared thinking sampling pin on a
+            # payload with nothing else to repair must not be short-circuited
+            # away. Cheap to test here and impossible to notice if wrong — the
+            # endpoint would simply keep decoding at the engine default.
+            and not (thinking_temperature >= 0 or thinking_top_p >= 0)
         ):
             return payload
         p = dict(payload)
@@ -155,6 +163,12 @@ class LlamaCppProvider(Provider):
             p, thinking_budget_ratio,
             field=self.descriptor.reasoning_budget_field,
             absolute=reasoning_budget_tokens)
+        # AFTER the extra_body merge and the thinking-switch default above, so
+        # the predicate reads the switch as it will actually go on the wire —
+        # including a caller's switch that arrived nested in extra_body, and
+        # including the explicit False this provider writes for everyone else.
+        _apply_thinking_sampling(
+            p, temperature=thinking_temperature, top_p=thinking_top_p)
         return p
 
     async def discover_capacity(

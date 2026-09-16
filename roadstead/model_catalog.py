@@ -540,6 +540,14 @@ _POLICY_PASSTHROUGH = (
     # it, and 400s the request instead). Absent/0 = inject nothing, which is
     # what every endpoint except a reasoner wants.
     "thinking_budget_ratio",
+    # Decode temperature / top_p for a call that has REASONING ON, applied only
+    # when the caller sent none. Negative/absent = inject nothing. This is the
+    # only place the vendor's published thinking recipe can enter the system: the
+    # served weights' own generation_config.json carries the engine's neutral
+    # defaults, so no --generation-config setting can supply it. Guarded by
+    # test_reasoning_tuning.py::test_thinking_sampling_reaches_endpoint_config.
+    "thinking_temperature",
+    "thinking_top_p",
     # ABSOLUTE reasoning cap in tokens, sent under the engine's own wire name
     # (ProviderDescriptor.reasoning_budget_field). Unlike the ratio above it needs
     # no launch flag on llama.cpp. Absent/0 = inject nothing. Guarded by

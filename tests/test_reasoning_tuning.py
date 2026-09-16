@@ -39,6 +39,7 @@ import pytest
 
 from roadstead import model_catalog
 from roadstead.providers import LLAMACPP, VLLM
+from roadstead.providers import payload
 from roadstead.providers.payload import (
     _THINKING_BUDGET_FLOOR,
     _apply_thinking_token_budget,
@@ -280,3 +281,111 @@ def test_the_int_form_is_capped_by_the_declared_headroom_not_the_global():
     p = {"messages": [], "max_tokens": 1400, "thinking": 6000}
     m.apply_thinking(_req(p))
     assert p["max_tokens"] == 3400
+
+
+# =========================================================================
+# Thinking-mode SAMPLING (2026-09-16)
+# =========================================================================
+#
+# WHY THESE EXIST AT ALL. The knob decides whether a long reasoning run
+# produces an answer or burns its whole budget cycling and returns nothing —
+# measured 4/6 runaway at greedy decode against 0/3 at the vendor recipe on
+# one hard prompt. Every failure mode of a knob like that is SILENT: a key
+# dropped by the passthrough allowlist, a payload short-circuited out of the
+# provider before the injector runs, or a predicate that fires on an ordinary
+# call all look identical from outside — the endpoint simply keeps decoding
+# at the engine default and nobody learns otherwise until a two-hour run
+# comes back empty. So each is sabotaged separately below rather than covered
+# by one end-to-end assertion that any of them would satisfy.
+
+def test_thinking_sampling_reaches_endpoint_config():
+    """The allowlist half. A key absent from `_POLICY_PASSTHROUGH` is dropped in
+    SILENCE by design, so the declaration would read fine in models.yaml and
+    mean nothing."""
+    from roadstead.config import EndpointConfig
+
+    entry = model_catalog.EndpointEntry(
+        name="probe", provider="p", kind="chat",
+        policy={"thinking_temperature": 0.6, "thinking_top_p": 0.95},
+    )
+    kw = model_catalog.build_endpoint_kwargs(entries=[entry])["probe"]
+    assert kw["thinking_temperature"] == 0.6
+    assert kw["thinking_top_p"] == 0.95
+    ep = EndpointConfig(**{k: v for k, v in kw.items()
+                           if k in EndpointConfig.__dataclass_fields__})
+    assert ep.thinking_temperature == 0.6
+    assert ep.thinking_top_p == 0.95
+
+
+def test_undeclared_sampling_is_inert():
+    """The default must be indistinguishable from the field not existing."""
+    from roadstead.config import EndpointConfig
+
+    ep = EndpointConfig(endpoint_class="probe", role="probe")
+    assert ep.thinking_temperature < 0 and ep.thinking_top_p < 0
+    p = {"messages": [], "chat_template_kwargs": {"thinking": True}}
+    payload._apply_thinking_sampling(
+        p, temperature=ep.thinking_temperature, top_p=ep.thinking_top_p)
+    assert "temperature" not in p and "top_p" not in p
+
+
+def test_zero_is_a_declarable_temperature():
+    """0.0 is greedy, a legal thing to pin — which is why the sentinel is -1.0.
+    A `> 0` test here would silently drop exactly the declaration an operator
+    makes to REPRODUCE the runaway rather than avoid it."""
+    p = {"chat_template_kwargs": {"thinking": True}}
+    payload._apply_thinking_sampling(p, temperature=0.0, top_p=-1.0)
+    assert p["temperature"] == 0.0
+    assert "top_p" not in p
+
+
+def test_sampling_is_not_applied_to_an_ordinary_call():
+    """The predicate has to read the switch's VALUE. The vLLM provider writes
+    `thinking: False` into every non-opted-in payload on a reasoning-capable
+    endpoint, so a presence test would repaint the decode of ~99% of that
+    endpoint's traffic — none of which asked to reason."""
+    for ck in ({"thinking": False}, {"enable_thinking": False}, {}):
+        p = {"chat_template_kwargs": dict(ck)}
+        payload._apply_thinking_sampling(p, temperature=0.6, top_p=0.95)
+        assert "temperature" not in p, ck
+        assert "top_p" not in p, ck
+
+
+def test_a_callers_own_sampling_wins():
+    """Fill-if-absent. A judge or grammar-constrained caller that sent 0 is not
+    asking to be made creative because it also asked to reason."""
+    p = {"chat_template_kwargs": {"thinking": True},
+         "temperature": 0.0, "top_p": 1.0}
+    payload._apply_thinking_sampling(p, temperature=0.6, top_p=0.95)
+    assert p["temperature"] == 0.0
+    assert p["top_p"] == 1.0
+
+
+def test_switch_nested_in_extra_body_is_seen():
+    """dsh sets chat_template_kwargs directly and never touches the `thinking:`
+    opt-in, so keying off the opt-in alone would miss a real reasoning caller."""
+    p = {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
+    payload._apply_thinking_sampling(p, temperature=0.6, top_p=0.95)
+    assert p["temperature"] == 0.6
+
+
+def test_declared_sampling_survives_a_payload_with_nothing_else_to_repair():
+    """The short-circuit half, through the REAL provider. A payload carrying no
+    system/extra_body/grammar returns early; if that guard does not name the
+    sampling declaration, the knob is a documented no-op — the same shape of
+    silent drop `reasoning_budget_tokens` already had to be rescued from."""
+    p = VLLM.prepare_chat_payload(
+        {"messages": [{"role": "user", "content": "hi"}],
+         "chat_template_kwargs": {"thinking": True}},
+        thinking_temperature=0.6, thinking_top_p=0.95)
+    assert p["temperature"] == 0.6
+    assert p["top_p"] == 0.95
+
+
+def test_provider_does_not_mutate_the_callers_payload():
+    """Corpus capture stores req.payload and the retry path re-sends it."""
+    original = {"messages": [{"role": "user", "content": "hi"}],
+                "chat_template_kwargs": {"thinking": True}}
+    VLLM.prepare_chat_payload(
+        original, thinking_temperature=0.6, thinking_top_p=0.95)
+    assert "temperature" not in original

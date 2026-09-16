@@ -188,6 +188,57 @@ def _has_thinking_kwarg(payload: dict) -> bool:
     return False
 
 
+def _thinking_is_on(payload: dict) -> bool:
+    """True when reasoning is switched ON in this payload.
+
+    Deliberately NOT `_has_thinking_kwarg`, which answers a different question:
+    that one is True when a switch is PRESENT at any value, because its callers
+    want "did the caller pin this, whichever way?". Sampling has to key on the
+    switch being TRUE — the whole point is to decode a reasoning trace, and a
+    payload carrying ``thinking: False`` (which the vLLM provider writes into
+    every non-opted-in request by default) is an ordinary call that must keep
+    the engine's ordinary sampling.
+    """
+    for container in (payload, payload.get("extra_body")):
+        if isinstance(container, dict):
+            ck = container.get("chat_template_kwargs")
+            if isinstance(ck, dict):
+                for name in _THINKING_KWARG_NAMES:
+                    if ck.get(name) is True:
+                        return True
+    return False
+
+
+def _apply_thinking_sampling(p: dict, *, temperature: float, top_p: float) -> None:
+    """Fill in the endpoint's declared thinking-mode sampling, if it declared any
+    and the caller asked for none.
+
+    Silent no-op unless reasoning is actually ON for this call. An endpoint
+    declaration is a statement about how its weights behave WHILE REASONING;
+    applying it to that endpoint's ordinary traffic would change the decode of
+    every non-thinking call on a shared reasoner, which on our own fleet is
+    ~99% of its rows.
+
+    FILL-IF-ABSENT, never override. ``temperature: 0`` from a caller is a real
+    request — a grammar-constrained or judge-style call wants greedy decode and
+    is not asking to be made creative because it also asked to reason. The cost
+    of that rule is that a client which always writes its own default
+    temperature can never be reached from here; that is a defect in such a
+    client (it asserts an opinion it does not have), and the fix belongs there.
+
+    Both fields move together but independently: an operator may pin only a
+    temperature and leave top_p to the engine.
+    """
+    if temperature < 0 and top_p < 0:
+        return                      # endpoint declared nothing
+    if not _thinking_is_on(p):
+        return                      # ordinary call on a reasoning-capable endpoint
+    if temperature >= 0 and p.get("temperature") is None:
+        p["temperature"] = temperature
+    if top_p >= 0 and p.get("top_p") is None:
+        p["top_p"] = top_p
+
+
 #: Floor and ceiling on an injected reasoning cap.
 #:
 #: FLOOR: vLLM #44676 reports forced reasoning-end tokens landing INSIDE tool-call
