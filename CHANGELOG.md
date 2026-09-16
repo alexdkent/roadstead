@@ -14,6 +14,27 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Added
 
+- **An endpoint can declare the decode sampling to use while REASONING
+  (`policy.thinking_temperature` / `policy.thinking_top_p`).** A reasoning model's failure mode at
+  low temperature is not a worse answer, it is NO answer: an easy cyclic continuation out-competes a
+  hard progress-making one, and that competition sharpens as temperature falls (arXiv 2512.12895).
+  Measured on a DeepSeek-V4-Flash reasoner, one hard prompt, greedy decode — 4 of 6 draws cycled
+  inside the reasoning channel, consumed the whole `max_tokens` and returned zero answer characters,
+  worst case over an hour; at the vendor's published recipe the same prompt converged 3 of 3. That
+  number belongs to the weights, so it belongs to the endpoint stanza rather than to a call site,
+  which cannot know it. Do not expect a serving engine's generation-config setting to supply it: a
+  checkpoint's own `generation_config.json` commonly carries the engine's neutral defaults, in which
+  case every such setting decodes identically and the published recipe reaches the wire from
+  nowhere. Applied at the provider seam so it covers every reasoning caller, fill-if-absent so a
+  caller's own sampling wins, and inert unless declared. See `docs/api.md` §3.13b.
+- **`GET /v1/status` reports `build_sha`** — the source commit the process was built from, from
+  `ROADSTEAD_SOURCE_SHA`, or `unknown` when the deployment did not stamp one. A source SHA and not
+  an image tag on purpose: a tag is customarily rewritten in place on each deploy, so it names a
+  stream rather than a commit, and an operator debugging through the proxy cannot otherwise tell
+  which code is answering without shell access to the host. `ROADSTEAD_SOURCE_SHA` joins the stable
+  set — renaming it later would not fail a deploy, it would quietly make every deploy report
+  `unknown`, which is the exact blindness the field exists to remove.
+
 - **A `response_format` json_schema is served as a FORCED TOOL CALL on a backend that declares no
   constrained decoding (`Correction.apply_forced_tool_schema` + `finalize_forced_tool_schema`).**
   Some builds ship without a grammar engine, and the honest ones REFUSE the field: a candidate

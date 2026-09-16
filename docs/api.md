@@ -1318,6 +1318,13 @@ In particular a control action that could not be **persisted** is not an error: 
 | `GET /rs/v1/admin/stream` · `GET /v1/stream` | Live `call.completed` + `metrics` SSE. Admin-gated since 2026-09-01. The alias exists because `EventSource` cannot set a header (§3.7). |
 | `POST /v1/calls/log` | Ingest a call the proxy did not schedule — audio, imagegen, OCR (§3.11). Admin-gated by the same gate, on a path that is not an `admin/` one; refuses anything the proxy records natively. |
 
+`GET /v1/status` leads with **`build_sha`** — the git commit this process was built from, or
+`unknown` when the deployment did not supply one (`ROADSTEAD_SOURCE_SHA`). It is deliberately a
+source SHA and not an image tag: a tag is customarily rewritten in place on each deploy, so it names
+a stream rather than a commit, and "which code is actually answering?" is the question an operator
+debugging *through* the proxy cannot otherwise answer without shell access to the host. Stamp it
+from the same value that labels the image, so the two cannot disagree.
+
 Open surfaces: `GET /v1/status` (per-endpoint health, capacity, reliability counters),
 `GET /v1/timeouts` and `GET /v1/timeout-advice/shadow-report` (§1.4), `GET /v1/recent` (§3.11),
 `GET /v1/inflight`, `GET /v1/history`, `GET /v1/series`, `GET /v1/metrics/cost-model` and
@@ -2387,6 +2394,29 @@ The same trap §3.6 documents, in four more places. With no DB connection:
 
 `/v1/inflight` and `/v1/metrics/cost-model` read no DB at all and are unaffected — though the cost
 model is `{}` until startup registers the endpoints, which is the same "empty is not zero" reading.
+
+### 3.13b Thinking-mode sampling — `policy.thinking_temperature` / `thinking_top_p`
+
+An endpoint may declare the decode sampling to use **for calls that have reasoning switched on**.
+Applied at the provider seam, so it reaches every reasoning caller and not only those using the
+`thinking:` opt-in; **fill-if-absent**, so a caller that sent its own `temperature`/`top_p` keeps it.
+Negative or absent = declare nothing = byte-identical behaviour to before the keys existed. `0.0` is
+a legal declared value, which is why the sentinel is negative rather than zero.
+
+🚨 **This decides whether an answer arrives at all, not how it reads.** A reasoning model's failure
+mode at low temperature is not a worse answer but *no* answer: an easy cyclic continuation
+out-competes a hard progress-making one, and that competition sharpens as temperature falls
+(arXiv 2512.12895). Measured on a DeepSeek-V4-Flash reasoner, one hard prompt, greedy decode: 4 of 6
+draws cycled inside the reasoning channel, consumed the entire `max_tokens` and returned zero answer
+characters. At the vendor's published recipe the same prompt converged 3 of 3.
+
+⚠️ **Do not expect a serving engine's own generation-config setting to supply this.** A checkpoint's
+`generation_config.json` frequently carries the engine's neutral defaults, in which case `auto` and
+the engine's own mode decode identically and the published recipe — which lives in the model card's
+prose — reaches the wire from nowhere. An operator declaration is the only route. Pair it with
+`thinking_budget_ratio` (§3.13) and the loop-break guard (§3.14): sampling changes how often a
+runaway starts, the cap bounds what one costs, and the guard recovers an answer from one already
+under way.
 
 ### 3.14 Reasoning loop-break — `abort_reason: reasoning_loop`
 
