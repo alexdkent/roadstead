@@ -21,7 +21,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from . import cache_stats
-from .config import LLMPriority, normalize_endpoint
+from .config import LLMPriority, normalize_endpoint, source_sha
 from .constants import _PAYLOAD_KIND
 from .enriched import WIRE_OPENAI
 from .goodput import Verdict as GoodputVerdictOutcome
@@ -729,6 +729,16 @@ class ProxyHttpHandlers:
             })
 
         return JSONResponse({
+            # WHICH BUILD IS ANSWERING. Deliberately the SOURCE SHA and not an
+            # image tag: `roadstead:fleet` is rewritten in place on every deploy,
+            # so a tag answers "which name" and never "which code". The value
+            # comes from the same deploy-time variable as the image's
+            # `org.roadstead.source-sha` label, so the two cannot disagree — and
+            # `unknown` here means the deploy did not supply it, which is itself
+            # the answer to "why does the fix I just shipped not seem to be in?".
+            # Until this existed the only way to tell was `docker inspect` on the
+            # Unraid host, which a caller debugging through the proxy cannot run.
+            "build_sha": source_sha(),
             "endpoints": endpoints,
             "agents": agents,
             "alerts": alerts,  # Phase 2.5 — health-verifier/log_scan surface

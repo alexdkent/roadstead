@@ -389,3 +389,66 @@ def test_provider_does_not_mutate_the_callers_payload():
     VLLM.prepare_chat_payload(
         original, thinking_temperature=0.6, thinking_top_p=0.95)
     assert "temperature" not in original
+
+
+def test_every_policy_kwarg_is_forwarded_at_every_backend_call_site():
+    """The knob is only real if `backend.py` actually hands it over.
+
+    Removing the two `thinking_temperature=`/`thinking_top_p=` lines from
+    backend.py's dispatch broke NOTHING in this suite before this test existed:
+    the field still loaded from models.yaml, the provider still applied what it
+    was given, and every unit test still passed — while the endpoint decoded at
+    the engine default forever. `thinking_budget_ratio`, `thinking_kwargs` and
+    `reasoning_budget_tokens` shared that hole.
+
+    So this pins the SEAM rather than any one knob, and pins it structurally
+    (via `ast`, on keyword names) rather than by grepping for a line of text —
+    a source grep matches the comment that documents the call as happily as the
+    call. Any parameter added to `prepare_chat_payload` is covered the day it
+    is added, which is the only version of this test worth having.
+    """
+    import ast
+    import inspect
+    import pathlib
+
+    from roadstead.providers.base import Provider
+
+    policy_kwargs = {
+        name for name, prm
+        in inspect.signature(Provider.prepare_chat_payload).parameters.items()
+        if prm.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+    assert "thinking_temperature" in policy_kwargs, "signature regressed"
+
+    src = pathlib.Path(inspect.getsourcefile(Provider)).parent.parent / "backend.py"
+    tree = ast.parse(src.read_text())
+    sites = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "prepare_chat_payload"]
+    assert sites, "no prepare_chat_payload call sites found in backend.py"
+
+    for call in sites:
+        passed = {kw.arg for kw in call.keywords if kw.arg}
+        missing = policy_kwargs - passed
+        assert not missing, (
+            f"backend.py:{call.lineno} calls prepare_chat_payload without "
+            f"{sorted(missing)} — the endpoint's declaration will silently "
+            f"never reach the wire.")
+
+
+def test_status_reports_the_source_sha_not_a_tag(monkeypatch):
+    """`roadstead:fleet` is rewritten in place on every deploy, so the image tag
+    identifies a name and never a commit. Anyone debugging through the proxy has
+    to be able to ask WHICH CODE is answering without shelling into the Unraid
+    host to read a container label."""
+    from roadstead import config
+
+    monkeypatch.setenv("ROADSTEAD_SOURCE_SHA", "8421d96")
+    assert config.source_sha() == "8421d96"
+    # Absent or blank must say so rather than inventing a plausible value: the
+    # deploy failing to stamp it IS the finding when a shipped fix seems absent.
+    monkeypatch.setenv("ROADSTEAD_SOURCE_SHA", "   ")
+    assert config.source_sha() == "unknown"
+    monkeypatch.delenv("ROADSTEAD_SOURCE_SHA")
+    assert config.source_sha() == "unknown"

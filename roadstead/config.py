@@ -816,6 +816,17 @@ DEFAULT_ENDPOINTS: dict[str, EndpointConfig] = {
 # that vLLM emits at the reason→JSON boundary under MTP spec-decode — see
 # grammar.recover_structured_object + vLLM #34650/PR #44142).
 
+def source_sha() -> str:
+    """The git SHA of the source this process was built from, or ``unknown``.
+
+    Set by the deployment from the SAME variable that stamps the image's
+    ``org.roadstead.source-sha`` label, which is the point: an image tag is
+    rewritten in place on every deploy and therefore identifies a name rather
+    than a commit. Never inferred from anything inside the container — a value
+    this reports must be one an operator can check against the label."""
+    return os.environ.get("ROADSTEAD_SOURCE_SHA", "").strip() or "unknown"
+
+
 def thinking_enabled() -> bool:
     """Feature kill-switch (default ON). Per-request opt-in is the real gate;
     nothing reasons until a caller sets ``thinking: true``, so this only exists
