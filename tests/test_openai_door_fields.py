@@ -3,13 +3,22 @@
 §1.1 was ONE table until 2026-09-02, and it was the union of two doors presented
 as one door's. It listed `agent_id`, `priority`, `call_site`, `caller_id`,
 `request_id`, `session_id` and `turn_id` as accepted body fields on
-``POST /v1/chat/completions``. `handle_openai_chat` reads exactly two things off
-that body — `model` and `timeout_s` — and overwrites the identity fields from the
-resolved principal; the leftovers travel to the backend inside the payload.
-`caller_id` and `request_id` genuinely ARE read, on ``/rs/v1/chat``, which is what
-made the section almost-right and therefore worse than plainly wrong: a migrator
-sending `agent_id` here got no error, no effect, and no hint that the field they
-wanted was on the other door.
+``POST /v1/chat/completions``. At that point `handle_openai_chat` read exactly
+two things off that body — `model` and `timeout_s` — and always overwrote the
+identity fields (`agent_id`/`caller_id`/`priority`) from the resolved principal;
+everything else travelled to the backend inside the payload. `caller_id` and
+`request_id` genuinely ARE read, on ``/rs/v1/chat``, which is what made the
+section almost-right and therefore worse than plainly wrong: a migrator sending
+`agent_id` here got no error, no effect, and no hint that the field they wanted
+was on the other door.
+
+`session_id`/`turn_id` moved OFF this door's ignored list on 2026-09-17: the
+handler now reads and records them too, as an opaque per-request correlation
+id — a downstream reader needs to know WHICH JOB made a call, not just which
+model answered it. The identity fields did not move: `agent_id`/`caller_id`/
+`priority` still come from nowhere but the resolved principal, and pinning that
+a body-supplied `agent_id`/`caller_id` still does not override it is the
+security-relevant half of this file.
 
 `grammar` and `thinking` are the other half of "almost": they are not read by the
 handler either, and they work anyway, because `correction.py` reads them off the
@@ -173,10 +182,11 @@ def test_the_parser_actually_found_the_tables(section):
                              stop="\n#####"))
     embed = _read_rows(_block(section, "#### `POST /v1/embeddings`"))
     ignored = _ignored(_block(section, "##### What this door does NOT read"))
-    assert {"model", "timeout_s", "grammar", "thinking"} <= set(chat), chat
+    assert {"model", "timeout_s", "grammar", "thinking",
+            "session_id", "turn_id"} <= set(chat), chat
     assert {"input", "encoding_format", "model"} <= set(embed), embed
-    assert {"agent_id", "priority", "call_site", "caller_id",
-            "session_id", "turn_id", "request_id"} <= ignored, sorted(ignored)
+    assert {"agent_id", "priority", "call_site",
+            "caller_id", "request_id"} <= ignored, sorted(ignored)
 
 
 @pytest.mark.parametrize("heading", sorted(_DOORS))

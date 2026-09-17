@@ -212,6 +212,20 @@ summary. The bullets below link in there where the long version is worth reading
   names the quantity the floor actually needs: a conservative rate for the slow tail of real
   traffic, not an idle number.
 
+- **`POST /v1/chat/completions` now reads `session_id`/`turn_id` off the body, records them on the
+  completion row, and pops them so they never reach the backend.** Before, §1.1 documented both as
+  ignored-and-forwarded: unread by the proxy, left in the payload, and left for a strict backend to
+  possibly reject as an unknown field. A caller who happened to send either now gets different wire
+  behaviour — the field disappears from what the backend receives — which is why this is `### Breaking`
+  and not `### Added` even though the change is additive in spirit. The reason: a downstream reader of
+  `proxy_completions` needs to know WHICH JOB made a call, not just which model answered it, and the
+  fleet's own agentic CLI stamps `session_id` on every request it makes — through this door, where it
+  was silently dropped. `agent_id`/`caller_id`/`priority` are unchanged: they still come from nowhere
+  but the resolved principal, never the body — a correlation id lets a caller tag its own request, not
+  relabel who it is. Treated as untrusted input from an internet-facing door: non-string or longer than
+  256 chars is silently dropped rather than causing a 400. `docs/api.md` §1.1 updated in the same
+  commit (moved out of "What this door does NOT read" and into the main table).
+
 ### Fixed
 
 - **A caller's own reasoning effort, sent the OpenAI way, drew a 400 on any endpoint declaring

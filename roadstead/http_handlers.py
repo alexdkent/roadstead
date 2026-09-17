@@ -144,6 +144,28 @@ def _to_float(value: object, default: float) -> float:
         return default
 
 
+# An opaque per-request correlation id (`session_id`/`turn_id` on the OpenAI
+# door, §1.1) is untrusted body input from an internet-facing route: it is
+# never forwarded to a backend and never used to establish identity, so the
+# only thing it needs bounding against is being unreasonably large in the
+# completion record it rides on.
+_MAX_CORRELATION_ID_LEN = 256
+
+
+def _correlation_id(value: object) -> str | None:
+    """Sanitize an opaque caller-supplied correlation id — string counterpart
+    to ``_to_int``/``_to_float``: never raises, a malformed value silently
+    becomes "no id" rather than failing the call it was meant to just tag.
+    Anything non-string (a client sending ``{"session_id": 123}`` or a list)
+    and anything past the length bound is dropped."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > _MAX_CORRELATION_ID_LEN:
+        return None
+    return value
+
+
 def _spend_block(state) -> dict:
     """The `/v1/status` money readout (roadmap Workstream D).
 
@@ -214,6 +236,17 @@ class ProxyHttpHandlers:
         # the default there, same as before).
         client_timeout = body.pop("timeout_s", None) or request.headers.get("X-Timeout-S")
 
+        # Opaque per-request correlation (2026-09-17): `session_id`/`turn_id`
+        # let a caller TAG its own request for later attribution — unlike
+        # `agent_id`/`caller_id`/`priority` below, they carry no identity
+        # claim, so reading them does not weaken the identity/priority floor.
+        # Popped from the body (same reasoning as `timeout_s` above: it's
+        # proxy metadata, not part of the OpenAI request, and a strict
+        # backend could reject the unknown key) and sanitized as untrusted
+        # input from an internet-facing door — see `_correlation_id`.
+        session_id = _correlation_id(body.pop("session_id", None))
+        turn_id = _correlation_id(body.pop("turn_id", None))
+
         submit_body = {
             "agent_id": agent_id,
             "endpoint": model,
@@ -229,6 +262,10 @@ class ProxyHttpHandlers:
         # Omitting it lets the one precedence in `handle_submit` decide.
         if client_timeout is not None:
             submit_body["timeout_s"] = client_timeout
+        if session_id is not None:
+            submit_body["session_id"] = session_id
+        if turn_id is not None:
+            submit_body["turn_id"] = turn_id
         return await self.lifecycle.handle_submit(submit_body, request, wire=WIRE_OPENAI)
     async def handle_openai_embeddings(self, body: dict, request: Request) -> Response:
         """POST /v1/embeddings — the OpenAI-compatible embeddings door.

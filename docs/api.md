@@ -56,6 +56,8 @@ A caller may send these alongside standard OpenAI fields. Each is optional.
 | `timeout_s` | float | Caller's own deadline. Omitted → the smart default applies (a computed recommendation, see §1.2). Popped from the body, so it never reaches the backend. | `http_handlers.handle_openai_chat` |
 | `thinking` | bool \| int | Opt into reasoning. `true` grants a flat headroom on `max_tokens`; an int gives an explicit, usually smaller, headroom — the form an interactive caller wants. | `correction.py` |
 | `grammar` | string | GBNF. Validated and repaired pre-enqueue; invalid grammar fails loud with 422. | `correction.py` |
+| `session_id` | string | **Added 2026-09-17.** An opaque per-request correlation id — recorded on the completion row so a caller's own agentic loop can be attributed later. It asserts nothing about identity: unlike `agent_id`/`caller_id`/`priority` below, which stay fixed to the resolved principal, this is the one pair of fields the door reads from the body without weakening who the caller is. Popped from the body (never reaches the backend). Untrusted-input handling: non-string or longer than 256 chars is silently dropped (recorded as absent), never a 400. | `http_handlers.handle_openai_chat` |
+| `turn_id` | string | Same as `session_id`, one level finer — a single turn within a session. Same popping/bounding. | `http_handlers.handle_openai_chat` |
 
 Header: **`X-Timeout-S`**, read by the same handler as an alternative to the body field.
 
@@ -63,7 +65,8 @@ Header: **`X-Timeout-S`**, read by the same handler as an alternative to the bod
 carrying the request id Roadstead itself minted (§4.1) — this document used to list it here as
 "forwarded", which reads as "send one and we will carry it". Nothing consults an inbound one. The
 enriched door's `request_id` body field (§1.7.2) is the supported way to correlate a caller's own id
-with the durable record.
+with the durable record — `session_id`/`turn_id` above are the correlation fields this door itself
+now supports; `request_id` still is not one of them here.
 
 ##### What this door does NOT read 🚨
 
@@ -77,7 +80,14 @@ rather than omitted:
 | `priority` | **Ignored, and that is now a decision rather than a gap** (2026-09-02). The band is *configured* per caller instead — see "A static band per caller" below. A per-call body field was measured against real traffic and rejected. |
 | `call_site` | **Ignored.** Set to `<agent_id>.openai_compat`, so this door's traffic is distinguishable in attribution. |
 | `caller_id` | **Ignored.** Set to the `agent_id`. Read on `/rs/v1/chat`, which is where a caller with sub-identities should be. |
-| `session_id`, `turn_id`, `request_id` | **Ignored** — and, unlike the four above, not replaced either: they travel to the backend inside the payload, where a strict engine may reject the unknown key. Read on `/rs/v1/chat`. |
+| `request_id` | **Ignored** — and, unlike the four above, not replaced either: it travels to the backend inside the payload, where a strict engine may reject the unknown key. Read on `/rs/v1/chat`. |
+
+🚨 **`session_id`/`turn_id` moving into the table above (2026-09-17) does not reopen identity.**
+`agent_id`, `caller_id` and `priority` are still read from nowhere but the resolved principal — a
+correlation id lets a caller tag ITS OWN request, never relabel who it is. `tests/test_openai_door_fields.py`
+pins that this table stays honest about which fields the handler reads; the runtime claim itself —
+a body-supplied `agent_id`/`caller_id`/`priority` still does not override the principal — is pinned
+in `tests/test_openai_door_session_id.py`.
 
 **The header spellings are ignored too**, and they are listed because a fleet arriving from a proxy
 that read identity out of headers will try them before it reads this table:
