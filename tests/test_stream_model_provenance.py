@@ -15,6 +15,22 @@ endpoint's declared ``effective_model_id`` only when no chunk carried one.
 ``model_source`` distinguishes the two so a reader can tell a proven answer
 from a belief.
 
+**This was a measured assumption, not a guess: confirmed live 2026-09-17
+against proxy build 2ed872b (a fleet deployment; not this repo's example
+catalog).** A single small streaming request to a live chat endpoint showed
+every SSE chunk (19 of 19) carrying the backend's own served-model id in the
+top-level ``model`` field, byte-identical to the id the non-streaming path
+already records for that same endpoint. Every configured chat endpoint on
+that deployment was checked the same way and each one's chunks echoed its
+own distinct backend id — none fell back to silence. So in production this
+code takes the ``backend_echo`` branch, not the ``endpoint_config``
+fallback, which is what makes a downstream reader's gate on this field
+strong rather than a guess about engine behaviour. The real chunk's key set
+was exactly ``{choices, created, id, model, object, usage}``; the fixture
+below (``_chunk``) matches it. (Fleet-specific endpoint names and model ids
+are deliberately not reproduced here — see this repo's scrub rule in
+``CONTRIBUTING.md``.)
+
 Pins:
   * A streaming call whose backend echoes ``model`` in a chunk records that
     model with ``model_source: backend_echo``.
@@ -66,19 +82,32 @@ def _payload(content="x", *, stream=False, max_tokens=64):
     return p
 
 
-def _chunk(content=None, finish=None, model=None):
+def _chunk(content=None, finish=None, model=None, usage=None):
+    # Shape verified against a LIVE proxy chunk 2026-09-17 (fleet build
+    # 2ed872b, a live chat endpoint): a real chunk's keys are exactly
+    # {choices, created, id, model, object, usage} on every one of 19 chunks
+    # in the stream, not just the first. `model` is kept omittable here (not
+    # real-shaped) only for the endpoint_config fallback test below, which
+    # models a backend/engine that does NOT echo it.
     delta = {"content": content} if content is not None else {}
-    obj = {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+    obj = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        "usage": usage,
+    }
     if model is not None:
         obj["model"] = model
     return json.dumps(obj)
 
 
 def _svc_stream(pieces, finish, *, model=None, db_path):
-    """A proxy whose backend streams `pieces` then a finish chunk. The FIRST
-    piece carries `model` in its chunk when one is given — mirrors a real
-    llama-server/vLLM stream, where every chunk (including the first) already
-    carries the top-level `model` field.
+    """A proxy whose backend streams `pieces` then a finish chunk. EVERY
+    chunk carries `model` when one is given — this matches the live
+    measurement above (all 19 chunks, not just the first) rather than an
+    assumption; the code only needs the first occurrence, but the fixture
+    should not be more permissive than the real wire.
 
     ``db_path`` is required (not the default empty-string config): an unset
     ``queue_db_path`` means ``PersistentQueue`` never opens a connection at
@@ -86,10 +115,10 @@ def _svc_stream(pieces, finish, *, model=None, db_path):
     svc = ProxyService(ProxyConfig(queue_db_path=str(db_path)))
 
     async def fake_stream(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
-        for i, piece in enumerate(pieces):
-            text = _chunk(piece, model=model if i == 0 else None)
+        for piece in pieces:
+            text = _chunk(piece, model=model)
             yield BackendStreamEvent("chunk", text, json.loads(text))
-        final = _chunk(finish=finish)
+        final = _chunk(finish=finish, model=model)
         yield BackendStreamEvent("chunk", final, json.loads(final))
         yield BackendStreamEvent("done", "[DONE]")
 

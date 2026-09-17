@@ -49,6 +49,14 @@ summary. The bullets below link in there where the long version is worth reading
   Fail-open, matching every other per-completion tally in `record_completion`: a capture failure
   loses the tag on that one row, never the completion or the stream itself.
 
+  **Confirmed live 2026-09-17 (fleet build 2ed872b), not just assumed:** every SSE chunk of a real
+  streaming request (19 of 19) carried the backend's own served-model id in its top-level `model`
+  field, byte-identical to the id the non-streaming path already records for that same endpoint —
+  and every configured chat endpoint checked the same way echoed its own distinct id. So in
+  production this takes the `backend_echo` branch, not the `endpoint_config` fallback, which is
+  what makes a downstream reader's gate on this field strong rather than a guess about engine
+  behaviour.
+
 - **A `response_format` json_schema is served as a FORCED TOOL CALL on a backend that declares no
   constrained decoding (`Correction.apply_forced_tool_schema` + `finalize_forced_tool_schema`).**
   Some builds ship without a grammar engine, and the honest ones REFUSE the field: a candidate
