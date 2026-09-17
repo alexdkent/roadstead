@@ -1933,6 +1933,34 @@ class Lifecycle:
         ep_cfg: EndpointConfig,
         decision: DispatchDecision,
     ) -> None:
+        # Which model actually served this stream (2026-09-17). A streaming
+        # completion otherwise persists response_json=NULL unconditionally —
+        # measured fleet-wide 264/264 streaming rows NULL vs 0/1332 for
+        # non-streaming, which always attaches the backend's response body.
+        # That makes "which model served this call?" structurally unanswerable
+        # for every streaming caller (dsh always streams). Prefer what the
+        # BACKEND ITSELF echoed in a stream chunk's top-level `model` field —
+        # that is evidence of what actually ran — and fall back to the
+        # endpoint's declared model only when no chunk carried one (a
+        # cancel/timeout/error before any chunk arrived). `model_source` says
+        # which, so a downstream reader can tell a proven answer from a belief.
+        echoed_model: str | None = None
+
+        def _stream_model_body() -> dict | None:
+            # Fail-open like every other observability tally in this module
+            # (e.g. the degenerate-length classification above): a broken
+            # capture must lose the model tag on this one row, never the
+            # completion itself or the stream the caller is reading.
+            try:
+                model = echoed_model or ep_cfg.effective_model_id
+                return {
+                    "model": model,
+                    "model_source": "backend_echo" if echoed_model else "endpoint_config",
+                }
+            except Exception:  # noqa: BLE001
+                logger.debug("stream model-provenance capture failed", exc_info=True)
+                return None
+
         stream_q = self.state.pending_streams.get(req.request_id)
         if not stream_q:
             # No consumer for this stream (it died with a previous process, or
@@ -1943,7 +1971,8 @@ class Lifecycle:
             logger.warning(
                 "streaming dispatch %s has no consumer — reclaiming slot",
                 req.request_id)
-            self.record_completion(req, decision, 0.0, 0, 0, "cancelled")
+            self.record_completion(req, decision, 0.0, 0, 0, "cancelled",
+                                    response_body=_stream_model_body())
             return
 
         await stream_q.put({
@@ -2123,6 +2152,10 @@ class Lifecycle:
                         _cm.reschedule(loop.time() + min(gap_deadline_s, remaining))
                         usage_only = False
                         if event.parsed:
+                            if echoed_model is None:
+                                m = event.parsed.get("model")
+                                if isinstance(m, str) and m:
+                                    echoed_model = m
                             usage = event.parsed.get("usage")
                             choices = event.parsed.get("choices") or []
                             if usage:
@@ -2274,7 +2307,8 @@ class Lifecycle:
             await stream_q.put({"type": "error", "error": err})
             duration = time.monotonic() - t0
             self._note_stream_extension(req, duration, stream_timeout, soft_budget)
-            self.record_completion(req, decision, duration, input_tokens, output_tokens, "timeout")
+            self.record_completion(req, decision, duration, input_tokens, output_tokens,
+                                    "timeout", response_body=_stream_model_body())
             self.record_timeout_event(
                 req, layer="stream", elapsed_s=duration,
                 queue_wait_ms=decision.queue_wait_ms, emit_metrics_and_log=False,
@@ -2291,7 +2325,8 @@ class Lifecycle:
         except Exception as exc:
             await stream_q.put({"type": "error", "error": str(exc)})
             duration = time.monotonic() - t0
-            self.record_completion(req, decision, duration, input_tokens, output_tokens, "error")
+            self.record_completion(req, decision, duration, input_tokens, output_tokens,
+                                    "error", response_body=_stream_model_body())
             self.health.record_dispatch_failure(req.endpoint, exc)  # Step 4b
             return
         finally:
@@ -2327,7 +2362,8 @@ class Lifecycle:
                     "reasoning chars; the answer-now re-ask returned nothing")})
                 duration = time.monotonic() - t0
                 self.record_completion(req, decision, duration, input_tokens,
-                                       output_tokens, "error")
+                                       output_tokens, "error",
+                                       response_body=_stream_model_body())
                 return
 
         duration = time.monotonic() - t0
@@ -2472,6 +2508,7 @@ class Lifecycle:
             status = "truncated"
         self.record_completion(
             req, decision, duration, input_tokens, output_tokens, status,
+            response_body=_stream_model_body(),
             finish_reason=last_finish_reason, cached_tokens=cached_tokens,
         )
         # Step 4a: uniform streaming detection over the reassembled content

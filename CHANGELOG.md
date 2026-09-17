@@ -35,6 +35,20 @@ summary. The bullets below link in there where the long version is worth reading
   set — renaming it later would not fail a deploy, it would quietly make every deploy report
   `unknown`, which is the exact blindness the field exists to remove.
 
+- **A streaming completion's `proxy_completions.response_json` now names which model served it.**
+  Every non-streaming completion has always attached the backend's response body; a streaming one
+  never did, because `execute_streaming`'s terminal `record_completion` calls passed no
+  `response_body` at all — measured fleet-wide, 264/264 streaming rows had `response_json IS NULL`
+  against 0/1332 non-streaming, making "which model answered?" unanswerable for every streaming
+  caller. The captured object is deliberately tiny — `{"model": ..., "model_source": ...}`, never the
+  streamed content — to avoid changing data volume or privacy posture for every streaming call on the
+  fleet. `model` prefers what the BACKEND ITSELF echoed in a stream chunk's top-level `model` field
+  (`model_source: "backend_echo"`, evidence of what actually ran) and falls back to the endpoint's
+  declared `effective_model_id` only when no chunk carried one, e.g. a cancel/timeout/error before
+  any chunk arrived (`model_source: "endpoint_config"`, the proxy's own belief, not a measurement).
+  Fail-open, matching every other per-completion tally in `record_completion`: a capture failure
+  loses the tag on that one row, never the completion or the stream itself.
+
 - **A `response_format` json_schema is served as a FORCED TOOL CALL on a backend that declares no
   constrained decoding (`Correction.apply_forced_tool_schema` + `finalize_forced_tool_schema`).**
   Some builds ship without a grammar engine, and the honest ones REFUSE the field: a candidate
