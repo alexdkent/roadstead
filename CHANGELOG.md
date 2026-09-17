@@ -192,6 +192,16 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Fixed
 
+- **A caller's own reasoning effort, sent the OpenAI way, drew a 400 on any endpoint declaring
+  `policy.reasoning_effort`.** "A caller's own pin wins" was checked against
+  `chat_template_kwargs` only, so a top-level `reasoning_effort` (plain OpenAI clients, agent
+  harnesses) or `reasoning: {effort}` (the OpenRouter shape) got the declared default injected
+  BESIDE it, and an engine that validates the pair refused every such request: `conflicting
+  reasoning_effort: 'medium' at the top level and 'low' in chat_template_kwargs`. The caller's value
+  now moves into `chat_template_kwargs` (the one channel a declaring endpoint is known to read) and
+  the alias is removed, so the pin wins and arrives under one name; `"none"` sets the declared
+  thinking switch off. A caller that sends two different values itself is left as sent. See
+  `docs/api.md` §3.11.
 - **`/v1/fleet/savings` reported a rolling 30-day window under the word "total".** `savings_summary`
   summed `proxy_completions` with no lower bound, and `cleanup_old_completions` prunes that table at
   `completions_retention_s` — so the figure a dashboard labels "saved total" stopped growing once the

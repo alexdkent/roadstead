@@ -733,6 +733,76 @@ def _conform_body(
 # function — is enforced by the tool-argument path instead, which such builds
 # do implement. See ``Correction.apply_forced_tool_schema`` for the measurement.
 
+#: `fold_caller_effort` outcomes. Only ABSENT and OFF leave room for the
+#: endpoint's declared default: OFF turned the switch off (an effort beside a
+#: false switch is inert, and harmless), and a thinking opt-in that outranks it
+#: must not fall to the template's own default rung.
+EFFORT_ABSENT = "absent"      # the caller said nothing about effort
+EFFORT_FOLDED = "folded"      # the caller's rung now lives in ck
+EFFORT_OFF = "off"            # the caller sent "none": switch keys set False
+EFFORT_LEFT = "left"          # ck already had one, or the caller sent two values
+
+
+def fold_caller_effort(payload: dict, ck: dict, switch_keys) -> str:
+    """Move a caller's OWN reasoning effort into ``ck`` before the endpoint's
+    declared default is considered. Returns one of the ``EFFORT_*`` outcomes;
+    a declared default may be injected only on ABSENT or OFF.
+
+    WHY. The injection sites below write ``chat_template_kwargs.reasoning_effort``
+    and treat "the caller pinned an effort" as "``ck`` already has the key". But a
+    caller speaking plain OpenAI sends the TOP-LEVEL ``reasoning_effort``, and an
+    OpenRouter-shaped one sends ``reasoning: {effort}``. Neither is in ``ck``, so
+    the default was injected BESIDE the caller's pin and the request carried the
+    same control under two names with two values. An engine that validates the
+    pair refuses it outright — measured: ``400 conflicting reasoning_effort:
+    'medium' at the top level and 'low' in chat_template_kwargs`` for every
+    request from an agent harness whose config sets an effort, and the same 400
+    for ``reasoning.effort``. "A caller's own pin wins" held only for callers
+    that happened to spell it the way the proxy writes it.
+
+    WHY FOLD RATHER THAN SKIP. Skipping the injection would leave the caller's
+    value in a field some engines never read (a template-kwarg engine renders
+    its own default — on Qwen3.8 that is ``xhigh``, the maximum). ``ck`` is the
+    one channel every endpoint that declares an effort is already known to read,
+    because the injection depends on it. So the caller's value moves there and
+    the alias is removed: the pin wins AND arrives under one name.
+
+    ``"none"`` is not a rung, it is "thinking off" — the OpenAI spelling of the
+    switch. It becomes each declared switch key ``False`` (a caller's explicit
+    switch in ``ck`` still wins); the alias is removed so it is not sent twice.
+
+    A caller that already put an effort in ``ck``, or that sent two DIFFERENT
+    values itself, is left exactly as sent: that conflict is the caller's own,
+    and the backend's 400 names it accurately. Never raises."""
+    if not isinstance(payload, dict) or not isinstance(ck, dict):
+        return EFFORT_ABSENT
+    if "reasoning_effort" in ck:
+        return EFFORT_LEFT
+    top = payload.get("reasoning_effort")
+    obj = payload.get("reasoning")
+    obj_effort = obj.get("effort") if isinstance(obj, dict) else None
+    values = {v.strip() for v in (top, obj_effort) if isinstance(v, str) and v.strip()}
+    if not values:
+        return EFFORT_ABSENT
+    if len(values) > 1:
+        return EFFORT_LEFT
+    effort = values.pop()
+    if isinstance(top, str):
+        payload.pop("reasoning_effort", None)
+    if isinstance(obj_effort, str):
+        rest = {k: v for k, v in obj.items() if k != "effort"}
+        if rest:
+            payload["reasoning"] = rest
+        else:
+            payload.pop("reasoning", None)
+    if effort == "none":
+        for key in switch_keys or ():
+            ck.setdefault(key, False)
+        return EFFORT_OFF
+    ck["reasoning_effort"] = effort
+    return EFFORT_FOLDED
+
+
 #: Function name used when the caller's ``json_schema.name`` is missing or
 #: sanitizes away to nothing. A name is mandatory on the wire, so there has to
 #: be one; it is never shown to the caller (the synthesized tool is removed on
@@ -1770,14 +1840,20 @@ class Correction:
         # A CALLER'S OWN PIN ALWAYS WINS, switch included: an explicit
         # `enable_thinking: false` stays false. This is a per-endpoint DEFAULT
         # for the callers that said nothing, never an override of one that did.
+        # 🚨 "Said nothing" includes the OpenAI spellings of an effort — top-level
+        # `reasoning_effort` and `reasoning.effort` — not just `ck`. Checking
+        # only `ck` injected the default BESIDE a caller's top-level pin and the
+        # backend refused the pair (see `fold_caller_effort`).
         declared_effort = getattr(ep, "reasoning_effort", "") or ""
         switch_keys = tuple(getattr(ep, "thinking_kwargs", ()) or ())
         if declared_effort and switch_keys:
             ck = p.get("chat_template_kwargs")
             ck = dict(ck) if isinstance(ck, dict) else {}
+            outcome = fold_caller_effort(p, ck, switch_keys)
             for key in switch_keys:
                 ck.setdefault(key, True)
-            ck.setdefault("reasoning_effort", declared_effort)
+            if outcome in (EFFORT_ABSENT, EFFORT_OFF):
+                ck["reasoning_effort"] = declared_effort
             p["chat_template_kwargs"] = ck
         elif declared_effort:
             logger.warning(
@@ -2294,8 +2370,12 @@ class Correction:
         # nothing about how hard to think, not an override of a caller that did.
         # Absent declaration => nothing injected => the template's own default,
         # which is the pre-2026-09-07 behaviour exactly.
+        # The caller's pin includes its top-level / `reasoning.effort` spellings
+        # (`fold_caller_effort`). The switch is already forced True above — this
+        # caller opted into thinking, which outranks an effort of "none" — so
+        # OFF still takes the declared rung rather than the template's maximum.
         declared_effort = getattr(ep, "reasoning_effort", "") if ep is not None else ""
-        if declared_effort and "reasoning_effort" not in ck:
+        if declared_effort and fold_caller_effort(p, ck, ()) in (EFFORT_ABSENT, EFFORT_OFF):
             ck["reasoning_effort"] = declared_effort
         p["chat_template_kwargs"] = ck
         # HOW MUCH REASONING HEADROOM. `thinking: true` keeps the historic flat

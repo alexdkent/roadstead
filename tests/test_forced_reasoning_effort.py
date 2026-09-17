@@ -199,3 +199,88 @@ def test_declared_budget_reaches_endpoint_config():
     assert "forced_reasoning_budget" in _POLICY_PASSTHROUGH
     assert hasattr(config.EndpointConfig, "forced_reasoning_budget") or \
         "forced_reasoning_budget" in getattr(config.EndpointConfig, "__annotations__", {})
+
+
+# ── the caller's pin in the OpenAI spellings (2026-09-16) ─────────────────────
+#
+# THE REGRESSION. "A caller's own pin wins" was checked against `ck` only. An
+# agent harness speaking plain OpenAI sends a TOP-LEVEL `reasoning_effort`, so the
+# declared default was injected BESIDE it and the backend refused the pair on
+# every request, live:
+#     400 conflicting reasoning_effort: 'medium' at the top level and 'low' in
+#         chat_template_kwargs; they are the same control under two names
+# and the OpenRouter shape `reasoning: {effort}` drew the same 400.
+
+def _one_effort_name(payload):
+    """How many places carry an effort — the backend refuses more than one."""
+    n = 0
+    if "reasoning_effort" in (payload.get("chat_template_kwargs") or {}):
+        n += 1
+    if "reasoning_effort" in payload:
+        n += 1
+    if isinstance(payload.get("reasoning"), dict) and "effort" in payload["reasoning"]:
+        n += 1
+    return n
+
+
+def test_top_level_caller_effort_wins_and_is_sent_under_one_name():
+    m = _mock()
+    req = _req({"max_tokens": 500, "messages": [], "reasoning_effort": "medium"})
+    m.apply_forced_reasoning_budget(req)
+    p = req.payload
+    assert _one_effort_name(p) == 1, (
+        "the default was injected beside the caller's top-level effort — the "
+        "exact payload the backend 400s as 'the same control under two names'")
+    assert p["chat_template_kwargs"] == {"enable_thinking": True, "reasoning_effort": "medium"}
+
+
+def test_reasoning_object_effort_wins_and_its_other_fields_survive():
+    m = _mock()
+    req = _req({"max_tokens": 500, "messages": [],
+                "reasoning": {"effort": "high", "max_tokens": 900}})
+    m.apply_forced_reasoning_budget(req)
+    p = req.payload
+    assert _one_effort_name(p) == 1
+    assert p["chat_template_kwargs"]["reasoning_effort"] == "high"
+    assert p["reasoning"] == {"max_tokens": 900}, "only `effort` moves"
+
+
+def test_reasoning_object_holding_only_effort_is_removed_whole():
+    m = _mock()
+    req = _req({"max_tokens": 500, "messages": [], "reasoning": {"effort": "high"}})
+    m.apply_forced_reasoning_budget(req)
+    assert "reasoning" not in req.payload
+
+
+def test_effort_none_turns_the_switch_off():
+    """`none` is the OpenAI spelling of thinking OFF, not a rung — and not a
+    value a template's effort ladder accepts."""
+    m = _mock()
+    req = _req({"max_tokens": 500, "messages": [], "reasoning_effort": "none"})
+    m.apply_forced_reasoning_budget(req)
+    ck = req.payload["chat_template_kwargs"]
+    assert ck["enable_thinking"] is False
+    assert ck.get("reasoning_effort") != "none"
+    assert _one_effort_name(req.payload) <= 1
+
+
+def test_a_conflict_the_caller_wrote_itself_is_left_as_sent():
+    """Two DIFFERENT values from the caller is the caller's own conflict; the
+    backend's 400 names it accurately, so the proxy must not pick a winner."""
+    m = _mock()
+    req = _req({"max_tokens": 500, "messages": [], "reasoning_effort": "medium",
+                "reasoning": {"effort": "high"}})
+    m.apply_forced_reasoning_budget(req)
+    p = req.payload
+    assert p["reasoning_effort"] == "medium" and p["reasoning"] == {"effort": "high"}
+    assert "reasoning_effort" not in p["chat_template_kwargs"], (
+        "a third value was added to a caller's two")
+
+
+def test_no_caller_effort_still_gets_the_declared_default():
+    """Sabotage guard for the fold itself: the fix must not stop the default."""
+    m = _mock()
+    req = _req({"max_tokens": 500, "messages": [], "reasoning": {"max_tokens": 900}})
+    m.apply_forced_reasoning_budget(req)
+    assert req.payload["chat_template_kwargs"]["reasoning_effort"] == "low"
+    assert req.payload["reasoning"] == {"max_tokens": 900}

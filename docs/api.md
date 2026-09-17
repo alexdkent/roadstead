@@ -1692,7 +1692,12 @@ false` does not read the key at all; declaring it there is inert.
 merge KEY-BY-KEY over the server's launch default, so an effort sent *without* the switch renders
 with thinking OFF and the effort silently dropped. The proxy builds one object for exactly this
 reason; a caller assembling its own should do the same. A caller's own `reasoning_effort` always
-wins — the declaration is a default for callers that opted into thinking and said nothing about how
+wins, in any of its three spellings — `chat_template_kwargs.reasoning_effort`, a top-level
+`reasoning_effort`, or `reasoning.effort`. The latter two are MOVED into `chat_template_kwargs` and
+removed from where they arrived, so the backend never receives the same control under two names
+(an engine that validates the pair 400s it); `"none"` sets the declared thinking switch off instead.
+A caller that sends two different values itself is forwarded unchanged. The declaration is a
+default for callers that opted into thinking and said nothing about how
 hard to think.
 
 🚨 **A cap's wire name is per ENGINE, and getting it wrong is silent.** vLLM reads

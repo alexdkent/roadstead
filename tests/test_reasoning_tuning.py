@@ -452,3 +452,24 @@ def test_status_reports_the_source_sha_not_a_tag(monkeypatch):
     assert config.source_sha() == "unknown"
     monkeypatch.delenv("ROADSTEAD_SOURCE_SHA")
     assert config.source_sha() == "unknown"
+
+
+def test_a_callers_top_level_effort_wins_on_the_opt_in_path_too():
+    """Same defect as the forced path (test_forced_reasoning_effort.py): a
+    top-level `reasoning_effort` must not get a SECOND, different effort
+    injected into chat_template_kwargs beside it."""
+    m = _optin_self(reasoning_effort="low")
+    p = {"messages": [], "max_tokens": 800, "thinking": True, "reasoning_effort": "high"}
+    m.apply_thinking(_req(p))
+    assert "reasoning_effort" not in p
+    assert p["chat_template_kwargs"] == {"enable_thinking": True, "reasoning_effort": "high"}
+
+
+def test_opt_in_with_effort_none_takes_the_declared_rung_not_the_template_max():
+    """`thinking: true` outranks an effort of "none"; dropping both would leave
+    the template's own default, which on Qwen3.8 is `xhigh`."""
+    m = _optin_self(reasoning_effort="low")
+    p = {"messages": [], "max_tokens": 800, "thinking": True, "reasoning_effort": "none"}
+    m.apply_thinking(_req(p))
+    assert "reasoning_effort" not in p
+    assert p["chat_template_kwargs"] == {"enable_thinking": True, "reasoning_effort": "low"}
