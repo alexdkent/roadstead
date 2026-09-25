@@ -196,14 +196,23 @@ def _timeout_below_recommended(
 # OpenAI-shaped error envelope — shared by Lifecycle + the HTTP front door.
 def _openai_error(
     message: str, err_type: str, status_code: int, code: str | None = None,
+    partial_content: str | None = None,
 ) -> JSONResponse:
     """OpenAI-shaped error envelope for the /v1/chat/completions front door
     (goose-cli + any OpenAI client expects ``{"error": {...}}``). ``code``
     is the machine-readable taxonomy field (M2) — additive; the message
-    substrings the fleet's deferral classifier sniffs are unchanged."""
+    substrings the fleet's deferral classifier sniffs are unchanged.
+
+    ``partial_content`` is additive too: the backend's own truncated text,
+    carried ONLY for the structured-truncation failure (never sent by any
+    other caller of this function — the default is None). An unknown key
+    inside the OpenAI ``error`` object is inert to any client that doesn't
+    look for it."""
     err: dict = {"message": str(message), "type": err_type}
     if code:
         err["code"] = code
+    if partial_content:
+        err["partial_content"] = partial_content
     return JSONResponse({"error": err}, status_code=status_code)
 
 
@@ -1153,6 +1162,7 @@ class Lifecycle:
             return _openai_error(
                 result.get("error", "backend error"), "backend_error", 502,
                 code="backend_error",
+                partial_content=result.get("partial_content"),
             )
         if wire == WIRE_LEGACY:
             # The six-key envelope, and no `corrections` list: the legacy shape
@@ -1239,6 +1249,11 @@ class Lifecycle:
         # to be a field rather than something to parse out of the message.
         if result.get("backend_status") is not None:
             body["backend_status"] = result["backend_status"]
+        # The backend's own truncated text — additive, same reasoning as
+        # backend_status above. Only ever set for a structured-truncation
+        # failure (state.resolve_error); absent on every other error.
+        if result.get("partial_content"):
+            body["partial_content"] = result["partial_content"]
         return JSONResponse(body, status_code=502)
 
     async def handle_streaming_submit(
@@ -1699,6 +1714,7 @@ class Lifecycle:
                 # detector `maybe_correct_degenerate` uses.
                 degen_arm = None
                 degen_ev: dict = {}
+                _body_text = ""
                 try:
                     _body_text = _chat_completion_text(resp.body)
                     degen_arm = _degenerate_text_arm(_body_text)
@@ -1749,10 +1765,21 @@ class Lifecycle:
                         )
                     else:
                         # Shadow: counted + logged above, but caller-visible
-                        # behavior stays byte-identical to today.
-                        self.state.resolve_error(req, truncated_msg)
+                        # behavior stays byte-identical to today except for the
+                        # additive `partial_content` below.
+                        self.state.resolve_error(
+                            req, truncated_msg, partial_content=_body_text)
                 else:
-                    self.state.resolve_error(req, truncated_msg)
+                    # The genuine truncation case — NOT a repetition loop. Carry
+                    # what the backend actually generated: today this text is
+                    # simply discarded, and a caller's own salvage path (repair
+                    # a cut-off JSON array by dropping the partial trailing
+                    # item) has nothing to repair. Never sent on the
+                    # DEGENERATE-output branch above — garbage is not worth
+                    # salvaging, and the extra bytes there would only invite a
+                    # caller to try.
+                    self.state.resolve_error(
+                        req, truncated_msg, partial_content=_body_text)
                 self.record_completion(
                     req, decision, duration,
                     resp.input_tokens, resp.output_tokens, "truncated",

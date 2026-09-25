@@ -212,6 +212,10 @@ async def test_structured_truncation_fails_loud():
     r = fut.result()
     assert r["status"] == "error"
     assert "truncated structured output" in r["error"]
+    # The backend's own truncated text rides the error result — additive
+    # `partial_content`, so a caller's salvage path has something to repair
+    # instead of an empty string (verified live 2026-09-24).
+    assert r["partial_content"] == '{"a":'
 
 
 @pytest.mark.asyncio

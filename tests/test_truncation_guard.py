@@ -35,7 +35,7 @@ import logging
 
 import pytest
 
-from roadstead.backend import BackendResponse, BackendStreamEvent
+from roadstead.backend import BackendError, BackendResponse, BackendStreamEvent
 from roadstead.config import ProxyConfig
 from roadstead.scheduler import QueuedRequest
 from roadstead.service import ProxyService
@@ -187,6 +187,47 @@ async def test_sync_structured_truncation_502_and_marker(caplog):
     assert svc._correction.state.truncation_total == 1
 
 
+@pytest.mark.asyncio
+async def test_sync_structured_truncation_502_includes_partial_content():
+    """The backend's own truncated text rides the 502 as `partial_content`
+    (docs/api.md §2.2, additive). Without it a caller's truncation-salvage
+    path (repair a cut-off JSON array by dropping the partial trailing item)
+    has nothing to work from — verified live 2026-09-24 against a kv4
+    probe-generation call that produced 52 complete JSON items before
+    truncating, and the caller received an empty string."""
+    svc = _svc_sync('{"a":', "length")
+    resp, result = await _drive_sync(svc, _payload(structured=True))
+    assert resp.status_code == 502
+    assert result["partial_content"] == '{"a":'
+
+
+@pytest.mark.asyncio
+async def test_sync_unrelated_error_has_no_partial_content():
+    """`partial_content` is scoped to the structured-truncation failure — a
+    plain backend 4xx (never a truncation) must not carry it, and every
+    existing error-body assertion elsewhere in this file still holds."""
+    svc = ProxyService(ProxyConfig())
+
+    async def fake_call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
+        raise BackendError(400, "bad request: malformed field")
+
+    svc._backend.call = fake_call
+    resp, result = await _drive_sync(svc, _payload(structured=True))
+    assert resp.status_code == 502
+    assert "partial_content" not in result
+
+
+@pytest.mark.asyncio
+async def test_sync_freetext_truncation_ok_response_has_no_partial_content():
+    """Free-text truncation is never a failure (status ok) — nothing carries
+    `partial_content` on a 200, guarding against the field leaking onto a
+    served response."""
+    svc = _svc_sync("a long capped reply", "length")
+    resp, result = await _drive_sync(svc, _payload())
+    assert resp.status_code == 200
+    assert "partial_content" not in result
+
+
 # --------------------------------------------------------------------------- #
 # sync — structured length classified as DEGENERATE (not benign truncation)
 # 2026-09-06: a structured finish_reason=length response is run through the
@@ -241,6 +282,33 @@ async def test_sync_structured_length_degenerate_enforce_changes_message(caplog)
     st = svc._correction.state
     assert st.degeneration_detected == 1
     assert st.degeneration_by_call_site["kv4.judge"]["detected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_structured_length_degenerate_enforce_has_no_partial_content():
+    """The DEGENERATE-output branch (distinct marker, flag ON) must NOT carry
+    `partial_content` — a repetition loop's output is garbage by definition,
+    and offering it invites a caller to spend a repair attempt salvaging
+    nothing. `partial_content` is scoped to the `truncated structured output`
+    marker; this branch deliberately emits a different one."""
+    svc = _svc_sync(_degen_body(), "length", output_tokens=500)
+    svc._flags.set_many({"degenerate_length_enforce": True})
+    resp, result = await _drive_sync(svc, _payload(structured=True))
+    assert resp.status_code == 502
+    assert "degenerate structured output" in result["error"]
+    assert "partial_content" not in result
+
+
+@pytest.mark.asyncio
+async def test_sync_structured_length_degenerate_shadow_still_has_partial_content():
+    """Shadow (flag off, the default): the caller-visible MESSAGE stays the
+    ordinary 'truncated structured output' marker, so `partial_content` rides
+    along exactly as it does for a non-degenerate truncation — the internal
+    classification is invisible to the caller either way."""
+    svc = _svc_sync(_degen_body(), "length", output_tokens=500)
+    resp, result = await _drive_sync(svc, _payload(structured=True))
+    assert resp.status_code == 502
+    assert result["partial_content"] == _degen_body()
 
 
 @pytest.mark.asyncio

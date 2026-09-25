@@ -134,6 +134,13 @@ def sync_response(req: "QueuedRequest", result: dict) -> Response:
         # advising a retry the proxy itself declined to make.
         if result.get("backend_status") is not None:
             body["backend_status"] = result["backend_status"]
+        # The backend's own truncated text (structured-truncation failures
+        # only — see Lifecycle._execute_sync / state.resolve_error). Additive,
+        # same reasoning as backend_status: no caller pins this envelope's key
+        # set, and without it a caller's truncation-salvage path gets nothing
+        # to salvage.
+        if result.get("partial_content"):
+            body["partial_content"] = result["partial_content"]
         return JSONResponse(body, status_code=502)
 
     body = {

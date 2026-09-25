@@ -14,6 +14,17 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Added
 
+- **A structured-truncation 502 (`truncated structured output`, §2.2) now carries `partial_content`
+  — the text the backend actually generated before the cut.** Additive on every door that can emit
+  the marker (legacy §1.9.4, enriched §1.7.3, and nested inside the OpenAI door's `error` object);
+  the status, message and `code` are unchanged. Without it a caller's truncation-salvage path (repair
+  a cut-off JSON array by dropping the partial trailing item) had nothing to repair — the 502 simply
+  discarded the body. Measured 2026-09-24: a kv4 probe-generation call produced 52 complete, valid
+  JSON items in 5000 tokens before truncating, and the caller received an empty string. Never sent on
+  the degenerate-generation (repetition-loop) branch, which emits a distinct marker — that output is
+  garbage by definition and not worth salvaging. Can be large (tens of KB for a long generation) and
+  is never truncated on the way out.
+
 - **An endpoint can declare the decode sampling to use while REASONING
   (`policy.thinking_temperature` / `policy.thinking_top_p`).** A reasoning model's failure mode at
   low temperature is not a worse answer, it is NO answer: an easy cyclic continuation out-competes a

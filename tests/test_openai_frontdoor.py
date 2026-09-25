@@ -188,6 +188,36 @@ async def test_backend_error_is_openai_shaped_502():
 
 
 @pytest.mark.asyncio
+async def test_structured_truncation_carries_partial_content_openai_door():
+    """The OpenAI door's 502 additionally nests `partial_content` inside the
+    `error` object — the backend's own truncated text, additive alongside the
+    existing `message`/`type`/`code` keys (docs/api.md §2.2)."""
+    async def truncated(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
+        return BackendResponse(
+            status_code=200,
+            body={"choices": [{"message": {"content": '{"a":'},
+                               "finish_reason": "length"}],
+                  "usage": {"prompt_tokens": 5, "completion_tokens": 16}},
+            duration_s=0.01, input_tokens=5, output_tokens=16,
+            finish_reason="length")
+
+    svc = await _make_started_service(call=truncated)
+    try:
+        body = _openai_body()
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "s", "schema": {"type": "object"}},
+        }
+        resp = await svc.handle_openai_chat(body, _FakeRequest())
+        assert resp.status_code == 502
+        result = json.loads(resp.body.decode())
+        assert "truncated structured output" in result["error"]["message"]
+        assert result["error"]["partial_content"] == '{"a":'
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_timeout_is_openai_shaped_504_and_honors_client_timeout():
     async def slow(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
         await asyncio.sleep(0.5)

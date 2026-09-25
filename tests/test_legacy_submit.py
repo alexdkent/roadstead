@@ -422,6 +422,39 @@ async def test_a_backend_failure_is_502_backend_error():
 
 
 @pytest.mark.asyncio
+async def test_a_structured_truncation_carries_partial_content():
+    """The legacy door's 502 additionally carries `partial_content` — the
+    backend's own truncated text — on the structured-truncation failure
+    (docs/api.md §1.9.4/§2.2). Additive: the six-key ok envelope and every
+    other error shape in this file are unaffected."""
+    svc = ProxyService(ProxyConfig())
+
+    async def truncated_call(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
+        return BackendResponse(
+            status_code=200,
+            body={"choices": [{"message": {"content": '{"a":'},
+                               "finish_reason": "length"}],
+                  "usage": {"prompt_tokens": 5, "completion_tokens": 16}},
+            duration_s=0.01, input_tokens=5, output_tokens=16,
+            finish_reason="length")
+
+    svc._backend.call = truncated_call
+    await svc.startup()
+    try:
+        resp, _ = await _submit(svc, _body(payload={
+            "messages": [{"role": "user", "content": "x"}],
+            "max_tokens": 64,
+            "response_format": {"type": "json_object"},
+        }), _Req())
+        body = json.loads(resp.body)
+        assert resp.status_code == 502
+        assert "truncated structured output" in body["error"]
+        assert body["partial_content"] == '{"a":'
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_a_deadline_that_fires_is_504_proxy_timeout():
     """🚨 ``error`` is the bare ``"timeout"`` the old door published, and
     ``status`` is the one field added to it — a caller reading

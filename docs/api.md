@@ -833,7 +833,9 @@ appears.
 
 **Errors** keep `code` and `error` at the top level, with the §2.1 spellings
 verbatim: the enriched API is a new shape, not a new taxonomy, and §2.2's marker
-substrings live in `error`.
+substrings live in `error`. A `truncated structured output` failure additionally
+carries `partial_content` at the top level (§2.2) — the same additive field the
+legacy door publishes (§1.9.4).
 
 #### 1.7.4 Substitution: opt-in, narrowable, always disclosed
 
@@ -1077,8 +1079,8 @@ published: `{"status":"error","request_id":…,"error":…,"code":…}`.
 | 504 | `proxy_timeout` | the deadline fired |
 | 400 / 401 / 403 / 413 | `invalid_request_error` / `invalid_api_key` / `access_denied` | §1.5, §1.10 |
 
-Two deliberate differences from what this door published before it was removed,
-both additive and both stated so nobody has to diff a response to find them:
+Three deliberate differences from what this door published before it was removed,
+all additive and all stated so nobody has to diff a response to find them:
 
 * the **504** body is `{"status":"error","request_id":…,"error":"timeout","code":"proxy_timeout"}`.
   `error` is still the bare `"timeout"`; `status` is new. The old body omitted it, every caller
@@ -1087,6 +1089,9 @@ both additive and both stated so nobody has to diff a response to find them:
 * a **502** carries `backend_status` when the failure came from a backend (§2.2). No caller pins the
   key set of an error envelope, and the alternative is this door advising a retry the proxy itself
   declined to make.
+* a **502** carrying the `truncated structured output` marker additionally carries `partial_content`
+  — the backend's own truncated text (§2.2). Same reasoning as `backend_status`: no caller pins this
+  envelope's key set.
 
 ### 1.10 Request and response size caps 🚨
 
@@ -1206,6 +1211,20 @@ The envelope therefore carries `backend_status`, the status the **backend** retu
 failure came from one. A `4xx` other than `408` and `429` is permanent; everything else, and an
 absent field, stays deferrable — so a client pointed at an older proxy behaves exactly as before.
 This narrows `backend_error` only, never `backpressure`.
+
+🚨 **The `truncated structured output` marker (only) additionally carries `partial_content` — the
+text the backend actually generated before the cut.** Without it, a caller whose salvage path repairs
+a truncated JSON array (drop the partial trailing item, close the array) has nothing to repair: the
+502 discarded the very body the repair needs. Measured 2026-09-24 against a kv4 probe-generation call
+that produced 52 complete, valid JSON items in 5000 tokens before truncating — the caller received an
+empty string. `partial_content` is a **string**, present only on this one failure (never on
+`schema_invalid`, `structured_invalid_json`, `backend_error`, or anything else in this table), and can
+be large — tens of KB is normal for a long structured generation, and it is never truncated on the way
+out. It is **omitted** entirely rather than sent empty when there is nothing to carry (a `finish_reason
+=length` classified as a repetition LOOP — §2.1's degenerate-generation shadow/enforce path — never
+gets one: garbage output is not worth salvaging). It rides on every door that can emit this marker: at
+the top level of the legacy (§1.9.4) and enriched (§1.7.3) envelopes, alongside `error`/`code`, and
+nested inside the OpenAI door's `error` object alongside `message`/`type`/`code`.
 
 The **context-overflow marker is verbatim**:
 

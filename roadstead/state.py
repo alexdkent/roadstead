@@ -732,7 +732,8 @@ class ProxyState:
         return advice
 
     def resolve_error(self, req: "QueuedRequest", error: str, *,
-                      backend_status: int | None = None) -> None:
+                      backend_status: int | None = None,
+                      partial_content: str | None = None) -> None:
         """Release a queued/pending request with an error, resolving whichever
         wait primitive the caller is blocked on (sync future or streaming queue).
 
@@ -745,6 +746,15 @@ class ProxyState:
         permanent failure and simultaneously advised retrying it. One fact, two
         readers: the retry decision here and the caller's, instead of the same
         judgement made twice and differently.
+
+        🚨 ``partial_content`` is the text the BACKEND actually generated before
+        the failure — today only the structured-truncation caller (Phase 1.1,
+        ``Lifecycle._execute_sync``) passes one. Without it a caller whose
+        request got cut mid-JSON has nothing to salvage: the 502 discarded the
+        very body a repair pass (drop the truncated trailing item, close the
+        array) needs to work from. Omitted (never an empty string) when there
+        is nothing to carry, so its presence alone tells a caller whether a
+        salvage attempt is possible.
         """
         payload = {
             "request_id": req.request_id,
@@ -753,6 +763,8 @@ class ProxyState:
         }
         if backend_status is not None:
             payload["backend_status"] = int(backend_status)
+        if partial_content:
+            payload["partial_content"] = partial_content
         future = self.pending_futures.get(req.request_id)
         if future and not future.done():
             future.set_result(dict(payload))
@@ -761,6 +773,8 @@ class ProxyState:
             frame = {"type": "error", "error": error}
             if backend_status is not None:
                 frame["backend_status"] = int(backend_status)
+            if partial_content:
+                frame["partial_content"] = partial_content
             try:
                 stream_q.put_nowait(frame)
             except asyncio.QueueFull:
