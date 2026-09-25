@@ -423,3 +423,28 @@ read git.
 **Guard.** Open, in the origin project: `commit_gate` should fail, not warn, when an excluded file is
 imported by an included one. Relevant here as a warning about any future tooling that reasons about
 "what changed" from a diff.
+
+---
+
+## `thinking: true` was a silent no-op on an always-thinking model with no switch
+
+**Symptom.** None visible in the response — the request 200s, the model answers, `finish_reason` is
+clean. The only signal is the ANSWER ITSELF being less deliberate than requested: a caller opted
+into `thinking: true` on GLM-5.3-Flash (tier3, post the 2026-09-25 cutover) and was silently served
+at the template's own default effort ("low") every time.
+
+**Root cause.** `Correction.apply_thinking` treats `policy.thinking_kwargs` (empty tuple) as
+"undeclared template, don't know which switch to flip" and bails — correct for a model whose switch
+genuinely hasn't been measured yet. It is the WRONG bail for a model that has no switch to declare at
+all: GLM-5.3-Flash always reasons, and its chat template's only lever is
+`chat_template_kwargs.reasoning_effort`. The two cases — "we don't know the switch" and "there is no
+switch" — collapsed onto the same `if not keys: return`, so an always-thinking endpoint was
+structurally unreachable by the opt-in regardless of what a caller asked for.
+
+**Guard.** `policy.thinking_effort` is a second, distinct catalog field for the switchless case
+(`config.py` docstring explains why it cannot be folded into `reasoning_effort`, which targets the
+switch-bearing case and is folded conditional on the switch loop having run). `apply_thinking`'s bail
+condition is now `not keys and not switchless_effort` rather than `not keys` alone.
+`tests/test_reasoning_replay.py::test_without_thinking_effort_a_switchless_endpoint_stays_a_noop`
+pins the ORIGINAL no-op behaviour for an endpoint that declares neither (so this fix cannot silently
+widen scope), and `test_thinking_effort_maps_opt_in_on_a_switchless_endpoint` pins the fix.

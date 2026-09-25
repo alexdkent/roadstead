@@ -2520,6 +2520,17 @@ restart empties it, which costs a cold cache, never a wrong answer.
 per-endpoint breakdown and the store's own `entries`/`bytes` occupancy. All zero unless at
 least one endpoint opts in.
 
+### 3.14c Switchless thinking effort — `policy.thinking_effort`
+
+**A model with NO thinking switch at all needs a second declaration to make the
+`thinking:` opt-in do anything.** `policy.thinking_effort` covers an always-thinking chat
+template whose only lever is an effort word (`chat_template_kwargs.reasoning_effort`) rather
+than an on/off switch — without it, such an endpoint's undeclared-switch bail makes
+`thinking: true` a silent no-op, same failure shape as the switch case §3.14's loop-break
+sibling §3.13b exists for. Reuses the same reasoning headroom switch-bearing endpoints
+already get on the opt-in; a caller's own effort still wins. See `docs/ledger.md`
+"`thinking: true` was a silent no-op on an always-thinking model with no switch".
+
 ### 3.13 Goodput collapse — `endpoints[].goodput` on `/v1/status`
 
 **"The ENDPOINT is sick", which no per-request watchdog can conclude.** A backend whose engine wedges

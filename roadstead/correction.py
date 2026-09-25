@@ -2451,7 +2451,14 @@ class Correction:
             return
         ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
         keys = tuple(ep.thinking_kwargs) if ep is not None else ()
-        if not keys:
+        # `thinking_effort` (policy.thinking_effort) covers a model with NO
+        # thinking switch at all — the chat template always reasons, and the
+        # only lever is an effort word. Without this, an always-thinking
+        # endpoint would hit the `not keys` bail below on every opt-in and
+        # `thinking: true` would be a silent no-op there too — see the field's
+        # docstring in config.py for the measured GLM-5.3-Flash case.
+        switchless_effort = getattr(ep, "thinking_effort", "") if ep is not None else ""
+        if not keys and not switchless_effort:
             # Undeclared template → we do not know which variable switches
             # reasoning on this model, and guessing is how the tier3 swap went
             # unnoticed. Refusing here is a no-op for the caller, same as the
@@ -2476,7 +2483,10 @@ class Correction:
         # over the server's launch default, so an effort sent on its own renders
         # with thinking OFF and the effort dropped — verified 2026-09-07 via a
         # live `/apply-template`. Building one dict here is what makes that
-        # impossible to get wrong from a catalog declaration.
+        # impossible to get wrong from a catalog declaration. (On a SWITCHLESS
+        # endpoint there is no switch key in `ck` to merge against — the effort
+        # rides alone, which is fine, because there is no launch default it
+        # could silently lose a race with.)
         #
         # A CALLER'S OWN PIN WINS. Same rule the switch keys follow: this is a
         # per-endpoint DEFAULT for callers that opted into thinking and said
@@ -2487,7 +2497,14 @@ class Correction:
         # (`fold_caller_effort`). The switch is already forced True above — this
         # caller opted into thinking, which outranks an effort of "none" — so
         # OFF still takes the declared rung rather than the template's maximum.
-        declared_effort = getattr(ep, "reasoning_effort", "") if ep is not None else ""
+        # `reasoning_effort` (switch-bearing) and `thinking_effort` (switchless)
+        # are two different catalog fields for two different endpoint shapes;
+        # an endpoint declaring both is not expected, and the switch-bearing
+        # one wins if it somehow happens, since that is the field the switch
+        # loop above already anchors to.
+        declared_effort = (
+            getattr(ep, "reasoning_effort", "") if ep is not None else ""
+        ) or switchless_effort
         if declared_effort and fold_caller_effort(p, ck, ()) in (EFFORT_ABSENT, EFFORT_OFF):
             ck["reasoning_effort"] = declared_effort
         p["chat_template_kwargs"] = ck

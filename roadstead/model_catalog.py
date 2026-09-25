@@ -563,6 +563,13 @@ _POLICY_PASSTHROUGH = (
     # max_tokens on the `thinking:` opt-in. Absent/0 = use the global. Guarded by
     # test_reasoning_tuning.py::test_thinking_budget_override_reaches_endpoint_config.
     "thinking_reasoning_budget",
+    # Reasoning EFFORT for the `thinking:` opt-in on a model with NO thinking
+    # switch (thinking_kwargs empty) — the template always reasons, and this
+    # is the only lever. Absent = inject nothing, same as reasoning_effort
+    # above but for the switch-LESS case, which apply_thinking otherwise
+    # bails out of before ever reaching effort logic. Guarded by
+    # test_thinking_effort.py::test_thinking_effort_reaches_endpoint_config.
+    "thinking_effort",
     # Reasoning LOOP-BREAK thresholds (correction.ReasoningLoopDetector). All
     # four must be positive for the detector to arm; absent/partial = inert.
     # Guarded by

@@ -382,6 +382,31 @@ class EndpointConfig:
     #: a caller's own pin is deliberately NOT gated on this: see
     #: ``backend._THINKING_KWARG_NAMES``.
     thinking_kwargs: tuple[str, ...] = ()
+    #: Reasoning EFFORT to apply on the proxy's ``thinking:`` opt-in, for a
+    #: model that has NO thinking switch at all — i.e. ``thinking_kwargs`` is
+    #: empty because the chat template always reasons and the only lever is
+    #: an effort word (``chat_template_kwargs.reasoning_effort``). From
+    #: ``policy.thinking_effort``. "" = undeclared, inject nothing.
+    #:
+    #: 🚨 THIS IS A DIFFERENT FIELD FROM ``reasoning_effort`` ABOVE, ON
+    #: PURPOSE. ``reasoning_effort`` is the default effort for an endpoint
+    #: that DOES declare a switch (``apply_thinking`` folds it in alongside
+    #: setting the switch True); an always-thinking model has no switch to
+    #: set, so without this field ``apply_thinking`` bails at the "undeclared
+    #: template" check before ever reaching the effort logic, and a caller's
+    #: `thinking: true` is a SILENT no-op — the model reasons at whatever its
+    #: server-side default is regardless of what the caller asked for.
+    #: Measured on GLM-5.3-Flash (tier3, 2026-09-25): `thinking_kwargs: []`
+    #: (always thinks, no switch), template's own default effort "low",
+    #: chat_template_kwargs.reasoning_effort accepts "low"/"high" (anything
+    #: else renders "max"). A caller opting into `thinking: true` there was
+    #: silently answered at "low" — a quality regression, not a neutral
+    #: no-op.
+    #:
+    #: A CALLER'S OWN PIN WINS, same rule as ``reasoning_effort`` above: this
+    #: is a default for a caller that opted into thinking and said nothing
+    #: about how hard to think, not an override of one that did.
+    thinking_effort: str = ""
     #: Opt in to REASONING REPLAY (roadstead/reasoning_replay.py), from
     #: ``policy.replay_reasoning_history``. False = undeclared, and the proxy
     #: neither stores nor restores anything for this endpoint — byte-identical

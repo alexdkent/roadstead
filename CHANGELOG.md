@@ -30,6 +30,17 @@ summary. The bullets below link in there where the long version is worth reading
   it onto a later request's history before dispatch. Off by default; a Roadstead restart
   empties the store. See `roadstead/reasoning_replay.py`.
 
+- **An endpoint with NO thinking switch at all can declare `policy.thinking_effort`
+  so the `thinking:` opt-in still does something.** `apply_thinking`'s undeclared-template
+  bail (`thinking_kwargs` empty) was written for a model whose switch we simply hadn't
+  measured yet; it also silently caught the different case of a model with no switch
+  to declare — an always-thinking template whose only lever is an effort word
+  (`chat_template_kwargs.reasoning_effort`). Measured on GLM-5.3-Flash (tier3,
+  2026-09-25): `thinking_kwargs: []`, template default effort "low", and a caller's
+  `thinking: true` was a silent no-op — answered at "low" regardless of what was asked
+  for. `thinking_effort` reuses the same headroom logic switch-bearing endpoints already
+  get; a caller's own effort still wins.
+
 - **A structured-truncation 502 (`truncated structured output`, §2.2) now carries `partial_content`
   — the text the backend actually generated before the cut.** Additive on every door that can emit
   the marker (legacy §1.9.4, enriched §1.7.3, and nested inside the OpenAI door's `error` object);
