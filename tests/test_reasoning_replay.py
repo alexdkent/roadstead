@@ -397,3 +397,21 @@ def test_undeclared_endpoint_gets_the_false_default():
     kw = model_catalog.build_endpoint_kwargs(entries=[entry])["probe2"]
     assert "replay_reasoning_history" not in kw
 
+
+
+def test_key_tolerates_client_side_reformatting_of_the_assistant_turn():
+    """Clients trim content, re-serialize tool-call arguments and drop ids when
+    they rebuild history; a byte-exact key would silently miss every time."""
+    from roadstead.reasoning_replay import replay_key
+    prefix = [{"role": "user", "content": "weather in Paris?"}]
+    served = replay_key(prefix, None, "Checking.\n",
+                        [{"id": "call_1", "index": 0, "type": "function",
+                          "function": {"name": "get_weather", "arguments": '{"city": "Paris", "unit": "c"}'}}])
+    echoed = replay_key(prefix, None, "Checking.",
+                        [{"type": "function",
+                          "function": {"name": "get_weather", "arguments": '{"unit":"c","city":"Paris"}'}}])
+    assert served == echoed
+    other_conv = replay_key([{"role": "user", "content": "weather in Rome?"}], None, "Checking.",
+                            [{"type": "function",
+                              "function": {"name": "get_weather", "arguments": '{"unit":"c","city":"Paris"}'}}])
+    assert other_conv != served, "the prefix must still separate conversations"

@@ -107,6 +107,34 @@ def _canonical(obj: Any) -> str:
         return repr(obj)
 
 
+def _normalize_tool_calls(tool_calls: Any) -> Any:
+    """The assistant turn's tool calls as (function name, canonical arguments)
+    pairs — no ``id``/``index``/``type``.
+
+    Clients rebuild history their own way: they re-serialize ``arguments``
+    (key order, spacing), drop or regenerate call ids, and trim whitespace off
+    ``content``. A byte-exact key would make every one of those a SILENT miss —
+    the feature would look deployed and do nothing. The conversation prefix is
+    still in the key, so this tolerance cannot pair two different
+    conversations' turns."""
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return None
+    out = []
+    for tc in tool_calls:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if not isinstance(fn, dict):
+            out.append(_canonical(tc))
+            continue
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (TypeError, ValueError):
+                args = args.strip()
+        out.append([fn.get("name"), args])
+    return out
+
+
 def replay_key(messages_before: Any, system: Any, content: Any,
                 tool_calls: Any) -> str:
     """The stable key for one assistant turn: its full conversation PREFIX
@@ -122,8 +150,8 @@ def replay_key(messages_before: Any, system: Any, content: Any,
         if isinstance(messages_before, list) else [])
     keyed: dict[str, Any] = {
         "messages": norm_messages,
-        "content": content if isinstance(content, str) else "",
-        "tool_calls": tool_calls or None,
+        "content": content.strip() if isinstance(content, str) else "",
+        "tool_calls": _normalize_tool_calls(tool_calls),
     }
     if system is not None:
         keyed["system"] = system
