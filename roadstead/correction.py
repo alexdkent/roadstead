@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .backend import BackendError, BackendUnavailable
 from .config import (
@@ -40,6 +40,7 @@ from .grammar import (
 from .hooks import degradation
 from .observability import MetricsSample, record_structured_outcome
 from .providers import provider_for
+from .reasoning_replay import replay_key
 
 # Phase 3 schema-repair backstop deps. json-repair recovers parseable-but-not-
 # valid JSON (fences / trailing prose / trailing commas / a missing brace) before
@@ -1780,6 +1781,118 @@ class Correction:
             if isinstance(props, dict):
                 return list(props.keys())
         return []
+    def apply_reasoning_replay_restore(self, req: QueuedRequest) -> None:
+        """Request-side: re-attach a PRIOR turn's own reasoning to any
+        assistant message in this request's history that lacks one, on an
+        endpoint that opted in (``policy.replay_reasoning_history``). See
+        ``roadstead/reasoning_replay.py`` for why this exists and how the key
+        is built. No-op on every other endpoint — undeclared behaves exactly
+        as it did before this method existed.
+
+        Runs whether or not a hit is found for a given message: a MISS is
+        counted and that message is left exactly as the caller sent it — the
+        backend's own template default applies, same as today. A message
+        that ALREADY carries ``reasoning``/``reasoning_content`` is left
+        untouched and counted separately (``reasoning_replay_skipped``): the
+        caller (or an earlier pass of this same method, on a prior hop) has
+        already done the job.
+
+        Mutates ``req.payload`` to a NEW dict/messages-list rather than
+        editing message dicts in place — the same "never hand back the
+        caller's own object mutated" care ``execute_streaming`` takes with
+        its local ``stream_options`` copy, applied here at admission time
+        instead of at dispatch time. Runs before ``persist_enqueue`` captures
+        ``req.payload`` for the corpus, so — like ``apply_thinking`` next
+        door — the restored reasoning becomes part of the recorded request,
+        which is correct: it is what was actually sent to the backend.
+
+        Never raises into the request path: a failure here costs a
+        prefix-cache hit on the backend, never a served response."""
+        if req.payload_type != "chat_completion":
+            return
+        p = req.payload
+        if not isinstance(p, dict):
+            return
+        ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
+        if ep is None or not getattr(ep, "replay_reasoning_history", False):
+            return
+        messages = p.get("messages")
+        if not isinstance(messages, list):
+            return
+        try:
+            system = p.get("system")
+            new_messages: list | None = None
+            ep_tally = self.state.reasoning_replay_by_endpoint.setdefault(
+                req.endpoint, {"stored": 0, "restored": 0, "miss": 0, "skipped": 0})
+            for i, m in enumerate(messages):
+                if not isinstance(m, dict) or m.get("role") != "assistant":
+                    continue
+                if m.get("reasoning") or m.get("reasoning_content"):
+                    self.state.reasoning_replay_skipped += 1
+                    ep_tally["skipped"] += 1
+                    continue
+                key = replay_key(messages[:i], system, m.get("content"),
+                                 m.get("tool_calls"))
+                reasoning = self.state.reasoning_replay.get(key)
+                if reasoning is None:
+                    self.state.reasoning_replay_miss += 1
+                    ep_tally["miss"] += 1
+                    continue
+                if new_messages is None:
+                    new_messages = list(messages)
+                new_messages[i] = {**m, "reasoning_content": reasoning}
+                self.state.reasoning_replay_restored += 1
+                ep_tally["restored"] += 1
+            if new_messages is not None:
+                req.payload = {**p, "messages": new_messages}
+        except Exception:  # noqa: BLE001 — a correction must never break a response
+            logger.debug("reasoning replay restore failed (call_site=%s)",
+                         req.call_site, exc_info=True)
+
+    def store_reasoning_replay(self, req: QueuedRequest, content: Any,
+                               tool_calls: Any, reasoning: Any) -> None:
+        """Response-side: remember the reasoning that produced THIS assistant
+        turn, keyed by the conversation prefix that led to it
+        (``req.payload["messages"]`` as SENT — before this turn's reply), so
+        a later call replaying this turn in history can get it back via
+        :meth:`apply_reasoning_replay_restore`. Opt-in per endpoint, same gate
+        as the restore side. Only stores when ``reasoning`` is non-empty —
+        there is nothing useful to remember about a turn the backend didn't
+        reason about, and storing an empty string would make every future
+        lookup for it a false "hit" of nothing.
+
+        Called from both the non-streaming path (``content``/``tool_calls``
+        read off the finalized response) and the streaming path (accumulated
+        across deltas) — this is the one place both converge, so the key is
+        built identically either way. Never raises into the request/response
+        path: a failure here costs a future prefix-cache hit, never this
+        response."""
+        if req.payload_type != "chat_completion":
+            return
+        ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
+        if ep is None or not getattr(ep, "replay_reasoning_history", False):
+            return
+        ep_tally = self.state.reasoning_replay_by_endpoint.setdefault(
+            req.endpoint, {"stored": 0, "restored": 0, "miss": 0, "skipped": 0})
+        if not (isinstance(reasoning, str) and reasoning.strip()):
+            self.state.reasoning_replay_skipped += 1
+            ep_tally["skipped"] += 1
+            return
+        try:
+            p = req.payload
+            messages = p.get("messages") if isinstance(p, dict) else None
+            if not isinstance(messages, list):
+                self.state.reasoning_replay_skipped += 1
+                ep_tally["skipped"] += 1
+                return
+            key = replay_key(messages, p.get("system"), content, tool_calls)
+            self.state.reasoning_replay.put(key, reasoning)
+            self.state.reasoning_replay_stored += 1
+            ep_tally["stored"] += 1
+        except Exception:  # noqa: BLE001 — a correction must never break a response
+            logger.debug("reasoning replay store failed (call_site=%s)",
+                         req.call_site, exc_info=True)
+
     def apply_forced_reasoning_budget(self, req: QueuedRequest) -> None:
         """Request-side: an endpoint whose model ALWAYS emits a reasoning trace it
         CANNOT disable (``capabilities.reasoning=true`` — e.g. ``creative``/Trinity-Mini)

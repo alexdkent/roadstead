@@ -382,6 +382,30 @@ class EndpointConfig:
     #: a caller's own pin is deliberately NOT gated on this: see
     #: ``backend._THINKING_KWARG_NAMES``.
     thinking_kwargs: tuple[str, ...] = ()
+    #: Opt in to REASONING REPLAY (roadstead/reasoning_replay.py), from
+    #: ``policy.replay_reasoning_history``. False = undeclared, and the proxy
+    #: neither stores nor restores anything for this endpoint — byte-identical
+    #: to before this field existed.
+    #:
+    #: WHY THIS EXISTS. A hybrid always-thinking reasoner's chat template
+    #: renders a past assistant turn differently depending on whether the
+    #: message carries its own reasoning, and the engine's prefix cache holds
+    #: the tokens it actually generated — WITH the reasoning. A caller that
+    #: rebuilds history from ``message.content`` alone (most do) therefore
+    #: diverges from the cached prefix at the FIRST assistant turn. Measured:
+    #: turn-2 prefix hit 95.9% on plain content vs 99.9% with the reasoning
+    #: re-attached. See the reasoning_replay module docstring for the full
+    #: account and the key design.
+    #:
+    #: 🚨 Declaring this on an endpoint whose backend does NOT accept
+    #: ``reasoning_content``/``reasoning`` on an input message is a no-op, not
+    #: a break — restore only ever ADDS a field a caller's own message did not
+    #: have, and an engine that ignores an unknown field ignores it exactly as
+    #: it always did. There is nothing here for a doctrine test to pin against
+    #: a serve script the way ``disable_any_whitespace`` is, because accepting
+    #: this key back is a template/parser property this repo cannot probe
+    #: without a live backend — declare it where it was MEASURED to matter.
+    replay_reasoning_history: bool = False
     #: The expected identity of the WEIGHTS behind this endpoint, from the
     #: stanza's ``policy.model_fingerprint``. vLLM reports `/v1/models[0].root`
     #: (a weights path); llama.cpp reports a `meta` block folded to

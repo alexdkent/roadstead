@@ -2492,6 +2492,34 @@ zero content once and 309,758 characters of scratchpad relabelled as the answer 
 `abort_reason: reasoning_loop` is **not** a backend fault and **not** deferrable. Retrying an
 unchanged prompt on a lane that loops reproduces it.
 
+### 3.14b Reasoning replay — `policy.replay_reasoning_history`
+
+**Closes a prefix-cache divergence a plain content-only history replay causes on an
+always-thinking reasoner.** Such a model's chat template renders a past assistant turn
+one way when the message carries its own reasoning and a different way when it does not;
+the engine's KV prefix cache holds what it actually generated — WITH the reasoning. A
+caller that rebuilds history from `message.content` alone (most do) diverges from the
+cached prefix at the FIRST assistant turn, and every later turn in that conversation is
+re-prefilled from scratch. Measured turn-2 prefix hit: 95.9% on plain content vs 99.9%
+with the reasoning re-attached (as either `reasoning_content` or `reasoning` — accepted on
+input either way).
+
+An endpoint declaring `policy.replay_reasoning_history: true` gets both halves for free:
+Roadstead remembers a completed turn's reasoning, keyed by its full conversation prefix
+(so two identical short replies in two different conversations can never cross-contaminate,
+and a message this proxy already enriched hashes identically to the client's own bytes), and
+re-attaches it to any assistant history message on a later request that arrives without one.
+A message that already carries its own reasoning is left untouched. **Absent ⇒ off**,
+byte-identical to before the field existed; the store is in-memory, bounded (entry count,
+total bytes, TTL — all deployment-tunable, not part of the wire contract), and a Roadstead
+restart empties it, which costs a cold cache, never a wrong answer.
+
+`GET /v1/status` reports `reasoning_replay_stored` / `reasoning_replay_restored` /
+`reasoning_replay_miss` (an assistant history message had none and no cached hit) /
+`reasoning_replay_skipped` (already had reasoning, or nothing to remember), plus a
+per-endpoint breakdown and the store's own `entries`/`bytes` occupancy. All zero unless at
+least one endpoint opts in.
+
 ### 3.13 Goodput collapse — `endpoints[].goodput` on `/v1/status`
 
 **"The ENDPOINT is sick", which no per-request watchdog can conclude.** A backend whose engine wedges

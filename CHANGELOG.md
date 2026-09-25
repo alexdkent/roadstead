@@ -14,6 +14,22 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Added
 
+- **An endpoint can opt in to reasoning REPLAY (`policy.replay_reasoning_history`),
+  which re-attaches a prior turn's own reasoning to history a caller replayed without it.**
+  A hybrid always-thinking reasoner's chat template renders a past assistant turn
+  differently depending on whether the message carries its own reasoning, and the
+  engine's prefix cache holds the tokens it actually generated — WITH the reasoning. A
+  caller that rebuilds history from `message.content` alone (most do; Roadstead already
+  returns the reasoning as `message.reasoning`/`delta.reasoning`, but that is usually
+  thrown away one hop later) diverges from the cached prefix at the FIRST assistant turn,
+  and every later turn in that conversation is re-prefilled from scratch. Measured
+  turn-2 prefix hit: 95.9% on plain content vs 99.9% with the reasoning re-attached. An
+  in-memory, bounded (entry count + bytes + TTL), single-loop store remembers a
+  completed turn's reasoning keyed by its full conversation prefix (so two identical
+  short replies in two different conversations can never cross-contaminate) and restores
+  it onto a later request's history before dispatch. Off by default; a Roadstead restart
+  empties the store. See `roadstead/reasoning_replay.py`.
+
 - **A structured-truncation 502 (`truncated structured output`, §2.2) now carries `partial_content`
   — the text the backend actually generated before the cut.** Additive on every door that can emit
   the marker (legacy §1.9.4, enriched §1.7.3, and nested inside the OpenAI door's `error` object);

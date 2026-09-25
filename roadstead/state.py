@@ -36,6 +36,7 @@ from .management import AdminOverlay
 from .observability import RequestLogger, RollingMetrics
 from .on_demand import OnDemandManager
 from .queue import PersistentQueue
+from .reasoning_replay import ReasoningReplayStore
 from .scheduler import Scheduler
 from .spend import (
     PriceBook,
@@ -177,6 +178,13 @@ class ProxyState:
         # Deterministic response cache (temperature=0).
         self.cache = DeterministicCache()
 
+        # Reasoning replay (roadstead/reasoning_replay.py): remembers a
+        # completed turn's reasoning keyed by its conversation prefix, for an
+        # opted-in endpoint to re-attach on a later call that replays the turn
+        # in history without it. Same single-loop, no-lock, empties-on-restart
+        # shape as `self.cache` above — see the module docstring.
+        self.reasoning_replay = ReasoningReplayStore()
+
         # Grammar authority: cache of normalize+validate results keyed by
         # grammar hash, + a set of hashes we've already alerted on so each
         # bad grammar logs loudly once (not per request).
@@ -232,6 +240,16 @@ class ProxyState:
         self.thinking_fallback = 0    # unrecoverable structured output — failed safe
         self.thinking_noop = 0        # thinking applied but response carried NO
                                       # reasoning (backend ignored enable_thinking)
+        # Reasoning replay (roadstead/reasoning_replay.py). All four stay 0
+        # unless at least one endpoint declares `policy.replay_reasoning_history`.
+        self.reasoning_replay_stored = 0    # a completed turn's reasoning was cached
+        self.reasoning_replay_restored = 0  # an outgoing message got its reasoning back
+        self.reasoning_replay_miss = 0      # assistant message had none and no hit
+        self.reasoning_replay_skipped = 0   # already had reasoning, or nothing to store
+        # Same four, broken down per endpoint — a fleet with ONE opted-in
+        # endpoint among many needs to see that endpoint's own hit rate, not a
+        # number diluted by every endpoint that never declared the flag.
+        self.reasoning_replay_by_endpoint: dict[str, dict[str, int]] = {}
         # WS-4 shadow egress detector: per-call_site silent grammar-drop tally
         # over ALL grammar-bearing responses (read-only; NEVER mutates a
         # response). {call_site: {"checked": int, "dropped": int}}. Populated by

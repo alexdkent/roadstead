@@ -592,6 +592,14 @@ _POLICY_PASSTHROUGH = (
     "goodput_max_prefill_tps",
     "goodput_recovery_evaluations",
     "goodput_max_hold_s",
+    # Opt in to reasoning replay (roadstead/reasoning_replay.py) — store a
+    # completed turn's reasoning keyed by its conversation prefix, and
+    # re-attach it when a later call replays that turn in history without it.
+    # False/absent = inject nothing, store nothing: the safe default for every
+    # endpoint whose engine or chat template was never measured against this.
+    # Guarded by
+    # test_reasoning_replay.py::test_declared_flag_reaches_endpoint_config.
+    "replay_reasoning_history",
 )
 
 

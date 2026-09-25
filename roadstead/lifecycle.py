@@ -87,6 +87,7 @@ from .legacy import (
 )
 from .observability import MetricsSample, RequestLogRecord
 from .on_demand import OnDemandUnavailable
+from .reasoning_replay import accumulate_tool_call_deltas
 from .scheduler import CompletionRecord, DispatchDecision, QueuedRequest
 from .sse_hub import DROP_SENTINEL
 
@@ -982,6 +983,18 @@ class Lifecycle:
                 self.state.on_demand.request_done(req.endpoint)
                 return resp
 
+        # Reasoning replay (roadstead/reasoning_replay.py): on an opted-in
+        # endpoint, re-attach a prior turn's own reasoning to any assistant
+        # history message that arrived without it — closes the prefix-cache
+        # divergence a plain content-only replay causes on an always-thinking
+        # reasoner. No-op on every endpoint that hasn't declared
+        # `policy.replay_reasoning_history`. Before the budget/thinking block
+        # below: it only ever touches `messages`, not `max_tokens`, so
+        # ordering against them doesn't matter — placed first because it is
+        # the one correction here that can add tokens to the PROMPT rather
+        # than the completion, which is worth reading first.
+        self.correction.apply_reasoning_replay_restore(req)
+
         # Forced-reasoning endpoints (e.g. creative/Trinity-Mini, capabilities.reasoning
         # =true) ALWAYS spend max_tokens on an un-disable-able CoT before the answer, so
         # small caller caps truncate mid-reasoning. Reserve answer headroom for BOTH the
@@ -1115,6 +1128,26 @@ class Lifecycle:
         # is set first). Byte-identical to the prior inline sequence — see
         # Correction.apply.
         await self.correction.apply(req, result)
+
+        # Reasoning replay STORE (non-streaming): remember the reasoning that
+        # produced this assistant turn, keyed by the conversation prefix that
+        # led to it, so a LATER call replaying this turn in history can get it
+        # back (roadstead/reasoning_replay.py). One hook point for all three
+        # wires (OPENAI/ENRICHED/LEGACY all reach here) — after
+        # `correction.apply` so a thinking-finalized/recovered body is what
+        # gets remembered, matching what the caller actually received.
+        if result.get("status") == "ok":
+            try:
+                resp_body = result.get("response")
+                ch0 = (resp_body.get("choices") or [{}])[0] if isinstance(
+                    resp_body, dict) else {}
+                msg = ch0.get("message") if isinstance(ch0, dict) else None
+                msg = msg if isinstance(msg, dict) else {}
+                reasoning = msg.get("reasoning") or msg.get("reasoning_content")
+                self.correction.store_reasoning_replay(
+                    req, msg.get("content"), msg.get("tool_calls"), reasoning)
+            except (AttributeError, IndexError, TypeError):
+                pass  # not a chat.completion shape — nothing to store
 
         # The caller-visible disclosure of what just happened to this
         # response (audit P2, 2026-09-04) — read BEFORE the internal markers
@@ -2061,7 +2094,16 @@ class Lifecycle:
             and self.correction.request_is_structured(req))
         stream_expects_json = (
             stream_structured and self.correction.request_expects_json(req))
-        accumulate = uniform_on or stream_expects_json
+        # Reasoning replay (roadstead/reasoning_replay.py), STREAMING half.
+        # Armed only on an opted-in endpoint — like the loop detector below, an
+        # undeclared lane pays one attribute check per chunk and nothing else.
+        # Forces content accumulation too (the STORE key needs the assistant's
+        # final `content`, not just its reasoning), independent of `accumulate`
+        # below — a caller not asking for JSON must not silently starve this.
+        replay_on = bool(getattr(ep_cfg, "replay_reasoning_history", False))
+        accumulated_reasoning = ""
+        stream_tool_calls: dict[int, dict] = {}
+        accumulate = uniform_on or stream_expects_json or replay_on
         accumulated_content = ""
         # Reasoning LOOP-BREAK (2026-09-15). Built from the ENDPOINT's declared
         # thresholds; an endpoint that declares none builds an inert detector
@@ -2206,6 +2248,18 @@ class Lifecycle:
                                     piece = delta.get("content") if isinstance(delta, dict) else None
                                     if isinstance(piece, str):
                                         accumulated_content += piece
+                                if replay_on and isinstance(delta, dict):
+                                    # Same both-spellings read as the loop
+                                    # detector below — vLLM's deepseek_v4
+                                    # parser emits `reasoning`, other lanes
+                                    # emit `reasoning_content`.
+                                    rrc = delta.get("reasoning")
+                                    if not isinstance(rrc, str):
+                                        rrc = delta.get("reasoning_content")
+                                    if isinstance(rrc, str):
+                                        accumulated_reasoning += rrc
+                                    accumulate_tool_call_deltas(
+                                        stream_tool_calls, delta.get("tool_calls"))
                                 if loop_detector.armed and isinstance(delta, dict):
                                     # BOTH spellings, always. vLLM's deepseek_v4
                                     # parser emits `reasoning`; other lanes emit
@@ -2543,6 +2597,17 @@ class Lifecycle:
         # self-gated on the flag; no-op when uniform correction is off.
         if uniform_on:
             self.correction.finalize_stream(req, accumulated_content, last_finish_reason)
+        # Reasoning replay STORE (streaming): remember the reasoning that
+        # produced this turn, same as the non-streaming hook in
+        # handle_sync_submit. Only on a genuinely completed ("ok") turn — a
+        # truncated/errored stream's reasoning is not what a future replay of
+        # this turn should get back.
+        if replay_on and status == "ok":
+            tool_calls_list = (
+                [stream_tool_calls[i] for i in sorted(stream_tool_calls)]
+                if stream_tool_calls else None)
+            self.correction.store_reasoning_replay(
+                req, accumulated_content, tool_calls_list, accumulated_reasoning)
     async def _answer_now_stream(
         self, req: QueuedRequest, ep_cfg, notes: str, stream_q,
         timeout_s: float,

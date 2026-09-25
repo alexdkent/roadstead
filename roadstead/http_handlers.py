@@ -858,6 +858,24 @@ class ProxyHttpHandlers:
                 # backend template ignored enable_thinking. Non-zero here means
                 # the opt-in is silently doing nothing on that endpoint.
                 "thinking_noop": self.state.thinking_noop,
+                # Reasoning replay (roadstead/reasoning_replay.py): a prior
+                # turn's reasoning re-attached to history on an opted-in
+                # endpoint. All 0 until an endpoint declares
+                # `policy.replay_reasoning_history`. `miss` (an assistant
+                # history message had none and no cached hit) vs `skipped`
+                # (already had reasoning, or a store had nothing to remember)
+                # are separate because they mean opposite things: a rising
+                # `miss` on a busy endpoint says the cache is too small or too
+                # short-lived; `skipped` climbing with it is expected and fine.
+                "reasoning_replay_stored": self.state.reasoning_replay_stored,
+                "reasoning_replay_restored": self.state.reasoning_replay_restored,
+                "reasoning_replay_miss": self.state.reasoning_replay_miss,
+                "reasoning_replay_skipped": self.state.reasoning_replay_skipped,
+                "reasoning_replay_by_endpoint": {
+                    ep: t for ep, t in self.state.reasoning_replay_by_endpoint.items()
+                    if any(t.values())
+                },
+                "reasoning_replay_cache": self.state.reasoning_replay.stats(),
                 # Reasoning loop-break. THREE counters, not one, because the
                 # gaps between them are the measurement: `detected - broken` is
                 # what shadow mode suppressed, and `broken - answered` is the
