@@ -451,6 +451,14 @@ async def test_a_blind_endpoint_never_sheds_and_says_so(proxy):
         "an unevaluable endpoint must publish NO collapsed series — a 0 there "
         "reads as verified-healthy")
 
+    # Drive ONE alert evaluation at the journey's own clock, exactly as `_poll`
+    # drives sampling. `/v1/status.alerts` is refreshed by the background poller,
+    # and this test used to rely on it happening to complete a pass between the
+    # samples above and the read below: it did ~once on a long-uptime dev box
+    # and never on a freshly booted CI runner, so CI was red on every push from
+    # 2026-09-17 on this assertion alone. Same convention as the other alert
+    # tests (`test_max_slots_reconcile`, `test_structured_empty_alarm`).
+    proxy.svc._health.evaluate_alerts(_poll._t)
     alerts = {a["name"] for a in (await proxy.client.get("/v1/status")).json()["alerts"]}
     assert "endpoint_goodput_blind" in alerts
 
