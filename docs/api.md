@@ -1187,6 +1187,14 @@ either as terminal throws away a call the next attempt would have completed:
 | `truncated structured output` | A structured request (a grammar, a `response_format` schema, structured outputs) came back with `finish_reason=length`, so the body is almost certainly unparseable JSON — `lifecycle.py` fails it loud with a deferrable error rather than record garbage, and never caches it. `correction.py` emits the same marker for the other spelling of the same fault: a tool call whose `arguments` were cut mid-JSON while `finish_reason` claimed `tool_calls`. That variant carries the code `toolcall_truncated` (§2.1, deferrable) and additionally reports `toolcall_truncated` in `X-Roadstead-Corrected` (§1.8). | **Raise the output budget and retry** — a larger `max_tokens`, or re-chunk the input so the answer fits under the one in force. Retrying the identical request unchanged truncates identically. |
 | `returned empty completion` | A backend answered `200` with no content at all (`backend.py`). The proxy retries this itself first, and arms a `min_tokens` re-dispatch to break a position-0-EOS degeneration — it matches this very substring to decide to do so, which makes the marker load-bearing *inside* the proxy as well as at the caller. A caller only sees it once those attempts have been spent. | **Retry.** It surfaces as a `502` carrying `backend_status: 502`, so the rule below keeps it deferrable — but a caller matching prose must not read "empty" as "the model had nothing to say". |
 
+A structured request whose generation dies with a backend **`500 InternalServerError`** is retried
+**once** by the proxy itself (`ROADSTEAD_STRUCTURED_FAULT_RETRY`; counted as
+`structured_fault_retries` on `GET /v1/status`). This is the engine terminating a request mid-generation
+after its grammar matcher and speculative decoding fell out of step (a draft rollback, then "grammar
+rejected tokens"), a sampling-path fault that a fresh generation almost always avoids. It is never retried
+twice, never retried for an unstructured request, and a malformed request is a `400`, not this. If the
+single retry also fails, the `500`-derived error surfaces unchanged.
+
 Free-form truncation is *not* in this set: a `finish_reason=length` on an unstructured request is a
 short answer, not a broken one, and it is returned normally.
 

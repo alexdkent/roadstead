@@ -1580,6 +1580,10 @@ class Lifecycle:
         # and must stay the caller's bytes.
         dispatch_payload = req.payload
         rescue_armed = False
+        # One-shot retry for a structured request whose generation died on the
+        # grammar-matcher / speculative-decoding desync (see
+        # Correction.is_structured_generation_fault). Never more than once.
+        structured_fault_retried = False
         while True:
             attempts += 1
             # Phase 1.5 slot-leak fix: bound each backend attempt to the
@@ -1667,8 +1671,13 @@ class Lifecycle:
                 # unreachable/503, or an empty completion — a backend hiccup, not
                 # a content error) RETRIES within the remaining deadline rather
                 # than burning the call. Deterministic 4xx/other 5xx surface.
+                structured_fault = (
+                    not structured_fault_retried
+                    and self.correction.is_structured_generation_fault(exc)
+                    and self.correction.request_is_structured(req)
+                )
                 if (
-                    self.correction.is_transient_backend_error(exc)
+                    (self.correction.is_transient_backend_error(exc) or structured_fault)
                     and attempts <= self.state.transient_retry_max
                     and (req.timeout_deadline - time.monotonic()) > _MIN_RETRY_BUDGET_S
                     and self.health.endpoint_healthy(req.endpoint)
@@ -1691,6 +1700,15 @@ class Lifecycle:
                             "empty completion on %s (attempt %d) — retrying "
                             "with min_tokens=%d (EOS-degeneration rescue)",
                             ep_cfg.role, attempts, _EMPTY_RESCUE_MIN_TOKENS,
+                        )
+                    elif structured_fault:
+                        structured_fault_retried = True
+                        self.state.structured_fault_retries += 1
+                        logger.warning(
+                            "ROADSTEAD_STRUCTURED_FAULT_RETRY %s (attempt %d): "
+                            "structured request died mid-generation with an "
+                            "engine 500 — retrying once: %s",
+                            ep_cfg.role, attempts, exc,
                         )
                     else:
                         logger.warning(

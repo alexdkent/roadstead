@@ -15,7 +15,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from .backend import BackendError, BackendUnavailable
+from .backend import BackendError, BackendTimeout, BackendUnavailable
 from .config import (
     degeneration_guard_enabled,
     degeneration_shadow_only,
@@ -2992,6 +2992,24 @@ class Correction:
         ):
             return True
         return False
+    @staticmethod
+    def is_structured_generation_fault(exc: Exception) -> bool:
+        """A vLLM 500 ``InternalServerError`` raised MID-GENERATION — the class a
+        structured-output request can hit when the grammar matcher and
+        speculative decoding fall out of step (the engine logs ``grammar
+        rejected tokens ... Terminating request`` after a draft ROLLBACK, and
+        answers the generic 500). It is a sampling-path fault, not a property
+        of the request: a fresh generation almost always takes a different
+        path. Callers pair this with :meth:`request_is_structured` and allow a
+        SINGLE retry — a genuinely deterministic 500 then costs one extra fast
+        failure, never a loop. Bad requests are 400s, not this."""
+        if not isinstance(exc, BackendError) or isinstance(exc, (BackendTimeout, BackendUnavailable)):
+            return False
+        if getattr(exc, "status_code", None) != 500:
+            return False
+        detail = (exc.detail or "").lower()
+        return "internal server error" in detail or "internalservererror" in detail
+
     @staticmethod
     def is_transient_backend_error(exc: Exception) -> bool:
         """Infra-transient backend failures that should DEFER (retry within the

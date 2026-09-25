@@ -900,6 +900,7 @@ class ProxyHttpHandlers:
                 # Empty-completion (position-0-EOS) rescue: retries dispatched
                 # with min_tokens, and how many produced a real response.
                 "empty_rescue_attempts": self.state.empty_rescue_attempts,
+                "structured_fault_retries": self.state.structured_fault_retries,
                 "empty_rescue_recovered": self.state.empty_rescue_recovered,
                 # Truncation / structured-validity guard (operator mandate
                 # 2026-07-11): per-(model, caller) finish_reason=length tallies

@@ -245,6 +245,7 @@ class ProxyService:
     _degeneration_by_call_site = _StateField("degeneration_by_call_site")
     _degen_redispatch_inflight = _StateField("degen_redispatch_inflight")
     _empty_rescue_attempts = _StateField("empty_rescue_attempts")
+    _structured_fault_retries = _StateField("structured_fault_retries")
     _empty_rescue_recovered = _StateField("empty_rescue_recovered")
     _timed_out_ids = _StateField("timed_out_ids")
     _inflight_tasks = _StateField("inflight_tasks")

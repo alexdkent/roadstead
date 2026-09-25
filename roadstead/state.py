@@ -284,6 +284,7 @@ class ProxyState:
         # _EMPTY_RESCUE_MIN_TOKENS. attempts = retries dispatched with
         # min_tokens; recovered = those that produced a real response.
         self.empty_rescue_attempts = 0
+        self.structured_fault_retries = 0
         self.empty_rescue_recovered = 0
         # Per-endpoint empty-completion events (audit 2026-07-12, C-3): a 2xx
         # backend response with no content/tool_calls (position-0-EOS), counted
