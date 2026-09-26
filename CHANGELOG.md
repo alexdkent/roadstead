@@ -33,10 +33,20 @@ summary. The bullets below link in there where the long version is worth reading
   failure resolves the SAME non-`"truncated structured output"` wording
   `degenerate_length_enforce` uses (that substring is what a caller's
   truncation-recovery path matches on to retry with MORE tokens, which for a
-  non-terminating loop is exactly the wrong move). 0/absent ⇒ off, byte-identical to
-  before this existed. `GET /v1/status` → `structured_blank_runs_detected` /
-  `_salvaged` / `_retried` / `_recovered` / `_unrecovered`. Grep marker:
-  `ROADSTEAD_STRUCTURED_BLANK_RUN`. See `docs/api.md` §3.15.
+  non-terminating loop is exactly the wrong move). `call_watched` bounds the WHOLE
+  attempt with the same total deadline `call()` honours (`asyncio.timeout`, raising the
+  same `BackendTimeout`) rather than only `stream()`'s per-read gap — a slow-but-alive
+  stream could otherwise outlive the caller's deadline and hold the slot. Its usage
+  block is the backend's OWN, passed through verbatim (never rebuilt field by field),
+  so a field like `usage.completion_tokens_details.reasoning_tokens` survives into the
+  reassembled body; when no usage frame arrives at all (an abort, mid-stream by
+  definition, or a clean completion whose backend never sent one), `output_tokens`
+  falls back to the repo's own chars/4 estimator (`cost_model.estimate_tokens_from_chars`)
+  rather than a chunk count (a chunk is not a token), logged loudly
+  (`ROADSTEAD_CALL_WATCHED_NO_USAGE`) so the estimate is never mistaken for a measured
+  count. 0/absent ⇒ off, byte-identical to before this existed. `GET /v1/status` →
+  `structured_blank_runs_detected` / `_salvaged` / `_retried` / `_recovered` /
+  `_unrecovered`. Grep marker: `ROADSTEAD_STRUCTURED_BLANK_RUN`. See `docs/api.md` §3.15.
 
 - **The "no accidental MAX" reasoning-effort guard — `policy.reasoning_effort_map`.**
   Measured on GLM-5.3-Flash (tier3): its chat template renders only `low`/`high`/`max`

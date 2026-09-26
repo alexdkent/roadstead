@@ -149,6 +149,42 @@ async def test_abort_then_retry_recovers(caplog):
     assert actions == ["retrying", "recovered"]
 
 
+@pytest.mark.asyncio
+async def test_abort_then_retry_then_salvage_counts_salvaged_not_recovered(caplog):
+    """🚨 THE REGRESSION THIS TEST PINS. Attempt 1 blank-runs on an
+    UNSALVAGEABLE prefix (retry granted); attempt 2 ALSO blank-runs, but this
+    time on a body that IS salvageable (trailing whitespace after an already-
+    complete object). This must count as `salvaged`, once — never ALSO as
+    `recovered`, which would double-count the same event under two labels."""
+    svc = _svc()
+    attempts = {"n": 0}
+
+    async def fake_stream(ep_cfg, payload, payload_type, request_id, timeout_s=180.0):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            yield _chunk('{"a": ')  # unparseable once stripped
+            yield _chunk(" " * (_THRESHOLD + 5))
+        else:
+            yield _chunk('{"a": 1}')  # already complete...
+            yield _chunk(" " * (_THRESHOLD + 5))  # ...then a salvageable run
+
+    svc._backend.stream = fake_stream
+    with caplog.at_level(logging.WARNING):
+        resp, result = await _drive(svc, _payload())
+    assert attempts["n"] == 2
+    assert resp.status_code == 200
+    assert result["response"]["choices"][0]["message"]["content"] == '{"a": 1}'
+    assert result["response"]["choices"][0]["finish_reason"] == "stop"
+    assert svc._state.structured_blank_runs_detected == 2
+    assert svc._state.structured_blank_runs_salvaged == 1
+    assert svc._state.structured_blank_runs_retried == 1
+    assert svc._state.structured_blank_runs_recovered == 0
+    assert svc._state.structured_blank_runs_unrecovered == 0
+    actions = [r.getMessage().split("action=")[1].split()[0]
+               for r in caplog.records if "ROADSTEAD_STRUCTURED_BLANK_RUN" in r.getMessage()]
+    assert actions == ["retrying", "salvaged"]
+
+
 # --------------------------------------------------------------------------- #
 # retry — blank-runs again -> degenerate error, non-"truncated" wording
 # --------------------------------------------------------------------------- #

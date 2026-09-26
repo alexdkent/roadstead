@@ -1736,6 +1736,20 @@ class Lifecycle:
                         salvaged_body = copy.deepcopy(exc.body_so_far)
                         salvaged_body["choices"][0]["message"]["content"] = stripped
                         salvaged_body["choices"][0]["finish_reason"] = "stop"
+                        if "usage" not in salvaged_body:
+                            # An abort never reaches the stream's usage frame
+                            # (see call_watched), so `body_so_far` usually
+                            # carries none — a served response must still
+                            # have SOME usage block, built from the same
+                            # counts (input measured if a usage frame ever
+                            # arrived earlier in the stream, output an
+                            # ESTIMATE otherwise per call_watched's own
+                            # chars/4 fallback) the exception itself reports.
+                            salvaged_body["usage"] = {
+                                "prompt_tokens": exc.input_tokens,
+                                "completion_tokens": exc.output_tokens,
+                                "total_tokens": exc.input_tokens + exc.output_tokens,
+                            }
                 if salvaged_body is not None:
                     # 🚨 The object was already COMPLETE — the "run" the
                     # detector caught was grammar-legal trailing whitespace
@@ -1745,6 +1759,14 @@ class Lifecycle:
                     # failure; fall through to the ordinary success path
                     # below by setting `resp` and NOT returning/continuing.
                     self.state.structured_blank_runs_salvaged += 1
+                    # 🚨 Set HERE, not only by the "recovered" check further
+                    # down: a salvage on the ONE retry attempt must count as
+                    # `salvaged`, never ALSO as `recovered` — the two would
+                    # otherwise both fire for the same event (the retry
+                    # attempt reaching this branch without raising again is
+                    # exactly the condition the "recovered" check below tests
+                    # for).
+                    blank_run_resolved = True
                     _log_blank_run_event(
                         req, ep_cfg, attempts, "salvaged",
                         run_chars=verdict.get("run_chars"),

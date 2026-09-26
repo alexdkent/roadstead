@@ -2601,8 +2601,10 @@ keys) arms the guard on **both** dispatch paths, with different consequences:
 * **Sync** (`stream` absent/false) — the eligible request (`chat_completion`, a JSON-implying
   constraint, no `tools`, `n` absent/1, no `logprobs`/`top_logprobs`) is dispatched over the
   STREAMING wire internally so the guard can watch it live, and reassembled into an ordinary
-  non-streaming response. On detection the stream is closed (freeing the backend's decode slot,
-  same reasoning as vLLM disconnect-driven cancellation elsewhere in this proxy) and:
+  non-streaming response, bounded by the SAME total deadline a plain (non-watched) call honours —
+  a slow-but-alive stream cannot outlive the caller's own timeout and hold the slot past it. On
+  detection the stream is closed (freeing the backend's decode slot, same reasoning as vLLM
+  disconnect-driven cancellation elsewhere in this proxy) and:
     1. **Salvage first** — if the content, with only its TRAILING blank run stripped, parses as
        JSON, the object was already complete and what the guard caught was grammar-legal trailing
        whitespace. Served as an ordinary successful response (`finish_reason: stop`), not an error.

@@ -341,6 +341,19 @@ def _content_chars(content) -> int:
     return total
 
 
+def estimate_tokens_from_chars(n_chars: int) -> int:
+    """The repo's ONE chars-to-tokens ratio (4 chars ~= 1 token), floored at 1.
+    `estimate_input_tokens` below calibrates it against 90,326 real rows (see
+    its own docstring) — this function exists so any OTHER caller estimating
+    from a raw character count (never a whole payload) shares that exact
+    calibration and floor instead of hand-rolling a second ``// 4``. Never
+    raises: a negative/garbage count still floors to 1."""
+    try:
+        return max(1, int(n_chars) // 4)
+    except (TypeError, ValueError):
+        return 1
+
+
 def estimate_input_tokens(payload: dict) -> int:
     """Rough token count from a chat-completion payload.  4 chars ≈ 1
     token.  Good enough for cost estimation — we calibrate from actuals.
@@ -424,7 +437,7 @@ def estimate_input_tokens(payload: dict) -> int:
         if isinstance(fn_call, dict):
             total_chars += len(str(fn_call.get("name") or ""))
             total_chars += _json_chars(fn_call.get("arguments"))
-    return max(1, total_chars // 4)
+    return estimate_tokens_from_chars(total_chars)
 
 
 # ---------------------------------------------------------------------------

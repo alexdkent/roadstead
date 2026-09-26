@@ -24,6 +24,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from .config import EndpointConfig, max_response_bytes_from_env
+from .cost_model import estimate_tokens_from_chars
 from .providers import DEFAULT_PROVIDER, ProviderError, provider_for
 
 logger = logging.getLogger(__name__)
@@ -534,6 +535,14 @@ class BackendClientPool:
         `payload` — the caller's own dict must never see wire-shape
         enrichment a sync dispatch is not supposed to add.
 
+        🚨 Deliberately NOT ``continuous_usage_stats`` (vLLM's per-CHUNK
+        cumulative usage, which would give an abort a REAL running count
+        instead of the chars/4 estimate below). Nothing in this repo has ever
+        requested or exercised that flag — no test, no fake-backend fixture,
+        no measured behaviour on a real vLLM build — and this repo's own rule
+        is to look before adopting a mechanism nobody has profiled. Revisit
+        WITH live-endpoint evidence, not as part of this fix.
+
         Raises `StructuredBlankRunAborted` the instant `detector.feed` fires.
         🚨 THE ABORT MUST ACTUALLY CLOSE THE HTTP RESPONSE, not merely stop
         reading it: vLLM frees a decode slot when the CLIENT disconnects, and
@@ -546,6 +555,22 @@ class BackendClientPool:
         run), so the `finally` below calls `aclose()` explicitly on every
         exit from this method, abort or clean, rather than leaving it to
         whichever collects the generator object first.
+
+        🚨 BOUNDED BY THE SAME TOTAL DEADLINE `call()` HONOURS, not merely a
+        per-read gap. `stream()`'s own `httpx.Timeout(read=timeout_s)` bounds
+        the SILENCE between two reads, not the call's total elapsed time —
+        deliberately, for `execute_streaming`'s progress-governed deadlines,
+        which extend a genuinely-progressing stream past a soft budget. This
+        caller has no such budget: it stands in for `call()`, whose own
+        `asyncio.wait_for(timeout_s)` bounds the WHOLE attempt (the Phase-1.5
+        slot-leak fix — an abandoned call must not outlive the caller's own
+        deadline and hold a scarce slot past it). A stream trickling one
+        token every few seconds — each gap individually under `timeout_s` —
+        would otherwise run to completion here no matter how long it took.
+        The `async with asyncio.timeout(...)` below restores that total
+        bound, raising the SAME `BackendTimeout` `call()` raises on its own
+        deadline so every existing `except BackendTimeout` in lifecycle.py
+        handles either dispatch path identically.
         """
         so = payload.get("stream_options") if isinstance(payload, dict) else None
         so = dict(so) if isinstance(so, dict) else {}
@@ -566,13 +591,18 @@ class BackendClientPool:
         input_tokens = 0
         output_tokens = 0
         cached_tokens: int | None = None
-        # No usage frame has arrived by the time an abort can fire — it rides
-        # on the LAST stream frame, after [DONE], which an abort by
-        # definition never reaches. Count content-bearing chunks as a rough
-        # stand-in (most backends emit ~1 token per delta, never guaranteed)
-        # for the abort log line's evidence only; never fed to billing or to
-        # the BackendResponse a caller further downstream trusts as measured.
-        content_chunks_seen = 0
+        # The backend's OWN usage block, kept VERBATIM (never rebuilt field by
+        # field) — same rule `call()` follows by construction: it forwards
+        # `resp.json()` untouched, so whatever the backend adds beyond
+        # prompt/completion/total tokens rides along for free. A hand-rebuilt
+        # usage would silently drop it — measured live on tier3's non-stream
+        # body: `usage.completion_tokens_details.reasoning_tokens`, which a
+        # field-by-field rebuild here would have discarded on every reassembled
+        # response. `input_tokens`/`output_tokens`/`cached_tokens` above are
+        # STILL parsed out of it separately, because `BackendResponse`'s typed
+        # fields feed accounting regardless of what shape the wire usage
+        # happens to carry.
+        last_usage: dict[str, Any] | None = None
 
         def _assemble_body() -> dict:
             msg: dict[str, Any] = {"role": "assistant", "content": content}
@@ -592,7 +622,13 @@ class BackendClientPool:
                 "id": resp_id, "object": obj, "created": created,
                 "model": model, "choices": [choice],
             }
-            if input_tokens or output_tokens or cached_tokens is not None:
+            if last_usage is not None:
+                b["usage"] = dict(last_usage)
+            elif input_tokens or output_tokens or cached_tokens is not None:
+                # No raw usage frame ever arrived (the abort case — a usage
+                # frame rides on the LAST stream frame, after [DONE], which an
+                # abort by definition never reaches) but SOMETHING is known —
+                # synthesize the minimal shape from it.
                 usage: dict[str, Any] = {
                     "prompt_tokens": input_tokens,
                     "completion_tokens": output_tokens,
@@ -606,70 +642,103 @@ class BackendClientPool:
         gen = self.stream(ep_cfg, stream_payload, payload_type, request_id,
                            timeout_s=timeout_s)
         try:
-            async for event in gen:
-                if event.event_type == "done":
-                    break
-                if event.event_type != "chunk" or not isinstance(event.parsed, dict):
-                    continue
-                parsed = event.parsed
-                if isinstance(parsed.get("id"), str) and parsed["id"]:
-                    resp_id = parsed["id"]
-                if isinstance(parsed.get("object"), str) and parsed["object"]:
-                    # A chunk's object is "chat.completion.chunk" — the
-                    # non-stream shape drops the ".chunk" suffix.
-                    obj = parsed["object"].replace(".chunk", "") or obj
-                if isinstance(parsed.get("created"), int):
-                    created = parsed["created"]
-                if isinstance(parsed.get("model"), str) and parsed["model"]:
-                    model = parsed["model"]
-                usage = parsed.get("usage")
-                if isinstance(usage, dict):
-                    input_tokens = coerce_token_count(usage.get("prompt_tokens"), input_tokens)
-                    output_tokens = coerce_token_count(usage.get("completion_tokens"), output_tokens)
-                    ct = extract_cached_tokens(usage)
-                    if ct is not None:
-                        cached_tokens = ct
-                choices = parsed.get("choices") or []
-                if not choices or not isinstance(choices[0], dict):
-                    continue
-                choice0 = choices[0]
-                fr = choice0.get("finish_reason")
-                if fr:
-                    finish_reason = fr
-                if "stop_reason" in choice0:
-                    stop_reason = choice0.get("stop_reason")
-                if "logprobs" in choice0:
-                    logprobs = choice0.get("logprobs")
-                delta = choice0.get("delta")
-                if not isinstance(delta, dict):
-                    continue
-                piece = delta.get("content")
-                if isinstance(piece, str) and piece:
-                    content += piece
-                    content_chunks_seen += 1
-                    verdict = detector.feed(piece)
-                    if verdict is not None:
-                        raise StructuredBlankRunAborted(
-                            body_so_far=_assemble_body(),
-                            verdict=verdict,
-                            input_tokens=input_tokens,
-                            output_tokens=output_tokens or content_chunks_seen,
-                            elapsed_s=time.monotonic() - t0,
-                        )
-                rc = delta.get("reasoning")
-                if isinstance(rc, str) and rc:
-                    reasoning += rc
-                    reasoning_key = "reasoning"
-                else:
-                    rc = delta.get("reasoning_content")
+            async with asyncio.timeout(timeout_s):
+                async for event in gen:
+                    if event.event_type == "done":
+                        break
+                    if event.event_type != "chunk" or not isinstance(event.parsed, dict):
+                        continue
+                    parsed = event.parsed
+                    if isinstance(parsed.get("id"), str) and parsed["id"]:
+                        resp_id = parsed["id"]
+                    if isinstance(parsed.get("object"), str) and parsed["object"]:
+                        # A chunk's object is "chat.completion.chunk" — the
+                        # non-stream shape drops the ".chunk" suffix.
+                        obj = parsed["object"].replace(".chunk", "") or obj
+                    if isinstance(parsed.get("created"), int):
+                        created = parsed["created"]
+                    if isinstance(parsed.get("model"), str) and parsed["model"]:
+                        model = parsed["model"]
+                    usage = parsed.get("usage")
+                    if isinstance(usage, dict):
+                        last_usage = usage
+                        input_tokens = coerce_token_count(usage.get("prompt_tokens"), input_tokens)
+                        output_tokens = coerce_token_count(usage.get("completion_tokens"), output_tokens)
+                        ct = extract_cached_tokens(usage)
+                        if ct is not None:
+                            cached_tokens = ct
+                    choices = parsed.get("choices") or []
+                    if not choices or not isinstance(choices[0], dict):
+                        continue
+                    choice0 = choices[0]
+                    fr = choice0.get("finish_reason")
+                    if fr:
+                        finish_reason = fr
+                    if "stop_reason" in choice0:
+                        stop_reason = choice0.get("stop_reason")
+                    if "logprobs" in choice0:
+                        logprobs = choice0.get("logprobs")
+                    delta = choice0.get("delta")
+                    if not isinstance(delta, dict):
+                        continue
+                    piece = delta.get("content")
+                    if isinstance(piece, str) and piece:
+                        content += piece
+                        verdict = detector.feed(piece)
+                        if verdict is not None:
+                            raise StructuredBlankRunAborted(
+                                body_so_far=_assemble_body(),
+                                verdict=verdict,
+                                input_tokens=input_tokens,
+                                # No usage frame has arrived yet (it rides on
+                                # the LAST frame, which an abort never
+                                # reaches) — the repo's own chars/4 estimator
+                                # (`cost_model.estimate_tokens_from_chars`,
+                                # calibrated in `estimate_input_tokens`'s
+                                # docstring), NOT a chunk count: a chunk is
+                                # not a token (MTP emits several tokens per
+                                # chunk), so presenting the chunk count as a
+                                # measured value would be wrong in the
+                                # direction that looks most plausible.
+                                output_tokens=(
+                                    output_tokens
+                                    or estimate_tokens_from_chars(len(content))
+                                ),
+                                elapsed_s=time.monotonic() - t0,
+                            )
+                    rc = delta.get("reasoning")
                     if isinstance(rc, str) and rc:
                         reasoning += rc
-                        reasoning_key = "reasoning_content"
+                        reasoning_key = "reasoning"
+                    else:
+                        rc = delta.get("reasoning_content")
+                        if isinstance(rc, str) and rc:
+                            reasoning += rc
+                            reasoning_key = "reasoning_content"
+        except asyncio.TimeoutError:
+            raise BackendTimeout(f"backend {ep_cfg.role} timeout after {timeout_s}s")
         finally:
             try:
                 await gen.aclose()
             except Exception:  # noqa: BLE001 — cleanup must never mask the real result
                 logger.debug("call_watched: stream close failed", exc_info=True)
+
+        if last_usage is None and content:
+            # A clean completion (no abort, no [DONE]-less drop) that never
+            # carried a usage frame at all — the backend answered but never
+            # emitted `stream_options.include_usage`'s payload, or the frame
+            # got lost. `output_tokens` would otherwise silently read 0 on an
+            # evidently non-empty answer, which downstream accounting cannot
+            # tell apart from a real zero. Loud, not silent: same chars/4
+            # estimator as the abort path above, logged so it is never
+            # mistaken for a measured count.
+            output_tokens = estimate_tokens_from_chars(len(content))
+            logger.warning(
+                "ROADSTEAD_CALL_WATCHED_NO_USAGE endpoint=%s request_id=%s "
+                "content_chars=%d estimated_output_tokens=%d — backend never "
+                "sent a usage frame; output_tokens is an ESTIMATE, not measured",
+                ep_cfg.role, request_id, len(content), output_tokens,
+            )
 
         body = _assemble_body()
         msg = body["choices"][0]["message"]
