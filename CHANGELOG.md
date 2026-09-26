@@ -14,6 +14,30 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Added
 
+- **Prefix keep-alive — `policy.prefix_keepalive_call_sites`/`_trigger_tokens`/`_idle_s`/
+  `_max_prefixes`.** Measured 2026-09-26 on tier3 (vLLM, hybrid GLM-5.3-Flash): an
+  interactive agent's ~36-40K-token tools+system prefix is evicted from the engine's
+  small prefix-cache LRU pool after ~300K tokens of OTHER uncached prefill (real fleet
+  traffic runs 190K-1.37M uncached tokens/hour, so the prefix survives only 13-50
+  minutes between real turns), and the next new session then re-prefills it cold
+  (~20-25s vs ~1s warm). Roadstead can now keep a declared call site's prefix warm with
+  small synthetic touches dispatched from the capacity poller — never on the request
+  path, never through DRR/admission, never ahead of real traffic (skipped, not
+  deferred, when the endpoint is paused/unhealthy/draining/full). After a real,
+  successful completion from a matching `call_site`, a prefix SKELETON (`tools`,
+  leading `system` message(s), `model`, `chat_template_kwargs`) is derived from the
+  request's own already-corrected payload and keyed by a stable hash; every completed
+  request on the endpoint then adds its own uncached prompt tokens to every OTHER
+  tracked prefix's countdown, and once one crosses its trigger a touch fires: the
+  skeleton plus a single trailing `keepalive <nonce>` user turn with a FRESH random
+  nonce every time — a byte-identical repeated touch was measured to refresh only the
+  end of its own prompt, never the checkpoint a genuinely new session resumes from,
+  while the unique-suffix form hit 39,542/39,550 cached tokens (1.5s) on a new session
+  after 606K tokens of filler. Touches never reach `Correction.apply`, retry, the
+  empty-completion rescue, degeneration re-dispatch, reasoning replay, or the response
+  cache. `GET /v1/status` → `endpoints[].prefix_keepalive`. Grep marker:
+  `ROADSTEAD_PREFIX_KEEPALIVE`. Four keys, all absent ⇒ off. See `docs/api.md` §3.16.
+
 - **Structured content blank-run abort — `policy.structured_blank_run_abort_chars`.**
   A sibling of the reasoning loop-break guard in a different channel: on tier3
   (GLM-5.3-Flash, vLLM, llguidance), ~0.45% of structured (JSON-schema / `json_object`)

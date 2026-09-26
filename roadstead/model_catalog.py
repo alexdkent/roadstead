@@ -626,13 +626,23 @@ _POLICY_PASSTHROUGH = (
     # Guarded by
     # test_reasoning_replay.py::test_declared_flag_reaches_endpoint_config.
     "replay_reasoning_history",
+    # Prefix keep-alive (roadstead/prefix_keepalive.py). Trigger/idle/cap are
+    # plain scalars; `prefix_keepalive_call_sites` is handled OUTSIDE this
+    # loop below, for the same reason `thinking_kwargs` is — YAML hands us a
+    # list, EndpointConfig holds a tuple. All three absent/0 -> the tracker
+    # never captures, accounts or touches for this endpoint. Guarded by
+    # test_prefix_keepalive.py::test_policy_keys_reach_endpoint_config.
+    "prefix_keepalive_trigger_tokens",
+    "prefix_keepalive_idle_s",
+    "prefix_keepalive_max_prefixes",
 )
 
 
 #: ``policy:`` keys read OUTSIDE the passthrough loop above, because their YAML
 #: shape is not their ``EndpointConfig`` shape. Listed here so the unknown-key
 #: notice does not report a key that is, in fact, load-bearing.
-_POLICY_HANDLED = frozenset({"model_fingerprint", "thinking_kwargs"})
+_POLICY_HANDLED = frozenset(
+    {"model_fingerprint", "thinking_kwargs", "prefix_keepalive_call_sites"})
 
 
 def build_endpoint_kwargs(cat: Catalog | None = None,
@@ -767,6 +777,15 @@ def build_endpoint_kwargs(cat: Catalog | None = None,
                 str(k) for k in raw_tk if isinstance(k, str) and k.strip())
         elif isinstance(raw_tk, str) and raw_tk.strip():
             kw["thinking_kwargs"] = (raw_tk.strip(),)
+        # Same reason as `thinking_kwargs` just above: YAML hands us a list of
+        # fnmatch patterns, EndpointConfig holds a tuple. Guarded by
+        # test_prefix_keepalive.py::test_policy_keys_reach_endpoint_config.
+        raw_pk = pol.get("prefix_keepalive_call_sites")
+        if isinstance(raw_pk, (list, tuple)):
+            kw["prefix_keepalive_call_sites"] = tuple(
+                str(p) for p in raw_pk if isinstance(p, str) and p.strip())
+        elif isinstance(raw_pk, str) and raw_pk.strip():
+            kw["prefix_keepalive_call_sites"] = (raw_pk.strip(),)
         out[e.name] = kw
 
     # Make `failover_to:` load-bearing, and only when the target is itself a

@@ -216,6 +216,14 @@ STUBBED_PROBES = {
     # probe before the first caller arms it, not after. `None` is "cannot
     # tell", which the goodput conjunction reads as blind, never as zero.
     "probe_busy_gauge": None,
+    # Added 2026-09-26 with the probe itself: it is reached from the POLLER
+    # (`health._schedule_prefix_keepalive_touches`, only when an endpoint
+    # declares `policy.prefix_keepalive_call_sites`). Nothing in the shipped
+    # catalog declares that today, but the whole reason this list exists is to
+    # stub a background-reachable probe before the first caller arms it, not
+    # after — see `probe_progress_counters`/`probe_busy_gauge` above. `None`
+    # is "cannot tell", which the tracker reads as a miss, never a hit.
+    "probe_prefix_touch": None,
 }
 
 

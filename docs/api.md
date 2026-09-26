@@ -2683,6 +2683,62 @@ This is **not** `endpoint_stalled`, which stays: that alert keys on COMPLETED ti
 `queued == 0`, so a collapse that fills every slot makes requests queue and the condition is false
 for the whole incident.
 
+### 3.16 Prefix keep-alive — `endpoints[].prefix_keepalive` on `/v1/status`
+
+**Touching a call site's declared prefix before the engine's prefix-cache LRU evicts it.** An
+interactive agent that sends the same large tools+system prefix on every turn shares one endpoint's
+small prefix-cache pool with everyone else's traffic; once enough OTHER uncached prefill has run, the
+prefix is evicted and the next real turn re-prefills it cold. Roadstead can keep a declared call
+site's prefix warm with small, low-cost synthetic requests dispatched from the capacity poller —
+never on the request path, never ahead of real traffic.
+
+🚨 **Roadstead ships NO default trigger/idle/cap.** Absent `policy.prefix_keepalive_call_sites` in
+`models.yaml` (empty by default) the whole feature is inert for that endpoint — no capture, no
+accounting, no touches, and `prefix_keepalive` is then absent from its `/v1/status` entry, same
+convention as `goodput` above. Configuring it is a per-deployment measurement, not a public default:
+size `prefix_keepalive_trigger_tokens` from how fast this endpoint's OWN traffic burns through its
+prefix-cache pool.
+
+Four `policy:` keys, all absent ⇒ inject nothing / touch nothing:
+
+| key | what it does |
+|---|---|
+| `prefix_keepalive_call_sites` | fnmatch patterns naming which `call_site`s this endpoint should keep warm (e.g. `["hermes.*"]`). Empty (default) = off. |
+| `prefix_keepalive_trigger_tokens` | Other uncached prefill tokens on this endpoint since a tracked prefix was last seen or touched, before a touch fires. |
+| `prefix_keepalive_idle_s` | Stop touching a prefix not seen from a real request for this long. `0` = never expire by idleness (pair with `_max_prefixes` instead). |
+| `prefix_keepalive_max_prefixes` | Cap on tracked prefixes per endpoint, LRU-evicted by last REAL use (never by last touch). `0` = unbounded. |
+
+| field | type | meaning |
+|---|---|---|
+| `tracked` | list | One entry per tracked prefix: `key` (a 12-char hash prefix, never the prompt itself), `call_site`, `approx_tokens` (from the last real request that refreshed it), `last_real_seen_age_s`, `tokens_since_touch`, `touch_in_flight`. |
+| `touches_sent` | int | Since-boot touches actually dispatched (hit + missed). |
+| `touches_hit` | int | Touches whose own prompt came back ≥90% cached (`prefix_keepalive.HIT_RATIO`) — the prefix was already warm. |
+| `touches_missed` | int | Touches that came back mostly uncached, or that the backend never answered at all. |
+| `touches_skipped` | int | Touches that were due but not dispatched because the endpoint was full — the trigger counter is NOT reset on a skip, so the very next poller pass tries again. |
+
+**Capture.** After a real, successful `chat_completion` from a call_site matching
+`policy.prefix_keepalive_call_sites` (fnmatch patterns), Roadstead derives a prefix SKELETON from the
+completed request's own payload — its `tools`, its leading `system` message(s), the `model`, and
+`chat_template_kwargs` — keyed by a stable hash of that skeleton, so two requests differing only in
+their own trailing turn key identically and two differing in tools/system/effort do not.
+
+**Accounting.** Every completed `chat_completion` on the endpoint adds its own uncached prompt tokens
+(`input_tokens - cached_tokens`, when both are known) to every OTHER tracked prefix's countdown; the
+one request that just refreshed a prefix resets that prefix's own countdown instead.
+
+**Touch.** When a tracked prefix's countdown reaches `policy.prefix_keepalive_trigger_tokens` and it
+was really used within `policy.prefix_keepalive_idle_s`, Roadstead dispatches ONE touch: the skeleton
+plus a single trailing user message `keepalive <nonce>` — a fresh random nonce every time, which is
+the load-bearing detail (see the `prefix_keepalive` module docstring: an IDENTICAL repeated touch only
+refreshes the end of its own prompt, never the checkpoint a genuinely new session resumes from), a
+tiny `max_tokens`, and the endpoint's own thinking/effort defaults. At most one touch in flight per
+prefix; the counter resets on dispatch, not on the verdict. A touch never reaches the DRR/admission
+path, `Correction.apply`, retry, the empty-completion rescue, degeneration re-dispatch, reasoning
+replay, or the response cache — none of that machinery is reachable from the direct backend call a
+touch makes — and it is logged under its own `call_site` marker
+(`ROADSTEAD_PREFIX_KEEPALIVE endpoint=… key=… prompt_tokens=… cached_tokens=… duration_s=… result=…`,
+`result` one of `hit` / `missed` / `error` / `skipped_at_capacity`).
+
 ---
 
 ## 4. South face — what Roadstead requires *of a backend*

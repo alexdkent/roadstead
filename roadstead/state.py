@@ -35,6 +35,7 @@ from .identity import IdentityResolver, KeyRegistry
 from .management import AdminOverlay
 from .observability import RequestLogger, RollingMetrics
 from .on_demand import OnDemandManager
+from .prefix_keepalive import PrefixKeepaliveTracker
 from .queue import PersistentQueue
 from .reasoning_replay import ReasoningReplayStore
 from .scheduler import Scheduler
@@ -536,6 +537,13 @@ class ProxyState:
         # poller's critical path instead — see `Health._schedule_thinking_canary`.
         # Same pattern as `inflight_tasks` above: `add_done_callback` self-prunes.
         self.thinking_canary_tasks: dict[str, asyncio.Task] = {}
+        # Prefix keep-alive (roadstead/prefix_keepalive.py, 2026-09-26). The
+        # tracker holds the STATE + pure decisions; this dict is the SAME
+        # strong-reference-plus-self-prune pattern as `thinking_canary_tasks`
+        # just above, keyed by (endpoint, prefix key) since one endpoint may
+        # have several tracked prefixes touchable in the same poller pass.
+        self.prefix_keepalive = PrefixKeepaliveTracker()
+        self.prefix_keepalive_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self.started_at = time.monotonic()
         # Wall-clock twin of started_at. `started_at` is monotonic and therefore
         # NOT a timestamp — /v1/models needs a real epoch for the OpenAI

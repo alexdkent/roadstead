@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import math
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
@@ -911,6 +912,69 @@ class BackendClientPool:
                     "content_chars": len(content)}
         except Exception:
             return None
+
+    async def probe_prefix_touch(
+        self, ep_cfg: EndpointConfig, payload: dict, timeout_s: float,
+    ) -> dict | None:
+        """Dispatch ONE prefix-keepalive touch (``roadstead/prefix_keepalive.
+        py``) and report the token counts the backend gave back, or None on
+        any failure.
+
+        Deliberately NOT routed through ``call()``, for the SAME reason
+        ``probe_thinking_switch`` above is not: it must never consume a DRR
+        slot or queue behind live traffic, and ``call()``'s empty-completion
+        gate exists to catch a CALLER's request coming back with nothing — a
+        touch's whole point is a tiny ``max_tokens``
+        (``prefix_keepalive.TOUCH_MAX_TOKENS``), and the prefill it exists to
+        cause has already happened by the time a (possibly empty) completion
+        arrives, so an empty answer here is a PASS, never a fault. This is
+        also, incidentally, why a touch never reaches ``call()``'s retry/
+        structured-output/degeneration machinery, its stats, or its
+        response-cache write — none of that lives on this path at all.
+
+        Unlike ``probe_thinking_switch``'s hand-built payload, this one DOES
+        go through ``prepare_chat_payload``: the touch's whole job is
+        rendering the SAME prefix bytes a real request to this endpoint
+        would, and the per-engine normalization (the served ``model`` id, a
+        declared reasoning budget) is part of that rendering, not an extra
+        step it can skip. See ``prefix_keepalive.derive_skeleton`` for why the
+        payload handed in here needs no further correction of its own.
+
+        Returns ``{"prompt_tokens": int | None, "cached_tokens": int | None}``
+        on any 200, or None if the call did not complete at all (unreachable/
+        busy/non-200/malformed body — we say nothing, never "missed")."""
+        client = self._client_for(ep_cfg.backend_url)
+        provider = provider_for(ep_cfg)
+        request_id = f"prefix-keepalive-{secrets.token_hex(4)}"
+        try:
+            path = provider.path_for("chat_completion")
+            headers = provider.request_headers(ep_cfg, request_id)
+            prepared = provider.prepare_chat_payload(
+                payload,
+                model_id=ep_cfg.effective_model_id,
+                thinking_budget_ratio=ep_cfg.thinking_budget_ratio,
+                thinking_kwargs=ep_cfg.thinking_kwargs,
+                reasoning_budget_tokens=ep_cfg.reasoning_budget_tokens,
+                thinking_temperature=ep_cfg.thinking_temperature,
+                thinking_top_p=ep_cfg.thinking_top_p)
+        except ProviderError:
+            return None
+        try:
+            resp = await asyncio.wait_for(
+                client.post(path, json=prepared, headers=headers),
+                timeout=timeout_s)
+            if resp.status_code != 200:
+                return None
+            body = resp.json()
+        except Exception:
+            return None
+        usage = body.get("usage") if isinstance(body, dict) else None
+        if not isinstance(usage, dict) or not usage:
+            return {"prompt_tokens": None, "cached_tokens": None}
+        return {
+            "prompt_tokens": coerce_token_count(usage.get("prompt_tokens", 0)),
+            "cached_tokens": extract_cached_tokens(usage),
+        }
 
     async def probe_health(self, ep_cfg: EndpointConfig) -> bool:
         """Simple health check."""

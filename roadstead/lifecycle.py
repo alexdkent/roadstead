@@ -3113,6 +3113,26 @@ class Lifecycle:
             except Exception:  # noqa: BLE001 — observability must not break accounting
                 logger.debug("truncation tally failed", exc_info=True)
 
+        # Prefix keep-alive accounting + capture (roadstead/prefix_keepalive.py).
+        # EVERY completed chat_completion request on this endpoint feeds the
+        # tracker: a real, successful, call_site-matching one refreshes (or
+        # creates) the tracked prefix its own payload renders; every one,
+        # matching or not, adds its own uncached prompt tokens to every OTHER
+        # tracked prefix's countdown. Absent `policy.prefix_keepalive_call_sites`
+        # -> `enabled()` is False and this is a single attribute read. Fail-open
+        # like the truncation tally above: this must never break accounting.
+        if req.payload_type == "chat_completion":
+            _pk_ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
+            if _pk_ep is not None:
+                try:
+                    self.state.prefix_keepalive.observe_completion(
+                        req.endpoint, _pk_ep, call_site=req.call_site,
+                        payload=req.payload, status=status,
+                        input_tokens=input_tokens, cached_tokens=cached_tokens,
+                        now=now)
+                except Exception:  # noqa: BLE001 — observability must not break accounting
+                    logger.debug("prefix_keepalive accounting failed", exc_info=True)
+
         # On-demand: a request to this endpoint reached a terminal outcome
         # (ok/error/timeout/cancel) — release its in-flight hold so the idle
         # watchdog can eventually drop the dispatcher lease. No-op for always-on

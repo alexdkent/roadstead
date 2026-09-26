@@ -743,6 +743,12 @@ class ProxyHttpHandlers:
             _gp = self.health.goodput_snapshot(ep_name, now)
             if _gp is not None:
                 snap["goodput"] = _gp
+            # Prefix keep-alive (roadstead/prefix_keepalive.py). Omitted for
+            # any endpoint that has never tracked or touched anything — same
+            # quiet-by-default convention as `goodput`/`thinking` above.
+            _pk = self.state.prefix_keepalive.status_snapshot(ep_name, now)
+            if _pk is not None:
+                snap["prefix_keepalive"] = _pk
             endpoints[ep_name] = snap
 
         agents = {

@@ -36,6 +36,7 @@ from .observability import (
     structured_empty_alerts,
 )
 from .hooks import record_security_event
+from .prefix_keepalive import HIT_RATIO
 from .providers import LLAMACPP, VLLM, CapacityReport, provider_for
 from .spend import SOURCE_PROVIDER, TokenPrice
 
@@ -45,6 +46,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: Wall-clock bound on ONE prefix-keepalive touch. Generous relative to
+#: ``prefix_keepalive.TOUCH_MAX_TOKENS`` (a handful of output tokens) because
+#: the thing a touch is FOR — prefill on a 36-40K-token prefix — is the
+#: expensive part, not the tiny completion; sized well under a real caller's
+#: own floor so a slow touch never masquerades as a stuck request on any
+#: shared dashboard.
+_PREFIX_KEEPALIVE_TOUCH_TIMEOUT_S = 60.0
 
 
 def model_swap_alerts(endpoints: dict) -> list["AlertCondition"]:
@@ -184,7 +192,7 @@ class Health:
             "backend_latency_ms", 95, endpoint=endpoint, now=time.monotonic())
         return max(5, min(60, int((p95 or 10000.0) / 1000.0)))
     async def update_endpoint_health(
-        self, ep_name: str, ep_cfg: "EndpointConfig", probe_ok: bool,
+        self, ep_name: str, ep_cfg: EndpointConfig, probe_ok: bool,
     ) -> None:
         """Drive the per-endpoint circuit from poller probe results.
 
@@ -645,6 +653,14 @@ class Health:
         except Exception as exc:  # noqa: BLE001
             logger.debug("goodput sample %s failed: %s", ep_name, exc)
 
+        # Prefix keep-alive (roadstead/prefix_keepalive.py). Guarded like every
+        # other step in this pass: a scheduling fault here must not stall
+        # discovery for every endpoint later in iteration order.
+        try:
+            self._schedule_prefix_keepalive_touches(ep_name, ep_cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("prefix_keepalive schedule %s failed: %s", ep_name, exc)
+
     def goodput_thresholds(self, ep_cfg: EndpointConfig) -> GoodputThresholds:
         """Read this endpoint's declared detector configuration.
 
@@ -882,6 +898,97 @@ class Health:
                 f"endpoint is serving now")
         except Exception as exc:  # noqa: BLE001
             logger.debug("thinking canary %s failed: %s", ep_name, exc)
+
+    def _schedule_prefix_keepalive_touches(self, ep_name: str, ep_cfg: EndpointConfig) -> None:
+        """Fire every DUE prefix-keepalive touch for one endpoint OFF the
+        poller's critical path — same reasoning as
+        ``_schedule_thinking_canary`` above: a touch costs a real generation
+        and must not delay every endpoint later in the poller's iteration
+        order. Unlike the canary (one liveness bit per endpoint) an endpoint
+        can have several tracked prefixes due at once, so this loops.
+
+        NEVER ADMITTED AHEAD OF REAL TRAFFIC. A touch is skipped (not
+        deferred — ``PrefixKeepaliveTracker.due_for_touch`` does not reset the
+        trigger counter on a skip, so the very next poller pass tries again)
+        when the whole proxy is draining, when the endpoint reads unhealthy
+        (paused for maintenance, circuit-open, cooldown, goodput-collapsed —
+        every one of those folds into ``endpoint_healthy`` already), or when
+        the endpoint looks FULL. Bypasses the scheduler's DRR/admission
+        entirely, exactly like the thinking canary next door: a touch is
+        proxy-internal maintenance, not caller traffic, so there is no caller
+        for it to be fair to and no queue for it to wait in — the capacity
+        check below is what stands in for a priority band."""
+        tracker = self.state.prefix_keepalive
+        if not tracker.enabled(ep_cfg):
+            return
+        if self.state.draining.is_set():
+            return
+        if not self.endpoint_healthy(ep_name):
+            return
+        now = time.monotonic()
+        for entry in tracker.due_for_touch(ep_name, ep_cfg, now):
+            task_key = (ep_name, entry.key)
+            existing = self.state.prefix_keepalive_tasks.get(task_key)
+            if existing is not None and not existing.done():
+                continue  # already in flight for this prefix
+            snap = self.state.scheduler.endpoint_snapshot(ep_name)
+            max_slots = ep_cfg.effective_max_slots
+            if max_slots > 0 and snap.get("in_flight", 0) >= max_slots:
+                # Full. Skip and retry next trigger — see the docstring above.
+                tracker.record_result(ep_name, None, "skipped")
+                logger.info(
+                    "ROADSTEAD_PREFIX_KEEPALIVE endpoint=%s key=%s "
+                    "prompt_tokens=n/a cached_tokens=n/a duration_s=0.00 "
+                    "result=skipped_at_capacity", ep_name, entry.key[:12])
+                continue
+            task = asyncio.create_task(self._touch_prefix(ep_name, ep_cfg, entry))
+            self.state.prefix_keepalive_tasks[task_key] = task
+            task.add_done_callback(
+                lambda t, k=task_key: self.state.prefix_keepalive_tasks.pop(k, None))
+
+    async def _touch_prefix(self, ep_name: str, ep_cfg: EndpointConfig, entry) -> None:
+        """Dispatch ONE touch and record its hit/miss verdict. Never raises —
+        a touch is best-effort maintenance and must not disturb the poller.
+
+        This is the ONE call site that reaches ``backend.probe_prefix_touch``
+        for a keepalive touch, so it is also the one place a touch could leak
+        into the machinery real requests go through — and it does not: there
+        is no ``QueuedRequest``, no ``Correction.apply``, no retry, no
+        ``record_completion``, so a touch cannot trip correction/retry/
+        structured guards, the empty-completion rescue, degeneration
+        re-dispatch, reasoning-replay capture, or the response cache, and it
+        never touches goodput/degeneration/empty-completion stats — none of
+        that machinery is even reachable from this path."""
+        tracker = self.state.prefix_keepalive
+        tracker.record_dispatch(entry)
+        payload = tracker.build_touch_payload(entry)
+        t0 = time.monotonic()
+        outcome = None
+        try:
+            outcome = await self.state.backend.probe_prefix_touch(
+                ep_cfg, payload, _PREFIX_KEEPALIVE_TOUCH_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 — best-effort, never raise
+            logger.debug("prefix_keepalive touch %s/%s failed: %s",
+                        ep_name, entry.key[:12], exc)
+        duration = time.monotonic() - t0
+        if outcome is None:
+            tracker.record_result(ep_name, entry, "missed")
+            logger.info(
+                "ROADSTEAD_PREFIX_KEEPALIVE endpoint=%s key=%s prompt_tokens=n/a "
+                "cached_tokens=n/a duration_s=%.2f result=error",
+                ep_name, entry.key[:12], duration)
+            return
+        prompt_tokens = outcome.get("prompt_tokens")
+        cached_tokens = outcome.get("cached_tokens")
+        hit = (
+            isinstance(prompt_tokens, int) and isinstance(cached_tokens, int)
+            and prompt_tokens > 0 and (cached_tokens / prompt_tokens) >= HIT_RATIO)
+        result = "hit" if hit else "missed"
+        tracker.record_result(ep_name, entry, result)
+        logger.info(
+            "ROADSTEAD_PREFIX_KEEPALIVE endpoint=%s key=%s prompt_tokens=%s "
+            "cached_tokens=%s duration_s=%.2f result=%s",
+            ep_name, entry.key[:12], prompt_tokens, cached_tokens, duration, result)
 
     async def capacity_poller_loop(self) -> None:
         """Periodically probe backends for slot counts and context sizes.

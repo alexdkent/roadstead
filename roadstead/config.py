@@ -489,6 +489,58 @@ class EndpointConfig:
     #: this key back is a template/parser property this repo cannot probe
     #: without a live backend — declare it where it was MEASURED to matter.
     replay_reasoning_history: bool = False
+    #: --- Prefix KEEP-ALIVE (roadstead/prefix_keepalive.py, 2026-09-26) -------
+    #: fnmatch patterns (``roadstead/model_catalog.py`` NOTE: a list in YAML,
+    #: kept as a TUPLE here — same reason as ``thinking_kwargs`` above, a list
+    #: would be mutable state shared across endpoints) — the ``call_site``s
+    #: whose prefix this endpoint should keep warm, from
+    #: ``policy.prefix_keepalive_call_sites``. Empty tuple = off: no capture,
+    #: no accounting, no touches, byte-identical to before this field existed.
+    #:
+    #: MEASURED 2026-09-26 on tier3 (vLLM, hybrid GLM-5.3-Flash). An
+    #: interactive agent sends a ~36-40K-token prefix (tools + system prompt)
+    #: on every turn, into a small LRU prefix-cache pool: after ~300K tokens of
+    #: OTHER uncached prefill the prefix is evicted and the next new session
+    #: re-prefills it cold (~20-25s vs ~1s warm). Real fleet traffic runs
+    #: 190K-1.37M uncached prefill tokens/hour, so the prefix naturally
+    #: survives only 13-50 minutes between real turns.
+    #:
+    #: 🚨 A hybrid model needs a NEW-SESSION-SHAPED touch, not merely any
+    #: touch. Touching with a byte-IDENTICAL request every ~150K tokens gave a
+    #: full cache hit every time, but a genuinely NEW session (a different
+    #: user message) still missed after 600K — an identical touch only
+    #: refreshes the checkpoint at the END of its own prompt, never the
+    #: system/user JUNCTION checkpoint a new session resumes from. Touching
+    #: with a UNIQUE user suffix each time (``keepalive <nonce>``) fixed it:
+    #: a new session after 606K of filler hit 39,542/39,550 cached tokens,
+    #: 1.5s. See ``prefix_keepalive.build_touch_payload`` — the unique nonce
+    #: on every touch is the load-bearing detail, not an incidental one.
+    prefix_keepalive_call_sites: tuple[str, ...] = ()
+    #: Other uncached prefill tokens on THIS endpoint, since a tracked prefix
+    #: was last seen from a real request OR last touched, before the tracker
+    #: fires a touch. From ``policy.prefix_keepalive_trigger_tokens``. 0 (with
+    #: no call_sites declared) = off. 🚨 THIS IS A MEASUREMENT, like the
+    #: goodput/reasoning-loop thresholds above, not mechanism — the one touch
+    #: measured to miss fired at ~150K; fire earlier (~100K) and tolerate an
+    #: occasional miss, since a miss simply re-seeds the prefix from whatever
+    #: request happens to trigger it rather than costing anything beyond that
+    #: one cold prefill.
+    prefix_keepalive_trigger_tokens: int = 0
+    #: Stop touching a prefix that has not been seen from a REAL request in
+    #: this long, from ``policy.prefix_keepalive_idle_s``. A caller that
+    #: stopped calling owes the endpoint nothing, and touching its stale
+    #: prefix forever would be spending decode on a conversation nobody is
+    #: coming back to. 0 = never expire (only sane paired with a small
+    #: `prefix_keepalive_max_prefixes`, which bounds it a different way).
+    prefix_keepalive_idle_s: int = 0
+    #: Cap on tracked prefixes PER ENDPOINT, LRU-evicted by last REAL use
+    #: (never by last touch — a prefix touched recently but not used for a
+    #: while is exactly the one about to go idle-expire, not the one to keep).
+    #: From ``policy.prefix_keepalive_max_prefixes``. 0 = unbounded, which is
+    #: only safe when `prefix_keepalive_idle_s` is doing the bounding instead;
+    #: an endpoint declaring neither can grow one tracked prefix per distinct
+    #: call_site forever.
+    prefix_keepalive_max_prefixes: int = 0
     #: The expected identity of the WEIGHTS behind this endpoint, from the
     #: stanza's ``policy.model_fingerprint``. vLLM reports `/v1/models[0].root`
     #: (a weights path); llama.cpp reports a `meta` block folded to
