@@ -585,8 +585,8 @@ _POLICY_PASSTHROUGH = (
     # Minimum dwell in degraded mode before flipping back. Guarded by
     # test_failover.py::test_dwell_reaches_endpoint_config.
     "failover_dwell_s",
-    # Endpoint-level goodput-collapse detector (goodput.py). All seven are
-    # absent/0 by default and absent means the detector does not run — the five
+    # Endpoint-level goodput-collapse detector (goodput.py). All ten are
+    # absent/0 by default and absent means the detector does not run — the six
     # detection numbers are fleet-hardware measurements this repository does not
     # ship. Guarded by
     # test_goodput_wiring.py::test_every_goodput_policy_key_reaches_endpoint_config,
@@ -599,6 +599,14 @@ _POLICY_PASSTHROUGH = (
     "goodput_max_prefill_tps",
     "goodput_recovery_evaluations",
     "goodput_max_hold_s",
+    # The chunked-prefill discriminator (goodput.CLAUSE_ENGINE_IDLE): an
+    # external GPU-power gauge, since the engine's own counters share the
+    # blind spot during a long chunked-prefill step. `goodput_busy_probe_url`
+    # may name a host other than this endpoint's own backend. Absent/0 ->
+    # this clause is simply not part of the conjunction; see config.py.
+    "goodput_busy_probe_url",
+    "goodput_busy_probe_metric",
+    "goodput_busy_min",
     # Opt in to reasoning replay (roadstead/reasoning_replay.py) — store a
     # completed turn's reasoning keyed by its conversation prefix, and
     # re-attach it when a later call replays that turn in history without it.

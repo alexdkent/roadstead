@@ -78,6 +78,42 @@ not run at all** for that endpoint. They arrive per-endpoint from ``models.yaml`
 ``policy.goodput_*``. The numbers in the tests and in ``docs/operations.md`` are
 labelled as measured on ONE fleet, and are worked examples rather than defaults.
 
+🚨 CHUNKED PREFILL IS A SECOND, UNRELATED WAY TO GO BLIND (found on a fleet,
+2026-09-26, after the rule above had already been running for two weeks). vLLM
+only emits its iteration/token counters on an output-producing scheduler step —
+during a long CHUNKED PREFILL the engine is doing real, heavy work and every
+counter this module reads (``prompt``, ``generation``, ``iterations``) sits
+exactly flat for the whole step, which is indistinguishable from the original
+wedge by every clause above. ``kv_cache_usage_perc`` was checked too and is
+equally flat at scrape resolution. The one signal that told the two apart was
+GPU POWER, read from an exporter that has nothing to do with the engine's own
+counters and cannot share their blind spot: a real wedge and idle both read low,
+while decode and cold prefill both read markedly higher.
+
+That earns a fifth, OPTIONAL clause, ``CLAUSE_ENGINE_IDLE`` — fed by
+``GoodputThresholds.busy_min`` and a per-endpoint ``(url, metric)`` pair
+``health.py`` scrapes as one extra GET, merged into the same counters dict
+under the key ``busy``. Two things about it are deliberately unlike the other
+three clauses:
+
+  * it reads the MAX of ``busy`` over the window, not a delta rate — this is a
+    LEVEL ("did the GPU do any real work at any point in here"), not a
+    quantity that accumulates, and a single busy sample anywhere in the window
+    is proof the engine was not wedged for that whole window. MIN would answer
+    a different, wrong question (whether it was busy for the *entire*
+    window), and would fail exactly the chunked-prefill case this clause
+    exists for the moment the step ends and generation resumes.
+  * its source is EXTERNAL to the endpoint's own backend — the probe URL may
+    (and for the fleet that measured this, does) name a different host, since
+    a GPU-power exporter is not the inference engine.
+
+It obeys the same invariant as every other clause: an undeclared URL/metric, a
+failed scrape, or a malformed reading (NaN, Inf, negative, a duplicated
+identical-label series) makes ``busy`` absent for that sample, which — same as
+a missing ``iterations`` counter above — pushes the WHOLE verdict to UNKNOWN
+rather than quietly dropping the one clause that exists precisely to prevent a
+false collapse.
+
 PURITY. No I/O, no async, no clock of its own — ``observe`` and ``evaluate`` both
 take the timestamp. ``tests/test_pure_modules.py`` holds this module to that, so
 a precision claim can be measured in microseconds against a fleet that does not
@@ -126,11 +162,20 @@ _RECOVERY_EVALUATIONS = 2
 #: holding on a claim nobody has re-confirmed is an outage we caused.
 _MAX_HOLD_S = 300.0
 
-#: The four counter keys this module reads, as ``backend.probe_progress_counters``
-#: publishes them. ``prompt``/``generation``/``iterations`` are CUMULATIVE (rates
-#: are deltas); ``running`` is a GAUGE (read as a level).
+#: The counter keys this module reads. ``prompt``/``generation``/``iterations``
+#: are CUMULATIVE (rates are deltas) and come from ``backend.
+#: probe_progress_counters``; ``running`` is a GAUGE (read as a level), also
+#: from that probe.
 CUMULATIVE_KEYS = ("iterations", "generation", "prompt")
 GAUGE_KEYS = ("running",)
+#: ``busy`` is a GAUGE too (read as a MAX-over-window level, not a delta — see
+#: CLAUSE_ENGINE_IDLE in the module docstring), but kept as ``float`` rather
+#: than truncated to ``int`` like the other gauge: a watts reading (5.3, 12.7)
+#: quantised to an int would blur exactly the range this clause exists to
+#: discriminate (5-18 W wedge vs 12 W idle vs 33-48 W decode, one fleet's own
+#: measurement — see docs/api.md, never shipped here as a default). Comes from
+#: ``backend.probe_busy_gauge``, a second and independent probe.
+GAUGE_FLOAT_KEYS = ("busy",)
 
 
 class Verdict(str, Enum):
@@ -161,6 +206,10 @@ CLAUSE_OCCUPANCY = "occupancy"
 CLAUSE_ITERATIONS = "iterations"
 CLAUSE_GENERATION = "generation"
 CLAUSE_PREFILL = "prefill"
+#: The fifth, OPTIONAL clause — see "CHUNKED PREFILL IS A SECOND, UNRELATED WAY
+#: TO GO BLIND" in the module docstring. Named for what a LOW reading means
+#: (the GPU did nothing this window), not for the counter it reads.
+CLAUSE_ENGINE_IDLE = "engine_idle"
 
 
 @dataclass(frozen=True)
@@ -187,6 +236,15 @@ class GoodputThresholds:
         threshold whose counter the engine never publishes does NOT make the
         detector stricter — it makes every verdict UNKNOWN, which the blindness
         metric is there to surface.
+      * ``busy_min`` undeclared -> the fifth clause (``CLAUSE_ENGINE_IDLE``,
+        see the module docstring) is simply not part of the conjunction, same
+        as any other undeclared progress threshold — it is additive, and never
+        required for ``armed``. Its counter comes from a probe undeclared
+        anywhere else on this dataclass (``goodput_busy_probe_url`` /
+        ``goodput_busy_probe_metric`` on ``EndpointConfig`` — read by
+        ``health.py``, not by this pure module), so an operator can declare
+        ``busy_min`` with no URL/metric by mistake: that reads as a permanently
+        absent counter, i.e. UNKNOWN, never as a stricter detector.
     """
 
     #: Occupancy gate: the engine must have at least this many requests running
@@ -203,6 +261,11 @@ class GoodputThresholds:
     #: either. 🚨 This clause is what keeps a legitimately prefill-heavy caller
     #: out of the wedge band — see the module docstring.
     max_prefill_tps: float | None = None
+    #: GPU-power (or equivalent external busy gauge) floor, below which the
+    #: MAX reading across the window says the engine did no real work — the
+    #: chunked-prefill discriminator; see CLAUSE_ENGINE_IDLE in the module
+    #: docstring. 0 = this clause is not part of the conjunction.
+    busy_min: float = 0.0
     #: Consecutive healthy evaluations required to clear. 0 = the module default.
     recovery_evaluations: int = 0
     #: Absolute ceiling on one hold, seconds. 0 = the module default.
@@ -219,6 +282,8 @@ class GoodputThresholds:
             out.append(CLAUSE_GENERATION)
         if self.max_prefill_tps is not None and self.max_prefill_tps > 0:
             out.append(CLAUSE_PREFILL)
+        if self.busy_min > 0:
+            out.append(CLAUSE_ENGINE_IDLE)
         return tuple(out)
 
     @property
@@ -261,6 +326,10 @@ class GoodputVerdict:
     generation_tps: float | None = None
     generation_tps_per_request: float | None = None
     prefill_tps: float | None = None
+    #: Maximum external busy-gauge (e.g. GPU watts) reading across the window —
+    #: the CLAUSE_ENGINE_IDLE input. ``None`` when the clause is undeclared, not
+    #: zero: absence must never read as "measured and idle".
+    busy_max: float | None = None
     #: Clauses whose collapse condition HELD this evaluation.
     clauses_held: tuple[str, ...] = ()
     #: Clauses that did NOT hold — on a HEALTHY verdict this is the evidence of
@@ -279,8 +348,9 @@ class _Sample:
     ts: float
     #: ``None`` for a key the scrape could not supply. Kept per-key rather than
     #: dropping the sample, because an engine that publishes three of the four
-    #: counters can still evaluate the three clauses it configured.
-    values: dict[str, int | None] = field(default_factory=dict)
+    #: counters can still evaluate the three clauses it configured. ``busy`` is
+    #: the one ``float`` value; the rest are ``int``.
+    values: dict[str, int | float | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -313,7 +383,7 @@ class GoodputMonitor:
     # ----------------------------------------------------------- observation
 
     def observe(self, endpoint: str, ts: float,
-                counters: dict[str, int | None] | None) -> None:
+                counters: dict[str, int | float | None] | None) -> None:
         """Record one scrape.
 
         ``counters=None`` is a FAILED scrape, and it is recorded as a sample
@@ -322,10 +392,13 @@ class GoodputMonitor:
         healthy-looking window in place.
         """
         ring = self._rings.setdefault(endpoint, deque(maxlen=self._ring_capacity))
-        values: dict[str, int | None] = {}
+        values: dict[str, int | float | None] = {}
         for key in CUMULATIVE_KEYS + GAUGE_KEYS:
             raw = None if counters is None else counters.get(key)
             values[key] = None if raw is None else int(raw)
+        for key in GAUGE_FLOAT_KEYS:
+            raw = None if counters is None else counters.get(key)
+            values[key] = None if raw is None else float(raw)
         ring.append(_Sample(ts=float(ts), values=values))
 
     def forget(self, endpoint: str) -> None:
@@ -398,6 +471,13 @@ class GoodputMonitor:
         generation_per_req = (
             None if generation_tps is None or running_mean <= 0
             else generation_tps / running_mean)
+        # A LEVEL, not a rate: the MAX ``busy`` reading anywhere in the window,
+        # never a delta. See CLAUSE_ENGINE_IDLE in the module docstring for why
+        # max (not min, not a rate) is the conservative reading here. ``None``
+        # when the clause is undeclared — computed unconditionally otherwise so
+        # it rides in the evidence on every return path below, same as the
+        # three rates above.
+        busy_max = self._max_level(window, "busy")
 
         if running_min < thresholds.min_running:
             # 🚨 SHORT-CIRCUIT ON THE OCCUPANCY GATE, and it is safe in the one
@@ -423,6 +503,7 @@ class GoodputMonitor:
                 generation_tps_per_request=(None if generation_per_req is None
                                             else round(generation_per_req, 3)),
                 prefill_tps=None if prefill_tps is None else round(prefill_tps, 2),
+                busy_max=None if busy_max is None else round(busy_max, 2),
                 clauses_cleared=(CLAUSE_OCCUPANCY,),
             )
 
@@ -433,6 +514,7 @@ class GoodputMonitor:
             (CLAUSE_GENERATION, generation_per_req,
              thresholds.max_generation_tps_per_request),
             (CLAUSE_PREFILL, prefill_tps, thresholds.max_prefill_tps),
+            (CLAUSE_ENGINE_IDLE, busy_max, thresholds.busy_min),
         ):
             if clause not in thresholds.progress_clauses:
                 continue
@@ -458,6 +540,7 @@ class GoodputMonitor:
             generation_tps_per_request=(
                 None if generation_per_req is None else round(generation_per_req, 3)),
             prefill_tps=None if prefill_tps is None else round(prefill_tps, 2),
+            busy_max=None if busy_max is None else round(busy_max, 2),
             clauses_held=tuple(held),
             clauses_cleared=tuple(cleared),
         )
@@ -545,6 +628,8 @@ class GoodputMonitor:
                 needed_keys.extend(("generation", "running"))
             elif clause == CLAUSE_PREFILL:
                 needed_keys.append("prompt")
+            elif clause == CLAUSE_ENGINE_IDLE:
+                needed_keys.append("busy")
         missing = []
         for key in dict.fromkeys(needed_keys):
             if any(s.values.get(key) is None for s in window):
@@ -560,3 +645,21 @@ class GoodputMonitor:
         if first is None or last is None:
             return None
         return (last - first) / span
+
+    @staticmethod
+    def _max_level(window: list[_Sample], key: str) -> float | None:
+        """The MAX reading of a GAUGE key across the window — not a delta.
+
+        Unlike ``_rate``, every sample contributes, not just the endpoints: a
+        single busy sample anywhere in the window is what CLAUSE_ENGINE_IDLE
+        treats as proof the engine did real work (see the module docstring), so
+        the whole window has to be looked at, not just its first and last tick.
+        ``None`` if the key was never supplied (clause undeclared) or any
+        sample in the window lacks it — the latter is unreachable once
+        ``_missing_counters`` has cleared the window, but this stays honest for
+        a caller (the idle-occupancy short-circuit) that reaches it earlier.
+        """
+        values = [s.values.get(key) for s in window]
+        if any(v is None for v in values):
+            return None
+        return max(float(v) for v in values)  # type: ignore[arg-type]

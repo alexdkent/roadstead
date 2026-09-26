@@ -553,6 +553,7 @@ class ProxyHttpHandlers:
                         ("generation_tps_per_request",
                          "roadstead_endpoint_goodput_generation_tps_per_request"),
                         ("prefill_tps", "roadstead_endpoint_goodput_prefill_tps"),
+                        ("busy_max", "roadstead_endpoint_goodput_busy_max"),
                     ):
                         _v = getattr(_gp, _field)
                         if _v is not None:

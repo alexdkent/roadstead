@@ -1414,6 +1414,7 @@ restart; it is kept rather than corrected because the name is the contract.
 | `roadstead_endpoint_goodput_iteration_rate` | gauge | `endpoint` | Scheduler iterations per second (vLLM `iteration_tokens_total_count`). Absent on an engine that publishes no iteration counter. |
 | `roadstead_endpoint_goodput_generation_tps_per_request` | gauge | `endpoint` | Generation tokens per second per busy slot. ⚠️ **A low value alone is not a fault** — a prefill-heavy caller reads 0.42 here while perfectly healthy; the prefill series is what separates them. |
 | `roadstead_endpoint_goodput_prefill_tps` | gauge | `endpoint` | Prompt tokens per second. The clause that keeps huge-prompt/tiny-output callers out of the wedge band. |
+| `roadstead_endpoint_goodput_busy_max` | gauge | `endpoint` | Maximum reading of the declared external busy gauge (e.g. GPU watts) across the window — the chunked-prefill discriminator (§3.13). Emitted only when `policy.goodput_busy_min` is declared; absent, never zero, on every other endpoint or on any scrape failure. |
 | `roadstead_empty_completion_total` | gauge | `endpoint` | Empty (position-0-EOS) completions, counted each time the fail-loud gate trips. |
 | `roadstead_truncations_total` | gauge | `endpoint`, `caller`, `structured` | Output-cap (`finish_reason=length`) hits, split `structured="true"`/`"false"` so a rule can alert on structured truncations alone — a climbing structured series is a caller's `max_tokens` set too low. |
 | `roadstead_dispatched_total` | counter | — | Since-boot scheduler dispatches. |

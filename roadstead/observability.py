@@ -701,7 +701,8 @@ def check_alerts(
                 f"running_min={gp.get('running_min')} "
                 f"iterations/s={gp.get('iteration_rate')} "
                 f"generation_tps_per_req={gp.get('generation_tps_per_request')} "
-                f"prefill_tps={gp.get('prefill_tps')} over {gp.get('window_s')}s / "
+                f"prefill_tps={gp.get('prefill_tps')} busy_max={gp.get('busy_max')} "
+                f"over {gp.get('window_s')}s / "
                 f"{gp.get('samples')} samples; clauses={','.join(gp.get('clauses_held') or ())}; "
                 f"held {gp.get('tripped_for_s')}s"
                 + (" — SHEDDING non-background traffic" if enforced else

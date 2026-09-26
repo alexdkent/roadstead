@@ -14,6 +14,23 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Added
 
+- **The goodput-collapse detector (`goodput.py`) gains a fifth, OPTIONAL clause —
+  `CLAUSE_ENGINE_IDLE` — for a second, unrelated way to go blind: a long vLLM
+  CHUNKED PREFILL step makes every one of the original four clauses read exactly
+  like the wedge they exist to catch, because the engine only emits its
+  iteration/token counters on an output-producing step. Fed by an external
+  busy gauge (`policy.goodput_busy_probe_url` — may name a different host than
+  the endpoint's own backend — `policy.goodput_busy_probe_metric`, matched on
+  its full name; `policy.goodput_busy_min`), it reads the MAX reading across the
+  window, not a rate — a single busy sample anywhere in the window is proof the
+  engine did real work. Absent/0 (the default) leaves the original four-clause
+  rule byte-for-byte unchanged. Same invariant as every other clause: a failed
+  scrape, an undeclared URL/metric, or a malformed reading (NaN, Inf, negative,
+  a duplicated identical-label series) makes the WHOLE verdict UNKNOWN, never
+  a quietly-dropped discriminator. Surfaced as `busy_max` on `/v1/status`'
+  `goodput` block and as the `roadstead_endpoint_goodput_busy_max` gauge. See
+  `roadstead/goodput.py`'s module docstring and `docs/api.md` §3.13.
+
 - **An endpoint can opt in to reasoning REPLAY (`policy.replay_reasoning_history`),
   which re-attaches a prior turn's own reasoning to history a caller replayed without it.**
   A hybrid always-thinking reasoner's chat template renders a past assistant turn

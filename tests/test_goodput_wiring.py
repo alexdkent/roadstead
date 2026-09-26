@@ -39,6 +39,22 @@ FLEET_POLICY = {
     "goodput_max_hold_s": 300.0,
 }
 
+#: The chunked-prefill discriminator's three keys, kept SEPARATE from
+#: FLEET_POLICY on purpose: every wiring test below builds its endpoint from
+#: FLEET_POLICY (via `_armed_ep`) and stubs a backend that answers
+#: `probe_progress_counters` alone. Folding the busy keys into FLEET_POLICY
+#: would silently arm CLAUSE_ENGINE_IDLE for every one of those tests too —
+#: which is exactly the opposite of proving "undeclared ⇒ unchanged" by
+#: construction. See tests/test_goodput_busy.py for the busy clause's own
+#: rule + wiring coverage.
+BUSY_POLICY = {
+    # RFC 5737 documentation address (never a real, dialable host) — see
+    # test_scrub_sweep.py.
+    "goodput_busy_probe_url": "http://192.0.2.10:9400/metrics",
+    "goodput_busy_probe_metric": "gpu_power_watts",
+    "goodput_busy_min": 20.0,
+}
+
 
 # --------------------------------------------------------------------------- #
 # 1. The catalog keys. A policy key absent from _POLICY_PASSTHROUGH is SILENTLY
@@ -50,7 +66,7 @@ def _goodput_passthrough_keys() -> list[str]:
 
 
 def test_every_goodput_policy_key_reaches_endpoint_config():
-    """All seven, end to end through the REAL builder.
+    """All ten, end to end through the REAL builder.
 
     Parametrised over `_POLICY_PASSTHROUGH` itself rather than a hand-kept list,
     so a key added to one and not the other cannot pass: an entry here with no
@@ -58,21 +74,22 @@ def test_every_goodput_policy_key_reaches_endpoint_config():
     fails the count assertion below.
     """
     keys = _goodput_passthrough_keys()
-    assert len(keys) == 7, f"expected seven goodput policy keys, got {keys}"
-    assert set(keys) == set(FLEET_POLICY), (
+    assert len(keys) == 10, f"expected ten goodput policy keys, got {keys}"
+    policy = {**FLEET_POLICY, **BUSY_POLICY}
+    assert set(keys) == set(policy), (
         "this test's policy block and the passthrough list have diverged — one of "
         "them is describing a key that is being dropped")
 
     entry = model_catalog.EndpointEntry(
-        name="probe", provider="p", kind="chat", policy=dict(FLEET_POLICY))
+        name="probe", provider="p", kind="chat", policy=dict(policy))
     kw = model_catalog.build_endpoint_kwargs(entries=[entry])["probe"]
-    for key, value in FLEET_POLICY.items():
+    for key, value in policy.items():
         assert kw.get(key) == value, f"{key} was dropped by the catalog"
 
     # …and they must be REAL fields, not kwargs EndpointConfig rejects.
     ep = EndpointConfig(**{k: v for k, v in kw.items()
                            if k in EndpointConfig.__dataclass_fields__})
-    for key, value in FLEET_POLICY.items():
+    for key, value in policy.items():
         assert getattr(ep, key) == value
 
 
@@ -84,7 +101,9 @@ def test_endpoint_config_ships_no_threshold_default():
     """
     ep = EndpointConfig(endpoint_class="x", role="x")
     for key in _goodput_passthrough_keys():
-        assert getattr(ep, key) in (0, 0.0), f"{key} ships a default"
+        # Falsy, not `in (0, 0.0)` — the two busy-probe STRING keys default to
+        # `""`, which is falsy but not numerically equal to either zero.
+        assert not getattr(ep, key), f"{key} ships a default"
     health = Health(_state())
     assert not health.goodput_thresholds(ep).armed
 

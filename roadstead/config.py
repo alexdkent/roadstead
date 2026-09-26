@@ -526,6 +526,19 @@ class EndpointConfig:
     # partially-specified config must still be unable to latch a trip forever.
     goodput_recovery_evaluations: int = 0
     goodput_max_hold_s: float = 0.0
+    # Sixth, OPTIONAL detection number: the chunked-prefill discriminator
+    # (goodput.CLAUSE_ENGINE_IDLE). vLLM's own counters go flat during a long
+    # chunked-prefill step, making a healthy engine doing heavy prefill
+    # indistinguishable from a real wedge to every clause above — the one
+    # signal that told them apart on one fleet was GPU power from an exporter
+    # external to the engine. `goodput_busy_probe_url` may (and on the fleet
+    # that measured this, does) name a DIFFERENT host than this endpoint's own
+    # backend. `goodput_busy_probe_metric` is matched on its full metric name,
+    # any labels. All three absent/0 -> this clause is simply not part of the
+    # conjunction; the four clauses above are unaffected.
+    goodput_busy_probe_url: str = ""
+    goodput_busy_probe_metric: str = ""
+    goodput_busy_min: float = 0.0
     # Minimum time (s) spent in degraded mode before returning to this endpoint,
     # even once it is healthy again and the degraded cohort has drained. NOT
     # redundant with the drain: without it a backend flapping every 30s produces

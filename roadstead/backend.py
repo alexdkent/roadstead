@@ -947,6 +947,93 @@ class BackendClientPool:
             pass
         return None
 
+    async def probe_busy_gauge(self, url: str, metric: str) -> float | None:
+        """Scrape ONE named Prometheus gauge from an ARBITRARY `/metrics` URL.
+
+        Feeds `goodput.py`'s optional ``CLAUSE_ENGINE_IDLE`` — the chunked-
+        prefill discriminator (see that module's docstring): vLLM's own
+        counters go flat during a long chunked-prefill step, so the one signal
+        that told a real wedge apart from healthy prefill on one fleet was GPU
+        power, read from an exporter that has nothing to do with the inference
+        engine and cannot share its blind spot. Unlike every other probe in
+        this file, ``url`` is not derived from an ``EndpointConfig`` — it is an
+        arbitrary, operator-declared origin (``goodput_busy_probe_url``), so it
+        is parsed and pooled on its own origin rather than the endpoint's.
+
+        Returns the metric's value, or ``None`` on ANY failure: unreachable
+        host, non-200, the metric absent from the body, or a reading this
+        function does not trust. ``None`` must read as "cannot tell", exactly
+        like `probe_progress_counters` — a level this clause cannot observe
+        must never be silently treated as zero (which would read as "the GPU
+        is idle" and make the goodput conjunction easier to satisfy, the one
+        direction this whole feature exists to forbid).
+
+        Matched on the metric's FULL name (before any ``{...}`` label set),
+        never a prefix — the same reasoning `probe_progress_counters` gives for
+        `vllm:iteration_tokens_total_count`: a prefix match would also catch an
+        unrelated sibling series and silently change what is being read.
+
+        Hardening mirrors `probe_progress_counters` deliberately (see its
+        docstring for the incidents each guards against), adapted from SUM to
+        MAX because this is a LEVEL, not accumulated work: multiple series
+        under the same metric name with DIFFERENT labels are real (a
+        multi-GPU exporter), and MAX is the conservative read for "did ANY of
+        them do real work" — summing would invent a number no single device
+        reported. A REPEATED identical label set, a negative reading (a power
+        gauge cannot be negative), or a value that fails to parse as a finite
+        float all make the metric ABSENT for this scrape rather than reported
+        as some derived number — the same "malformed is absence, never zero"
+        rule, applied to a gauge instead of a counter.
+        """
+        try:
+            parts = httpx.URL(url)
+        except Exception:
+            return None
+        if not parts.scheme or not parts.host:
+            return None
+        origin = f"{parts.scheme}://{parts.netloc.decode()}"
+        path = parts.raw_path.decode() or "/metrics"
+        client = self._client_for(origin)
+        try:
+            resp = await asyncio.wait_for(client.get(path), timeout=3.0)
+            if resp.status_code != 200:
+                return None
+            best: float | None = None
+            seen_labels: set[str] = set()
+            malformed = False
+            for line in resp.text.splitlines():
+                if line.startswith("#"):
+                    continue
+                try:
+                    name, val = line.rsplit(" ", 1)
+                except ValueError:
+                    continue
+                bare, _, labels = name.partition("{")
+                if bare != metric:
+                    continue
+                try:
+                    v = float(val)
+                except ValueError:
+                    malformed = True
+                    continue
+                if math.isnan(v) or math.isinf(v) or v < 0:
+                    malformed = True
+                    continue
+                if labels in seen_labels:
+                    # A repeated identical-label series is malformed exposition
+                    # (same reasoning as the duplicate-gauge case in
+                    # `probe_progress_counters`) — NOT summed, NOT maxed against
+                    # itself: it means the body cannot be trusted at all.
+                    malformed = True
+                    continue
+                seen_labels.add(labels)
+                best = v if best is None else max(best, v)
+            if malformed:
+                return None
+            return best
+        except Exception:
+            return None
+
     async def call_shadow(
         self,
         shadow_host: str,

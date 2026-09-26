@@ -384,7 +384,8 @@ class Health:
         if verdict.clauses_cleared:
             out["clauses_cleared"] = list(verdict.clauses_cleared)
         for key in ("running_min", "running_mean", "iteration_rate",
-                    "generation_tps", "generation_tps_per_request", "prefill_tps"):
+                    "generation_tps", "generation_tps_per_request", "prefill_tps",
+                    "busy_max"):
             value = getattr(verdict, key)
             if value is not None:
                 out[key] = value
@@ -648,9 +649,9 @@ class Health:
         """Read this endpoint's declared detector configuration.
 
         Built per call rather than cached on the config: it is a frozen
-        dataclass of seven scalars, and an operator editing the catalog through
+        dataclass of scalars, and an operator editing the catalog through
         the admin plane must not have to bounce the process for the change to
-        bite. 0 -> ``None`` on the three rate ceilings because 0 is how
+        bite. 0 -> ``None`` on the rate ceilings because 0 is how
         `models.yaml` spells "undeclared" everywhere else in this file, and a
         rate below 0.0 is not a condition any engine can satisfy.
         """
@@ -667,6 +668,7 @@ class Health:
             max_prefill_tps=(
                 float(ep_cfg.goodput_max_prefill_tps)
                 if getattr(ep_cfg, "goodput_max_prefill_tps", 0) else None),
+            busy_min=float(getattr(ep_cfg, "goodput_busy_min", 0.0) or 0.0),
             recovery_evaluations=int(
                 getattr(ep_cfg, "goodput_recovery_evaluations", 0) or 0),
             max_hold_s=float(getattr(ep_cfg, "goodput_max_hold_s", 0.0) or 0.0),
@@ -684,7 +686,13 @@ class Health:
         Costs one `/metrics` GET on an endpoint the poller already probed, with
         `probe_progress_counters`' own 3 s cap; a failed scrape is recorded as an
         ABSENT sample, which pushes the verdict towards UNKNOWN rather than
-        leaving a stale healthy window standing.
+        leaving a stale healthy window standing. A SECOND, independent GET is
+        made — only when this endpoint declares the chunked-prefill
+        discriminator (`goodput_busy_min`, `goodput.CLAUSE_ENGINE_IDLE`) —
+        against `goodput_busy_probe_url`, which may be a completely different
+        host than this endpoint's own backend (an external GPU-power
+        exporter). The two probes are independent sources: a failure on
+        either one must never blank the other.
 
         ``now`` is injectable for the same reason `goodput.py` takes it: the rule
         needs a MEASURED window (a span floor, and consecutive evaluations), and
@@ -702,6 +710,18 @@ class Health:
         ep = normalize_endpoint(ep_name)
         now = time.monotonic() if now is None else now
         counters = await self.state.backend.probe_progress_counters(ep_cfg)
+        if thresholds.busy_min > 0:
+            # Undeclared -> no second GET at all, not merely a probe that
+            # returns None fast: an endpoint that never opted in must cost
+            # exactly what it cost before this clause existed.
+            busy = await self.state.backend.probe_busy_gauge(
+                getattr(ep_cfg, "goodput_busy_probe_url", ""),
+                getattr(ep_cfg, "goodput_busy_probe_metric", ""))
+            # A dict copy (never `None`) so the progress counters — present or
+            # not — are carried through unmodified alongside `busy`, whichever
+            # of the two probes just failed.
+            counters = dict(counters) if counters else {}
+            counters["busy"] = busy
         self.state.goodput.observe(ep, now, counters)
         verdict = self.state.goodput.evaluate(ep, thresholds, now)
         self.state.goodput_verdicts[ep] = verdict
@@ -712,19 +732,20 @@ class Health:
             self.state.collapsed_endpoints.add(ep)
             logger.critical(
                 "ROADSTEAD_GOODPUT_COLLAPSE endpoint=%s TRIPPED%s — running_min=%s "
-                "iterations/s=%s generation_tps_per_req=%s prefill_tps=%s "
+                "iterations/s=%s generation_tps_per_req=%s prefill_tps=%s busy_max=%s "
                 "window=%.1fs samples=%d clauses=%s (sustained %d evaluations; "
-                "thresholds running>=%d iter<%s gen<%s prefill<%s)",
+                "thresholds running>=%d iter<%s gen<%s prefill<%s busy<%s)",
                 ep,
                 "" if self.state.flags.get("goodput_collapse_enforce")
                 else " (SHADOW — no caller effect)",
                 verdict.running_min, verdict.iteration_rate,
                 verdict.generation_tps_per_request, verdict.prefill_tps,
+                verdict.busy_max,
                 verdict.window_s, verdict.samples, ",".join(verdict.clauses_held),
                 thresholds.sustain_evaluations, thresholds.min_running,
                 thresholds.max_iteration_rate,
                 thresholds.max_generation_tps_per_request,
-                thresholds.max_prefill_tps,
+                thresholds.max_prefill_tps, thresholds.busy_min or None,
             )
             if self.state.flags.get("goodput_collapse_enforce"):
                 # Release the already-queued interactive cohort now, exactly as
@@ -738,11 +759,13 @@ class Health:
             logger.warning(
                 "ROADSTEAD_GOODPUT_RECOVERED endpoint=%s CLEARED after %ss — "
                 "verdict=%s running_min=%s iterations/s=%s "
-                "generation_tps_per_req=%s prefill_tps=%s cleared_clauses=%s%s",
+                "generation_tps_per_req=%s prefill_tps=%s busy_max=%s "
+                "cleared_clauses=%s%s",
                 ep, "?" if held is None else f"{held:.0f}",
                 verdict.outcome.value, verdict.running_min,
                 verdict.iteration_rate, verdict.generation_tps_per_request,
-                verdict.prefill_tps, ",".join(verdict.clauses_cleared),
+                verdict.prefill_tps, verdict.busy_max,
+                ",".join(verdict.clauses_cleared),
                 "" if verdict.outcome is Verdict.HEALTHY
                 else " (ABSOLUTE MAX HOLD expired — the rule was not re-confirmed, "
                      "so the hold was released rather than latched; it will "

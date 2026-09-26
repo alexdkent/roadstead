@@ -206,6 +206,16 @@ STUBBED_PROBES = {
     "probe_health": False,
     "probe_model_fingerprint": None,
     "probe_thinking_switch": None,
+    # Added 2026-09-26 with the probe itself, for the same reason as
+    # `probe_progress_counters` above: it is reached from the POLLER
+    # (`health.sample_goodput`, only when an endpoint declares
+    # `goodput_busy_min`) and its URL is OPERATOR-DECLARED — it need not even
+    # be one of `models.yaml`'s own backends, so nothing here can assume it is
+    # safely unreachable. Nothing in the shipped catalog declares it today,
+    # but the whole reason this list exists is to stub a background-reachable
+    # probe before the first caller arms it, not after. `None` is "cannot
+    # tell", which the goodput conjunction reads as blind, never as zero.
+    "probe_busy_gauge": None,
 }
 
 
