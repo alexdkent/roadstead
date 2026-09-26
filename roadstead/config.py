@@ -407,6 +407,35 @@ class EndpointConfig:
     #: is a default for a caller that opted into thinking and said nothing
     #: about how hard to think, not an override of one that did.
     thinking_effort: str = ""
+    #: The "no accidental MAX" guard (2026-09-26), from ``policy.
+    #: reasoning_effort_map`` — ``{<word a caller might send>: <word this
+    #: endpoint's template actually understands>}``. {} (default) = undeclared,
+    #: and every effort word passes through exactly as sent — the safe default
+    #: for an endpoint whose template's bucketing has not been measured.
+    #:
+    #: THE DEFECT THIS EXISTS FOR: the GLM-5.3-Flash template above buckets
+    #: "medium" — and any OTHER unrecognised word, including a typo — into
+    #: "max", its most expensive rung, SILENTLY. A caller (or an agent
+    #: harness's config) asking for a middling effort gets the model's
+    #: maximum instead, with nothing in the response distinguishing that from
+    #: an honoured request. Operator rule: "max must be an operator decision
+    #: or a decision at time of wiring — callers must not default to max."
+    #:
+    #: Applied by ``Correction.apply_reasoning_effort_map``, the LAST word on
+    #: whatever effort a request carries by the time it reaches the wire —
+    #: after ``apply_forced_reasoning_budget``'s and ``apply_thinking``'s own
+    #: injections, and in BOTH places a caller may have put the raw value
+    #: (``chat_template_kwargs.reasoning_effort`` and the plain OpenAI
+    #: top-level ``reasoning_effort``, the latter for a caller that never
+    #: opted into ``thinking:`` at all, which neither injection site above
+    #: ever touches). A value THIS MAP NAMES (compared case-insensitively
+    #: after stripping) is replaced by the mapped word, sent verbatim; a value
+    #: it does NOT name is REMOVED outright, so the engine's own server-side
+    #: default applies instead of an unbucketed word landing wherever the
+    #: template's fallback happens to be. {} means "undeclared" and leaves
+    #: every request byte-for-byte unchanged, the same contract every other
+    #: policy key here follows.
+    reasoning_effort_map: dict[str, str] = field(default_factory=dict)
     #: Opt in to REASONING REPLAY (roadstead/reasoning_replay.py), from
     #: ``policy.replay_reasoning_history``. False = undeclared, and the proxy
     #: neither stores nor restores anything for this endpoint — byte-identical

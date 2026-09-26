@@ -14,6 +14,27 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Added
 
+- **The "no accidental MAX" reasoning-effort guard — `policy.reasoning_effort_map`.**
+  Measured on GLM-5.3-Flash (tier3): its chat template renders only `low`/`high`/`max`
+  for `chat_template_kwargs.reasoning_effort`, and buckets `medium` — and any other
+  unrecognised word, typo included — into `max`, its most expensive rung, SILENTLY.
+  Operator rule: "max must be an operator decision or a decision at time of wiring —
+  callers must not default to max." A declared map normalizes the effort a request
+  ends up carrying in BOTH places a caller (or an endpoint's own declared default) may
+  put it — `chat_template_kwargs.reasoning_effort` and the plain top-level OpenAI
+  `reasoning_effort` — comparing case-insensitively after stripping: a word the map
+  names is replaced by the mapped word, sent verbatim; a word it does not name is
+  REMOVED outright, so the engine's own server-side default applies instead of an
+  unbucketed word landing wherever the template's fallback happens to be. Runs LAST
+  among the reasoning-effort corrections (`Correction.apply_reasoning_effort_map`,
+  after `apply_forced_reasoning_budget` and `apply_thinking`), so it is the final gate
+  on whatever either of them wrote — including an endpoint's OWN declared
+  `policy.reasoning_effort` default, deliberately, since a *declared* default can
+  itself be the stale or wrong word. {} (absent) is a total no-op. `GET /v1/status` →
+  `reliability.reasoning_effort_remaps`, keyed `endpoint|from->to` (`to: null` = the
+  value was removed), so an operator can see who is being remapped. See `docs/api.md`
+  §3.14d.
+
 - **The goodput-collapse detector (`goodput.py`) gains a fifth, OPTIONAL clause —
   `CLAUSE_ENGINE_IDLE` — for a second, unrelated way to go blind: a long vLLM
   CHUNKED PREFILL step makes every one of the original four clauses read exactly
@@ -282,6 +303,28 @@ summary. The bullets below link in there where the long version is worth reading
   commit (moved out of "What this door does NOT read" and into the main table).
 
 ### Fixed
+
+- **A non-int `priority` body field on `POST /v1/chat/completions` reached vLLM's own int-typed
+  `priority` field, drawing a 400 (surfaced to the caller as a 502).** Reproduced live 2026-09-26:
+  `{"model": "tier3", "priority": "P2_POST_TURN", ...}`. `/v1/chat/completions` forwards everything
+  it does not itself read (docs/api.md §1.1), and a caller carrying Roadstead's OWN `priority`
+  spelling — a fleet band, never an int — into an OpenAI-shaped body collided with vLLM's genuine
+  scheduling-priority field. `providers/payload.py::_strip_caller_only_fields` now strips a
+  non-int `priority` (bool included — a JSON `true`/`false` is not a priority) before the payload
+  is forwarded to either local provider; a genuine int passes through unchanged, since it is a
+  real backend feature a caller may be using intentionally. `call_site` — never a real backend
+  field at all — is stripped unconditionally, the same fix, since it can leak the same way. See
+  `docs/api.md` §1.1.
+
+- **The thinking canary (`Health._maybe_run_thinking_canary`) blocked the capacity poller,
+  reading OTHER endpoints as `too_few_samples` once an hour.** It makes a real generation call and
+  was awaited INLINE in the poller's sequential per-endpoint loop; when it ran past the goodput
+  detector's `_RATE_WINDOW_S` (25s), every endpoint later in iteration order had its own
+  `sample_goodput` call delayed past that window too — observed live 08:32:53Z and 09:33:08Z, with
+  the rest of that poller pass (capacity discovery, the circuit breaker, WAL/retention chores)
+  stale for the same stretch. `Health._schedule_thinking_canary` now fires it as its own background
+  task instead — still gated by the same rate limit and "never raises" contract, at most one in
+  flight per endpoint, cancelled (not drained) on shutdown since nothing waits on its result.
 
 - **A caller's own reasoning effort, sent the OpenAI way, drew a 400 on any endpoint declaring
   `policy.reasoning_effort`.** "A caller's own pin wins" was checked against

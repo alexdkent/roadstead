@@ -571,7 +571,7 @@ class Health:
                     )
                 if fp:
                     ep_cfg.discovered_model_fingerprint = fp
-            await self._maybe_run_thinking_canary(ep_name, ep_cfg)
+            self._schedule_thinking_canary(ep_name, ep_cfg)
         except Exception as exc:
             logger.debug("poller probe %s failed: %s", ep_name, exc)
         # Circuit-breaker health update (Phase 1.2). Guarded so a fault
@@ -781,18 +781,56 @@ class Health:
                 # true rather than nearly true — otherwise the dark soak is not
                 # measuring the same system the flag flip will arm.
                 self.state.dispatch_event.set()
+    def _schedule_thinking_canary(self, ep_name: str, ep_cfg: EndpointConfig) -> None:
+        """Fire ``_maybe_run_thinking_canary`` OFF the poller's critical path.
+
+        🚨 It used to be awaited INLINE in ``poll_endpoint_once``, which runs
+        sequentially over every endpoint in one poller pass. The canary costs a
+        genuine generation and routinely ran past the goodput detector's
+        ``_RATE_WINDOW_S`` (25s, see ``goodput.py``) — so whenever it fired, every
+        endpoint later in iteration order had its OWN ``sample_goodput`` call
+        delayed past that window too, and read UNKNOWN (``too_few_samples``) for
+        a reason that had nothing to do with it. Observed live, 08:32:53Z and
+        09:33:08Z. The rest of the poller pass (capacity discovery, the
+        circuit-breaker update, WAL/retention chores) was stale for the same
+        stretch, for the same reason.
+
+        The fix is where the canary RUNS, not what it does: still rides the
+        poller's cadence to decide WHEN to fire (no second loop, no new liveness
+        bit — the reasoning ``_maybe_run_thinking_canary`` itself gives), but the
+        one call that actually costs a generation is scheduled as its own task
+        instead of blocking the pass that every other endpoint depends on.
+
+        At most one in flight per endpoint: a slow canary is a reason to skip
+        the NEXT poller pass's attempt for this endpoint, not to pile a second
+        one behind it. `add_done_callback` self-prunes
+        ``state.thinking_canary_tasks``, the same pattern ``inflight_tasks`` uses.
+        """
+        existing = self.state.thinking_canary_tasks.get(ep_name)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._maybe_run_thinking_canary(ep_name, ep_cfg))
+        self.state.thinking_canary_tasks[ep_name] = task
+        task.add_done_callback(
+            lambda t, _ep=ep_name: self.state.thinking_canary_tasks.pop(_ep, None))
+
     async def _maybe_run_thinking_canary(self, ep_name, ep_cfg) -> None:
         """Prove the DECLARED thinking switch still works on the model that is
         actually loaded, by making one real call.
 
         Rate-limited hard: this costs a genuine generation, unlike every other
-        probe in the poller. It rides the existing poller rather than opening a
-        second loop on purpose — a new task would need its own liveness bit and
-        its own poisoned-tick guard, and this check is nowhere near important
-        enough to earn a new way for the proxy to die.
+        probe in the poller. Scheduled by ``_schedule_thinking_canary`` above
+        rather than awaited inline — see there for why — but the decision of
+        WHEN to fire still rides the poller's own cadence rather than opening a
+        second loop: a new loop would need its own liveness bit and its own
+        poisoned-tick guard, and this check is nowhere near important enough to
+        earn a new way for the proxy to die.
 
-        Never raises: the poller's own guard would survive it, but a canary that
-        can wedge discovery is worse than no canary."""
+        Never raises: a hung backend already has a hard bound
+        (``probe_thinking_switch``'s own 60s `asyncio.wait_for`), and this
+        broad guard is what makes a canary that DOES fail — timeout, 5xx,
+        malformed reply — cost nothing beyond that bound rather than escaping
+        as an unhandled exception in a bare background task."""
         try:
             if not ep_cfg.thinking_kwargs or not thinking_canary_enabled():
                 return

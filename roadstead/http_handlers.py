@@ -909,6 +909,12 @@ class ProxyHttpHandlers:
                 # Grep markers: ROADSTEAD_TRUNCATION / ROADSTEAD_STRUCTURED_INVALID.
                 "truncation_total": self.state.truncation_total,
                 "truncation_by_model_caller": self.state.truncation_by_model_caller,
+                # The "no accidental MAX" reasoning-effort guard (§policy
+                # `reasoning_effort_map`) — every remap/removal since boot,
+                # keyed "endpoint|from->to" ("to": null = the value was
+                # REMOVED, not remapped). Grep marker:
+                # ROADSTEAD_REASONING_EFFORT_REMAP.
+                "reasoning_effort_remaps": self.state.reasoning_effort_remaps,
                 "structured_parse_failure_total":
                     self.state.structured_parse_failure_total,
                 "structured_parse_failures_by_model_caller":

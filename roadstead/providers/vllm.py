@@ -23,6 +23,8 @@ from .payload import (
     _apply_thinking_sampling,
     _has_anthropic_image_block,
     _has_thinking_kwarg,
+    _needs_caller_field_strip,
+    _strip_caller_only_fields,
     _translate_anthropic_image_blocks,
 )
 
@@ -126,6 +128,11 @@ class VLLMProvider(Provider):
             and not needs_model_set
             and not needs_thinking_default
             and not needs_vision_xlate
+            # 🚨 Same trap as the two below it: a payload with nothing else to
+            # repair but a Roadstead-only `priority`/`call_site` field must not
+            # be short-circuited past `_strip_caller_only_fields` — see there
+            # for why a non-int `priority` reaching vLLM is a 400 (-> 502).
+            and not _needs_caller_field_strip(payload)
             and not (thinking_budget_ratio > 0)
             # 🚨 The absolute cap has to be in this guard too. Without it a
             # payload carrying no `system`/`extra_body` short-circuits out
@@ -156,6 +163,9 @@ class VLLMProvider(Provider):
         extra_body = p.pop("extra_body", None)
         if isinstance(extra_body, dict):
             p.update(extra_body)
+        # AFTER the extra_body merge, so a caller-only field smuggled inside
+        # `extra_body` is caught too, not just a top-level one.
+        _strip_caller_only_fields(p)
         if isinstance(p.get("grammar"), str) and p["grammar"].strip():
             so = p.get("structured_outputs")
             so = dict(so) if isinstance(so, dict) else {}

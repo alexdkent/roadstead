@@ -507,6 +507,134 @@ def test_cache_key_same_when_system_same():
 
 # --- test harness A/B applies normalization ---
 
+# --- priority/call_site stripping (vLLM 400 -> 502, 2026-09-26) -----------
+# `/v1/chat/completions` forwards everything it does not itself read — see
+# `docs/api.md` §1.1 — and a caller carrying Roadstead's OWN `priority`
+# spelling (a fleet band, e.g. "P2_POST_TURN") into that body reached vLLM's
+# genuine, int-typed `priority` field, failed its `int_parsing` validation,
+# and 400ed the WHOLE request (surfaced to the caller as a 502). `call_site`
+# is never a real backend field at all. Both are stripped in
+# `providers/payload.py`, applied by both providers' `prepare_chat_payload`.
+
+def test_vllm_strips_a_non_int_priority():
+    payload = {
+        "model": "tier3",
+        "messages": [{"role": "user", "content": "x"}],
+        "priority": "P2_POST_TURN",
+    }
+    out = VLLM.prepare_chat_payload(payload)
+    assert "priority" not in out
+
+
+def test_vllm_keeps_a_genuine_int_priority():
+    """vLLM's own scheduling `priority` is a real backend feature, distinct
+    from Roadstead's fleet band — a caller using it intentionally must not
+    have it removed."""
+    payload = {
+        "model": "tier3",
+        "messages": [{"role": "user", "content": "x"}],
+        "priority": 5,
+    }
+    out = VLLM.prepare_chat_payload(payload)
+    assert out["priority"] == 5
+
+
+def test_vllm_rejects_a_bool_priority_same_as_a_string():
+    # bool is an int subclass in Python; a JSON true/false is not a priority.
+    payload = {
+        "model": "tier3",
+        "messages": [{"role": "user", "content": "x"}],
+        "priority": True,
+    }
+    out = VLLM.prepare_chat_payload(payload)
+    assert "priority" not in out
+
+
+def test_vllm_strips_call_site_unconditionally():
+    payload = {
+        "model": "tier3",
+        "messages": [{"role": "user", "content": "x"}],
+        "call_site": "chat-agent.chat",
+    }
+    out = VLLM.prepare_chat_payload(payload)
+    assert "call_site" not in out
+
+
+def test_llamacpp_strips_the_same_two_fields():
+    payload = {
+        "model": "tier3",
+        "messages": [{"role": "user", "content": "x"}],
+        "priority": "P2_POST_TURN",
+        "call_site": "chat-agent.chat",
+    }
+    out = LLAMACPP.prepare_chat_payload(payload)
+    assert "priority" not in out
+    assert "call_site" not in out
+
+
+def test_stripping_is_the_only_repair_needed_still_applies():
+    """🚨 A payload with nothing ELSE to repair (no system/extra_body/grammar)
+    must not be short-circuited past the strip by a provider's early-return
+    guard — the same trap the thinking-budget clamps document."""
+    payload = {"model": "tier3", "messages": [{"role": "user", "content": "x"}],
+              "priority": "P2_POST_TURN"}
+    assert VLLM.prepare_chat_payload(payload) == {
+        "model": "tier3", "messages": [{"role": "user", "content": "x"}]}
+    assert LLAMACPP.prepare_chat_payload(payload) == {
+        "model": "tier3", "messages": [{"role": "user", "content": "x"}]}
+
+
+def test_a_caller_only_field_nested_in_extra_body_is_also_caught():
+    """The strip runs AFTER the extra_body merge, so a field smuggled inside
+    it (the OpenAI SDK's `extra_body` kwarg) is caught the same as a
+    top-level one."""
+    payload = {
+        "model": "tier3",
+        "messages": [{"role": "user", "content": "x"}],
+        "extra_body": {"priority": "P2_POST_TURN", "call_site": "x.y"},
+    }
+    out = VLLM.prepare_chat_payload(payload)
+    assert "priority" not in out
+    assert "call_site" not in out
+    assert "extra_body" not in out
+
+
+def test_a_clean_payload_with_a_genuine_int_priority_is_untouched():
+    """The no-op guard: nothing to strip and nothing else to repair passes
+    through byte-for-byte, same contract as every other repair in this file."""
+    payload = {
+        "model": "tier3",
+        "messages": [{"role": "user", "content": "x"}],
+        "priority": 3,
+    }
+    assert VLLM.prepare_chat_payload(payload) == payload
+    assert LLAMACPP.prepare_chat_payload(payload) == payload
+
+
+def test_stripping_does_not_mutate_the_callers_payload():
+    payload = {
+        "model": "tier3",
+        "messages": [{"role": "user", "content": "x"}],
+        "priority": "P2_POST_TURN",
+        "call_site": "a.b",
+    }
+    VLLM.prepare_chat_payload(payload)
+    assert payload["priority"] == "P2_POST_TURN", "input untouched (corpus capture)"
+    assert payload["call_site"] == "a.b"
+
+
+def test_needs_caller_field_strip_helper():
+    from roadstead.providers.payload import _needs_caller_field_strip
+
+    assert _needs_caller_field_strip({"priority": "P2_POST_TURN"})
+    assert _needs_caller_field_strip({"call_site": "x"})
+    assert _needs_caller_field_strip({"priority": True}), (
+        "bool is an int subclass but not a valid priority — must still strip")
+    assert not _needs_caller_field_strip({"priority": 3})
+    assert not _needs_caller_field_strip({})
+    assert not _needs_caller_field_strip({"messages": []})
+
+
 def test_ab_harness_normalizes_before_shadow_dispatch():
     """The A/B path must normalize the corpus payload so the shadow
     backend gets system+grammar, matching what the proxy sends primary.

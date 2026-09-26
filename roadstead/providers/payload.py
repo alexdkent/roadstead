@@ -239,6 +239,63 @@ def _apply_thinking_sampling(p: dict, *, temperature: float, top_p: float) -> No
         p["top_p"] = top_p
 
 
+def _is_valid_backend_priority(value: Any) -> bool:
+    """True when ``value`` is a real int an OpenAI-compatible backend's own
+    scheduling-``priority`` field can accept.
+
+    Not a bool: a JSON ``true``/``false`` is not a priority (``bool`` is an
+    ``int`` subclass in Python, the same trap ``config.LLMPriority.coerce``
+    guards against for Roadstead's own priority field)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _needs_caller_field_strip(payload: dict) -> bool:
+    """True when ``payload`` carries a Roadstead-only field that must not
+    reach the backend — see ``_strip_caller_only_fields`` for why. Exists so
+    a payload needing ONLY this repair doesn't get short-circuited by a
+    provider's early-return guard, the same trap the thinking-budget clamps
+    above already fell into once."""
+    if not isinstance(payload, dict):
+        return False
+    if "call_site" in payload:
+        return True
+    priority = payload.get("priority")
+    return "priority" in payload and not _is_valid_backend_priority(priority)
+
+
+def _strip_caller_only_fields(p: dict) -> None:
+    """Remove Roadstead-only scheduling fields from a payload about to be
+    forwarded to an OpenAI-compatible backend. Mutates ``p`` in place — ``p``
+    is always the provider's own copy by the time this runs, never the
+    caller's original dict.
+
+    ``call_site`` is Roadstead attribution metadata (docs/api.md §1.1): every
+    door either reads it from the top-level request and computes its own
+    value (``/rs/v1/chat``), or overwrites it outright
+    (``<agent_id>.openai_compat`` on the OpenAI door) — it is never a real
+    OpenAI/vLLM/llama.cpp field, so it is dropped unconditionally.
+
+    ``priority`` is different: vLLM's own OpenAI-compatible server has a
+    genuine, INT-typed ``priority`` field (engine scheduling priority), a
+    real backend feature distinct from Roadstead's OWN ``priority`` (a fleet
+    band, name or int — read only at ``/rs/v1/chat``, see
+    ``enriched._priority_for``; the OpenAI door reads none at all, docs/api.md
+    §1.1 "Why this door will not grow a priority field"). Reproduced live
+    2026-09-26: a caller sending Roadstead's own spelling
+    (``{"priority": "P2_POST_TURN"}``) through ``/v1/chat/completions`` got a
+    502 — the string reached vLLM's typed field, failed its `int_parsing`
+    validation, and vLLM 400s the WHOLE request, not just the bad field. Only
+    a non-int value is Roadstead's spelling leaking through; a genuine int is
+    a caller intentionally using vLLM's own field, so it is left alone here
+    too — this function re-checks the type itself rather than trusting its
+    caller to have gated on ``_needs_caller_field_strip`` first.
+    """
+    p.pop("call_site", None)
+    priority = p.get("priority")
+    if "priority" in p and not _is_valid_backend_priority(priority):
+        p.pop("priority", None)
+
+
 #: Floor and ceiling on an injected reasoning cap.
 #:
 #: FLOOR: vLLM #44676 reports forced reasoning-end tokens landing INSIDE tool-call

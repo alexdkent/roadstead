@@ -1046,6 +1046,14 @@ class Lifecycle:
         # thinking_active registration when streaming.
         self.correction.apply_thinking(req)
 
+        # The "no accidental MAX" reasoning-effort guard (2026-09-26). LAST
+        # among the reasoning-effort corrections: it is the final gate on
+        # whatever effort either injection above wrote into
+        # `chat_template_kwargs`, and it also catches an un-opted-in caller's
+        # raw top-level `reasoning_effort` that neither of them ever touches.
+        # No-op on every endpoint that declares no `policy.reasoning_effort_map`.
+        self.correction.apply_reasoning_effort_map(req)
+
         # 🚨 THE PROXY MUST NOT GRANT TOKENS AND WITHHOLD THE CLOCK.
         self.extend_deadline_for_granted_budget(req, _mt_before)
 

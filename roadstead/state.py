@@ -318,6 +318,15 @@ class ProxyState:
         self.structured_empty_total = 0
         self.structured_empty_by_call_site: dict[str, int] = {}
         self.structured_empty_window: dict[str, deque] = {}
+        # The "no accidental MAX" reasoning-effort guard (2026-09-26,
+        # `Correction.apply_reasoning_effort_map`). Keyed "endpoint|from->to"
+        # (empty "to" = the value was REMOVED, not remapped) so /v1/status can
+        # show the operator who is being remapped and to what, per endpoint.
+        self.reasoning_effort_remaps: dict[str, dict] = {}
+        # Dedup so a caller sending the same bad word on every turn logs ONCE,
+        # not on every request — same pattern as `alert_logged` above.
+        # {(agent_id, requested_value)}.
+        self.reasoning_effort_remap_logged: set = set()
         # Dedupe set so a single request that races across two timeout
         # layers (e.g. admission expiry + client-wait) is logged once.
         self.timed_out_ids: set[str] = set()
@@ -503,6 +512,16 @@ class ProxyState:
         self.scheduler_task: asyncio.Task | None = None
         self.poller_task: asyncio.Task | None = None
         self.inflight_task: asyncio.Task | None = None
+        # Thinking-canary background tasks, keyed by endpoint (2026-09-26).
+        # `Health._maybe_run_thinking_canary` used to be AWAITED INLINE in the
+        # poller's sequential per-endpoint loop — a real generation taking
+        # longer than the goodput detector's `_RATE_WINDOW_S` (25s) delayed
+        # every LATER endpoint's own `sample_goodput` call past its window,
+        # reading UNKNOWN (`too_few_samples`) for an endpoint the canary never
+        # touched (observed 08:32:53Z and 09:33:08Z). Scheduled off the
+        # poller's critical path instead — see `Health._schedule_thinking_canary`.
+        # Same pattern as `inflight_tasks` above: `add_done_callback` self-prunes.
+        self.thinking_canary_tasks: dict[str, asyncio.Task] = {}
         self.started_at = time.monotonic()
         # Wall-clock twin of started_at. `started_at` is monotonic and therefore
         # NOT a timestamp — /v1/models needs a real epoch for the OpenAI

@@ -70,17 +70,18 @@ now supports; `request_id` still is not one of them here.
 
 ##### What this door does NOT read 🚨
 
-Everything else in the body is **left in the payload and forwarded toward the backend**. For the
+Everything else in the body is **left in the payload and forwarded toward the backend** —
+except `call_site` and a non-int `priority`, stripped downstream (see their rows below). For the
 names below that is not what a caller carrying habits from `/v1/submit` expects, so each is stated
 rather than omitted:
 
 | Field | What actually happens here |
 |---|---|
 | `agent_id` | **Ignored.** Identity is the API key, or the source address — §1.5. A body could claim any `agent_id`, including one with a better DRR weight. |
-| `priority` | **Ignored, and that is now a decision rather than a gap** (2026-09-02). The band is *configured* per caller instead — see "A static band per caller" below. A per-call body field was measured against real traffic and rejected. |
-| `call_site` | **Ignored.** Set to `<agent_id>.openai_compat`, so this door's traffic is distinguishable in attribution. |
+| `priority` | **Ignored** for scheduling — the band is *configured* per caller instead — see "A static band per caller" below. A per-call body field was measured against real traffic and rejected (2026-09-02). 🚨 **A non-int value is also STRIPPED before the payload reaches the backend** (`providers/payload.py::_strip_caller_only_fields`, 2026-09-26): vLLM's OpenAI-compatible server has its own genuine, int-typed `priority` (engine scheduling priority), and a caller that reused Roadstead's own spelling (`"priority": "P2_POST_TURN"`) got a 400 from vLLM's type validation, surfaced as a 502. A caller's genuine int is left alone and reaches vLLM's own field unchanged. |
+| `call_site` | **Ignored, and STRIPPED before forwarding** (2026-09-26, same fix as `priority` above) — it is never a real backend field. Roadstead's own attribution is set to `<agent_id>.openai_compat`, so this door's traffic is distinguishable regardless of what the body said. |
 | `caller_id` | **Ignored.** Set to the `agent_id`. Read on `/rs/v1/chat`, which is where a caller with sub-identities should be. |
-| `request_id` | **Ignored** — and, unlike the four above, not replaced either: it travels to the backend inside the payload, where a strict engine may reject the unknown key. Read on `/rs/v1/chat`. |
+| `request_id` | **Ignored** — and, unlike `call_site` above, not stripped either: it travels to the backend inside the payload, where a strict engine may reject the unknown key. Read on `/rs/v1/chat`. |
 
 🚨 **`session_id`/`turn_id` moving into the table above (2026-09-17) does not reopen identity.**
 `agent_id`, `caller_id` and `priority` are still read from nowhere but the resolved principal — a
@@ -1714,6 +1715,7 @@ before they existed.
 | `reasoning_effort` | Chat-template effort level, folded into the **same** `chat_template_kwargs` object as the thinking switch. |
 | `reasoning_budget_tokens` | Absolute reasoning cap, sent under the engine's own wire name. |
 | `thinking_reasoning_budget` | Per-endpoint replacement for the global headroom added to `max_tokens` on the `thinking:` opt-in. |
+| `reasoning_effort_map` | The "no accidental MAX" guard — normalizes or REMOVES whatever effort word the request ends up carrying, in both places a caller may put it. See §3.14d. |
 
 🚨 **"Thinking on" is not a neutral toggle on a template that carries its own effort default.** Some
 templates render `reasoning_effort|default(...)` at their MAXIMUM, so switching thinking on and
@@ -2539,6 +2541,42 @@ than an on/off switch — without it, such an endpoint's undeclared-switch bail 
 sibling §3.13b exists for. Reuses the same reasoning headroom switch-bearing endpoints
 already get on the opt-in; a caller's own effort still wins. See `docs/ledger.md`
 "`thinking: true` was a silent no-op on an always-thinking model with no switch".
+
+### 3.14d The "no accidental MAX" guard — `policy.reasoning_effort_map`
+
+**A caller (or the endpoint's own stale declared default) asking for a middling effort must
+not silently become the model's MOST EXPENSIVE one.** Measured on GLM-5.3-Flash (tier3,
+2026-09-26): the chat template renders only `low`/`high`/`max` for
+`chat_template_kwargs.reasoning_effort`, and buckets `medium` — and ANY other unrecognised
+word, typo included — into `max`, with nothing in the response distinguishing that from an
+honoured request. Operator rule: *"max must be an operator decision or a decision at time of
+wiring — callers must not default to max."*
+
+`policy.reasoning_effort_map: {<word a caller might send>: <word this template actually
+understands>}` is the endpoint's own statement of which words it has measured, and what to do
+with everything else:
+
+| the request carries | outcome |
+|---|---|
+| a word THE MAP NAMES (compared case-insensitively, stripped) | replaced by the mapped word, sent **verbatim** as the operator wrote it |
+| a word the map does **not** name | **REMOVED** outright — the engine's own server-side default applies, rather than an unbucketed word landing wherever the template's fallback happens to be |
+| nothing at all | untouched |
+| — the endpoint declares `{}` (undeclared) | the payload is not even inspected — absent ⇒ off, same contract as every other `policy.*` key |
+
+Checked in **both** places a caller may have put the value: `chat_template_kwargs.reasoning_effort`
+(what `policy.reasoning_effort`'s and `policy.thinking_effort`'s own injections write, §3.11/§3.14c)
+and the plain top-level OpenAI `reasoning_effort` — the latter matters because a caller that never
+sends `thinking: true` at all is untouched by either injection above, and its raw top-level field
+would otherwise reach the backend completely unchecked. Runs LAST among the reasoning-effort
+corrections, so it is the final gate on whatever either injection wrote, not a substitute for
+either — an endpoint's OWN declared `policy.reasoning_effort` default is subject to the same map,
+which is deliberate: the guard exists precisely because a *declared* default can itself be the
+stale or wrong word.
+
+`GET /v1/status` → `reliability.reasoning_effort_remaps`, keyed `"<endpoint>|<requested>-><sent>"`
+(a `null` `to` means the value was removed, not remapped) — every remap or removal since boot, so
+an operator can see who is being remapped and to what. Grep marker in the log:
+`ROADSTEAD_REASONING_EFFORT_REMAP` (logged once per distinct caller+value, not once per request).
 
 ### 3.13 Goodput collapse — `endpoints[].goodput` on `/v1/status`
 

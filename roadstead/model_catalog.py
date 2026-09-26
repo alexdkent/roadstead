@@ -570,6 +570,13 @@ _POLICY_PASSTHROUGH = (
     # bails out of before ever reaching effort logic. Guarded by
     # test_thinking_effort.py::test_thinking_effort_reaches_endpoint_config.
     "thinking_effort",
+    # The "no accidental MAX" guard: {<requested word>: <word this template
+    # understands>}. {} (absent) = every effort word passes through unchanged.
+    # A value the map does not name is REMOVED rather than forwarded, so a
+    # typo or an unmeasured word cannot fall through to a template's own
+    # (possibly maximal) bucketing default. Guarded by
+    # test_reasoning_effort_map.py::test_declared_map_reaches_endpoint_config.
+    "reasoning_effort_map",
     # Reasoning LOOP-BREAK thresholds (correction.ReasoningLoopDetector). All
     # four must be positive for the detector to arm; absent/partial = inert.
     # Guarded by

@@ -249,6 +249,7 @@ class ProxyService:
     _empty_rescue_recovered = _StateField("empty_rescue_recovered")
     _timed_out_ids = _StateField("timed_out_ids")
     _inflight_tasks = _StateField("inflight_tasks")
+    _thinking_canary_tasks = _StateField("thinking_canary_tasks")
     _endpoint_health = _StateField("endpoint_health")
     _health_fail_threshold = _StateField("health_fail_threshold")
     _paused_endpoints = _StateField("paused_endpoints")
@@ -730,6 +731,14 @@ class ProxyService:
             self._poller_task.cancel()
         if self._inflight_task:
             self._inflight_task.cancel()
+        # Thinking-canary probes (2026-09-26) run off the poller's own task —
+        # cancelling the poller above does not reach them. They are bounded
+        # (60s) and self-contained (nothing awaits their result), so cancel
+        # rather than drain: unlike the dispatch tasks above, there is no
+        # caller or slot on the other end to resolve.
+        for t in self._thinking_canary_tasks.values():
+            if not t.done():
+                t.cancel()
         # Release any held on-demand dispatcher lease so the GPU slot frees for
         # other services across the restart (don't wait out the lease TTL), and
         # close the HTTP pools. CONCURRENTLY and BOUNDED, together, for two

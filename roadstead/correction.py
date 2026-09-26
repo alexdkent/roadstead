@@ -804,6 +804,24 @@ def fold_caller_effort(payload: dict, ck: dict, switch_keys) -> str:
     return EFFORT_FOLDED
 
 
+def _resolve_reasoning_effort_map(value: Any, effort_map: dict) -> tuple[bool, str]:
+    """(matched, mapped_value). ``mapped_value`` is meaningless when
+    ``matched`` is False — the caller removes the field in that case.
+
+    Compares the requested value against the map's KEYS case-insensitively
+    after stripping (an operator writing "Medium" and a caller sending
+    "medium " must agree); the value actually sent is whatever the operator
+    declared, verbatim, never case-folded — see
+    ``EndpointConfig.reasoning_effort_map``."""
+    if not isinstance(value, str):
+        return False, ""
+    needle = value.strip().lower()
+    for k, v in effort_map.items():
+        if isinstance(k, str) and k.strip().lower() == needle:
+            return True, v
+    return False, ""
+
+
 #: Function name used when the caller's ``json_schema.name`` is missing or
 #: sanitizes away to nothing. A name is mandatory on the wire, so there has to
 #: be one; it is never shown to the caller (the synthesized tool is removed on
@@ -2544,6 +2562,83 @@ class Correction:
             return
         self.state.thinking_active[req.request_id] = {
             "allowed_keys": self.thinking_allowed_keys(p)}
+
+    def apply_reasoning_effort_map(self, req: QueuedRequest) -> None:
+        """The "no accidental MAX" guard (2026-09-26): normalize whatever
+        reasoning EFFORT a request carries against the endpoint's declared
+        ``policy.reasoning_effort_map``, in BOTH places a caller may have put
+        it.
+
+        Measured on GLM-5.3-Flash (tier3): the chat template renders only
+        low/high/max, and buckets "medium" — and any OTHER unrecognised word,
+        typo included — into MAX, its most expensive rung, SILENTLY. Nothing
+        in the response distinguishes an honoured request from a mis-typed
+        one landing on the model's maximum. Operator rule: "max must be an
+        operator decision or a decision at time of wiring — callers must not
+        default to max."
+
+        Runs LAST among the reasoning-effort corrections — after
+        ``apply_forced_reasoning_budget`` and ``apply_thinking`` above, which
+        between them cover a forced-reasoning endpoint's declared default and
+        a caller's ``thinking:`` opt-in. Neither covers an ORDINARY caller on
+        a non-forced endpoint that never opts into ``thinking:`` at all:
+        ``apply_thinking`` bails out before ever building
+        ``chat_template_kwargs`` for such a request, so a plain OpenAI
+        caller's raw top-level ``reasoning_effort`` reaches here completely
+        untouched — the same field `fold_caller_effort` folds elsewhere, not
+        yet folded because nothing upstream of this method had reason to
+        touch it. So this checks BOTH
+        ``chat_template_kwargs.reasoning_effort`` (what either injection site
+        above writes) and the plain top-level field (what an un-opted-in
+        caller still carries), independently — whichever, if either, is
+        present.
+
+        {} (undeclared) is a TOTAL no-op — the payload is never even
+        inspected — the same "declaring nothing changes nothing" contract
+        every other policy key in this module follows.
+        """
+        p = req.payload
+        if not isinstance(p, dict) or req.payload_type != "chat_completion":
+            return
+        ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
+        effort_map = getattr(ep, "reasoning_effort_map", None) if ep is not None else None
+        if not effort_map:
+            return
+        ck = p.get("chat_template_kwargs")
+        if isinstance(ck, dict) and isinstance(ck.get("reasoning_effort"), str):
+            new_ck = dict(ck)
+            self._remap_one_effort_field(req, new_ck, effort_map)
+            p["chat_template_kwargs"] = new_ck
+        if isinstance(p.get("reasoning_effort"), str):
+            self._remap_one_effort_field(req, p, effort_map)
+
+    def _remap_one_effort_field(
+        self, req: QueuedRequest, container: dict, effort_map: dict,
+    ) -> None:
+        """Normalize ``container["reasoning_effort"]`` in place (``container``
+        is always a fresh copy by the time this runs — never the caller's
+        original dict) and record the outcome for the operator surface."""
+        requested = container["reasoning_effort"]
+        matched, mapped = _resolve_reasoning_effort_map(requested, effort_map)
+        if matched:
+            container["reasoning_effort"] = mapped
+            sent = mapped
+        else:
+            del container["reasoning_effort"]
+            sent = ""
+        tally_key = f"{req.endpoint}|{requested}->{sent}"
+        tally = self.state.reasoning_effort_remaps.setdefault(
+            tally_key, {"endpoint": req.endpoint, "from": requested,
+                       "to": sent or None, "count": 0})
+        tally["count"] += 1
+        log_key = (req.agent_id, requested)
+        if log_key not in self.state.reasoning_effort_remap_logged:
+            self.state.reasoning_effort_remap_logged.add(log_key)
+            logger.info(
+                "ROADSTEAD_REASONING_EFFORT_REMAP endpoint=%s agent=%s "
+                "requested=%r sent=%r", req.endpoint, req.agent_id, requested,
+                sent or None,
+            )
 
     # =====================================================================
     # DELETED 2026-08-22: fold_system_for_thinking. It merged the system

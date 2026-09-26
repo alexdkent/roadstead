@@ -22,7 +22,9 @@ from .payload import (
     _apply_thinking_sampling,
     _has_anthropic_image_block,
     _needs_alternation_fix,
+    _needs_caller_field_strip,
     _normalize_strict_alternation,
+    _strip_caller_only_fields,
     _translate_anthropic_image_blocks,
 )
 
@@ -120,6 +122,12 @@ class LlamaCppProvider(Provider):
             and "extra_body" not in payload
             and not needs_vision_xlate
             and not needs_alternation
+            # 🚨 Same trap as the two below it: a payload with nothing else to
+            # repair but a Roadstead-only `priority`/`call_site` field must not
+            # be short-circuited past `_strip_caller_only_fields` — see
+            # `payload.py` for why a non-int `priority` reaching the backend
+            # is a hard request failure there too.
+            and not _needs_caller_field_strip(payload)
             and not (thinking_budget_ratio > 0)
             # 🚨 The absolute cap has to be in this guard too. Without it a
             # payload carrying no `system`/`extra_body` short-circuits out
@@ -153,6 +161,9 @@ class LlamaCppProvider(Provider):
         extra_body = p.pop("extra_body", None)
         if isinstance(extra_body, dict):
             p.update(extra_body)
+        # AFTER the extra_body merge, so a caller-only field smuggled inside
+        # `extra_body` is caught too, not just a top-level one.
+        _strip_caller_only_fields(p)
         # Applied by BOTH providers, exactly as the single pre-split function
         # did. The ratio mirrors a vLLM `--reasoning-config` launch flag and is
         # 0 on every llama.cpp stanza today, so this is a no-op here — kept
