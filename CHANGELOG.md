@@ -14,6 +14,30 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Added
 
+- **Structured content blank-run abort — `policy.structured_blank_run_abort_chars`.**
+  A sibling of the reasoning loop-break guard in a different channel: on tier3
+  (GLM-5.3-Flash, vLLM, llguidance), ~0.45% of structured (JSON-schema / `json_object`)
+  requests degenerate into a CONTENT-channel whitespace loop and burn up to 12,000
+  output tokens (~4-5 minutes of a scarce decode slot at ~45 tok/s) before `max_tokens`
+  ends them. Detection is a trailing RUN LENGTH of blank/whitespace chars
+  (`correction.StructuredBlankRunDetector`) rather than a window ratio — the measured
+  runaway shapes are irregular mixes that no fixed `stop` string catches, and one shape
+  runs entirely AFTER an already-complete, closed JSON object (grammar-legal trailing
+  whitespace). **Streaming**: aborts with `abort_reason: structured_blank_run`, no
+  re-dispatch (chunks are already relayed). **Sync**: the eligible request (no `tools`,
+  `n` absent/1, no `logprobs`) is dispatched over the streaming wire internally
+  (`BackendClientPool.call_watched`) so the guard can watch it live and the stream can
+  be closed on detection, freeing the slot; the content with its trailing blank run
+  stripped is served as an ordinary successful response when it parses as JSON (the
+  object was already complete), otherwise ONE re-dispatch is attempted, and a second
+  failure resolves the SAME non-`"truncated structured output"` wording
+  `degenerate_length_enforce` uses (that substring is what a caller's
+  truncation-recovery path matches on to retry with MORE tokens, which for a
+  non-terminating loop is exactly the wrong move). 0/absent ⇒ off, byte-identical to
+  before this existed. `GET /v1/status` → `structured_blank_runs_detected` /
+  `_salvaged` / `_retried` / `_recovered` / `_unrecovered`. Grep marker:
+  `ROADSTEAD_STRUCTURED_BLANK_RUN`. See `docs/api.md` §3.15.
+
 - **The "no accidental MAX" reasoning-effort guard — `policy.reasoning_effort_map`.**
   Measured on GLM-5.3-Flash (tier3): its chat template renders only `low`/`high`/`max`
   for `chat_template_kwargs.reasoning_effort`, and buckets `medium` — and any other

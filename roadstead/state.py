@@ -129,6 +129,20 @@ class ProxyState:
         # returned nothing, which is the number that says whether the
         # rescue is worth its second call.
         self.reasoning_loops_answered = 0
+        # Structured CONTENT blank-run abort (correction.StructuredBlankRunDetector).
+        # FIVE counters, not one, because the gaps say what the guard is
+        # actually doing: `detected` rises on both dispatch paths; `salvaged`
+        # is the (common) case where the "run" was just grammar-legal
+        # trailing whitespace after an already-complete object; `retried` /
+        # `recovered` bracket the sync path's one re-dispatch (streaming never
+        # retries — see execute_streaming); `unrecovered` is what a caller
+        # actually sees as an error. `detected - salvaged - recovered` is the
+        # population `unrecovered` should equal.
+        self.structured_blank_runs_detected = 0
+        self.structured_blank_runs_salvaged = 0
+        self.structured_blank_runs_retried = 0
+        self.structured_blank_runs_recovered = 0
+        self.structured_blank_runs_unrecovered = 0
         self.budget_mgr = BudgetManager(starvation_timeout_s=config.starvation_timeout_s)
         # Money (roadmap Workstream D). The price book is seeded from the
         # catalog and then kept current by capacity discovery on any provider

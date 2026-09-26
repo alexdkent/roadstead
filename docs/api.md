@@ -316,7 +316,7 @@ Query: `hours` (default 24, clamped to **0.1–168**).
 | `admission` | waiting to be admitted — it never reached a backend. Capacity. |
 | `client_wait` | admitted, then out of time on the deadline in force for it. |
 | `backend` | the backend failed or its transport deadline fired. |
-| `stream` | mid-stream, and `by_abort_reason` says which bound: `ttft` (accepted, never emitted a first token), `stall` (was emitting, then stopped), `reasoning_loop` (emitting steadily but repeating itself), `hard_cap` (still healthy, cut for capacity) or `caller_deadline`. The first two are the substrate dying under a caller that did nothing wrong; the last two are Roadstead deciding to stop. |
+| `stream` | mid-stream, and `by_abort_reason` says which bound: `ttft` (accepted, never emitted a first token), `stall` (was emitting, then stopped), `reasoning_loop` (emitting steadily but repeating itself in the REASONING channel), `structured_blank_run` (emitting steadily but repeating itself in the CONTENT channel — see §3.15), `hard_cap` (still healthy, cut for capacity) or `caller_deadline`. The first two are the substrate dying under a caller that did nothing wrong; the last three are Roadstead deciding to stop. |
 
 **`abort_reason` is populated on every layer** as of 2026-09-12. 🚨 It was previously
 `stream`-only, and everywhere else defaulted to `NULL` — which is why one real endpoint wedge left
@@ -330,6 +330,7 @@ path nobody has named yet, and the count should be ~0.
 | `stall` | `stream` | tokens were flowing and stopped for the inter-token gap | **yes** |
 | `goodput_collapse` | `admission` | refused at the door: the endpoint's own engine counters said it was occupied and producing almost nothing (§3.13) | **yes** |
 | `reasoning_loop` | `stream` | the reasoning channel entered a long-period repetition cycle and stopped making progress. 🚨 Deliberately **not** a backend fault and deliberately **not** deferrable: the backend was healthy and decoding steadily — that is precisely why no watchdog catches it — and retrying an unchanged prompt reproduces the loop rather than escaping it (§3.14) | no — the model |
+| `structured_blank_run` | `stream` | the CONTENT channel of a structured (JSON-schema / json_object) call ran a blank/whitespace run past its declared threshold — a sibling of `reasoning_loop` in a different channel and with a different mechanism (a trailing-run LENGTH, not a distinct-gram ratio). **Streaming only** — the sync path salvages or retries instead of aborting (§3.15); a streaming caller has already received every relayed chunk, so there is nothing left to retry into | no — the model |
 | `hard_cap` | `stream` | a still-progressing stream cut off at the absolute cap | no — capacity |
 | `caller_deadline` | `stream` | the caller's own explicit wall, mid-stream | no — the caller's bound |
 | `sse_consumer_deadline` | `stream` | our SSE reader ran out of time waiting for the next frame. Distinct from every other `stream` reason, which are the producer's verdict about the backend | no |
@@ -2577,6 +2578,48 @@ stale or wrong word.
 (a `null` `to` means the value was removed, not remapped) — every remap or removal since boot, so
 an operator can see who is being remapped and to what. Grep marker in the log:
 `ROADSTEAD_REASONING_EFFORT_REMAP` (logged once per distinct caller+value, not once per request).
+
+### 3.15 Structured content blank-run abort — `policy.structured_blank_run_abort_chars`
+
+**A sibling of §3.14 in a different channel.** The reasoning loop-break guard watches the
+REASONING channel for a long-period repetition CYCLE; this one watches the CONTENT channel of a
+structured (JSON-schema / `json_object`) call for a RUN of consecutive blank/whitespace chars.
+Measured on tier3 (GLM-5.3-Flash, vLLM, llguidance) 2026-09-24: ~0.45% of structured requests
+degenerate into this shape and burn up to 12,000 output tokens — roughly 4-5 minutes of a scarce
+decode slot at ~45 tok/s — before `max_tokens` ends them. Real runaway shapes are irregular mixes of
+the blank-char alphabet (some start right after the opening `{`, some mid-object after a complete
+string value, and one measured case runs entirely AFTER a complete, closed object — grammar-legal
+trailing whitespace the grammar itself never forbade), which rules out a fixed `stop` string:
+detection is a trailing RUN LENGTH over the character class, not a window ratio.
+
+`policy.structured_blank_run_abort_chars: <n>` (0/absent ⇒ off, the same contract as §3.14's four
+keys) arms the guard on **both** dispatch paths, with different consequences:
+
+* **Streaming** (`stream: true`) — chunks are already relayed to the caller, so there is nothing to
+  retry into: the guard aborts with `abort_reason: structured_blank_run` (§3, `stream` layer,
+  non-deferrable — the caller already has everything it is going to get from this call).
+* **Sync** (`stream` absent/false) — the eligible request (`chat_completion`, a JSON-implying
+  constraint, no `tools`, `n` absent/1, no `logprobs`/`top_logprobs`) is dispatched over the
+  STREAMING wire internally so the guard can watch it live, and reassembled into an ordinary
+  non-streaming response. On detection the stream is closed (freeing the backend's decode slot,
+  same reasoning as vLLM disconnect-driven cancellation elsewhere in this proxy) and:
+    1. **Salvage first** — if the content, with only its TRAILING blank run stripped, parses as
+       JSON, the object was already complete and what the guard caught was grammar-legal trailing
+       whitespace. Served as an ordinary successful response (`finish_reason: stop`), not an error.
+    2. Otherwise **one re-dispatch**, subject to the same remaining-deadline floor and endpoint
+       health check every other in-proxy retry uses.
+    3. If the retry also runs blank (or isn't permitted), the call fails with the SAME
+       non-`"truncated structured output"` wording §2.2's `degenerate_length_enforce` branch
+       uses — deliberately: that substring is what a caller's truncation-recovery path matches on
+       to retry with a LARGER `max_tokens`, which for a loop that cannot terminate is exactly the
+       wrong move. Never cached as `ok`.
+
+`GET /v1/status` reports five counters — `structured_blank_runs_detected` /
+`_salvaged` / `_retried` / `_recovered` / `_unrecovered` — for the same reason §3.14's three do:
+`detected - salvaged - recovered` is the population `unrecovered` should equal, and the gaps between
+them are the measurement, not just the total. Grep marker:
+`ROADSTEAD_STRUCTURED_BLANK_RUN` (endpoint, call_site, request_id, attempt, action, run_chars,
+content_chars, output_tokens_so_far, elapsed_s — one line per stage, not one per request).
 
 ### 3.13 Goodput collapse — `endpoints[].goodput` on `/v1/status`
 

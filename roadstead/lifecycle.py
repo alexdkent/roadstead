@@ -30,6 +30,7 @@ from .backend import (
     BackendResponse,
     BackendTimeout,
     BackendUnavailable,
+    StructuredBlankRunAborted,
     coerce_token_count,
     extract_cached_tokens,
 )
@@ -40,6 +41,7 @@ from .config import (
     reasoning_loop_answer_now,
     reasoning_loop_break_enabled,
     reasoning_loop_break_shadow,
+    structured_blank_run_abort_enabled,
     structured_validity_guard_enabled,
     uniform_correction_enabled,
 )
@@ -62,11 +64,13 @@ from .constants import (
 from .correction import (
     _EMPTY_RESCUE_MIN_TOKENS,
     ReasoningLoopDetector,
+    StructuredBlankRunDetector,
     _ToolCallStreamSanitizer,
     _chat_completion_text,
     _degeneracy_evidence,
     _degenerate_text_arm,
     _fmt_evidence,
+    strip_trailing_blank_chars,
 )
 from .cost_model import context_fit, estimate_input_tokens
 from .enriched import (
@@ -123,6 +127,68 @@ _STALL_BEST_EFFORT_RATIO = 0.5
 # backend even a tenth of the recommended time still cools it on a genuine
 # stall. Raising this toward 0.5 re-disarms the cooldown; do not.
 _COOLDOWN_BEST_EFFORT_RATIO = 0.1
+
+
+#: Payload overrides applied on the ONE structured blank-run retry
+#: (`execute_sync`), layered over the caller's own payload with `{**payload,
+#: **_BLANK_RUN_RETRY_EXTRAS}`. Default `{}` — a plain re-sample at the
+#: caller's own temperature (measured callers run 0.2-0.8, so the retry is not
+#: starting from a deterministic replay of the same degenerate draw). A
+#: SINGLE module constant rather than a parameter, so a value derived from a
+#: live A/B lands as a one-line change with no call-site hunting.
+_BLANK_RUN_RETRY_EXTRAS: dict = {}
+
+
+def _blank_run_eligible(correction: "Correction", req: QueuedRequest) -> bool:
+    """Eligibility for the structured CONTENT blank-run guard, on EITHER
+    dispatch path — one gate so sync and streaming can never disagree about
+    which requests are watched.
+
+    Narrower than `request_is_structured`/`request_expects_json` alone: each
+    exclusion below is a shape this guard has no reassembly rule for yet, not
+    a judgement that the shape is safe.
+      * `tools` — a tool call's `function.arguments` accumulates across
+        deltas by INDEX (see `reasoning_replay.accumulate_tool_call_deltas`);
+        this guard doesn't carry that reassembly, so a request that might
+        emit one is left to the existing paths untouched.
+      * `n` other than 1 — the detector watches ONE content channel; N
+        parallel choices would need N independent detectors and the sync
+        salvage/retry logic has no notion of "choice index" today.
+      * `logprobs`/`top_logprobs` — the reassembled body has nowhere to carry
+        a token-logprob array through an abort/retry boundary.
+    """
+    if req.payload_type != "chat_completion":
+        return False
+    if not correction.request_expects_json(req):
+        return False
+    p = req.payload
+    if not isinstance(p, dict):
+        return False
+    if p.get("tools"):
+        return False
+    n = p.get("n")
+    if n not in (None, 1):
+        return False
+    if p.get("logprobs") or p.get("top_logprobs"):
+        return False
+    return True
+
+
+def _log_blank_run_event(
+    req: QueuedRequest, ep_cfg: "EndpointConfig", attempt: int, action: str, *,
+    run_chars: int | str = "-", content_chars: int | str = "-",
+    output_tokens: int = 0, elapsed_s: float = 0.0,
+) -> None:
+    """The one greppable log line for every stage of the blank-run guard —
+    `log_scan`/an operator greps `ROADSTEAD_STRUCTURED_BLANK_RUN` rather than
+    four differently-shaped WARNING lines."""
+    logger.warning(
+        "ROADSTEAD_STRUCTURED_BLANK_RUN endpoint=%s call_site=%s "
+        "request_id=%s attempt=%d action=%s run_chars=%s content_chars=%s "
+        "output_tokens_so_far=%d elapsed_s=%.1f",
+        ep_cfg.role, req.call_site or "?", req.request_id, attempt, action,
+        run_chars, content_chars, output_tokens, elapsed_s,
+    )
 
 
 #: Content-part type tags that carry an IMAGE. Both wire shapes appear here:
@@ -1592,6 +1658,18 @@ class Lifecycle:
         # grammar-matcher / speculative-decoding desync (see
         # Correction.is_structured_generation_fault). Never more than once.
         structured_fault_retried = False
+        # Structured CONTENT blank-run abort (2026-09-26). Computed ONCE (the
+        # endpoint/request shape don't change across attempts) rather than
+        # re-checked every loop — `ep_cfg.structured_blank_run_abort_chars`
+        # is 0 for every endpoint that hasn't declared it, so this is a single
+        # attribute read for the byte-identical common case.
+        blank_run_armed = (
+            structured_blank_run_abort_enabled()
+            and int(getattr(ep_cfg, "structured_blank_run_abort_chars", 0) or 0) > 0
+            and _blank_run_eligible(self.correction, req)
+        )
+        blank_run_retried = False  # the ONE re-dispatch has already been spent
+        blank_run_resolved = False  # "recovered" logged at most once
         while True:
             attempts += 1
             # Phase 1.5 slot-leak fix: bound each backend attempt to the
@@ -1631,10 +1709,107 @@ class Lifecycle:
 
             t0 = time.monotonic()
             try:
-                resp = await self.state.backend.call(
-                    ep_cfg, dispatch_payload, req.payload_type,
-                    req.request_id, timeout_s=max(1.0, remaining),
-                )
+                if blank_run_armed:
+                    resp = await self.state.backend.call_watched(
+                        ep_cfg, dispatch_payload, req.payload_type,
+                        req.request_id,
+                        StructuredBlankRunDetector(
+                            threshold=ep_cfg.structured_blank_run_abort_chars),
+                        timeout_s=max(1.0, remaining),
+                    )
+                else:
+                    resp = await self.state.backend.call(
+                        ep_cfg, dispatch_payload, req.payload_type,
+                        req.request_id, timeout_s=max(1.0, remaining),
+                    )
+            except StructuredBlankRunAborted as exc:
+                self.state.structured_blank_runs_detected += 1
+                verdict = exc.verdict
+                stripped = strip_trailing_blank_chars(exc.content)
+                salvaged_body: dict | None = None
+                if stripped:
+                    try:
+                        json.loads(stripped)
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        salvaged_body = None
+                    else:
+                        salvaged_body = copy.deepcopy(exc.body_so_far)
+                        salvaged_body["choices"][0]["message"]["content"] = stripped
+                        salvaged_body["choices"][0]["finish_reason"] = "stop"
+                if salvaged_body is not None:
+                    # 🚨 The object was already COMPLETE — the "run" the
+                    # detector caught was grammar-legal trailing whitespace
+                    # after a closed `}`/`]`, not a degeneration. Serve it as
+                    # a normal successful response (stripped, finish_reason
+                    # "stop") rather than treating a harmless tail as a
+                    # failure; fall through to the ordinary success path
+                    # below by setting `resp` and NOT returning/continuing.
+                    self.state.structured_blank_runs_salvaged += 1
+                    _log_blank_run_event(
+                        req, ep_cfg, attempts, "salvaged",
+                        run_chars=verdict.get("run_chars"),
+                        content_chars=verdict.get("content_chars"),
+                        output_tokens=exc.output_tokens, elapsed_s=exc.elapsed_s,
+                    )
+                    resp = BackendResponse(
+                        status_code=200,
+                        body=salvaged_body,
+                        duration_s=exc.elapsed_s,
+                        input_tokens=exc.input_tokens,
+                        output_tokens=exc.output_tokens,
+                        finish_reason="stop",
+                        cached_tokens=(salvaged_body.get("usage") or {})
+                            .get("prompt_tokens_details", {}).get("cached_tokens"),
+                    )
+                else:
+                    can_retry = (
+                        not blank_run_retried
+                        and (req.timeout_deadline - time.monotonic()) > _MIN_RETRY_BUDGET_S
+                        and self.health.endpoint_healthy(req.endpoint)
+                    )
+                    if can_retry:
+                        blank_run_retried = True
+                        self.state.structured_blank_runs_retried += 1
+                        _log_blank_run_event(
+                            req, ep_cfg, attempts, "retrying",
+                            run_chars=verdict.get("run_chars"),
+                            content_chars=verdict.get("content_chars"),
+                            output_tokens=exc.output_tokens, elapsed_s=exc.elapsed_s,
+                        )
+                        dispatch_payload = {**req.payload, **_BLANK_RUN_RETRY_EXTRAS}
+                        await asyncio.sleep(_RETRY_BACKOFF_S)
+                        continue
+                    self.state.structured_blank_runs_unrecovered += 1
+                    blank_run_resolved = True
+                    _log_blank_run_event(
+                        req, ep_cfg, attempts, "unrecovered",
+                        run_chars=verdict.get("run_chars"),
+                        content_chars=verdict.get("content_chars"),
+                        output_tokens=exc.output_tokens, elapsed_s=exc.elapsed_s,
+                    )
+                    # Same non-"truncated" wording/shape as the
+                    # degenerate_length_enforce branch below (arm=blank_run
+                    # rather than the repetition-loop arms) — 🚨 must NOT
+                    # contain "truncated structured output": that substring is
+                    # what a caller's truncation-recovery path
+                    # (is_output_truncation_error()) matches on to retry with
+                    # MORE tokens, which is exactly the defect here — pouring
+                    # more decode into a loop that cannot terminate.
+                    self.state.resolve_error(
+                        req,
+                        f"backend {ep_cfg.role} degenerate structured output "
+                        f"(blank-run loop, arm=blank_run, "
+                        f"run_chars={verdict.get('run_chars')}, "
+                        f"content_chars={verdict.get('content_chars')}, "
+                        f"output_tokens={exc.output_tokens})",
+                    )
+                    # status="truncated": never cached as ok, same bucket the
+                    # degenerate-length gate below uses for the same reason.
+                    self.record_completion(
+                        req, decision, exc.elapsed_s, exc.input_tokens,
+                        exc.output_tokens, "truncated",
+                    )
+                    return
             except BackendTimeout as exc:
                 duration = time.monotonic() - t0
                 self.state.resolve_error(req, str(exc))
@@ -1741,6 +1916,20 @@ class Lifecycle:
                 return
 
             duration = time.monotonic() - t0
+
+            if blank_run_armed and blank_run_retried and not blank_run_resolved:
+                # Reached only by falling all the way through the try/except
+                # above WITHOUT a StructuredBlankRunAborted — i.e. the ONE
+                # re-dispatch this request was granted came back clean. The
+                # salvage branch above sets `blank_run_resolved` itself so a
+                # salvage on the retry attempt is counted as `salvaged`, not
+                # double-counted here as ALSO `recovered`.
+                blank_run_resolved = True
+                self.state.structured_blank_runs_recovered += 1
+                _log_blank_run_event(
+                    req, ep_cfg, attempts, "recovered",
+                    output_tokens=resp.output_tokens, elapsed_s=duration,
+                )
 
             if rescue_armed:
                 # The min_tokens re-dispatch produced a real response where the
@@ -2147,6 +2336,20 @@ class Lifecycle:
         ) if reasoning_loop_break_enabled() else ReasoningLoopDetector()
         loop_broken = False
         answer_now = False
+        # Structured CONTENT blank-run abort (2026-09-26), streaming half.
+        # `_blank_run_eligible` already requires `request_expects_json`, which
+        # is one of `accumulate`'s own OR-clauses (`stream_expects_json`) —
+        # so whenever this detector is armed, `accumulate` is already True and
+        # the content `piece` extracted below is the same one this needs. No
+        # re-dispatch on this path (chunks are already relayed to the caller);
+        # see the except block below for the abort.
+        blank_detector = StructuredBlankRunDetector(
+            threshold=getattr(ep_cfg, "structured_blank_run_abort_chars", 0)
+        ) if (
+            structured_blank_run_abort_enabled()
+            and _blank_run_eligible(self.correction, req)
+        ) else StructuredBlankRunDetector()
+        blank_run_broken = False
 
         # Phase 1.5: bound the stream to the caller's remaining deadline so an
         # abandoned stream can't hold its slot past the SLA.
@@ -2274,6 +2477,30 @@ class Lifecycle:
                                     piece = delta.get("content") if isinstance(delta, dict) else None
                                     if isinstance(piece, str):
                                         accumulated_content += piece
+                                        if blank_detector.armed and piece:
+                                            bverdict = blank_detector.feed(piece)
+                                            if bverdict is not None:
+                                                self.state.structured_blank_runs_detected += 1
+                                                self.state.structured_blank_runs_unrecovered += 1
+                                                logger.warning(
+                                                    "ROADSTEAD_STRUCTURED_BLANK_RUN "
+                                                    "endpoint=%s call_site=%s "
+                                                    "request_id=%s attempt=1 "
+                                                    "action=unrecovered run_chars=%d "
+                                                    "content_chars=%d "
+                                                    "output_tokens_so_far=%d "
+                                                    "elapsed_s=%.1f (streaming — "
+                                                    "no re-dispatch, chunks already "
+                                                    "relayed)",
+                                                    req.endpoint, req.call_site or "?",
+                                                    req.request_id,
+                                                    bverdict["run_chars"],
+                                                    bverdict["content_chars"],
+                                                    output_tokens,
+                                                    time.monotonic() - t0,
+                                                )
+                                                blank_run_broken = True
+                                                raise asyncio.TimeoutError
                                 if replay_on and isinstance(delta, dict):
                                     # Same both-spellings read as the loop
                                     # detector below — vLLM's deepseek_v4
@@ -2390,6 +2617,22 @@ class Lifecycle:
                        "chars (distinct_gram_ratio "
                        f"{loop_detector.verdict['distinct_gram_ratio']} over "
                        f"{loop_detector.verdict['window_chars']} chars)")
+                watchdog = True
+            elif blank_run_broken:
+                # Second-most specific, same reasoning as loop_broken above:
+                # this is a CONTENT-shape verdict the proxy made, not a timing
+                # bound, and it must not fall through to `stall`/
+                # `caller_deadline` and hide the real signal. Deliberately NOT
+                # "backpressure"-worded (§2.2's deferrable marker) — the
+                # streaming caller already received every relayed chunk, and
+                # nothing here is retried, so there is nothing to retry into.
+                v = blank_detector.verdict or {}
+                abort_reason = "structured_blank_run"
+                err = ("backend content entered a blank/whitespace run and "
+                       "stopped making progress; aborted after "
+                       f"{v.get('run_chars')} consecutive blank chars "
+                       f"({v.get('content_chars')} content chars) — not "
+                       "re-dispatched on a streaming caller")
                 watchdog = True
             elif ttft_ms is None and isinstance(exc, asyncio.TimeoutError):
                 abort_reason = "ttft"

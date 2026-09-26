@@ -204,6 +204,35 @@ class EndpointConfig:
     # .apply_json_object_guard`` uses this flag to strip bare json_object on
     # these endpoints. False everywhere the launch flag is absent.
     disable_any_whitespace: bool = False
+    #: --- Structured CONTENT blank-run abort (2026-09-26) ---------------------
+    #: Consecutive blank/whitespace chars (``correction._BLANK_CHARS``) the
+    #: CONTENT channel of a structured (JSON-schema / json_object) call may run
+    #: before the sync dispatcher aborts the stream outright. 0 (default) =
+    #: undeclared, the detector is never constructed — an endpoint that says
+    #: nothing here pays nothing and dispatches exactly as it did before this
+    #: field existed.
+    #:
+    #: Distinct from ``disable_any_whitespace`` above, which is a LAUNCH-TIME
+    #: declaration that the grammar itself refuses to emit whitespace at all —
+    #: a stronger, backend-side fix where it is available. This is a RUNTIME
+    #: content-channel guard for the fleets that either don't run with that flag
+    #: or still see the failure some other way: a whitespace loop that starts
+    #: mid-object (after a complete string value) or AFTER a complete, closed
+    #: JSON object (grammar-legal trailing whitespace the grammar itself never
+    #: forbade). Measured on tier3 (GLM-5.3-Flash, vLLM, llguidance) 2026-09-24:
+    #: ~0.45% of structured calls degenerate into this shape and burn up to
+    #: 12,000 output tokens (~4-5 min of a scarce decode slot at ~45 tok/s)
+    #: before ``max_tokens`` ends them.
+    #:
+    #: 🚨 THESE ARE MEASUREMENTS AND BELONG TO A DEPLOYMENT, NOT TO THIS REPO —
+    #: same reasoning as the reasoning-loop thresholds above. 512 is what one
+    #: fleet calibrated (2,453 structured completions, 2 days): the longest
+    #: LEGITIMATE whitespace run in content was 37 chars (next 33, 26, then
+    #: <=16); every runaway measured >= 7,194 chars. 512 sits 14x the
+    #: legitimate max — deliberately not tightened toward it, because a sample
+    #: max is a LOWER BOUND on the true legitimate neighbour, not the neighbour
+    #: itself.
+    structured_blank_run_abort_chars: int = 0
     #: Fraction of a request's ``max_tokens`` to give the model for REASONING, when
     #: this backend supports a reasoning budget at all. 0.0 = unsupported, inject
     #: nothing — and that is the safe default for every endpoint.
@@ -978,6 +1007,28 @@ def reasoning_loop_break_enabled() -> bool:
     constructed at all. Env kill-switch ``ROADSTEAD_PROXY_REASONING_LOOP_BREAK``."""
     return os.environ.get(
         "ROADSTEAD_PROXY_REASONING_LOOP_BREAK", "1",
+    ).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def structured_blank_run_abort_enabled() -> bool:
+    """Structured CONTENT blank-run abort (2026-09-26): watch the CONTENT
+    channel of a structured call — sync dispatch as a live stream, streaming
+    dispatch as it relays — for a run of consecutive blank chars long enough
+    that it can only be the whitespace-loop degeneration, never legitimate
+    formatting, and stop it before ``max_tokens`` does.
+
+    Distinct from ``reasoning_loop_break_enabled`` above in channel (content,
+    not reasoning) and in mechanism (a trailing-run LENGTH, not a distinct-gram
+    ratio over a window — the runaway shapes measured here are irregular
+    mixes of the blank-char alphabet, so no fixed `stop` string or window ratio
+    catches all of them; only a run-length over the character class does).
+
+    Default ON, but INERT unless the endpoint declares a positive
+    ``structured_blank_run_abort_chars`` — absent declaration => no detector is
+    constructed at all, on either dispatch path. Env kill-switch
+    ``ROADSTEAD_PROXY_STRUCTURED_BLANK_RUN_ABORT``."""
+    return os.environ.get(
+        "ROADSTEAD_PROXY_STRUCTURED_BLANK_RUN_ABORT", "1",
     ).strip().lower() not in ("0", "false", "no", "off", "")
 
 

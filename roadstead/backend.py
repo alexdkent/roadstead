@@ -166,6 +166,42 @@ class BackendUnavailable(BackendError):
         super().__init__(503, detail)
 
 
+class StructuredBlankRunAborted(Exception):
+    """Raised by `BackendClientPool.call_watched` the instant its detector
+    fires: the stream has already been closed (see the method's docstring for
+    why that specifically is what frees the backend's decode slot) and
+    everything reassembled so far rides on this exception, so the caller can
+    salvage or retry without a second reconstruction pass over the same
+    events.
+
+    Deliberately NOT a `BackendError` subclass — this is a content-shape
+    verdict the proxy itself made, not something the backend told us, and a
+    caller's blanket ``except (BackendUnavailable, BackendError)`` must not
+    silently absorb it into the transient-retry path that exists for THOSE."""
+
+    def __init__(self, *, body_so_far: dict, verdict: dict,
+                 input_tokens: int, output_tokens: int, elapsed_s: float) -> None:
+        self.body_so_far = body_so_far
+        self.verdict = verdict
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.elapsed_s = elapsed_s
+        super().__init__(
+            f"structured blank-run aborted after {verdict.get('run_chars')} "
+            f"blank chars ({verdict.get('content_chars')} content chars, "
+            f"~{output_tokens} output tokens so far)")
+
+    @property
+    def content(self) -> str:
+        """The assistant content accumulated before the abort — never raises,
+        `''` on anything but the expected chat.completion shape."""
+        try:
+            msg = ((self.body_so_far.get("choices") or [{}])[0] or {}).get("message") or {}
+            return msg.get("content") or ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+
 #: Slack between the transport read deadline and the request's own deadline, so
 #: `asyncio.wait_for` is always the layer that fires and the failure is typed as
 #: a TIMEOUT (retryable, deferrable) rather than as a transport 502.
@@ -475,6 +511,182 @@ class BackendClientPool:
             raise BackendTimeout(f"backend {ep_cfg.role} stream timeout after {timeout_s}s")
         except httpx.HTTPError as exc:
             raise BackendError(502, f"backend {ep_cfg.role} stream http error: {exc}")
+
+    async def call_watched(
+        self,
+        ep_cfg: EndpointConfig,
+        payload: dict,
+        payload_type: str,
+        request_id: str,
+        detector: "StructuredBlankRunDetector",
+        timeout_s: float = 180.0,
+    ) -> BackendResponse:
+        """A non-streaming call dispatched over the STREAMING wire, so
+        `detector` can watch CONTENT deltas as they arrive and the caller can
+        abort mid-generation — `call()` only learns a body is degenerate
+        after the whole `max_tokens` budget is already spent. Reassembles a
+        `BackendResponse` matching `call()`'s shape on every field
+        `lifecycle.execute_sync`'s downstream logic reads (the length gate,
+        the degeneration guard, the schema backstop, `record_completion`),
+        so that logic runs unchanged whichever path dispatched.
+
+        Requests usage via ``stream_options.include_usage`` on a COPY of
+        `payload` — the caller's own dict must never see wire-shape
+        enrichment a sync dispatch is not supposed to add.
+
+        Raises `StructuredBlankRunAborted` the instant `detector.feed` fires.
+        🚨 THE ABORT MUST ACTUALLY CLOSE THE HTTP RESPONSE, not merely stop
+        reading it: vLLM frees a decode slot when the CLIENT disconnects, and
+        a client that stops calling `.__anext__()` on a suspended async
+        generator has not disconnected anything — the socket stays open until
+        something throws `GeneratorExit` into the generator's `yield`. Async
+        generators cannot rely on GC for this inside a running event loop
+        (CPython warns "coroutine ignored GeneratorExit" and the interpreter
+        has no deadline for when — or whether — that GC-driven close would
+        run), so the `finally` below calls `aclose()` explicitly on every
+        exit from this method, abort or clean, rather than leaving it to
+        whichever collects the generator object first.
+        """
+        so = payload.get("stream_options") if isinstance(payload, dict) else None
+        so = dict(so) if isinstance(so, dict) else {}
+        so["include_usage"] = True
+        stream_payload = {**payload, "stream": True, "stream_options": so}
+
+        t0 = time.monotonic()
+        content = ""
+        reasoning = ""
+        reasoning_key = "reasoning_content"
+        resp_id = f"chatcmpl-{request_id}"
+        obj = "chat.completion"
+        created = int(time.time())
+        model = ep_cfg.effective_model_id
+        finish_reason: str | None = None
+        stop_reason: Any = None
+        logprobs: Any = None
+        input_tokens = 0
+        output_tokens = 0
+        cached_tokens: int | None = None
+        # No usage frame has arrived by the time an abort can fire — it rides
+        # on the LAST stream frame, after [DONE], which an abort by
+        # definition never reaches. Count content-bearing chunks as a rough
+        # stand-in (most backends emit ~1 token per delta, never guaranteed)
+        # for the abort log line's evidence only; never fed to billing or to
+        # the BackendResponse a caller further downstream trusts as measured.
+        content_chunks_seen = 0
+
+        def _assemble_body() -> dict:
+            msg: dict[str, Any] = {"role": "assistant", "content": content}
+            if reasoning:
+                msg[reasoning_key] = reasoning
+            choice = {
+                "index": 0,
+                "message": msg,
+                "logprobs": logprobs,
+                "finish_reason": finish_reason,
+                # vLLM's own extension field, carried on both the stream's
+                # chunks and (per its OpenAI-compat server) the non-stream
+                # body — default None, same as an unset stream chunk.
+                "stop_reason": stop_reason,
+            }
+            b: dict[str, Any] = {
+                "id": resp_id, "object": obj, "created": created,
+                "model": model, "choices": [choice],
+            }
+            if input_tokens or output_tokens or cached_tokens is not None:
+                usage: dict[str, Any] = {
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                }
+                if cached_tokens is not None:
+                    usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+                b["usage"] = usage
+            return b
+
+        gen = self.stream(ep_cfg, stream_payload, payload_type, request_id,
+                           timeout_s=timeout_s)
+        try:
+            async for event in gen:
+                if event.event_type == "done":
+                    break
+                if event.event_type != "chunk" or not isinstance(event.parsed, dict):
+                    continue
+                parsed = event.parsed
+                if isinstance(parsed.get("id"), str) and parsed["id"]:
+                    resp_id = parsed["id"]
+                if isinstance(parsed.get("object"), str) and parsed["object"]:
+                    # A chunk's object is "chat.completion.chunk" — the
+                    # non-stream shape drops the ".chunk" suffix.
+                    obj = parsed["object"].replace(".chunk", "") or obj
+                if isinstance(parsed.get("created"), int):
+                    created = parsed["created"]
+                if isinstance(parsed.get("model"), str) and parsed["model"]:
+                    model = parsed["model"]
+                usage = parsed.get("usage")
+                if isinstance(usage, dict):
+                    input_tokens = coerce_token_count(usage.get("prompt_tokens"), input_tokens)
+                    output_tokens = coerce_token_count(usage.get("completion_tokens"), output_tokens)
+                    ct = extract_cached_tokens(usage)
+                    if ct is not None:
+                        cached_tokens = ct
+                choices = parsed.get("choices") or []
+                if not choices or not isinstance(choices[0], dict):
+                    continue
+                choice0 = choices[0]
+                fr = choice0.get("finish_reason")
+                if fr:
+                    finish_reason = fr
+                if "stop_reason" in choice0:
+                    stop_reason = choice0.get("stop_reason")
+                if "logprobs" in choice0:
+                    logprobs = choice0.get("logprobs")
+                delta = choice0.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                piece = delta.get("content")
+                if isinstance(piece, str) and piece:
+                    content += piece
+                    content_chunks_seen += 1
+                    verdict = detector.feed(piece)
+                    if verdict is not None:
+                        raise StructuredBlankRunAborted(
+                            body_so_far=_assemble_body(),
+                            verdict=verdict,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens or content_chunks_seen,
+                            elapsed_s=time.monotonic() - t0,
+                        )
+                rc = delta.get("reasoning")
+                if isinstance(rc, str) and rc:
+                    reasoning += rc
+                    reasoning_key = "reasoning"
+                else:
+                    rc = delta.get("reasoning_content")
+                    if isinstance(rc, str) and rc:
+                        reasoning += rc
+                        reasoning_key = "reasoning_content"
+        finally:
+            try:
+                await gen.aclose()
+            except Exception:  # noqa: BLE001 — cleanup must never mask the real result
+                logger.debug("call_watched: stream close failed", exc_info=True)
+
+        body = _assemble_body()
+        msg = body["choices"][0]["message"]
+        if payload_type == "chat_completion":
+            err = empty_completion_error(ep_cfg.role, msg, finish_reason, output_tokens)
+            if err is not None:
+                raise err
+
+        return BackendResponse(
+            status_code=200,
+            body=body,
+            duration_s=time.monotonic() - t0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            finish_reason=finish_reason,
+            cached_tokens=cached_tokens,
+        )
 
     async def probe_props(self, ep_cfg: EndpointConfig) -> dict | None:
         """Probe backend /props for capacity discovery."""

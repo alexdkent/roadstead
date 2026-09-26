@@ -375,6 +375,117 @@ class ReasoningLoopDetector:
             return None
 
 
+# --- Structured CONTENT blank-run detection over a live stream --------------
+# A THIRD degeneration shape (2026-09-26), disjoint from both arms above. The
+# tail arm of `_degenerate_text_arm` judges the REASSEMBLED body only after
+# finish_reason=length has already cost the whole `max_tokens` budget, and
+# `ReasoningLoopDetector` watches the REASONING channel — this one watches
+# CONTENT, live, so the caller can be answered (or re-dispatched) before the
+# budget is spent. Measured on tier3 (GLM-5.3-Flash, vLLM, llguidance)
+# 2026-09-24: ~0.45% of structured (JSON-schema / json_object) requests
+# degenerate into a CONTENT-channel whitespace loop and burn up to 12,000
+# output tokens — roughly 4-5 minutes of a scarce decode slot at ~45 tok/s —
+# before `max_tokens` ends them.
+#
+# Real runaway shapes (content channel; the reasoning channel was fine):
+#   '  \n\n\n\n  \n\n  \n\n  \n\n …'              (7,194 chars, starts right
+#                                                   after the opening '{')
+#   '\n   \n   \n   \n\n\n\n\n   \n\n\n\n\n   …'   (14,636 / 12,060 chars, mid-
+#                                                   object after a complete
+#                                                   string value)
+#   ' \n\n \n  \n \n\n\n\n\n\n\n\n…'               (22,404 chars, mid-object)
+#   '\t\r\t\r\t\r…'                                (11,769 chars, AFTER a
+#                                                   complete, closed JSON
+#                                                   object — the grammar
+#                                                   allows trailing
+#                                                   whitespace and the object
+#                                                   was already done)
+# The mix is irregular enough that a fixed `stop` string cannot catch it;
+# detection has to be a run-length over the character class, which is why
+# this watches the CURRENT TRAILING run rather than a window ratio the way
+# the two arms above do.
+#
+# CALIBRATION (2,453 tier3 structured completions, 2 days): the longest
+# LEGITIMATE whitespace run in content was 37 chars (next 33, 26, then <=16);
+# every runaway measured >= 7,194. The default threshold (512, in
+# ``EndpointConfig.structured_blank_run_abort_chars``) sits 14x the
+# legitimate max — a sample max is a LOWER BOUND on the true neighbour (the
+# same reasoning the reasoning-loop block above states for its own
+# nearest-neighbour), so this does not tighten toward it.
+
+
+class StructuredBlankRunDetector:
+    """Streaming detector for a whitespace/blank-char RUNAWAY in the CONTENT
+    channel of a structured call. Fed content deltas as they arrive; reports
+    the moment the CURRENT TRAILING run of `_BLANK_CHARS` reaches `threshold`.
+
+    Bounded memory by construction: only two counters are kept, never the
+    accumulated text — the caller (`backend.BackendClientPool.call_watched`)
+    already keeps the text itself for salvage/error evidence, so duplicating
+    it here would be pure waste. Total: every method is fail-open (never
+    raises, never fires on error).
+
+    DISARMED unless `threshold` is positive — an endpoint that declares
+    nothing (`structured_blank_run_abort_chars: 0`, the default) gets an inert
+    detector whose `feed` short-circuits on its first line."""
+
+    __slots__ = ("_threshold", "_run", "_content_chars", "_verdict")
+
+    def __init__(self, *, threshold: int = 0) -> None:
+        self._threshold = int(threshold or 0)
+        self._run = 0
+        self._content_chars = 0
+        self._verdict: dict | None = None
+
+    @property
+    def armed(self) -> bool:
+        return self._threshold > 0
+
+    @property
+    def verdict(self) -> dict | None:
+        """The evidence dict from the firing check, or None."""
+        return self._verdict
+
+    def feed(self, delta) -> dict | None:
+        """Accumulate one content delta; return the verdict dict the instant
+        the trailing blank run reaches `threshold`, else None. Idempotent
+        after firing — a caller that keeps feeding after the first verdict
+        gets `None` back, never a second, later verdict."""
+        if not self.armed or self._verdict is not None:
+            return None
+        try:
+            if not delta or not isinstance(delta, str):
+                return None
+            self._content_chars += len(delta)
+            for ch in delta:
+                if ch in _BLANK_CHARS:
+                    self._run += 1
+                    if self._run >= self._threshold:
+                        self._verdict = {
+                            "run_chars": self._run,
+                            "threshold": self._threshold,
+                            "content_chars": self._content_chars,
+                        }
+                        return self._verdict
+                else:
+                    self._run = 0
+            return None
+        except Exception:  # noqa: BLE001 — a detector fault must never kill a stream
+            return None
+
+
+def strip_trailing_blank_chars(text: str) -> str:
+    """`text` with every TRAILING `_BLANK_CHARS` char removed — the blank-run
+    salvage check's own strip. Deliberately NOT `str.strip()`: that also
+    removes LEADING whitespace, which salvage must never do — a body that
+    never had a leading `{` at all must still fail `json.loads`, not be
+    quietly made to look like one. Total: never raises."""
+    try:
+        return (text or "").rstrip("".join(_BLANK_CHARS))
+    except Exception:  # noqa: BLE001 — fail-open: an unstrippable body just fails json.loads next
+        return text or ""
+
+
 def _degeneracy_evidence(text) -> dict:
     """The MEASURED quantities behind a degeneracy verdict, for the error
     message and the log — so a caller that disagrees can check the claim

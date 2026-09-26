@@ -886,6 +886,17 @@ class ProxyHttpHandlers:
                 "reasoning_loops_detected": self.state.reasoning_loops_detected,
                 "reasoning_loops_broken": self.state.reasoning_loops_broken,
                 "reasoning_loops_answered": self.state.reasoning_loops_answered,
+                # Structured CONTENT blank-run abort
+                # (correction.StructuredBlankRunDetector). Five counters for
+                # the same reason the reasoning-loop three are: `detected -
+                # salvaged - recovered` is the population `unrecovered` should
+                # equal, and `retried` brackets how often the sync path's one
+                # re-dispatch fired at all.
+                "structured_blank_runs_detected": self.state.structured_blank_runs_detected,
+                "structured_blank_runs_salvaged": self.state.structured_blank_runs_salvaged,
+                "structured_blank_runs_retried": self.state.structured_blank_runs_retried,
+                "structured_blank_runs_recovered": self.state.structured_blank_runs_recovered,
+                "structured_blank_runs_unrecovered": self.state.structured_blank_runs_unrecovered,
                 # WS-4 shadow egress detector — silent grammar-drop over ALL
                 # grammar-bearing responses (read-only/zero-risk). Per-call_site
                 # rate + a flat fleet rate (health-verifier thresholds the scalar).

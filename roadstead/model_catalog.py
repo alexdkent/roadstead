@@ -585,6 +585,10 @@ _POLICY_PASSTHROUGH = (
     "reasoning_loop_min_chars",
     "reasoning_loop_max_distinct_ratio",
     "reasoning_loop_check_every_chars",
+    # Structured CONTENT blank-run abort threshold
+    # (correction.StructuredBlankRunDetector). 0/absent = inert. Guarded by
+    # test_structured_blank_run_policy.py::test_threshold_reaches_endpoint_config.
+    "structured_blank_run_abort_chars",
     # Marks the endpoint backing the conversational lane, which is what
     # `/readyz` fails closed on. Guarded by
     # test_readyz.py::test_readiness_critical_flag_reaches_endpoint_config.
