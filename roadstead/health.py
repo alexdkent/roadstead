@@ -48,10 +48,10 @@ logger = logging.getLogger(__name__)
 
 #: Wall-clock bound on ONE prefix-keepalive touch. Generous relative to
 #: ``prefix_keepalive.TOUCH_MAX_TOKENS`` (a handful of output tokens) because
-#: the thing a touch is FOR — prefill on a 36-40K-token prefix — is the
-#: expensive part, not the tiny completion; sized well under a real caller's
-#: own floor so a slow touch never masquerades as a stuck request on any
-#: shared dashboard.
+#: a MISSED touch pays a real re-prefill on a 36-40K-token prefix — the
+#: expensive case this bound has to cover, even though a touch is normally a
+#: fast cache hit (~1s); sized well under a real caller's own floor so a slow
+#: touch never masquerades as a stuck request on any shared dashboard.
 _PREFIX_KEEPALIVE_TOUCH_TIMEOUT_S = 60.0
 
 
@@ -899,25 +899,65 @@ class Health:
         except Exception as exc:  # noqa: BLE001
             logger.debug("thinking canary %s failed: %s", ep_name, exc)
 
+    def _endpoint_has_inflight_touch(self, ep_name: str) -> bool:
+        """Is a prefix-keepalive touch already running (or merely SCHEDULED —
+        see below) for this endpoint, on ANY of its tracked prefixes.
+
+        🚨 Checked against the TASK DICT, not
+        ``PrefixKeepaliveTracker.in_flight_count`` — ``asyncio.create_task``
+        only SCHEDULES a coroutine, it does not run any of its body
+        synchronously, so ``TrackedPrefix.touch_in_flight`` (set by
+        ``record_dispatch``, inside the task) is not yet True the instant
+        this function returns. Two ``_schedule_prefix_keepalive_touches``
+        calls back to back in the same tick (the poller re-entering before an
+        event-loop turnover, or — the case this guards in the test suite — a
+        test driving the scheduling call twice by hand) must still see the
+        first task as "in flight", and the task dict IS populated
+        synchronously the moment ``create_task`` returns."""
+        return any(
+            ep == ep_name and not task.done()
+            for (ep, _key), task in self.state.prefix_keepalive_tasks.items()
+        )
+
     def _schedule_prefix_keepalive_touches(self, ep_name: str, ep_cfg: EndpointConfig) -> None:
-        """Fire every DUE prefix-keepalive touch for one endpoint OFF the
-        poller's critical path — same reasoning as
+        """Fire AT MOST ONE due prefix-keepalive touch for one endpoint OFF
+        the poller's critical path — same reasoning as
         ``_schedule_thinking_canary`` above: a touch costs a real generation
         and must not delay every endpoint later in the poller's iteration
-        order. Unlike the canary (one liveness bit per endpoint) an endpoint
-        can have several tracked prefixes due at once, so this loops.
+        order. Several prefixes can cross their trigger in the same tick;
+        only the first is dispatched, and the rest wait for the NEXT tick —
+        see ``_endpoint_has_inflight_touch``.
 
-        NEVER ADMITTED AHEAD OF REAL TRAFFIC. A touch is skipped (not
-        deferred — ``PrefixKeepaliveTracker.due_for_touch`` does not reset the
-        trigger counter on a skip, so the very next poller pass tries again)
-        when the whole proxy is draining, when the endpoint reads unhealthy
-        (paused for maintenance, circuit-open, cooldown, goodput-collapsed —
-        every one of those folds into ``endpoint_healthy`` already), or when
-        the endpoint looks FULL. Bypasses the scheduler's DRR/admission
-        entirely, exactly like the thinking canary next door: a touch is
-        proxy-internal maintenance, not caller traffic, so there is no caller
-        for it to be fair to and no queue for it to wait in — the capacity
-        check below is what stands in for a priority band."""
+        NEVER ADMITTED AHEAD OF REAL TRAFFIC, in every sense that phrase can
+        mean. A touch is skipped (never deferred — ``PrefixKeepaliveTracker.
+        due_for_touch`` does not reset the trigger counter on a skip, so the
+        very next poller pass tries again) when:
+
+        * the whole proxy is draining, or the endpoint reads unhealthy
+          (paused for maintenance, circuit-open, cooldown, goodput-collapsed
+          — every one of those folds into ``endpoint_healthy`` already);
+        * a touch is ALREADY IN FLIGHT for this endpoint — at most one at a
+          time, ever;
+        * ANY request is already QUEUED on this endpoint, at ANY priority —
+          a touch existing at all must never be the reason a real request
+          that is already waiting for a slot waits even one tick longer;
+        * the endpoint has no room in the SAME background-band capacity a
+          real BACKGROUND request is held to (``Scheduler.
+          background_available`` — ``background_cap_slots``, i.e. any
+          ``fast_path_reserve_slots`` headroom the catalog reserves for
+          interactive/fast-path traffic, folding in this endpoint's own
+          touch occupancy, which never registers in the scheduler's own
+          ``_active`` and would otherwise be invisible to this same gate).
+          🚨 NOT the bare ``effective_max_slots`` — that would let a touch
+          spend the exact headroom the catalog reserved for interactive
+          traffic, which is the one thing "never ahead of real traffic" most
+          directly forbids.
+
+        Bypasses the scheduler's DRR/admission entirely, exactly like the
+        thinking canary next door: a touch is proxy-internal maintenance,
+        not caller traffic, so there is no caller for it to be fair to and no
+        queue of its own to wait in — the checks above are what stand in for
+        a priority band."""
         tracker = self.state.prefix_keepalive
         if not tracker.enabled(ep_cfg):
             return
@@ -925,26 +965,37 @@ class Health:
             return
         if not self.endpoint_healthy(ep_name):
             return
-        now = time.monotonic()
-        for entry in tracker.due_for_touch(ep_name, ep_cfg, now):
-            task_key = (ep_name, entry.key)
-            existing = self.state.prefix_keepalive_tasks.get(task_key)
-            if existing is not None and not existing.done():
-                continue  # already in flight for this prefix
-            snap = self.state.scheduler.endpoint_snapshot(ep_name)
-            max_slots = ep_cfg.effective_max_slots
-            if max_slots > 0 and snap.get("in_flight", 0) >= max_slots:
-                # Full. Skip and retry next trigger — see the docstring above.
-                tracker.record_result(ep_name, None, "skipped")
-                logger.info(
-                    "ROADSTEAD_PREFIX_KEEPALIVE endpoint=%s key=%s "
-                    "prompt_tokens=n/a cached_tokens=n/a duration_s=0.00 "
-                    "result=skipped_at_capacity", ep_name, entry.key[:12])
-                continue
-            task = asyncio.create_task(self._touch_prefix(ep_name, ep_cfg, entry))
-            self.state.prefix_keepalive_tasks[task_key] = task
-            task.add_done_callback(
-                lambda t, k=task_key: self.state.prefix_keepalive_tasks.pop(k, None))
+        if self._endpoint_has_inflight_touch(ep_name):
+            return
+        due = tracker.due_for_touch(ep_name, ep_cfg, time.monotonic())
+        if not due:
+            return
+        entry = due[0]  # exactly one touch dispatched per endpoint per tick
+
+        snap = self.state.scheduler.endpoint_snapshot(ep_name)
+        if snap.get("queued", 0) > 0:
+            tracker.record_result(ep_name, None, "skipped")
+            logger.info(
+                "ROADSTEAD_PREFIX_KEEPALIVE endpoint=%s key=%s prompt_tokens=n/a "
+                "cached_tokens=n/a duration_s=0.00 result=skipped_queued",
+                ep_name, entry.key[:12])
+            return
+
+        available = self.state.scheduler.background_available(
+            ep_name, extra_occupied=tracker.in_flight_count(ep_name))
+        if available <= 0:
+            tracker.record_result(ep_name, None, "skipped")
+            logger.info(
+                "ROADSTEAD_PREFIX_KEEPALIVE endpoint=%s key=%s prompt_tokens=n/a "
+                "cached_tokens=n/a duration_s=0.00 result=skipped_at_capacity",
+                ep_name, entry.key[:12])
+            return
+
+        task_key = (ep_name, entry.key)
+        task = asyncio.create_task(self._touch_prefix(ep_name, ep_cfg, entry))
+        self.state.prefix_keepalive_tasks[task_key] = task
+        task.add_done_callback(
+            lambda t, k=task_key: self.state.prefix_keepalive_tasks.pop(k, None))
 
     async def _touch_prefix(self, ep_name: str, ep_cfg: EndpointConfig, entry) -> None:
         """Dispatch ONE touch and record its hit/miss verdict. Never raises —

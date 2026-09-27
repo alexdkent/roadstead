@@ -2714,13 +2714,19 @@ Four `policy:` keys, all absent ⇒ inject nothing / touch nothing:
 | `touches_sent` | int | Since-boot touches actually dispatched (hit + missed). |
 | `touches_hit` | int | Touches whose own prompt came back ≥90% cached (`prefix_keepalive.HIT_RATIO`) — the prefix was already warm. |
 | `touches_missed` | int | Touches that came back mostly uncached, or that the backend never answered at all. |
-| `touches_skipped` | int | Touches that were due but not dispatched because the endpoint was full — the trigger counter is NOT reset on a skip, so the very next poller pass tries again. |
+| `touches_skipped` | int | Touches that were due but not dispatched — a real request was already queued on the endpoint, or the endpoint had no room in the SAME background-band capacity real background traffic is held to. The trigger counter is NOT reset on a skip, so the very next poller pass tries again. |
 
 **Capture.** After a real, successful `chat_completion` from a call_site matching
 `policy.prefix_keepalive_call_sites` (fnmatch patterns), Roadstead derives a prefix SKELETON from the
-completed request's own payload — its `tools`, its leading `system` message(s), the `model`, and
+completed request's own payload — its `tools`, its leading `system` prompt in whichever of the TWO
+shapes a provider's own `prepare_chat_payload` folds identically (a `messages`-array `system` role, or
+a top-level `system` field — captured raw and replayed on the touch in that same shape, so the SAME
+folding function renders it identically both times), its `tool_choice`, the `model`, and
 `chat_template_kwargs` — keyed by a stable hash of that skeleton, so two requests differing only in
-their own trailing turn key identically and two differing in tools/system/effort do not.
+their own trailing turn key identically and two differing in tools/system/tool_choice/effort do not.
+A system prompt hidden inside `extra_body` (a THIRD shape no provider here folds the way the two above
+are) is refused rather than silently tracked wrong — a payload whose system shape cannot be reproduced
+byte-identically is not tracked at all, never touching a prefix this cannot render faithfully.
 
 **Accounting.** Every completed `chat_completion` on the endpoint adds its own uncached prompt tokens
 (`input_tokens - cached_tokens`, when both are known) to every OTHER tracked prefix's countdown; the
@@ -2731,13 +2737,26 @@ was really used within `policy.prefix_keepalive_idle_s`, Roadstead dispatches ON
 plus a single trailing user message `keepalive <nonce>` — a fresh random nonce every time, which is
 the load-bearing detail (see the `prefix_keepalive` module docstring: an IDENTICAL repeated touch only
 refreshes the end of its own prompt, never the checkpoint a genuinely new session resumes from), a
-tiny `max_tokens`, and the endpoint's own thinking/effort defaults. At most one touch in flight per
-prefix; the counter resets on dispatch, not on the verdict. A touch never reaches the DRR/admission
-path, `Correction.apply`, retry, the empty-completion rescue, degeneration re-dispatch, reasoning
-replay, or the response cache — none of that machinery is reachable from the direct backend call a
-touch makes — and it is logged under its own `call_site` marker
+tiny `max_tokens`, and the endpoint's own thinking/effort defaults. 🚨 **A touch is normally a fast
+cache HIT (~1s)** — the whole point of firing before the trigger's worth of OTHER traffic evicts the
+prefix is that most of it is still resident, so the backend serves the shared portion from cache and
+prefills only the tiny unique suffix; only a MISS (tolerated, not eliminated — see the module
+docstring) pays a real re-prefill.
+
+**Admission, and why a touch cannot get ahead of real traffic.** At most ONE touch in flight per
+ENDPOINT (a later due prefix waits for the next poller pass, never piling a second generation onto
+the same endpoint in the same tick); the trigger counter resets on dispatch, not on the verdict.
+Gated on the SAME background-band availability real background traffic is held to
+(`Scheduler.background_available` — `background_cap_slots`, i.e. any `fast_path_reserve_slots`
+headroom the catalog reserves for interactive/fast-path traffic, never the bare slot count — folding
+in this endpoint's own in-flight touch, which never registers in the scheduler's own occupancy
+otherwise), and skipped outright — never dispatched — if the endpoint already has ANY request queued,
+so a touch can never be the reason a real request waits longer. A touch never reaches the
+DRR/admission path itself, `Correction.apply`, retry, the empty-completion rescue, degeneration
+re-dispatch, reasoning replay, or the response cache — none of that machinery is reachable from the
+direct backend call a touch makes — and it is logged under its own `call_site` marker
 (`ROADSTEAD_PREFIX_KEEPALIVE endpoint=… key=… prompt_tokens=… cached_tokens=… duration_s=… result=…`,
-`result` one of `hit` / `missed` / `error` / `skipped_at_capacity`).
+`result` one of `hit` / `missed` / `error` / `skipped_queued` / `skipped_at_capacity`).
 
 ---
 

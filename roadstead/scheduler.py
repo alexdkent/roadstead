@@ -653,6 +653,35 @@ class Scheduler:
             },
         }
 
+    def background_available(self, endpoint: str, extra_occupied: int = 0) -> int:
+        """How many BACKGROUND-band slots are free right now, exactly as the
+        DRR dispatch loop itself would compute it for a real background
+        request — the same ``_available_for_band`` calculation
+        ``_dispatch_endpoint`` uses, exposed read-only for a caller that wants
+        to know "would a background request be admitted right now" without
+        actually enqueuing and dispatching one.
+
+        🚨 Written for ``prefix_keepalive.py``'s poller-side touches, which
+        are dispatched directly against the backend rather than through this
+        scheduler and are therefore invisible to ``_active`` — a re-derived
+        capacity check (re-reading ``effective_max_slots`` and forgetting the
+        ``background_cap_slots``/``fast_path_reserve_slots`` headroom real
+        background traffic is held to) is exactly the kind of second
+        definition of "is there room" this repository keeps having to fix.
+        ``extra_occupied`` is how a caller folds in occupancy this scheduler
+        cannot see for itself — e.g. its OWN in-flight touch count — so that
+        occupancy is not invisible to the same gate real background traffic
+        answers to.
+
+        Any other caller wanting the same answer should use this rather than
+        re-deriving it from ``endpoint_snapshot``."""
+        eq = self._queues.get(endpoint)
+        ep_cfg = self._config.endpoints.get(endpoint)
+        if eq is None or ep_cfg is None:
+            return 0
+        in_flight = len(self._active.get(endpoint, {})) + max(0, extra_occupied)
+        return self._available_for_band(ep_cfg, PriorityBand.BACKGROUND, in_flight, eq)
+
     def inflight_snapshot(self, now: float) -> dict:
         """Live snapshot of every in-flight (dispatched, not-yet-completed)
         request plus per-endpoint occupancy/queue state. Pure in-memory read —

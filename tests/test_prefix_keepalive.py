@@ -20,9 +20,12 @@ import types
 import pytest
 
 from roadstead import model_catalog
+from roadstead.agent_budget import BudgetManager
 from roadstead.backend import BackendResponse
 from roadstead.config import EndpointConfig, ProxyConfig
+from roadstead.cost_model import CostModel
 from roadstead.health import Health
+from roadstead.scheduler import QueuedRequest, Scheduler
 from roadstead.prefix_keepalive import (
     HIT_RATIO,
     PrefixKeepaliveTracker,
@@ -99,12 +102,85 @@ def test_skeleton_key_is_stable_across_the_TRAILING_user_turn():
     lambda p: p["messages"].__setitem__(0, {"role": "system", "content": "different"}),
     lambda p: p.__setitem__("model", "a-different-model"),
     lambda p: p.__setitem__("chat_template_kwargs", {"reasoning_effort": "high"}),
+    lambda p: p.__setitem__("tool_choice", "required"),
 ])
 def test_skeleton_key_differs_when_a_rendering_relevant_field_differs(mutate):
     base = _payload(model="glm", ck={"reasoning_effort": "low"})
+    base["tool_choice"] = "auto"
     other = _payload(model="glm", ck={"reasoning_effort": "low"})
+    other["tool_choice"] = "auto"
     mutate(other)
     assert skeleton_key(derive_skeleton(base)) != skeleton_key(derive_skeleton(other))
+
+
+def test_tool_choice_is_carried_into_the_skeleton():
+    sk = derive_skeleton({"messages": [{"role": "user", "content": "hi"}],
+                          "tools": _TOOLS, "tool_choice": "required"})
+    assert sk["tool_choice"] == "required"
+
+
+# --------------------------------------------------------------------------- #
+# 1b. derive_skeleton — the TWO system-prompt shapes, and the one it refuses
+# --------------------------------------------------------------------------- #
+
+def test_a_top_level_system_field_is_captured_and_keys_like_the_shape_it_is():
+    """The Anthropic-shaped door: a top-level `system` string, folded into
+    `messages` only at dispatch time by the provider — the skeleton must
+    capture the RAW field, not pre-fold it itself (see the module
+    docstring)."""
+    payload = {"messages": [{"role": "user", "content": "hi"}],
+              "system": "be terse", "tools": _TOOLS}
+    sk = derive_skeleton(payload)
+    assert sk is not None
+    assert sk["top_level_system"] == "be terse"
+    assert sk["system_messages"] == []
+
+
+def test_the_two_system_shapes_key_differently_even_with_the_same_text():
+    """A messages-array system message and a top-level `system` field are
+    DIFFERENT wire shapes a provider treats differently (the array form is
+    already positioned; the top-level form gets prepended by
+    `prepare_chat_payload`) — collapsing them into one key would touch
+    whichever shape happened to be captured, not the one a later real
+    request actually sends."""
+    as_message = derive_skeleton(
+        {"messages": [{"role": "system", "content": "be terse"},
+                      {"role": "user", "content": "hi"}]})
+    as_top_level = derive_skeleton(
+        {"messages": [{"role": "user", "content": "hi"}], "system": "be terse"})
+    assert skeleton_key(as_message) != skeleton_key(as_top_level)
+
+
+def test_a_top_level_system_field_alone_with_no_tools_is_still_worth_tracking():
+    sk = derive_skeleton({"messages": [{"role": "user", "content": "hi"}],
+                          "system": "be terse"})
+    assert sk is not None
+    assert sk["top_level_system"] == "be terse"
+
+
+def test_a_system_prompt_hidden_inside_extra_body_is_refused_not_dropped():
+    """No provider in this package folds `extra_body.system` the way a
+    top-level `system` is (see providers/*.py's `prepare_chat_payload`) — a
+    skeleton built from this shape would silently omit real prefix content,
+    so it must refuse to track the prefix at all rather than track a
+    skeleton that renders differently from what a real request sent."""
+    payload = {"messages": [{"role": "user", "content": "hi"}],
+              "extra_body": {"system": "be terse"}, "tools": _TOOLS}
+    assert derive_skeleton(payload) is None
+
+
+def test_the_touch_payload_sends_a_top_level_system_field_back_as_one():
+    """The touch must reproduce the shape, not translate it — the SAME
+    `prepare_chat_payload` call folds it identically either way (see
+    `backend.probe_prefix_touch`); folding it here too would be a second
+    implementation of that rule to keep in step with the first."""
+    t = PrefixKeepaliveTracker()
+    entry = _entry(skeleton={"system_messages": [], "top_level_system": "be terse",
+                             "tools": None, "tool_choice": None, "model": None,
+                             "chat_template_kwargs": None})
+    payload = t.build_touch_payload(entry)
+    assert payload["system"] == "be terse"
+    assert "system" not in (payload["messages"][0] if payload["messages"] else {})
 
 
 # --------------------------------------------------------------------------- #
@@ -308,7 +384,8 @@ def test_zero_trigger_never_arms_due_checking_even_with_a_tracked_prefix():
 # --------------------------------------------------------------------------- #
 
 def _entry(**over):
-    kw = dict(key="k", skeleton={"system_messages": [_SYS], "tools": _TOOLS,
+    kw = dict(key="k", skeleton={"system_messages": [_SYS], "top_level_system": None,
+                                 "tools": _TOOLS, "tool_choice": "required",
                                  "model": "glm", "chat_template_kwargs": {"a": 1}},
               call_site="kv4.judge", last_real_seen=0.0)
     kw.update(over)
@@ -323,9 +400,11 @@ def test_build_touch_payload_shape():
     assert payload["messages"][1]["role"] == "user"
     assert payload["messages"][1]["content"].startswith("keepalive ")
     assert payload["tools"] == _TOOLS
+    assert payload["tool_choice"] == "required"
     assert payload["model"] == "glm"
     assert payload["chat_template_kwargs"] == {"a": 1}
     assert payload["max_tokens"] > 0
+    assert "system" not in payload, "no top-level system was tracked for this entry"
 
 
 def test_build_touch_payload_nonce_is_unique_every_call():
@@ -436,6 +515,82 @@ def test_an_unknown_policy_key_is_still_reported_not_silently_dropped(monkeypatc
 
 
 # --------------------------------------------------------------------------- #
+# 5b. Scheduler.background_available — the reusable capacity primitive
+#
+# health.py's gate MUST reuse this rather than re-deriving "is there room"
+# from `effective_max_slots` — a real Scheduler proves it actually reads
+# `fast_path_reserve_slots`/`background_cap_slots`, not a stub that always
+# answers whatever a test wants.
+# --------------------------------------------------------------------------- #
+
+def _sched(max_slots=4, fast_path_reserve_slots=0):
+    config = ProxyConfig()
+    config.endpoints["tier3"].max_slots = max_slots
+    config.endpoints["tier3"].fast_path_reserve_slots = fast_path_reserve_slots
+    cm = CostModel()
+    for ep, epc in config.endpoints.items():
+        cm.register_endpoint(ep, epc.max_slots)
+    bm = BudgetManager()
+    bm.set_total_capacity(config.total_fleet_slots)
+    return Scheduler(config, cm, bm)
+
+
+def _bg_req(now, agent_id="bg-agent"):
+    return QueuedRequest.create(
+        agent_id=agent_id, endpoint="tier3", priority="P3_INGESTION",
+        call_site="test", payload_type="chat_completion",
+        payload={"messages": [{"role": "user", "content": "x"}], "max_tokens": 8},
+        timeout_s=60.0, now=now)
+
+
+def test_background_available_is_the_full_cap_when_the_endpoint_is_idle():
+    sched = _sched(max_slots=4, fast_path_reserve_slots=1)
+    # background_cap_slots = max(floor, effective_max_slots - reserve) = max(1, 3) = 3
+    assert sched.background_available("tier3") == 3
+
+
+def test_background_available_respects_the_fast_path_reserve():
+    """🚨 THE DEFECT THE REVIEW FLAGGED. `tier3` declares `fast_path_reserve_
+    slots: 1` in the shipped catalog: with 4 physical slots and 3 already
+    occupied by BACKGROUND-band real traffic, one raw slot is free
+    (4 - 3 = 1), but it is the slot the catalog reserved for interactive/
+    fast-path traffic — comparing against the bare `effective_max_slots`
+    would say "1 available" here, which is exactly wrong."""
+    sched = _sched(max_slots=4, fast_path_reserve_slots=1)
+    now = 1000.0
+    for i in range(3):
+        sched.enqueue(_bg_req(now + i * 0.001, agent_id=f"agent{i}"))
+    decisions = sched.tick(now + 0.01)
+    assert len(decisions) == 3, "all three background requests must dispatch"
+    assert sched.active_count("tier3") == 3
+
+    assert sched.background_available("tier3") == 0, (
+        "the reserved slot must not read as background-available, even "
+        "though a bare (max_slots - in_flight) would say 1")
+
+
+def test_background_available_folds_in_extra_occupied():
+    """A caller (a prefix-keepalive touch) that the scheduler cannot see for
+    itself must not be invisible to the same gate real background traffic
+    answers to — it shrinks the OVERALL free-slot ceiling exactly as a real
+    dispatched request would (``min(effective_max_slots - occupied,
+    background_cap_slots)``)."""
+    sched = _sched(max_slots=5, fast_path_reserve_slots=1)
+    # background_cap_slots = max(floor=1, effective_max_slots(5) - reserve(1)) = 4.
+    assert sched.background_available("tier3") == 4
+    assert sched.background_available("tier3", extra_occupied=2) == 3
+    assert sched.background_available("tier3", extra_occupied=4) == 1
+    assert sched.background_available("tier3", extra_occupied=5) == 0
+    assert sched.background_available("tier3", extra_occupied=10) == 0, (
+        "must never go negative")
+
+
+def test_background_available_is_zero_for_an_unknown_endpoint():
+    sched = _sched()
+    assert sched.background_available("no-such-endpoint") == 0
+
+
+# --------------------------------------------------------------------------- #
 # 6. health.py scheduling — the capacity/health gate, without a real ProxyService
 # --------------------------------------------------------------------------- #
 
@@ -450,7 +605,8 @@ def _health_state(**over):
         prefix_keepalive_tasks={},
         draining=types.SimpleNamespace(is_set=lambda: False),
         scheduler=types.SimpleNamespace(
-            endpoint_snapshot=lambda ep: {"in_flight": 0, "max_slots": 4}),
+            endpoint_snapshot=lambda ep: {"in_flight": 0, "max_slots": 4, "queued": 0},
+            background_available=lambda ep, extra_occupied=0: 4),
         on_demand=types.SimpleNamespace(manages=lambda ep: False),
         backend=None,
     )
@@ -529,11 +685,15 @@ async def test_a_paused_endpoint_is_skipped_not_touched():
 
 
 @pytest.mark.asyncio
-async def test_a_full_endpoint_is_skipped_and_the_counter_is_NOT_reset():
+async def test_a_full_background_gate_is_skipped_and_the_counter_is_NOT_reset():
+    """"Full" is decided by `Scheduler.background_available` — the SAME gate
+    real background traffic is held to — never by a bare `in_flight vs
+    max_slots` comparison that would ignore `fast_path_reserve_slots`."""
     state = _health_state(
         backend=_StubBackend([{"prompt_tokens": 10, "cached_tokens": 10}]),
         scheduler=types.SimpleNamespace(
-            endpoint_snapshot=lambda ep: {"in_flight": 4, "max_slots": 4}))
+            endpoint_snapshot=lambda ep: {"queued": 0},
+            background_available=lambda ep, extra_occupied=0: 0))
     ep = _due_ep()
     state.prefix_keepalive.observe_completion(
         "tier3", ep, call_site="kv4.judge", payload=_payload(), status="ok",
@@ -549,6 +709,104 @@ async def test_a_full_endpoint_is_skipped_and_the_counter_is_NOT_reset():
     assert snap["tracked"][0]["tokens_since_touch"] == 200, (
         "a SKIP must not reset the countdown — the very next poller pass "
         "must retry, not wait out a fresh trigger")
+
+
+@pytest.mark.asyncio
+async def test_a_queued_real_request_skips_the_touch_entirely():
+    """A real request already waiting for a slot must never wait even one
+    tick longer because a touch got there first — checked BEFORE the
+    capacity gate, and regardless of what that gate would have said."""
+    state = _health_state(
+        backend=_StubBackend([{"prompt_tokens": 10, "cached_tokens": 10}]),
+        scheduler=types.SimpleNamespace(
+            endpoint_snapshot=lambda ep: {"queued": 1},
+            background_available=lambda ep, extra_occupied=0: 4))
+    ep = _due_ep()
+    state.prefix_keepalive.observe_completion(
+        "tier3", ep, call_site="kv4.judge", payload=_payload(), status="ok",
+        input_tokens=100, cached_tokens=0, now=0.0)
+    state.prefix_keepalive.observe_completion(
+        "tier3", ep, call_site="other", payload={}, status="ok",
+        input_tokens=200, cached_tokens=0, now=1.0)
+    health = Health(state)
+    await _tick_and_await(health, "tier3", ep)
+    assert state.backend.calls == [], "a queued real request must pre-empt any touch"
+    snap = state.prefix_keepalive.status_snapshot("tier3", 1.0)
+    assert snap["touches_skipped"] == 1
+    assert snap["tracked"][0]["tokens_since_touch"] == 200, (
+        "a SKIP must not reset the countdown")
+
+
+@pytest.mark.asyncio
+async def test_two_due_prefixes_in_one_tick_produce_exactly_one_touch():
+    """Several tracked prefixes can cross their trigger in the same poller
+    pass; only ONE touch is dispatched, and the other waits for the next
+    tick rather than piling a second generation onto the endpoint."""
+    state = _health_state(
+        backend=_StubBackend([{"prompt_tokens": 10, "cached_tokens": 10}]))
+    ep = _due_ep()
+    state.prefix_keepalive.observe_completion(
+        "tier3", ep, call_site="kv4.a", payload=_payload(sys_content="A"),
+        status="ok", input_tokens=100, cached_tokens=0, now=0.0)
+    state.prefix_keepalive.observe_completion(
+        "tier3", ep, call_site="kv4.b", payload=_payload(sys_content="B"),
+        status="ok", input_tokens=100, cached_tokens=0, now=1.0)
+    # One other request pushes BOTH tracked prefixes' countdowns past the
+    # trigger (100) at once.
+    state.prefix_keepalive.observe_completion(
+        "tier3", ep, call_site="other", payload={}, status="ok",
+        input_tokens=200, cached_tokens=0, now=2.0)
+    assert len(state.prefix_keepalive.due_for_touch("tier3", ep, now=2.0)) == 2, (
+        "both prefixes must genuinely be due before the schedule pass runs")
+
+    health = Health(state)
+    health._schedule_prefix_keepalive_touches("tier3", ep)
+    await asyncio.sleep(0)  # let the dispatched task reach record_dispatch
+    assert len(state.backend.calls) == 1, "at most one touch per endpoint per tick"
+    still_due = state.prefix_keepalive.due_for_touch("tier3", ep, now=2.0)
+    assert len(still_due) == 1, "the other prefix must remain due for the next tick"
+    # Let the in-flight touch finish so the test leaves nothing pending.
+    await asyncio.gather(*state.prefix_keepalive_tasks.values())
+
+
+@pytest.mark.asyncio
+async def test_a_running_touch_on_this_endpoint_counts_against_the_gate():
+    """`extra_occupied` passed to `Scheduler.background_available` must be
+    THIS endpoint's own in-flight touch count, so a touch is never invisible
+    to the same gate real background traffic is held to — independent of
+    (and in addition to) the task-dict single-flight guard."""
+    calls: list[int] = []
+
+    def _bg(ep, extra_occupied=0):
+        calls.append(extra_occupied)
+        return max(0, 1 - extra_occupied)  # exactly one background slot, total
+
+    state = _health_state(
+        backend=_StubBackend([{"prompt_tokens": 10, "cached_tokens": 10}]),
+        scheduler=types.SimpleNamespace(
+            endpoint_snapshot=lambda ep: {"queued": 0},
+            background_available=_bg))
+    ep = _due_ep()
+    # Prefix A: simulated as ALREADY mid-touch (no task ever created for it —
+    # isolates the `extra_occupied` wiring from the task-dict guard above).
+    state.prefix_keepalive.observe_completion(
+        "tier3", ep, call_site="kv4.a", payload=_payload(sys_content="A"),
+        status="ok", input_tokens=100, cached_tokens=0, now=0.0)
+    entry_a = next(iter(state.prefix_keepalive._by_endpoint["tier3"].values()))
+    entry_a.touch_in_flight = True
+    # Prefix B: a DIFFERENT tracked prefix that IS due.
+    state.prefix_keepalive.observe_completion(
+        "tier3", ep, call_site="kv4.b", payload=_payload(sys_content="B"),
+        status="ok", input_tokens=100, cached_tokens=0, now=1.0)
+    state.prefix_keepalive.observe_completion(
+        "tier3", ep, call_site="other", payload={}, status="ok",
+        input_tokens=200, cached_tokens=0, now=2.0)
+
+    health = Health(state)
+    health._schedule_prefix_keepalive_touches("tier3", ep)
+    assert calls == [1], "extra_occupied must equal prefix A's in-flight touch count"
+    assert state.backend.calls == [], (
+        "the gate (1 slot total, 1 already occupied) must refuse prefix B's touch")
 
 
 @pytest.mark.asyncio

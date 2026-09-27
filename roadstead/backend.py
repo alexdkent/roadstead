@@ -925,12 +925,14 @@ class BackendClientPool:
         slot or queue behind live traffic, and ``call()``'s empty-completion
         gate exists to catch a CALLER's request coming back with nothing — a
         touch's whole point is a tiny ``max_tokens``
-        (``prefix_keepalive.TOUCH_MAX_TOKENS``), and the prefill it exists to
-        cause has already happened by the time a (possibly empty) completion
-        arrives, so an empty answer here is a PASS, never a fault. This is
-        also, incidentally, why a touch never reaches ``call()``'s retry/
-        structured-output/degeneration machinery, its stats, or its
-        response-cache write — none of that lives on this path at all.
+        (``prefix_keepalive.TOUCH_MAX_TOKENS``), and whatever prefill this
+        touch triggers — normally none at all, since landing on a still-warm
+        prefix is the common case a touch exists to keep common — has already
+        happened by the time a (possibly empty) completion arrives, so an
+        empty answer here is a PASS, never a fault. This is also, incidentally,
+        why a touch never reaches ``call()``'s retry/structured-output/
+        degeneration machinery, its stats, or its response-cache write — none
+        of that lives on this path at all.
 
         Unlike ``probe_thinking_switch``'s hand-built payload, this one DOES
         go through ``prepare_chat_payload``: the touch's whole job is

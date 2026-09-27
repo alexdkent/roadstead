@@ -20,12 +20,17 @@ summary. The bullets below link in there where the long version is worth reading
   small prefix-cache LRU pool after ~300K tokens of OTHER uncached prefill (real fleet
   traffic runs 190K-1.37M uncached tokens/hour, so the prefix survives only 13-50
   minutes between real turns), and the next new session then re-prefills it cold
-  (~20-25s vs ~1s warm). Roadstead can now keep a declared call site's prefix warm with
-  small synthetic touches dispatched from the capacity poller — never on the request
-  path, never through DRR/admission, never ahead of real traffic (skipped, not
-  deferred, when the endpoint is paused/unhealthy/draining/full). After a real,
-  successful completion from a matching `call_site`, a prefix SKELETON (`tools`,
-  leading `system` message(s), `model`, `chat_template_kwargs`) is derived from the
+  (~20-25s vs ~1s warm — a touch itself is normally a fast cache HIT, ~1s; only a
+  MISS pays the real re-prefill, and the design tolerates that rather than tries to
+  eliminate it). Roadstead can now keep a declared call site's prefix warm with small
+  synthetic touches dispatched from the capacity poller — never on the request path,
+  never through DRR/admission. After a real, successful completion from a matching
+  `call_site`, a prefix SKELETON (`tools`, `tool_choice`, the leading system prompt in
+  WHICHEVER SHAPE the caller sent it — a `messages`-array `system` role or a top-level
+  `system` field, replayed on the touch in that same raw shape so the SAME
+  `Provider.prepare_chat_payload` call folds it identically both times; a shape no
+  provider here folds the same way, e.g. `extra_body.system`, is refused rather than
+  silently tracked wrong — `model`, `chat_template_kwargs`) is derived from the
   request's own already-corrected payload and keyed by a stable hash; every completed
   request on the endpoint then adds its own uncached prompt tokens to every OTHER
   tracked prefix's countdown, and once one crosses its trigger a touch fires: the
@@ -33,10 +38,17 @@ summary. The bullets below link in there where the long version is worth reading
   nonce every time — a byte-identical repeated touch was measured to refresh only the
   end of its own prompt, never the checkpoint a genuinely new session resumes from,
   while the unique-suffix form hit 39,542/39,550 cached tokens (1.5s) on a new session
-  after 606K tokens of filler. Touches never reach `Correction.apply`, retry, the
-  empty-completion rescue, degeneration re-dispatch, reasoning replay, or the response
-  cache. `GET /v1/status` → `endpoints[].prefix_keepalive`. Grep marker:
-  `ROADSTEAD_PREFIX_KEEPALIVE`. Four keys, all absent ⇒ off. See `docs/api.md` §3.16.
+  after 606K tokens of filler. **Never ahead of real traffic, in every sense**: at most
+  ONE touch in flight per endpoint (a later due prefix waits for the next tick), gated
+  on `Scheduler.background_available` — the SAME `background_cap_slots`/
+  `fast_path_reserve_slots` headroom a real BACKGROUND request is held to, never the
+  bare slot count, folding in this endpoint's own in-flight touch occupancy (which
+  never registers in the scheduler's own `_active`) — and skipped outright, never
+  dispatched, if the endpoint already has ANY request queued. Touches never reach
+  `Correction.apply`, retry, the empty-completion rescue, degeneration re-dispatch,
+  reasoning replay, or the response cache. `GET /v1/status` →
+  `endpoints[].prefix_keepalive`. Grep marker: `ROADSTEAD_PREFIX_KEEPALIVE`. Four keys,
+  all absent ⇒ off. See `docs/api.md` §3.16.
 
 - **Structured content blank-run abort — `policy.structured_blank_run_abort_chars`.**
   A sibling of the reasoning loop-break guard in a different channel: on tier3

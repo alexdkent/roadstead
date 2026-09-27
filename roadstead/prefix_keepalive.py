@@ -73,16 +73,21 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-#: ``max_tokens`` on a touch. Small on purpose — the touch's only job is to
-#: walk the backend through prefill on a byte-identical prefix (refreshing
-#: the KV/recurrent-state checkpoint a later real session resumes from); it
-#: is never meant to be READ. Not 1: a forced-reasoning or always-thinking
-#: endpoint spends its first output tokens on the CoT, and a 1-token cap
-#: would return an empty completion every single time — fine for the
-#: prefill this exists to cause, but it leaves nothing to compute a hit/miss
-#: verdict from. A handful of tokens gives a thinking-off endpoint enough
-#: room for one real (discarded) word, and a thinking-on endpoint a chance
-#: of a few reasoning tokens landing before the cap.
+#: ``max_tokens`` on a touch. Small on purpose — the touch's only job is one
+#: call against the tracked prefix so the engine sees recent activity on it.
+#: 🚨 A touch is NORMALLY A CACHE HIT (~1s): the whole point of firing before
+#: the trigger's worth of OTHER traffic evicts the prefix is that most of it
+#: is still resident, so the backend serves the shared portion straight from
+#: cache and only prefills the tiny unique suffix. Only when a touch itself
+#: MISSES — the tolerated, occasional case the trigger sizing accepts — does
+#: it pay a real, full re-prefill. Not 1 token: a forced-reasoning or
+#: always-thinking endpoint spends its first output tokens on the CoT, and a
+#: 1-token cap would return an empty completion every single time — harmless
+#: either way (the prefill/cache-hit already happened before the first output
+#: token), but it leaves nothing to compute a hit/miss verdict from. A
+#: handful of tokens gives a thinking-off endpoint enough room for one real
+#: (discarded) word, and a thinking-on endpoint a chance of a few reasoning
+#: tokens landing before the cap.
 TOUCH_MAX_TOKENS = 4
 
 #: A touch counts as a HIT when at least this fraction of its OWN prompt
@@ -115,11 +120,12 @@ def _leading_system_messages(messages: Any) -> list:
 
 
 def derive_skeleton(payload: dict) -> dict | None:
-    """The prefix SKELETON a real request rendered: its ``tools``, its
-    leading ``system`` message(s), and the chat-template variables that
-    change the rendered prefix bytes (``model``, ``chat_template_kwargs`` —
-    which by capture time carries whatever ``reasoning_effort``/thinking
-    switch ``Correction`` folded in for this call).
+    """The prefix SKELETON a real request rendered: its ``tools`` and
+    ``tool_choice``, its leading ``system`` prompt in WHICHEVER SHAPE the
+    caller sent it, the ``model``, and the chat-template variables that
+    change the rendered prefix bytes (``chat_template_kwargs`` — which by
+    capture time carries whatever ``reasoning_effort``/thinking switch
+    ``Correction`` folded in for this call).
 
     🚨 CAPTURED FROM ``req.payload`` AFTER CORRECTION, BEFORE ENGINE
     NORMALIZATION — and that is what makes a touch built from it render the
@@ -139,20 +145,49 @@ def derive_skeleton(payload: dict) -> dict | None:
     time it was ever handed to ``prepare_chat_payload``, and passing it
     through that SAME function again (see ``backend.probe_prefix_touch``)
     applies the identical one-time normalization a fresh real request would
-    also get. Returns None when there is nothing distinctive to keep warm."""
+    also get.
+
+    🚨 TWO SYSTEM-PROMPT SHAPES, AND ONLY THOSE TWO. A caller may put its
+    system prompt in the ``messages`` array (``role: "system"``) or in a
+    top-level ``system`` field (the Anthropic-shaped door) — every provider's
+    ``prepare_chat_payload`` (llama.cpp/vLLM/OpenRouter) pops the LATTER and
+    prepends it as the first ``messages`` entry, unconditionally coercing a
+    non-string value with ``str(system)``. Both shapes are captured RAW (the
+    top-level value untouched, not pre-coerced here) so replaying it through
+    the SAME provider function on the touch reproduces the identical
+    coercion rather than a second, potentially-diverging one. A caller
+    putting its system prompt inside ``extra_body`` (e.g.
+    ``extra_body: {"system": ...}``) is a THIRD shape NO provider in this
+    package folds the way the two above are, so it is deliberately left
+    unread here — see the refusal below, which is why an untracked prefix
+    like that is a documented choice, not an oversight. Returns None when
+    there is nothing distinctive to keep warm, or when the payload carries a
+    shape this function has not been taught to reproduce byte-identically —
+    never track a prefix this cannot render faithfully."""
     if not isinstance(payload, dict):
         return None
+    extra_body = payload.get("extra_body")
+    if isinstance(extra_body, dict) and extra_body.get("system"):
+        # A shape no provider here folds the way a top-level `system` is —
+        # see the docstring. Refuse rather than silently drop it, or track a
+        # skeleton missing content the real request's prefix actually had.
+        return None
     system_messages = _leading_system_messages(payload.get("messages"))
+    top_level_system = payload.get("system")
     tools = payload.get("tools")
+    tool_choice = payload.get("tool_choice")
     ck = payload.get("chat_template_kwargs")
-    if not system_messages and not (isinstance(tools, list) and tools):
+    has_tools = isinstance(tools, list) and bool(tools)
+    if not system_messages and not top_level_system and not has_tools:
         # A bare user turn with no system prompt and no tools has no prefix
         # beyond the model's own template boilerplate, which the engine
         # never evicts on its own — nothing here is worth keeping warm.
         return None
     return {
         "system_messages": system_messages,
-        "tools": tools if isinstance(tools, list) and tools else None,
+        "top_level_system": top_level_system if top_level_system else None,
+        "tools": tools if has_tools else None,
+        "tool_choice": tool_choice,
         "model": payload.get("model") or None,
         "chat_template_kwargs": ck if isinstance(ck, dict) and ck else None,
     }
@@ -169,10 +204,11 @@ def _canonical(obj: Any) -> str:
 
 def skeleton_key(skeleton: dict) -> str:
     """Stable identity for a prefix skeleton. Two requests that render the
-    SAME prefix bytes (same tools, same leading system messages, same model,
-    same chat-template variables) must key identically regardless of what
-    their own trailing turn said; two that differ in any of those must key
-    differently, or a touch would refresh the wrong prefix."""
+    SAME prefix bytes (same tools, same tool_choice, same system prompt in
+    the same shape, same model, same chat-template variables) must key
+    identically regardless of what their own trailing turn said; two that
+    differ in any of those must key differently, or a touch would refresh
+    the wrong prefix."""
     return hashlib.sha256(_canonical(skeleton).encode()).hexdigest()
 
 
@@ -276,6 +312,19 @@ class PrefixKeepaliveTracker:
 
     # --- touch scheduling ---------------------------------------------------
 
+    def in_flight_count(self, ep_name: str) -> int:
+        """How many touches are currently running on this endpoint. Used by
+        ``health.py`` for two things: the "at most ONE touch in flight per
+        endpoint" rule (a nonzero count here means don't start another), and
+        folding that occupancy into ``Scheduler.background_available`` (a
+        touch never registers in the scheduler's own ``_active``, so without
+        this it would be invisible to the same gate real background traffic
+        is held to)."""
+        bucket = self._by_endpoint.get(ep_name)
+        if not bucket:
+            return 0
+        return sum(1 for entry in bucket.values() if entry.touch_in_flight)
+
     def due_for_touch(self, ep_name: str, ep_cfg: Any, now: float) -> list[TrackedPrefix]:
         bucket = self._by_endpoint.get(ep_name)
         if not bucket:
@@ -300,7 +349,15 @@ class PrefixKeepaliveTracker:
     def build_touch_payload(self, entry: TrackedPrefix) -> dict:
         """Skeleton + ONE unique trailing user turn. The nonce is what makes
         this a NEW-SESSION-shaped touch rather than a repeat of the last one
-        — see the module docstring for why that distinction is load-bearing."""
+        — see the module docstring for why that distinction is load-bearing.
+
+        The system prompt travels in WHICHEVER SHAPE the real request used —
+        a top-level ``system`` field is sent back as a top-level ``system``
+        field, never pre-folded into ``messages`` here, so the SAME
+        ``prepare_chat_payload`` call that renders the touch (see
+        ``backend.probe_prefix_touch``) folds it exactly as it folded the
+        original. Doing that folding twice, once here and once there, is how
+        two implementations of "the same" rule quietly drift apart."""
         nonce = secrets.token_hex(8)
         messages = list(entry.skeleton.get("system_messages") or [])
         messages.append({"role": "user", "content": f"{TOUCH_USER_PREFIX} {nonce}"})
@@ -309,8 +366,12 @@ class PrefixKeepaliveTracker:
             "max_tokens": TOUCH_MAX_TOKENS,
             "temperature": 0.0,
         }
+        if entry.skeleton.get("top_level_system"):
+            payload["system"] = entry.skeleton["top_level_system"]
         if entry.skeleton.get("tools"):
             payload["tools"] = entry.skeleton["tools"]
+        if entry.skeleton.get("tool_choice") is not None:
+            payload["tool_choice"] = entry.skeleton["tool_choice"]
         if entry.skeleton.get("model"):
             payload["model"] = entry.skeleton["model"]
         if entry.skeleton.get("chat_template_kwargs"):
@@ -327,9 +388,11 @@ class PrefixKeepaliveTracker:
 
     def record_result(self, ep_name: str, entry: TrackedPrefix | None, result: str) -> None:
         """``result`` is one of ``"hit"``/``"missed"``/``"skipped"``. A
-        ``"skipped"`` touch (endpoint paused/unhealthy/draining/full) may be
-        recorded with no entry at all — see ``Health._schedule_prefix_keepalive_
-        touches``, which can skip before it ever picks one."""
+        ``"skipped"`` touch (endpoint paused/unhealthy/draining, a real
+        request already queued, or no room in the background-band capacity
+        gate) may be recorded with no entry at all — see ``Health.
+        _schedule_prefix_keepalive_touches``, which can skip before it ever
+        picks one."""
         if entry is not None:
             entry.touch_in_flight = False
         stats = self._stats.setdefault(ep_name, _EndpointStats())
