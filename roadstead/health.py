@@ -106,6 +106,13 @@ def model_swap_alerts(endpoints: dict) -> list["AlertCondition"]:
     return out
 
 
+#: Every value ``Health.endpoint_status`` can put in ``state``. One place, so
+#: the one-hot ``roadstead_endpoint_state`` gauge cannot omit a state the
+#: status route can emit.
+AVAILABILITY_STATES = ("healthy", "paused", "unloaded", "unreachable",
+                       "unhealthy", "unknown")
+
+
 class Health:
     """Per-endpoint circuit breaker, capacity poller, and drain/pause logic."""
 

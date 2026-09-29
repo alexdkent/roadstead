@@ -290,7 +290,11 @@ class EnrichedApi:
                 # An unrouted endpoint has no health to report and no poller
                 # looking at it; calling it healthy would put a green light on a
                 # name nobody can dispatch to.
-                healthy=(self.health.endpoint_healthy(name)
+                # The availability state, not the breaker: `endpoint_healthy`
+                # says "not refusing traffic", which an on-demand endpoint nobody
+                # probes answers True for whatever the backend is doing. Intent
+                # resolution ranks on this, so a dead one must not rank as live.
+                healthy=(self.health.endpoint_status(name)["state"] == "healthy"
                          if routed and ep_cfg is not None else False),
                 max_slots=int(snap.get("max_slots") or 0),
                 in_flight=int(snap.get("in_flight") or 0),

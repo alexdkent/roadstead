@@ -1368,7 +1368,7 @@ Open surfaces: `GET /v1/status` (per-endpoint health, capacity, reliability coun
 `GET /v1/timeouts` and `GET /v1/timeout-advice/shadow-report` (§1.4), `GET /v1/recent` (§3.11),
 `GET /v1/inflight`, `GET /v1/history`, `GET /v1/series`, `GET /v1/metrics/cost-model` and
 `GET /v1/timeouts/stalls` (§3.12), `GET /metrics` (Prometheus), `GET /health`, `GET /readyz` (fails
-closed on readiness-critical endpoints), and the `/v1/fleet/*` analytics family together with
+closed on readiness-critical endpoints, except for an `unloaded` one — §3.17), and the `/v1/fleet/*` analytics family together with
 `GET /v1/usage` (§3.6; `/v1/fleet/top-callers` and `/v1/fleet/cache-attribution` are in §3.12,
 `/v1/fleet/cache-stats` in §3.11).
 
@@ -1405,7 +1405,8 @@ restart; it is kept rather than corrected because the name is the contract.
 | `roadstead_recent_requests_5m` | gauge | `endpoint` | Requests in the last 5 min. |
 | `roadstead_slot_seconds_5m` | gauge | `endpoint` | Slot-seconds consumed in 5 min. |
 | `roadstead_endpoint_utilization_pct` | gauge | `endpoint` | 5-min slot utilization %. Emitted only where `max_slots > 0`. |
-| `roadstead_endpoint_healthy` | gauge | `endpoint` | 1 if the endpoint is healthy (not paused), else 0. |
+| `roadstead_endpoint_healthy` | gauge | `endpoint` | 1 iff the endpoint's availability `state` is `healthy` (§3.17): it answered a probe and no breaker, drain or cooldown holds it. 0 for `paused`, `unloaded`, `unreachable`, `unhealthy` and `unknown` alike — read `roadstead_endpoint_state` to tell a plan from a page. |
+| `roadstead_endpoint_state` | gauge | `endpoint`, `state` | One-hot availability state (§3.17): six series per endpoint, exactly one is 1. `unloaded` (evicted by its dispatcher, expected) and `paused` (a drain) are not failures; `unreachable` and `unhealthy` are. |
 | `roadstead_structured_empty_rate` | gauge | `endpoint` | Fraction of structured responses carrying no answer (30m window). 🚨 **Emitted only once the endpoint clears the sample floor** — an unevaluated endpoint must not publish a 0/0 that reads as "healthy", so absence here is not zero. |
 | `roadstead_structured_samples_30m` | gauge | `endpoint` | Structured responses in that window; same sample-floor rule. |
 | `roadstead_endpoint_goodput_collapsed` | gauge | `endpoint` | 1 if the endpoint's engine is occupied and producing almost nothing (§3.13). 🚨 **ABSENT when the verdict is `unknown`** — the rule is a conjunction, so "could not evaluate" cannot borrow a value from either outcome; read `roadstead_endpoint_goodput_unknown` beside it. Absent for an endpoint with no `policy.goodput_*` thresholds: absence means "not watched", never "watched and fine". |
@@ -2826,6 +2827,14 @@ the on-demand manager uses (`docs/configuration.md`), once per poller pass. It a
 explains a failed probe** — `evicted` + not answering is `unloaded`; `resident` + not answering is
 `unreachable`/`unhealthy`; an evicted tenant that still answers is `healthy`. It never makes an
 endpoint healthy on its own.
+
+Every surface that reports an endpoint's health reads this same `state`: `/v1/status`, the admin
+endpoint view, `roadstead_endpoint_healthy` / `roadstead_endpoint_state`, `GET /health`
+(`unhealthy_endpoints` lists `unhealthy` and `unreachable`; `unloaded_endpoints` lists the expected
+ones, and neither `unloaded` nor `paused` degrades the proxy), `GET /readyz` (a readiness-critical
+endpoint is unready when `paused`, `unhealthy`, `unreachable` or `unknown` — reasons `paused`,
+`circuit_open`, `unreachable`, `unknown` — and **not** when `unloaded`, so readiness does not flap with
+an eviction the dispatcher chose) and `/rs/v1/models` `healthy` (which intent resolution ranks on).
 
 🚨 **This is read-only, and it does not wake anything.** The reader issues `GET /status` and nothing
 else; admission is unchanged (`endpoint_healthy` is not consulted differently and a request to an

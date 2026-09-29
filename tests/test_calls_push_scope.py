@@ -155,11 +155,11 @@ def test_the_network_gate_is_shared():
 def test_a_binding_narrows_the_scope_like_any_key():
     keys = KeyRegistry()
     keys.register(secret="s", agent_id="a", key_id="a", calls_push=True,
-                  bind=["10.9.0.0/16"])
+                  bind=["203.0.113.0/24"])
     r = _resolver(keys)
     denial = r.calls_push_denial(_Peer({"X-API-Key": "s"}))
     assert denial is not None and denial.status == 401
-    assert "is bound to 10.9.0.0/16" in denial.message
+    assert "is bound to 203.0.113.0/24" in denial.message
 
 
 # ---------------------------------------------------------------------------

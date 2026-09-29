@@ -25,6 +25,7 @@ from .config import LLMPriority, normalize_endpoint, source_sha
 from .constants import _PAYLOAD_KIND
 from .enriched import WIRE_OPENAI
 from .goodput import Verdict as GoodputVerdictOutcome
+from .health import AVAILABILITY_STATES
 from .lifecycle import _openai_error
 from .observability import structured_empty_rates
 from .sse_hub import DROP_SENTINEL
@@ -501,10 +502,21 @@ class ProxyHttpHandlers:
                     out.append(Metric("roadstead_endpoint_utilization_pct",
                                       round(util, 1), lbl, "gauge",
                                       help="5-min slot utilization %"))
-                h = self.state.endpoint_health.get(ep_name, {})
+                # Off the availability STATE, not the breaker alone: an on-demand
+                # endpoint nothing probes has a breaker frozen at True, and this
+                # gauge used to report a dead one as 1. `unloaded` (evicted by
+                # its dispatcher, expected) and `paused` are 0 here too — not
+                # serving — and the one-hot state gauge below is what tells a
+                # page from a plan.
+                avail_state = self.health.endpoint_status(ep_name)["state"]
                 out.append(Metric("roadstead_endpoint_healthy",
-                                  1 if h.get("healthy", True) else 0, lbl, "gauge",
-                                  help="1 if the endpoint is healthy (not paused)"))
+                                  1 if avail_state == "healthy" else 0, lbl, "gauge",
+                                  help="1 if the endpoint answered a probe and nothing holds it (state=healthy), else 0"))
+                for st in AVAILABILITY_STATES:
+                    out.append(Metric("roadstead_endpoint_state",
+                                      1 if avail_state == st else 0,
+                                      {**lbl, "state": st}, "gauge",
+                                      help="one-hot availability state of the endpoint"))
                 # Empty-structured rate (ledger tier3-json-object-empty-brace):
                 # the fraction of this endpoint's structured responses that came
                 # back a well-formed JSON object with no answer in it. VM builds
@@ -1550,7 +1562,15 @@ class ProxyHttpHandlers:
     async def handle_health(self, request: Request) -> Response:
         ok = self.health.scheduler_loop_alive()
         poller_ok = self.health.poller_alive()
-        unhealthy = [ep for ep, h in self.state.endpoint_health.items() if not h["healthy"]]
+        # Off the availability state (Health.endpoint_status), not the breaker
+        # alone: an on-demand endpoint nothing probes had a breaker frozen at
+        # True, so a dead one never listed here. `unloaded` (evicted by its
+        # dispatcher, expected) and `paused` (a drain) are reported apart and do
+        # NOT degrade the proxy, same as a drain never did.
+        states = {ep: self.health.endpoint_status(ep)["state"]
+                  for ep in self.state.config.endpoints}
+        unhealthy = [ep for ep, st in states.items() if st in ("unhealthy", "unreachable")]
+        unloaded = [ep for ep, st in states.items() if st == "unloaded"]
         # The proxy is UP iff its scheduler is alive (200). A dead BACKEND
         # degrades status but must NOT 503 the proxy — that would make a monitor
         # restart a healthy front door over a backend blip (alert-don't-kill).
@@ -1565,6 +1585,7 @@ class ProxyHttpHandlers:
                 "endpoints": len(self.state.config.endpoints),
                 "total_slots": self.state.config.total_fleet_slots,
                 "unhealthy_endpoints": unhealthy,
+                "unloaded_endpoints": unloaded,
                 "scheduler_alive": ok,
                 "poller_alive": poller_ok,
             },
@@ -1602,10 +1623,21 @@ class ProxyHttpHandlers:
         scheduler_ok = self.health.scheduler_loop_alive()
         unready: dict[str, str] = {}
         for name in critical:
-            if name in self.state.paused_endpoints:
+            state = self.health.endpoint_status(name)["state"]
+            if state == "paused":
                 unready[name] = "paused"          # operator drain
-            elif not self.state.endpoint_health.get(name, {}).get("healthy", True):
+            elif state == "unhealthy":
                 unready[name] = "circuit_open"    # consecutive probe failures
+            elif state == "unreachable":
+                # Nothing answers and nothing excuses it — the on-demand
+                # endpoint the breaker never sees. Fails closed like the above.
+                unready[name] = "unreachable"
+            elif state == "unknown":
+                unready[name] = "unknown"         # no probe has reached it yet
+            # `unloaded` is deliberately NOT here: its dispatcher evicted it on
+            # purpose, so readiness must not flap with every eviction. A
+            # deployment that cannot tolerate that keeps such an endpoint out of
+            # `readiness_critical`.
         if not scheduler_ok:
             unready["_scheduler"] = "dead"
         ready = not unready

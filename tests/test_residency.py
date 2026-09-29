@@ -395,3 +395,147 @@ async def test_the_admin_endpoint_view_carries_the_same_state():
     assert view["health"]["state"] == "unloaded"
     assert view["health"]["healthy"] is False
     assert view["health"]["residency"] == "evicted"
+
+
+# ------------------------------- every other surface reads the same state
+
+def _critical_svc(*, tenant: str = "t-crit") -> ProxyService:
+    """An on-demand, readiness-critical endpoint nothing manages — the shape
+    whose breaker never moved off its initial True."""
+    cfg = ProxyConfig()
+    for ep in cfg.endpoints.values():
+        ep.readiness_critical = False
+    cfg.endpoints["crit"] = EndpointConfig(
+        endpoint_class="crit", role="crit", on_demand=True, readiness_critical=True,
+        residency_tenant=tenant, host="127.0.0.1", port=1, max_slots=1,
+        min_expected_slots=1)
+    svc = ProxyService(cfg)
+    svc._state.residency = ResidencyReader(
+        cfg.endpoints, dispatcher_url="http://dispatcher.invalid")
+
+    async def down(ep_cfg):
+        return False
+    svc._backend.probe_health = down
+    return svc
+
+
+async def _started(svc: ProxyService) -> ProxyService:
+    """`/readyz` also asks whether the scheduler loop is alive. The background
+    poller is cancelled so the test drives its own passes deterministically."""
+    await svc.startup()
+    svc._poller_task.cancel()
+    return svc
+
+
+async def _prom(svc: ProxyService) -> str:
+    return (await svc.handle_prometheus_metrics(_Req())).body.decode()
+
+
+def _series(text: str, name: str, endpoint: str) -> dict[str, float]:
+    """{state-label-or-'': value} for one endpoint's series of one metric."""
+    out = {}
+    for line in text.splitlines():
+        if line.startswith(name + "{") and f'endpoint="{endpoint}"' in line:
+            labels, value = line.rsplit(" ", 1)
+            state = ""
+            if 'state="' in labels:
+                state = labels.split('state="')[1].split('"')[0]
+            out[state] = float(value)
+    return out
+
+
+@pytest.mark.asyncio
+async def test_a_dead_on_demand_endpoint_never_reads_healthy_on_the_metrics():
+    """`roadstead_endpoint_healthy` was `1` for it (breaker default)."""
+    svc = _critical_svc()
+    await svc._poller_iteration()
+    text = await _prom(svc)
+    assert _series(text, "roadstead_endpoint_healthy", "crit") == {"": 0.0}
+    states = _series(text, "roadstead_endpoint_state", "crit")
+    assert set(states) == set(residency_state_names())
+    assert states["unreachable"] == 1.0 and sum(states.values()) == 1.0
+
+
+def residency_state_names():
+    from roadstead.health import AVAILABILITY_STATES
+    return AVAILABILITY_STATES
+
+
+@pytest.mark.asyncio
+async def test_unloaded_is_distinguishable_from_unhealthy_on_the_state_gauge():
+    svc = _critical_svc()
+    svc._state.residency._client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"intended_state": {"t-crit": "evicted"}})))
+    await svc._poller_iteration()
+    text = await _prom(svc)
+    assert _series(text, "roadstead_endpoint_healthy", "crit") == {"": 0.0}
+    states = _series(text, "roadstead_endpoint_state", "crit")
+    assert states["unloaded"] == 1.0 and states["unreachable"] == 0.0
+    assert states["unhealthy"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_health_route_lists_a_dead_on_demand_endpoint_and_not_an_evicted_one():
+    svc = _critical_svc()
+    await svc._poller_iteration()
+    body = json.loads((await svc.handle_health(_Req())).body)
+    assert "crit" in body["unhealthy_endpoints"]
+    assert "crit" not in body["unloaded_endpoints"]
+
+    svc = _critical_svc()
+    svc._state.residency._client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"intended_state": {"t-crit": "evicted"}})))
+    await svc._poller_iteration()
+    body = json.loads((await svc.handle_health(_Req())).body)
+    assert "crit" not in body["unhealthy_endpoints"]
+    assert body["unloaded_endpoints"] == ["crit"]
+    # (`status` itself is not asserted: the scheduler is not started here and
+    # every other default endpoint is dead too. What matters is that `crit`
+    # neither listed itself nor was mistaken for a failure.)
+
+
+@pytest.mark.asyncio
+async def test_readyz_fails_closed_on_a_dead_on_demand_critical_endpoint():
+    """It read READY (breaker default) with nothing listening."""
+    svc = await _started(_critical_svc())
+    try:
+        await svc._poller_iteration()
+        resp = await svc.handle_readyz(_Req())
+        assert resp.status_code == 503
+        assert json.loads(resp.body)["unready"] == {"crit": "unreachable"}
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_readyz_does_not_flap_for_an_expected_eviction():
+    svc = await _started(_critical_svc())
+    try:
+        svc._state.residency._client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"intended_state": {"t-crit": "evicted"}})))
+        await svc._poller_iteration()
+        resp = await svc.handle_readyz(_Req())
+        assert resp.status_code == 200, resp.body
+        assert json.loads(resp.body)["unready"] == {}
+        # ...but an unexcused silence, same endpoint, is not ready: the dispatcher
+        # going quiet must not turn an outage into a green light.
+        svc._state.residency._client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(503)))
+        await svc._poller_iteration()
+        assert (await svc.handle_readyz(_Req())).status_code == 503
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_intent_routing_facts_do_not_rank_a_dead_on_demand_endpoint_healthy():
+    svc = _critical_svc()
+    await svc._poller_iteration()
+    facts = {f.endpoint: f for f in svc._enriched.facts()}
+    assert facts["crit"].healthy is False
+
+    async def up(ep_cfg):
+        return True
+    svc._backend.probe_health = up
+    await svc._poller_iteration()
+    assert {f.endpoint: f for f in svc._enriched.facts()}["crit"].healthy is True

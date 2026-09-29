@@ -28,6 +28,13 @@ summary. The bullets below link in there where the long version is worth reading
   alert, breaker-trip log at WARNING rather than CRITICAL (the breaker itself still trips — it is what
   keeps a failover target from arming into nothing). **Read-only: nothing here loads a backend or
   changes admission.**
+  The same `state` now feeds every other health surface: `roadstead_endpoint_healthy` is `1` only for
+  `state == healthy` (so `0` for an evicted, drained or dead endpoint — **a consumer alerting on
+  `== 0` will now also see planned drains/evictions; use the new one-hot `roadstead_endpoint_state`
+  to tell them apart**), `GET /health` lists `unhealthy`/`unreachable` endpoints and reports
+  `unloaded_endpoints` separately without degrading, `GET /readyz` fails closed for a dead on-demand
+  critical endpoint (`unreachable`/`unknown`) but does not flap for an `unloaded` one, and
+  `/rs/v1/models` `healthy` (ranked on by intent resolution) reads the state too.
 
 - **`calls_push` — a key scope that permits `POST /v1/calls/log` and nothing else.** Since the
   address stopped granting admin (2026-09-01) the ingest route, which was admin-gated, refused every
