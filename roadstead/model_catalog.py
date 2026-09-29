@@ -635,6 +635,11 @@ _POLICY_PASSTHROUGH = (
     "prefix_keepalive_trigger_tokens",
     "prefix_keepalive_idle_s",
     "prefix_keepalive_max_prefixes",
+    # The dispatcher's name for this endpoint's model, so `/v1/status` can say
+    # "evicted (expected)" instead of "unreachable". Read-only — see
+    # residency.py. Guarded by
+    # test_residency.py::test_declared_tenant_reaches_endpoint_config.
+    "residency_tenant",
 )
 
 

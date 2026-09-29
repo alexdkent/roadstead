@@ -2333,6 +2333,7 @@ class ManagementApi:
         descriptor = provider_for_engine(ep.backend_engine).descriptor
         health = self.state.endpoint_health.get(name, {})
         paused = name in self.state.paused_endpoints
+        avail = self._http.health.endpoint_status(name)
         price = self.state.prices.price(name)
         return {
             "endpoint": name,
@@ -2374,9 +2375,13 @@ class ManagementApi:
                       "real": price.real,
                       "operator_declared": declared_price(name, ep) is not None},
             "health": {
-                "healthy": bool(health.get("healthy", True)) and not paused,
+                # The availability `state` (see Health.endpoint_status), not the
+                # breaker alone: an on-demand endpoint the poller skips has a
+                # breaker frozen at its initial True.
+                "healthy": avail["state"] == "healthy",
                 "admin_paused": paused,
                 "probe_healthy": bool(health.get("healthy", True)),
+                **avail,
             },
             "routing": {"failover_to": ep.failover_to or None,
                         "spill_to": ep.spill_to or None},

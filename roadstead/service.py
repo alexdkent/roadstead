@@ -753,6 +753,7 @@ class ProxyService:
         try:
             await asyncio.wait_for(
                 asyncio.gather(self._on_demand.close(), self._backend.close(),
+                               self._state.residency.close(),
                                return_exceptions=True),
                 timeout=_TEARDOWN_CLOSE_S,
             )

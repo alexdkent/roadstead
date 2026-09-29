@@ -184,6 +184,62 @@ class Health:
             return True
         h = self.state.endpoint_health.get(ep)
         return h["healthy"] if h else True
+    def expected_unloaded(self, ep: str) -> bool:
+        """The endpoint does not answer AND its dispatcher says it is evicted —
+        a state somebody chose, not a fault. The single predicate the alarm
+        arms share, so "expected" cannot mean one thing in the log and another
+        in the alert. Needs BOTH halves: an evicted tenant that still answers is
+        not "unloaded", and a silent one whose dispatcher says nothing is not
+        "expected" (``residency.UNKNOWN`` never excuses)."""
+        return (self.state.residency.state(ep) == "evicted"
+                and self.state.endpoint_reachable.get(ep) is False)
+    def endpoint_status(self, ep: str) -> dict:
+        """What ``/v1/status`` says about an endpoint's AVAILABILITY. Reporting
+        only — admission still reads ``endpoint_healthy`` and this changes none
+        of it.
+
+        ``state`` is one of:
+          ``healthy``     answers a probe (and no breaker/pause/cooldown holds it)
+          ``paused``      an operator drain
+          ``unloaded``    not answering, and the dispatcher says it is evicted:
+                          EXPECTED, not a failure, and not healthy either
+          ``unreachable`` not answering and nothing excuses it
+          ``unhealthy``   answers, or answered until the breaker tripped, but is
+                          refused traffic (circuit open, cooldown, goodput)
+          ``unknown``     an endpoint the breaker cannot vouch for (on-demand or
+                          residency-declared) that no probe has reached yet
+
+        🚨 ``healthy`` is a probe RESULT, never a default. An on-demand endpoint
+        that is not loaded is skipped by the circuit breaker, so its breaker
+        reads healthy forever whatever the backend is doing — that reading is a
+        lack of evidence, and it is why `healthy: true` used to be reported for a
+        backend nothing was listening on.
+        """
+        residency = self.state.residency.state(ep)
+        reachable = self.state.endpoint_reachable.get(ep)
+        cfg = self.state.config.endpoints.get(ep)
+        out: dict = {}
+        if residency is not None:
+            out["residency"] = residency
+            age = self.state.residency.age_s()
+            if age is not None:
+                out["residency_age_s"] = age
+        if reachable is not None:
+            out["reachable"] = reachable
+        if ep in self.state.paused_endpoints:
+            out["state"] = "paused"
+        elif not self.endpoint_healthy(ep):
+            out["state"] = "unloaded" if self.expected_unloaded(ep) else "unhealthy"
+        elif getattr(cfg, "on_demand", False) or residency is not None:
+            if reachable is None:
+                out["state"] = "unknown"
+            elif reachable:
+                out["state"] = "healthy"
+            else:
+                out["state"] = "unloaded" if self.expected_unloaded(ep) else "unreachable"
+        else:
+            out["state"] = "healthy"
+        return out
     def retry_after_s(self, endpoint: str) -> int:
         """Retry-After for a shed (Phase 2.4), derived from the endpoint's
         recent p95 backend latency (a drained slot frees on ~that cadence),
@@ -232,10 +288,18 @@ class Health:
             if not alive:
                 h["healthy"] = False
                 h["unhealthy_since"] = time.monotonic()
-                logger.critical(
-                    "endpoint %s UNHEALTHY — %d consecutive probe failures + /health "
+                # The breaker STILL trips for an evicted endpoint — it is what
+                # keeps a failover target from arming into nothing — but the
+                # dispatcher choosing to evict it is not a page. CRITICAL is
+                # what log_scan and the health verifier key on.
+                (logger.warning if self.expected_unloaded(ep_name)
+                 else logger.critical)(
+                    "endpoint %s UNHEALTHY%s — %d consecutive probe failures + /health "
                     "down; deferring its queue, fast-failing interactive",
-                    ep_name, h["consecutive_failures"],
+                    ep_name,
+                    " (evicted by its dispatcher — expected)"
+                    if self.expected_unloaded(ep_name) else "",
+                    h["consecutive_failures"],
                 )
                 self.fast_fail_interactive(ep_name)
             else:
@@ -413,7 +477,13 @@ class Health:
             # backend-down. Exclude operator drains so a planned maintenance
             # pause doesn't page as an outage — those surface as a separate
             # informational endpoint_drained alert below.
-            s["paused"] = (not self.endpoint_healthy(ep)) and ep not in self.state.paused_endpoints
+            # Likewise an endpoint its dispatcher has EVICTED (expected_unloaded):
+            # it stays refused traffic, but nobody broke it, so it is not the
+            # endpoint_paused ERROR either. `/v1/status` reports it as
+            # `state: unloaded` instead.
+            s["paused"] = ((not self.endpoint_healthy(ep))
+                           and ep not in self.state.paused_endpoints
+                           and not self.expected_unloaded(ep))
             gp = self.goodput_snapshot(ep, now)
             if gp is not None:
                 s["goodput"] = gp
@@ -524,7 +594,26 @@ class Health:
         # mark it unhealthy. Skip until a lease is held (model resident); then
         # discover served-model/context normally.
         if getattr(ep_cfg, "on_demand", False) and not self.state.on_demand.is_loaded(ep_name):
-            return
+            # ...but skipping the probe is not the same as not LOOKING. This
+            # used to `return` here unconditionally, so an on-demand endpoint
+            # nothing manages (no lease is ever held) was never probed again,
+            # its breaker sat at its initial `healthy: true` for the life of the
+            # process, and /v1/status reported a backend nothing was listening
+            # on as healthy. One quiet /health — no discovery, no breaker, no
+            # log — says whether it is there. Down: record that and stop. Up
+            # (someone else's lease loaded it): fall through and discover it
+            # like any other endpoint.
+            reachable = await self.state.backend.probe_health(ep_cfg)
+            self.state.endpoint_reachable[ep_name] = reachable
+            if not reachable:
+                # An unloaded on-demand endpoint is not a fault, so it must not
+                # keep a breaker state from an earlier life either: one that
+                # tripped while it was up would otherwise stay open across the
+                # eviction, refusing traffic with nothing left to recover it.
+                h = self.state.endpoint_health.get(ep_name)
+                if h is not None and not h["healthy"]:
+                    h.update(healthy=True, consecutive_failures=0, unhealthy_since=None)
+                return
         probe_ok = False
         provider = provider_for(ep_cfg)
         try:
@@ -582,6 +671,15 @@ class Health:
             self._schedule_thinking_canary(ep_name, ep_cfg)
         except Exception as exc:
             logger.debug("poller probe %s failed: %s", ep_name, exc)
+        # Whether it is THERE — recorded before the breaker update so the
+        # breaker's own log line can tell an eviction from a crash. A failed
+        # discovery is not "down" (a backend can answer /health and fail /props),
+        # so a failure is re-asked of /health itself.
+        try:
+            self.state.endpoint_reachable[ep_name] = (
+                probe_ok or await self.state.backend.probe_health(ep_cfg))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("reachability probe %s failed: %s", ep_name, exc)
         # Circuit-breaker health update (Phase 1.2). Guarded so a fault
         # here never stalls discovery.
         try:
@@ -1062,6 +1160,10 @@ class Health:
             await asyncio.sleep(self.state.config.poller_interval_s)
     async def poller_iteration(self) -> None:
         """One full poller pass: probe every endpoint, then the periodic chores."""
+        # Residency first, so this pass's probe failures are read against a
+        # fresh answer. Bounded (3s) and never raises: a dispatcher that is
+        # down must not slow or stall the probes it only annotates.
+        await self.state.residency.refresh()
         for ep_name, ep_cfg in self.state.config.endpoints.items():
             # Phase 5F: an operator-paused endpoint is intentionally down
             # (maintenance) — don't probe it (probes would fail + churn the

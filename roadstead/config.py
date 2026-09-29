@@ -811,6 +811,14 @@ class EndpointConfig:
     on_demand: bool = False
     dispatcher_capability: str = ""
 
+    #: The name the host dispatcher files this endpoint's model under in its
+    #: ``GET /status`` ``intended_state`` map (see ``residency.py``). Declared
+    #: in ``policy.residency_tenant``. Empty = the endpoint declares no
+    #: residency and ``/v1/status`` carries no ``residency`` field for it.
+    #: READ-ONLY: it explains a failed probe as "evicted, expected"; it never
+    #: loads anything and never gates admission.
+    residency_tenant: str = ""
+
     # When True, the proxy injects ``id_slot`` into chat_completion payloads
     # for INTERACTIVE-band requests, keyed by a deterministic hash of
     # session_id. This pins each conversation to one llama.cpp slot across

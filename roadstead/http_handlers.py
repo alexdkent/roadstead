@@ -697,8 +697,26 @@ class ProxyHttpHandlers:
             # for check_alerts Phase 2.5 — an operator/coordinator pause reads
             # paused:False by design); surface the deliberate pause via the
             # explicit `admin_paused` field instead.
-            snap["healthy"] = h.get("healthy", True) and not admin_paused
-            snap["paused"] = not h.get("healthy", True)  # check_alerts (Phase 2.5) keys on this
+            #
+            # The same shape of blind spot, second instance: an on-demand endpoint
+            # that is not loaded is skipped by the poller too, so its breaker
+            # froze at the initial `healthy: true` and a backend nothing was
+            # listening on read healthy for as long as the process lived. So
+            # `healthy` is now the availability `state` below being `healthy`,
+            # which needs a probe that answered — never a default. `state`
+            # (healthy | paused | unloaded | unreachable | unhealthy | unknown)
+            # is what to read; `healthy` stays as its boolean projection, and an
+            # `unloaded` endpoint (dispatcher-evicted, expected) is NOT healthy.
+            avail = self.health.endpoint_status(ep_name)
+            snap["state"] = avail["state"]
+            for key in ("residency", "residency_age_s", "reachable"):
+                if key in avail:
+                    snap[key] = avail[key]
+            snap["healthy"] = avail["state"] == "healthy"
+            # `paused` feeds check_alerts (Phase 2.5) as "unexpectedly down": an
+            # evicted-by-its-dispatcher endpoint is down on purpose, same as a drain.
+            snap["paused"] = (not h.get("healthy", True)
+                              and not self.health.expected_unloaded(ep_name))
             if admin_paused:
                 snap["admin_paused"] = True
             # Step 4b — rate-windowed cooldown surface (shadow report + enforce

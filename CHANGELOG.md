@@ -14,6 +14,21 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Added
 
+- **Honest availability on `/v1/status`: `state`, `reachable`, and a read-only `residency`.** An
+  `on_demand` endpoint that is not loaded was skipped by the capacity poller, so an endpoint nothing
+  manages (no lease is ever held) was never probed again, its circuit breaker sat at its initial
+  `healthy: true`, and `/v1/status` reported a backend nothing was listening on as healthy while every
+  call to it failed `503 unreachable`. It is now probed quietly (one `/health`, no breaker, no log),
+  `healthy` is `state == "healthy"` and needs a probe that answered, and `state` is one of `healthy` /
+  `paused` / `unloaded` / `unreachable` / `unhealthy` / `unknown` (`docs/api.md` §3.17). The admin
+  endpoint view's `health` carries the same. New `policy.residency_tenant` (absent ⇒ off) names the
+  endpoint's key in the host dispatcher's `GET /status` `intended_state`; the dispatcher is read once
+  per poller pass and `residency` is `resident` | `evicted` | `unknown` (never a confident value from a
+  failed read). `evicted` + not answering is `unloaded`: expected, not healthy, no `endpoint_paused`
+  alert, breaker-trip log at WARNING rather than CRITICAL (the breaker itself still trips — it is what
+  keeps a failover target from arming into nothing). **Read-only: nothing here loads a backend or
+  changes admission.**
+
 - **`calls_push` — a key scope that permits `POST /v1/calls/log` and nothing else.** Since the
   address stopped granting admin (2026-09-01) the ingest route, which was admin-gated, refused every
   pusher that presented no credential — including a relay on loopback — so the audio/TTS/diarize

@@ -2791,6 +2791,47 @@ direct backend call a touch makes — and it is logged under its own `call_site`
 (`ROADSTEAD_PREFIX_KEEPALIVE endpoint=… key=… prompt_tokens=… cached_tokens=… duration_s=… result=…`,
 `result` one of `hit` / `missed` / `error` / `skipped_queued` / `skipped_at_capacity`).
 
+### 3.17 Availability — `endpoints[].state` / `residency` / `reachable` on `/v1/status`
+
+`endpoints[].healthy` answers "can this endpoint serve right now", and it is a **probe result, never a
+default**. `state` says which of six things that is; `healthy` is its boolean projection
+(`state == "healthy"`).
+
+| `state` | meaning |
+|---|---|
+| `healthy` | Answered a probe, and no breaker, drain or cooldown holds it. |
+| `paused` | An operator drain (`admin_paused` is also set). |
+| `unloaded` | Not answering **and its host dispatcher says it is evicted** — expected, not a failure, and **not healthy**. Raises no `endpoint_paused` alert and no CRITICAL log line. |
+| `unreachable` | Not answering, and nothing excuses it. |
+| `unhealthy` | Refused traffic by the circuit breaker, a cooldown or a goodput trip. |
+| `unknown` | An on-demand or residency-declared endpoint no probe has reached yet. |
+
+🚨 An `on_demand` endpoint that is not loaded is skipped by the circuit breaker, so its breaker never
+moves off its initial `healthy: true`. Until this section landed `/v1/status` projected that default as a fact and
+reported a backend nothing was listening on as healthy. It is now probed quietly (one `/health`, no
+discovery, no breaker, no log) and `reachable` carries the answer; if it answers it is discovered like
+any other endpoint.
+
+**`policy.residency_tenant`** (absent ⇒ off) names the key the host dispatcher files this endpoint's
+model under in its `GET /status` `intended_state` map, read from the same dispatcher URL setting
+the on-demand manager uses (`docs/configuration.md`), once per poller pass. It adds two fields:
+
+| field | meaning |
+|---|---|
+| `residency` | `resident` \| `evicted` \| `unknown`. 🚨 **Three-valued; `unknown` is never folded into either other value** — no dispatcher URL, a dispatcher that does not answer or answers a shape this does not know, a tenant it does not list, or a reading older than 60 s. Absent (not `unknown`) when the endpoint declares no tenant. |
+| `residency_age_s` | Age of the reading behind `residency`. Absent when there is no current reading. |
+| `reachable` | Whether the last poll's `/health` answered. Absent before the first pass. |
+
+🚨 `intended_state` is the dispatcher's **intent**, not what is running, so `residency` **only ever
+explains a failed probe** — `evicted` + not answering is `unloaded`; `resident` + not answering is
+`unreachable`/`unhealthy`; an evicted tenant that still answers is `healthy`. It never makes an
+endpoint healthy on its own.
+
+🚨 **This is read-only, and it does not wake anything.** The reader issues `GET /status` and nothing
+else; admission is unchanged (`endpoint_healthy` is not consulted differently and a request to an
+`unloaded` endpoint is dispatched as before). A deployment that forbids a request from loading a model
+keeps that property: waking is `on_demand`'s `ensure_loaded`, which is a separate, opt-in mechanism.
+
 ---
 
 ## 4. South face — what Roadstead requires *of a backend*

@@ -35,6 +35,7 @@ from .identity import IdentityResolver, KeyRegistry
 from .management import AdminOverlay
 from .observability import RequestLogger, RollingMetrics
 from .on_demand import OnDemandManager
+from .residency import ResidencyReader
 from .prefix_keepalive import PrefixKeepaliveTracker
 from .queue import PersistentQueue
 from .reasoning_replay import ReasoningReplayStore
@@ -179,6 +180,15 @@ class ProxyState:
         # On-demand endpoints: the model is NOT always-resident — it is loaded
         # lazily under a host dispatcher's lease and idle-unloaded when quiet.
         self.on_demand = OnDemandManager(config.endpoints)
+        # Read-only view of which declared endpoints the dispatcher currently
+        # holds loaded (residency.py). Never loads anything.
+        self.residency = ResidencyReader(config.endpoints)
+        # Last poller answer to "does this endpoint answer a probe" — absent
+        # until the first pass. The circuit breaker below says whether the
+        # endpoint is REFUSING traffic; this says whether it is THERE, which
+        # is the honest half for an endpoint the breaker never sees (an
+        # on-demand one that is not loaded is skipped by the breaker).
+        self.endpoint_reachable: dict[str, bool] = {}
         # § 9 tier3 failover. Assigned by ProxyService right after Health is
         # built (Failover consumes endpoint_healthy and must not duplicate it),
         # which is why this is a late-bound attribute rather than constructed
