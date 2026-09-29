@@ -1568,7 +1568,7 @@ class PersistentQueue:
         if not self._conn:
             return []
         from .timeout_model import percentile
-        from .usage_rates import cloud_cost_usd
+        from .usage_rates import cloud_cost_usd, warn_if_undeclared
         col = {
             "agent": "agent_id", "call_site": "call_site",
             "endpoint": "endpoint", "provider": "endpoint",
@@ -1596,6 +1596,7 @@ class PersistentQueue:
             a["tokens_in"] += int(tin or 0)
             a["tokens_out"] += int(tout or 0)
             a["cost_usd"] += cloud_cost_usd(endpoint or "", tin, tout)
+            warn_if_undeclared(endpoint or "")  # log-only; the payload is unchanged
             a["_lats"].extend(int(x) for x in (lats or "").split(",") if x)
         out: list[dict] = []
         for a in agg.values():
@@ -1624,8 +1625,9 @@ class PersistentQueue:
         question about the operator's day, not about a storage bucket.
         """
         if not self._conn:
-            return {"today_usd": 0.0, "total_usd": 0.0, "by_endpoint": []}
-        from .usage_rates import cloud_cost_usd
+            return {"today_usd": 0.0, "total_usd": 0.0, "by_endpoint": [],
+                    "undeclared": []}
+        from .usage_rates import cloud_cost_usd, warn_if_undeclared
         if today_start is None:
             lt = time.localtime()
             today_start = time.mktime((
@@ -1636,11 +1638,16 @@ class PersistentQueue:
             "  SUM(COALESCE(input_tokens,0)) AS in_live, "
             "  SUM(COALESCE(output_tokens,0)) AS out_live, "
             "  SUM(CASE WHEN completed_at >= ? THEN COALESCE(input_tokens,0) ELSE 0 END) AS in_today, "
-            "  SUM(CASE WHEN completed_at >= ? THEN COALESCE(output_tokens,0) ELSE 0 END) AS out_today "
+            "  SUM(CASE WHEN completed_at >= ? THEN COALESCE(output_tokens,0) ELSE 0 END) AS out_today, "
+            "  COUNT(*) AS n_live "
             "FROM proxy_completions GROUP BY ep, day",
             (today_start, today_start),
         ).fetchall()
         today_by_ep: dict[str, list[int]] = {}
+        # Requests still HELD in proxy_completions, per endpoint. The lifetime
+        # rollup keeps tokens only, so this is the one figure in `undeclared`
+        # that covers the retention window and not the lifetime.
+        live_requests: dict[str, int] = {}
         # (endpoint, day) -> [tokens_in, tokens_out]. The rollup and the live
         # table are two VIEWS of one bucket, never two halves to add up, so they
         # compose by MAX — which cannot double-count whatever the two disagree
@@ -1650,10 +1657,11 @@ class PersistentQueue:
         # and any day whose finalisation is stale or was dropped), the rollup
         # wins the moment rows start disappearing from under it.
         buckets: dict[tuple[str, int], list[int]] = {}
-        for ep, day, in_live, out_live, in_today, out_today in rows:
+        for ep, day, in_live, out_live, in_today, out_today, n_live in rows:
             buckets[(ep, int(day))] = [int(in_live or 0), int(out_live or 0)]
             t = today_by_ep.setdefault(ep, [0, 0])
             t[0] += int(in_today or 0); t[1] += int(out_today or 0)
+            live_requests[ep] = live_requests.get(ep, 0) + int(n_live or 0)
         for ep, day, tin, tout in self._reader().execute(
                 "SELECT endpoint, day, tokens_in, tokens_out "
                 "FROM proxy_savings_daily").fetchall():
@@ -1666,6 +1674,7 @@ class PersistentQueue:
         today_usd = total_usd = 0.0
         today_in = today_out = total_in = total_out = 0
         by_endpoint: list[dict] = []
+        undeclared: list[dict] = []
         for ep in sorted(set(lifetime_by_ep) | set(today_by_ep)):
             in_total, out_total = lifetime_by_ep.get(ep, [0, 0])
             in_today, out_today = today_by_ep.get(ep, [0, 0])
@@ -1679,12 +1688,25 @@ class PersistentQueue:
                 "total_usd": round(t_total, 4),
                 "tokens_in": in_total, "tokens_out": out_total,
             })
+            # 🚨 A name with NO pricing decision books $0 exactly like a lane
+            # that is deliberately free, and the two read identically in
+            # `by_endpoint`. Pricing stays fail-open (a raise here would take the
+            # whole rollup down for one unrecognised name), so the miss is
+            # reported HERE, where the whole endpoint set is visible at once.
+            if warn_if_undeclared(ep):
+                undeclared.append({
+                    "endpoint": ep, "requests": live_requests.get(ep, 0),
+                    "input_tokens": in_total, "output_tokens": out_total,
+                })
         by_endpoint.sort(key=lambda x: -x["total_usd"])
+        undeclared.sort(key=lambda x: (-(x["input_tokens"] + x["output_tokens"]),
+                                       x["endpoint"]))
         return {
             "today_usd": round(today_usd, 2), "total_usd": round(total_usd, 2),
             "today_tokens_in": today_in, "today_tokens_out": today_out,
             "total_tokens_in": total_in, "total_tokens_out": total_out,
             "today_start": int(today_start), "by_endpoint": by_endpoint,
+            "undeclared": undeclared,
         }
 
     # ----- query (for simulation / observability) -----

@@ -23,9 +23,9 @@ claim rather than an accounting one.
 Two cost regimes:
 
   1. TOKEN-NATIVE LLM classes (chat / embed / rerank) — (in, out) USD per 1M
-     tokens. Keyed by the proxy endpoint-CLASS (creative / companion / thinker /
-     gemma / embed / rerank); every legacy role/alias resolves to one of
-     those via `_ENDPOINT_CLASS`.
+     tokens. Keyed by the rate CLASS (tier3 / tier2 / tier1 / embed / rerank);
+     every endpoint name, role and legacy alias resolves to one of those via
+     `_ENDPOINT_CLASS`.
 
   2. PER-UNIT capabilities (speech / audio) — Roadstead does not serve these; a
      deployment's own wrapper pushes them through `/v1/calls/log`, and packs its
@@ -40,11 +40,18 @@ Two cost regimes:
      below is what selects the decoder, so a new audio capability must be added
      there and taught the packing, in that order.
 
-  3. MEDIA generation (imagegen / video / musicgen) is per-image / per-second /
-     per-generation and is NOT yet metered — those jobs don't push a
-     `proxy_completions` row — so they contribute $0 today. The published
-     per-unit rates are recorded in the comments below so wiring a job-count push
-     later is a one-place change.
+  3. MEDIA generation (imagegen / comfyui / meshgen / videogen / musicgen) is
+     per-image / per-second / per-generation and is NOT yet metered — those jobs
+     don't push a `proxy_completions` row — so they contribute $0 today, by a
+     DECLARED None rather than by omission. The published per-unit rates are
+     recorded in the comments below so wiring a job-count push later is a
+     one-place change.
+
+Every name that reaches this table is either priced or deliberately zeroed. A
+name that is neither books $0 without saying so, which is why the rollup
+(`queue.savings_summary`) reports the ones it sees as `undeclared` and this
+module logs each once — see :func:`is_declared_endpoint` and
+:func:`warn_if_undeclared`.
 
 The single entry point is `cloud_cost_usd(endpoint, in_tokens, out_tokens)`.
 `cloud_rate(endpoint)` is kept for backward-compat (token (in,out) rate only), and is also what
@@ -56,6 +63,10 @@ the price itself, because both kinds are USD per million tokens and nothing else
 """
 
 from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 1. Token-native LLM classes — (input, output) USD per 1M tokens.
@@ -142,6 +153,17 @@ _ENDPOINT_CLASS: dict[str, str | None] = {
     # endpoint name (409), and the push client drops proxy-native providers
     # before queueing. So nothing but real router traffic can land here.
     "gemma": "tier1", "gemma-router": "tier1", "gemma-greeter": "tier1",
+    # `usersim` is a small DENSE model (~8B) serving a simulated user for
+    # conversation drills, so its traffic is SYNTHETIC — and that does not make
+    # it free: it occupies the same silicon a cloud rental would bill for, and
+    # this table does not price by caller anywhere. Eval and drill traffic on
+    # the tier endpoints is booked at the tier rate like any other call, so a
+    # zero here would be the one lane treated differently for being a test.
+    # Anchored at tier1 (small dense) rather than tier2 (a ~30B sparse MoE):
+    # by the class rule — parameter count and architecture, not the name — an
+    # 8B dense model is nearest the small dense class, and tier1's rate sits at
+    # the low end of the mid-market 8B rentals, so it can only under-claim.
+    "usersim": "tier1",
     "embed": "embed", "embeddings": "embed",
     "rerank": "rerank",
     # --- remote spill: real money, and not this table's business. Explicitly
@@ -155,6 +177,22 @@ _ENDPOINT_CLASS: dict[str, str | None] = {
     "stt": "stt", "whisper-1": "stt", "transcribe": "stt",
     "diarize": "diarize",
     "stem": "stem",
+    # 🚨 HOST-QUALIFIED PUSH NAMES. A producer pushes `<host>-<unit>` as the
+    # provider, and `config.normalize_endpoint` no longer strips a host prefix
+    # (deliberately — that rule was one deployment's naming hardcoded into the
+    # public code, and the catalog's `aliases:` is the only rewriting mechanism).
+    # The rollup therefore books the name AS PUSHED, and a bare unit key above
+    # never matches it: these lanes booked $0 while reading as priced. They are
+    # spelled out rather than matched by pattern on purpose — a prefix rule would
+    # price any `<x>-tts` somebody pushes, whatever it packs, and this file's
+    # contract is that each name was verified at its producer first. Verified
+    # 2026-09-28:
+    #   cortex-diarize / cortex-diarize-offline / diarize-gpu:
+    #       input_tokens = int(audio_seconds*100), output_tokens = segment count
+    #   cortex-orpheus-tts / cortex-chatterbox-tts:
+    #       input_tokens = chars_in, output_tokens = int(audio_seconds_out*100)
+    "cortex-diarize": "diarize", "cortex-diarize-offline": "diarize",
+    "diarize-gpu": "diarize",
     # 🚨 The UNIT names a deployment actually pushes, which are not the
     # capability names above. Each was verified at its producer's packing site
     # before being priced here — the contract is `input_tokens = seconds*100`
@@ -179,10 +217,18 @@ _ENDPOINT_CLASS: dict[str, str | None] = {
     # class an output rate, or an ordinary backlog of synthesised speech gets
     # priced as tens of millions of output tokens.
     "orpheus-tts": "tts", "chatterbox-tts": "tts",
+    "cortex-orpheus-tts": "tts", "cortex-chatterbox-tts": "tts",
     # --- explicit $0 (no clean cloud analog, or would double-count) ---
     "stream": None,          # streaming audio mux; transcription counted under stt
+    "cortex-stream": None,   # the name `stream` is actually pushed under; same reason
     "ocr": None,             # folded into vision; no separate volume
-    "musicgen": None, "imagegen": None, "video": None,  # media: not yet metered
+    # Media: NOT METERED. No producer pushes a count for any of these — the
+    # generators are dispatcher capabilities that run a job and return an
+    # artifact, and no `push_call`/`calls/log` site exists for them (swept
+    # 2026-09-28), so a rate here would multiply nothing. Declared rather than
+    # omitted so the day one starts pushing is a decision, not a silent $0.
+    "musicgen": None, "imagegen": None, "video": None,
+    "comfyui": None, "meshgen": None, "videogen": None,
     "probe": None,           # infra/no-op
     # Deliberate $0 with a MEASURED reason, so nobody "fixes" them into a rate:
     #  · `stream` re-counts audio already billed under the whisper units — two of
@@ -224,6 +270,48 @@ def is_declared_endpoint(endpoint: str) -> bool:
     whole endpoint set at once.
     """
     return (endpoint or "").strip().lower() in _DECLARED_ENDPOINTS
+
+
+#: Names already warned about, so a name that books $0 is announced ONCE per
+#: process rather than once per rollup poll (a dashboard asks every few seconds).
+#: Bounded, because the name is caller-supplied text — `/v1/calls/log` accepts
+#: any endpoint string from an admin-scoped pusher — and an unbounded set is a
+#: leak a misbehaving pusher can grow. A restart re-warns, which is the point of
+#: a warning nobody may have been watching for the first one.
+_WARNED_UNDECLARED: set[str] = set()
+_WARNED_UNDECLARED_CAP = 256
+_cap_notice_sent = False
+
+
+def warn_if_undeclared(endpoint: str) -> bool:
+    """True when ``endpoint`` has no pricing decision; WARNs once per name.
+
+    Detection belongs at the surface that sees the whole endpoint set at once
+    (see :func:`is_declared_endpoint`), and pricing itself stays fail-open: this
+    only ever logs and returns a bool, so a rollup that calls it cannot be taken
+    down by a name nobody recognises.
+    """
+    if is_declared_endpoint(endpoint):
+        return False
+    name = (endpoint or "").strip().lower()
+    if name in _WARNED_UNDECLARED:
+        return True
+    if len(_WARNED_UNDECLARED) >= _WARNED_UNDECLARED_CAP:
+        global _cap_notice_sent
+        if not _cap_notice_sent:
+            _cap_notice_sent = True
+            logger.warning(
+                "usage_rates: %d undeclared endpoint names already reported; "
+                "further ones are counted in /v1/fleet/savings `undeclared` but "
+                "no longer logged", _WARNED_UNDECLARED_CAP)
+        return True
+    _WARNED_UNDECLARED.add(name)
+    logger.warning(
+        "usage_rates: endpoint %r has NO pricing decision, so it books $0 in the "
+        "savings total. Declare it in _ENDPOINT_CLASS — priced, or None with the "
+        "reason. Its volume is listed under `undeclared` in /v1/fleet/savings.",
+        name)
+    return True
 
 
 def _capability(endpoint: str) -> str | None:

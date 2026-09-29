@@ -400,6 +400,19 @@ grant for every operator who wrote it. `identity.py` decides and everything else
 `may_admin_write` or `admin_readonly` is read anywhere else — a second place deciding what a scope
 permits is the `_remote_ip` shape again.
 
+🚨 **`calls_push` is a GRANT, so it is built as the smallest one that does the job and is kept out of
+`admin`.** It permits `POST /v1/calls/log` and nothing else — the ingest for calls the proxy did not
+schedule, whose pusher used to be authorised by its address until 2026-09-01. `admin` was the wrong
+size: reading every caller's traffic and minting keys to fix a missing row. The containment is
+structural, not a list: every other admin route gates on `admin` alone through `admin_denial`, which
+never reads the scope, so the scope is refused there by construction, and `calls_push_denial` is the
+ONE place it is honoured (network gate and CSRF checks shared with admin). It is never combined with
+`admin` (refused at the registry and the management boundary), never expressible in the shared
+identity grammar (an address ACL parsing a scope it must ignore would read as granting it), and an
+AST guard fails if `calls_push` is read outside `identity.py`. `tests/e2e/test_calls_push_scope.py`
+drives the REAL route table and asserts the scoped key gets the same answer as a plain key on every
+route but the one.
+
 🚨 **`GET /rs/v1/admin/audit` says who changed what, and EVERY mutating admin route records.**
 Flags, pause, resume and maintenance touch no overlay state and would otherwise record nothing; a
 trail covering only some of them is worse than none, because a reader assumes completeness. The

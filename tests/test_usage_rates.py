@@ -51,6 +51,14 @@ class TestEveryLiveEndpointIsPriced:
             ("unraid-htdemucs", "stem"),
             ("orpheus-tts", "tts"),
             ("chatterbox-tts", "tts"),
+            # host-qualified names, as the producers actually push them
+            ("cortex-orpheus-tts", "tts"),
+            ("cortex-chatterbox-tts", "tts"),
+            ("cortex-diarize", "diarize"),
+            ("cortex-diarize-offline", "diarize"),
+            ("diarize-gpu", "diarize"),
+            # a synthetic-traffic LLM lane is still priced (see the table note)
+            ("usersim", "tier1"),
         ],
     )
     def test_endpoint_resolves_to_its_rate_class(self, endpoint, expected_class):
@@ -62,6 +70,8 @@ class TestEveryLiveEndpointIsPriced:
             "tier2-chat", "tier2-analyst", "tier2-flash", "gemma",
             "unraid-whisper", "unraid-whisper-lyrics", "unraid-diarize",
             "unraid-htdemucs", "orpheus-tts", "chatterbox-tts",
+            "cortex-orpheus-tts", "cortex-chatterbox-tts", "cortex-diarize",
+            "cortex-diarize-offline", "diarize-gpu", "usersim",
         ],
     )
     def test_endpoint_bills_something_for_real_volume(self, endpoint):
@@ -78,7 +88,11 @@ class TestEveryLiveEndpointIsPriced:
 class TestDeliberateZeroesStayZero:
     """These are decided, not forgotten — and each has a measured reason."""
 
-    @pytest.mark.parametrize("endpoint", ["stream", "asr", "cortex-asr", "got-ocr"])
+    @pytest.mark.parametrize("endpoint", [
+        "stream", "cortex-stream", "asr", "cortex-asr", "got-ocr",
+        # media generators: no producer pushes a count, so nothing to multiply
+        "imagegen", "comfyui", "meshgen", "videogen", "musicgen", "video",
+    ])
     def test_endpoint_is_declared_but_free(self, endpoint):
         assert is_declared_endpoint(endpoint), (
             f"{endpoint} must stay DECLARED — an undeclared name is indistinguishable "
@@ -94,6 +108,9 @@ class TestDeliberateZeroesStayZero:
         later "fixes".
         """
         assert _ENDPOINT_CLASS["stream"] is None
+        # ...and the name it is actually pushed under, which the bare key never
+        # matched once the host prefix stopped being stripped.
+        assert _ENDPOINT_CLASS["cortex-stream"] is None
 
 
 class TestTheUnknownEndpointIsDistinguishable:
@@ -115,6 +132,42 @@ class TestTheUnknownEndpointIsDistinguishable:
         free, unknown = "stream", "tier4-whatever-lands-next"
         assert cloud_cost_usd(free, 10**6, 0) == cloud_cost_usd(unknown, 10**6, 0)
         assert is_declared_endpoint(free) != is_declared_endpoint(unknown)
+
+
+class TestWarnIfUndeclared:
+    """The loud half of the distinction: a name with no decision is announced."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_warned_set(self, monkeypatch):
+        from roadstead import usage_rates
+        monkeypatch.setattr(usage_rates, "_WARNED_UNDECLARED", set())
+        monkeypatch.setattr(usage_rates, "_cap_notice_sent", False)
+
+    def test_an_undeclared_name_warns_once_and_a_declared_one_never(self, caplog):
+        from roadstead.usage_rates import warn_if_undeclared
+        with caplog.at_level("WARNING", logger="roadstead.usage_rates"):
+            assert warn_if_undeclared("brand-new-unit") is True
+            assert warn_if_undeclared("Brand-New-Unit ") is True   # same name
+            assert warn_if_undeclared("stream") is False           # decided, $0
+            assert warn_if_undeclared("tier3") is False            # decided, priced
+        hits = [r for r in caplog.records if "brand-new-unit" in r.getMessage()]
+        assert len(hits) == 1, "once per NAME, however often a dashboard polls"
+        assert hits[0].levelname == "WARNING"
+
+    def test_the_warned_set_is_bounded_but_the_answer_stays_true(self, caplog, monkeypatch):
+        """Names are caller-supplied text, so the memory of them cannot grow
+        without bound — and going quiet must not change what is REPORTED."""
+        from roadstead import usage_rates
+        monkeypatch.setattr(usage_rates, "_WARNED_UNDECLARED_CAP", 3)
+        with caplog.at_level("WARNING", logger="roadstead.usage_rates"):
+            for i in range(10):
+                assert usage_rates.warn_if_undeclared(f"junk-{i}") is True
+        assert len(usage_rates._WARNED_UNDECLARED) == 3
+        assert sum("no longer logged" in r.getMessage()
+                   for r in caplog.records) == 1, "the cap notice goes out once"
+
+    def test_pricing_itself_never_raises_on_an_undeclared_name(self):
+        assert cloud_cost_usd("nobody-priced-this", 10**6, 10**6) == 0.0
 
 
 class TestAudioPackingIsDecodedNotGuessed:

@@ -251,6 +251,22 @@ class Principal:
     #: scope that could grant what the operator withheld is the self-asserted
     #: ``agent_id`` bug in another costume.
     admin_readonly: bool = False
+    #: 🚨 The INGEST scope: permits exactly ``POST /v1/calls/log`` and nothing
+    #: else on the admin plane — not a GET, not a read-only view, not any other
+    #: route. A GRANT, unlike ``admin_readonly``, so it is made as small as a
+    #: grant can be and is kept apart from ``admin`` rather than built out of it:
+    #: what a pusher of call records needs is one write to one route, and every
+    #: rung of ``admin`` on the way to it (reading callers' traffic, pausing a
+    #: backend, minting keys) is a capability the credential would carry for
+    #: nothing. Never set together with ``admin`` (``KeyRegistry.register``
+    #: refuses), so "an admin key that also pushes" cannot mean two things, and
+    #: an address never confers it — it exists only on a key record.
+    #:
+    #: 🚨 Read it through ``IdentityResolver.calls_push_denial`` and NOWHERE
+    #: else, on the same rule as ``admin_readonly``: a second place deciding what
+    #: a scope permits is the ``_remote_ip`` shape. ``tests/
+    #: test_admin_audit.py`` fails if one appears.
+    calls_push: bool = False
     #: How this identity was established: ``api_key`` (authenticated) or ``ip``
     #: (a weak second factor). The two are NOT interchangeable — see the module
     #: docstring's third rule; ``authenticated`` is the property to branch on.
@@ -480,6 +496,7 @@ class KeyRegistry:
         min_timeout_s: float | None = None,
         admin: bool = False,
         admin_readonly: bool = False,
+        calls_push: bool = False,
         expires_at: float | None = None,
         bind: "list[str] | tuple[str, ...] | None" = None,
         may_assert: "list[str] | tuple[str, ...] | None" = None,
@@ -528,6 +545,17 @@ class KeyRegistry:
                            digest[:8])
             return None
         label = key_id or digest[:8]
+        if calls_push and admin:
+            # Refused rather than tolerated. The ingest scope is deliberately a
+            # complete credential on its own, and an admin key already reaches
+            # the route: combining them buys nothing, and with `admin_readonly`
+            # in the mix it would read as a read-only admin key that can also
+            # write — a narrowing another statement cancels is not a narrowing.
+            logger.warning(
+                "api key %s for %r sets both admin and calls_push — the ingest "
+                "scope is a credential on its own and is never combined with "
+                "admin; entry skipped", label, agent_id)
+            return None
         if digest in self._by_digest:
             # Two identities on one secret is not a merge, it is a
             # misconfiguration where one of them silently never applies.
@@ -561,6 +589,7 @@ class KeyRegistry:
             min_timeout_s=min_timeout_s,
             admin=admin,
             admin_readonly=admin_readonly,
+            calls_push=calls_push,
             source="api_key",
             key_id=label,
             may_assert=assertable,
@@ -692,6 +721,10 @@ class KeyRegistry:
                     # read-only one indistinguishable at a glance in the UI.
                     "admin_readonly": p.admin_readonly,
                     "may_write": p.may_admin_write,
+                    # The ingest scope, beside `admin` for the same reason
+                    # `admin_readonly` is: an operator auditing "which
+                    # credentials can do what" reads one row per key.
+                    "calls_push": p.calls_push,
                     # Where the registration came from, so an operator can tell
                     # a runtime enrolment from a line in the environment.
                     "source": self._credential.get(d, {}).get("source", "file"),
@@ -746,6 +779,12 @@ class KeyRegistry:
 
         The right-hand side is the shared grammar (``parse_identity_spec``), so
         this is the ACL's format with a secret where the address goes.
+
+        🚨 The ``calls_push`` (ingest) scope is NOT expressible here, on purpose:
+        the grammar is shared with ``ROADSTEAD_ACL``, where an address must never
+        be able to confer a scope, and a segment the address registry parsed but
+        had to ignore is a scope that reads as granted. It is declared on a
+        keys-file entry or at runtime through ``POST /rs/v1/admin/keys``.
         """
         for entry in raw.split(","):
             entry = entry.strip()
@@ -772,7 +811,8 @@ class KeyRegistry:
     #: already had once each.
     _FILE_FIELDS = frozenset({
         "id", "agent_id", "key", "key_sha256", "priority", "min_timeout_s",
-        "admin", "admin_readonly", "expires_at", "bind", "may_assert",
+        "admin", "admin_readonly", "calls_push", "expires_at", "bind",
+        "may_assert",
     })
 
     def _load_file(self, path: str | Path) -> None:
@@ -828,6 +868,7 @@ class KeyRegistry:
                 min_timeout_s=(float(floor) if floor is not None else None),
                 admin=bool(entry.get("admin", False)),
                 admin_readonly=bool(entry.get("admin_readonly", False)),
+                calls_push=bool(entry.get("calls_push", False)),
                 expires_at=_expiry_from_file(entry),
                 bind=_binding_from_file(entry),
                 may_assert=_may_assert_from_file(entry),
@@ -1814,24 +1855,9 @@ class IdentityResolver:
         thing to keep in step with ``routes.py``, and when it falls behind the
         failure is silent and in the widening direction.
         """
-        # 🚨 THE NETWORK GATE, first and before anything reads a credential.
-        # Both must pass: the address says who may REACH this plane, the
-        # credential says who may USE it. Checked first so a blocked network
-        # never learns whether a presented key was valid, and never gets a
-        # password box out of the UI door — the refusal is about the network and
-        # no credential can answer it.
-        address = self.client_address(request)
-        if not self.acl.may_reach_admin(
-                address.ip, trust_builtin_nets=not address.forwarded):
-            return Denial(
-                code="access_denied",
-                status=403,
-                message=(
-                    f"the admin plane is not reachable from {address.ip}. This "
-                    f"is a NETWORK refusal and no credential answers it: add "
-                    f"the address to ROADSTEAD_ADMIN_NETS, which names who may "
-                    f"reach the plane rather than who is an admin"),
-            )
+        network = self._admin_reach_denial(request)
+        if network is not None:
+            return network
         resolved = self.resolve(request)
         if not resolved.ok:
             return resolved.denial
@@ -1859,6 +1885,71 @@ class IdentityResolver:
             if csrf is not None:
                 return csrf
         return None
+
+    def _admin_reach_denial(self, request: Any) -> Denial | None:
+        """🚨 THE NETWORK GATE, first and before anything reads a credential.
+
+        Both must pass: the address says who may REACH this plane, the
+        credential says who may USE it. Checked first so a blocked network
+        never learns whether a presented key was valid, and never gets a
+        password box out of the UI door — the refusal is about the network and
+        no credential can answer it.
+
+        Shared by :meth:`admin_denial` and :meth:`calls_push_denial`: the ingest
+        scope is narrower than admin and must not be reachable from anywhere
+        admin is not.
+        """
+        address = self.client_address(request)
+        if not self.acl.may_reach_admin(
+                address.ip, trust_builtin_nets=not address.forwarded):
+            return Denial(
+                code="access_denied",
+                status=403,
+                message=(
+                    f"the admin plane is not reachable from {address.ip}. This "
+                    f"is a NETWORK refusal and no credential answers it: add "
+                    f"the address to ROADSTEAD_ADMIN_NETS, which names who may "
+                    f"reach the plane rather than who is an admin"),
+            )
+        return None
+
+    def calls_push_denial(self, request: Any) -> Denial | None:
+        """THE authorization decision for ``POST /v1/calls/log``. ``None`` to proceed.
+
+        🚨 The ingest scope lives HERE and the admin gate above never looks at
+        it. That asymmetry IS the containment: every other admin route funnels
+        through :meth:`admin_denial`, which reads ``admin`` and nothing else, so a
+        ``calls_push`` credential is refused on all of them by construction —
+        there is no route list to keep in step, and a route added tomorrow is
+        closed to this scope without anyone remembering to close it.
+        ``tests/test_calls_push_scope.py`` enumerates the route table to prove it
+        rather than trusting that argument.
+
+        An ``admin`` credential is decided by :meth:`admin_denial` unchanged, so
+        the route keeps every behaviour it had: an admin key pushes (read-only
+        admin does not — a push is a mutation), an address alone is refused with
+        the byte-identical 403 body, a presented key that does not resolve is a
+        401. The new case is one narrow addition: a resolved, non-admin key with
+        ``calls_push``, presenting POST, past the same network gate and the same
+        CSRF checks a mutating admin call gets.
+        """
+        network = self._admin_reach_denial(request)
+        if network is not None:
+            return network
+        resolved = self.resolve(request)
+        principal = resolved.principal if resolved.ok else None
+        if principal is None or principal.admin or not principal.calls_push:
+            return self.admin_denial(request)
+        method = str(getattr(request, "method", "GET") or "GET").upper()
+        if method != "POST":
+            return Denial(
+                code="access_denied",
+                status=403,
+                message=(
+                    f"this credential has the call-ingest scope, which permits "
+                    f"POST /v1/calls/log only; {method} is refused"),
+            )
+        return self._csrf_denial(request)
 
     def _csrf_denial(self, request: Any) -> Denial | None:
         """CSRF hardening for the mutating admin plane. ``None`` to proceed.

@@ -791,7 +791,7 @@ async function viewKeys(root) {
       // operator takes when auditing who can change things.
       el("td", {}, pick(row, "admin")
         ? (pick(row, "admin_readonly") ? tag("admin (read)", "") : tag("admin", "warn"))
-        : ""),
+        : (pick(row, "calls_push") ? tag("ingest only", "") : "")),
       // 🚨 Where the key was DECLARED, not where it is stored. An env-declared
       // key can be revoked now and comes back on restart; the response says so
       // and this column is why an operator is not surprised by it.

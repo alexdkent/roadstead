@@ -14,6 +14,24 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Added
 
+- **`calls_push` — a key scope that permits `POST /v1/calls/log` and nothing else.** Since the
+  address stopped granting admin (2026-09-01) the ingest route, which was admin-gated, refused every
+  pusher that presented no credential — including a relay on loopback — so the audio/TTS/diarize
+  rows a deployment pushes for non-LLM work were 403'd silently. The scope is declared on a
+  keys-file entry or `POST /rs/v1/admin/keys {"calls_push": true}`, never combined with `admin`,
+  never expressible in the address ACL, and reported per key by `GET /rs/v1/admin/keys`. The gate
+  is `IdentityResolver.calls_push_denial`; every other admin route still gates on `admin` alone,
+  so the scope is refused on all of them by construction (a test enumerates the route table).
+- **`GET /v1/fleet/savings` gains `undeclared`** — endpoint names seen with no pricing decision
+  (`{endpoint, requests, input_tokens, output_tokens}`), so a lane nobody priced no longer books
+  `$0` indistinguishably from one that is genuinely free. The first sight of each name is also
+  logged once at WARNING (`/v1/usage` does the same). Pricing stays fail-open. The degraded
+  (no-DB) shape gains `undeclared: []`.
+- **`usage_rates`: declared** `usersim` (tier1), the host-qualified names producers push
+  (`cortex-orpheus-tts`, `cortex-chatterbox-tts`, `cortex-diarize`, `cortex-diarize-offline`,
+  `diarize-gpu`, and `cortex-stream` as a deliberate zero), and the unmetered media generators
+  `comfyui` / `meshgen` / `videogen` as deliberate zeroes.
+
 - **Prefix keep-alive — `policy.prefix_keepalive_call_sites`/`_trigger_tokens`/`_idle_s`/
   `_max_prefixes`.** Measured 2026-09-26 on tier3 (vLLM, hybrid GLM-5.3-Flash): an
   interactive agent's ~36-40K-token tools+system prefix is evicted from the engine's

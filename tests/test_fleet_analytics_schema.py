@@ -115,7 +115,7 @@ def test_the_section_parses_into_the_expected_shape():
     format changes, every check below would sail through on empty sets."""
     docs = _documented_tables(_S36)
     assert len(docs) >= 4, f"expected >=4 subsections in §3.6, found {sorted(docs)}"
-    expected_tables = {"fleet/activity": 3, "fleet/savings": 2, "v1/usage": 2}
+    expected_tables = {"fleet/activity": 3, "fleet/savings": 3, "v1/usage": 2}
     for substring, n in expected_tables.items():
         tables = _tables_for(substring)
         assert len(tables) == n, (
@@ -172,11 +172,21 @@ def test_fleet_activity_matches_the_documented_schema(seeded):
 
 def test_savings_summary_matches_the_documented_schema(seeded):
     data = seeded.savings_summary()
-    top, by_ep = _tables_for("fleet/savings")
+    top, by_ep, undeclared = _tables_for("fleet/savings")
     assert data["by_endpoint"], "seed produced no endpoint rows"
     _assert_matches(set(data), top, "savings_summary (top level)")
     _assert_matches(set(data["by_endpoint"][0]), by_ep,
                     "savings_summary by_endpoint[]")
+    # The seed prices only declared names, so `undeclared` is empty and its ROW
+    # shape would go unchecked. Seed one name nobody priced to check it.
+    seeded.persist_external_call(
+        request_id="u1", agent_id="probe", endpoint="never-priced-unit",
+        call_site="site", kind="external", input_tokens=5, output_tokens=2,
+        duration_s=0.1, status="ok")
+    seeded.flush(timeout=5.0)
+    rows = seeded.savings_summary()["undeclared"]
+    assert rows, "a name with no pricing decision was not reported"
+    _assert_matches(set(rows[0]), undeclared, "savings_summary undeclared[]")
 
 
 def test_usage_rollup_matches_the_documented_schema(seeded):
@@ -209,7 +219,7 @@ def test_the_unopened_db_shapes_are_the_narrower_ones(tmp_path):
     assert "now" not in activity
 
     savings = pq.savings_summary()
-    assert set(savings) == {"today_usd", "total_usd", "by_endpoint"}
+    assert set(savings) == {"today_usd", "total_usd", "by_endpoint", "undeclared"}
     assert "today_start" not in savings
 
     assert pq.usage_rollup() == []

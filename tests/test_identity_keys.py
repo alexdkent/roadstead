@@ -132,6 +132,9 @@ def test_a_snapshot_never_carries_the_secret_or_its_digest():
                    "priority_declared": False,
                    "min_timeout_s": None,
                    "admin": False, "admin_readonly": False, "may_write": False,
+                   # The ingest scope (POST /v1/calls/log only), published beside
+                   # `admin` so "which credentials can do what" is one row per key.
+                   "calls_push": False,
                    "expires_at": None, "expired": False, "bind": [],
                    # 🚨 Published deliberately (2026-09-02). It is a list of
                    # fair-share names rather than anything secret, and "which

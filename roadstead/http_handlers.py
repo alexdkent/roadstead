@@ -1297,11 +1297,16 @@ class ProxyHttpHandlers:
     async def handle_calls_log(self, request: Request) -> Response:
         """Ingest a non-LLM service call (audio/imagegen/ocr/translate) that
         never traversed the scheduler, so the proxy is the single fleet
-        call-metrics store. Internal/LAN — gated by the same ACL as admin.
+        call-metrics store. Gated like the admin plane (same network reach, and
+        an admin credential) with ONE addition: a key carrying the narrow
+        ``calls_push`` scope may push here and reaches no other admin route —
+        see ``IdentityResolver.calls_push_denial``. A caller with no credential
+        is refused, which is how every audio/TTS/diarize push went missing when
+        the address stopped granting admin.
         Best-effort: validates the minimum, records, fans out, returns ok."""
         remote_ip = self.state.identity.client_ip(request)
         self.audit_admin_ip("/v1/calls/log", remote_ip)
-        denied = self.deny_non_admin(request, remote_ip)
+        denied = self.deny_non_ingest(request, remote_ip)
         if denied is not None:
             return denied
         try:
@@ -1617,7 +1622,19 @@ class ProxyHttpHandlers:
         the resolver, which resolves the address itself through the one place
         allowed to.
         """
-        denial = self.state.identity.admin_denial(request)
+        return self._render_denial(self.state.identity.admin_denial(request), remote_ip)
+
+    def deny_non_ingest(self, request: Request, remote_ip: str) -> Response | None:
+        """The gate for ``POST /v1/calls/log`` alone: admin, or the ingest scope.
+
+        Separate from :meth:`deny_non_admin` so the ingest scope cannot leak onto
+        the routes that gate through it. Decides nothing itself — the resolver
+        does, for the reason :meth:`deny_non_admin` gives.
+        """
+        return self._render_denial(
+            self.state.identity.calls_push_denial(request), remote_ip)
+
+    def _render_denial(self, denial, remote_ip: str) -> Response | None:
         if denial is None:
             return None
         # The 403 for a non-admin identity is byte-identical to what this

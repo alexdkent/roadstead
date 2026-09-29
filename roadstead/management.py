@@ -223,7 +223,7 @@ EDITABLE_QUOTA_FIELDS = (
 #: Fields a ``POST /rs/v1/admin/keys`` accepts.
 _KEY_CREATE_FIELDS = frozenset({
     "agent_id", "priority", "min_timeout_s", "admin", "admin_readonly",
-    "expires_in_s", "bind", "may_assert", "id", "key_sha256",
+    "calls_push", "expires_in_s", "bind", "may_assert", "id", "key_sha256",
 })
 
 #: Fields a ``POST /rs/v1/admin/keys/{key_id}/rotate`` accepts.
@@ -462,6 +462,7 @@ class AdminOverlay:
                                else float(entry["min_timeout_s"])),
                 admin=bool(entry.get("admin", False)),
                 admin_readonly=bool(entry.get("admin_readonly", False)),
+                calls_push=bool(entry.get("calls_push", False)),
                 # 🚨 The ABSOLUTE instant, replayed as-is. A key enrolled with a
                 # one-hour life and restarted after two hours must come back
                 # expired, not with a fresh hour — which is what re-deriving it
@@ -859,6 +860,19 @@ def validate_key_create(body: Any) -> dict:
                 "admin_readonly narrows the admin scope and grants nothing on "
                 "its own — set admin: true beside it, or omit it")
         out["admin_readonly"] = body["admin_readonly"]
+    if "calls_push" in body:
+        if not isinstance(body["calls_push"], bool):
+            raise Invalid("calls_push must be a JSON boolean")
+        # 🚨 Refused, not merged. The ingest scope is a complete credential — one
+        # write to POST /v1/calls/log — and an admin key already reaches that
+        # route. Combined with `admin_readonly` it would also read as a read-only
+        # admin key that can write, which is a narrowing another field cancels.
+        if body["calls_push"] and out.get("admin", False):
+            raise Invalid(
+                "calls_push is the narrow ingest scope and is never combined "
+                "with admin — an admin key already reaches POST /v1/calls/log; "
+                "issue a separate key for the pusher")
+        out["calls_push"] = body["calls_push"]
     if body.get("expires_in_s") is not None:
         # 🚨 A DURATION, not an instant. A caller sending an absolute time has
         # to agree with this process about the clock and the zone, and the
@@ -1078,6 +1092,7 @@ class ManagementApi:
             min_timeout_s=spec.get("min_timeout_s"),
             admin=bool(spec.get("admin", False)),
             admin_readonly=bool(spec.get("admin_readonly", False)),
+            calls_push=bool(spec.get("calls_push", False)),
             expires_at=expires_at,
             bind=spec.get("bind"),
             may_assert=spec.get("may_assert"),
@@ -1102,6 +1117,11 @@ class ManagementApi:
             "min_timeout_s": spec.get("min_timeout_s"),
             "admin": bool(spec.get("admin", False)),
             "admin_readonly": bool(spec.get("admin_readonly", False)),
+            # Load-bearing for the same reason `may_assert` is: without it the
+            # scope lives only in memory and a restart replays the key as a plain
+            # non-admin credential — the pusher is refused with no change anyone
+            # made.
+            "calls_push": bool(spec.get("calls_push", False)),
             "expires_at": expires_at,
             "bind": spec.get("bind", []),
             # 🚨 Load-bearing. Without it the grant lives only in memory: the
@@ -1124,6 +1144,7 @@ class ManagementApi:
             "min_timeout_s": record["min_timeout_s"],
             "admin": record["admin"],
             "admin_readonly": record["admin_readonly"],
+            "calls_push": record["calls_push"],
             "expires_at": record["expires_at"],
             "bind": record["bind"],
             # The widening field belongs in the trail more than any of the
@@ -1141,6 +1162,7 @@ class ManagementApi:
             "min_timeout_s": record["min_timeout_s"],
             "admin": record["admin"],
             "admin_readonly": record["admin_readonly"],
+            "calls_push": record["calls_push"],
             "expires_at": record["expires_at"],
             "bind": record["bind"],
             # Echoed because it WIDENS. An operator granting a credential the
@@ -1296,6 +1318,7 @@ class ManagementApi:
             min_timeout_s=row["min_timeout_s"],
             admin=bool(row["admin"]),
             admin_readonly=bool(row["admin_readonly"]),
+            calls_push=bool(row.get("calls_push", False)),
             expires_at=expires_at,
             bind=row["bind"],
             # A successor inherits the delegation grant, unlike the expiry: the
@@ -1327,6 +1350,7 @@ class ManagementApi:
             "min_timeout_s": row["min_timeout_s"],
             "admin": bool(row["admin"]),
             "admin_readonly": bool(row["admin_readonly"]),
+            "calls_push": bool(row.get("calls_push", False)),
             "expires_at": expires_at,
             "bind": list(row["bind"]),
             # Inherited, unlike the expiry: the grant is a policy the operator
@@ -1399,6 +1423,7 @@ class ManagementApi:
             "min_timeout_s": landed.get("min_timeout_s"),
             "admin": landed.get("admin"),
             "admin_readonly": landed.get("admin_readonly"),
+            "calls_push": landed.get("calls_push"),
             "expires_at": landed.get("expires_at"),
             "bind": landed.get("bind", []),
             "may_assert": landed.get("may_assert", []),

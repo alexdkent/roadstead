@@ -1355,7 +1355,7 @@ In particular a control action that could not be **persisted** is not an error: 
 | `GET`/`POST /rs/v1/admin/maintenance` · `GET`/`POST /v1/admin/maintenance` | List, or backdate a closed window for a restart done without draining. |
 | `GET /rs/v1/admin/ui` | The operator UI (§3.7). **Only when `ROADSTEAD_ADMIN_UI` is set** — otherwise the route does not exist. Refuses with 401 + `WWW-Authenticate: Basic`. |
 | `GET /rs/v1/admin/stream` · `GET /v1/stream` | Live `call.completed` + `metrics` SSE. Admin-gated since 2026-09-01. The alias exists because `EventSource` cannot set a header (§3.7). |
-| `POST /v1/calls/log` | Ingest a call the proxy did not schedule — audio, imagegen, OCR (§3.11). Admin-gated by the same gate, on a path that is not an `admin/` one; refuses anything the proxy records natively. |
+| `POST /v1/calls/log` | Ingest a call the proxy did not schedule — audio, imagegen, OCR (§3.11). Gated like the admin plane, on a path that is not an `admin/` one, with one addition: a key with the narrow `calls_push` scope (§3.3) may push here and reaches no other route. Refuses anything the proxy records natively. |
 
 `GET /v1/status` leads with **`build_sha`** — the git commit this process was built from, or
 `unknown` when the deployment did not supply one (`ROADSTEAD_SOURCE_SHA`). It is deliberately a
@@ -1480,6 +1480,19 @@ silently overwrites the first.
 **Revocation is never refused on provenance grounds.** A key declared in `ROADSTEAD_API_KEYS` or a
 keys file can be revoked at runtime and the revocation survives a restart — but this plane cannot
 edit an environment, so the response warns that the declaration will outlive the reason it is dead.
+
+🚨 **`calls_push` is the ingest scope: one write to one route, and nothing else.** A credential with
+`calls_push: true` may `POST /v1/calls/log` (§3.11) and is refused `403` on every other admin route,
+read or write — `GET /rs/v1/admin/keys` included — because every one of them gates on `admin`, which
+this scope does not carry. It is a GRANT, so it is kept as small as one can be and is not built out
+of `admin`: it is **refused at enrolment when `admin` is set beside it** (an admin key already
+reaches the route, and beside `admin_readonly` it would read as a read-only admin that can write).
+It rides the same network gate as the admin plane (`ROADSTEAD_ADMIN_NETS`) and the same CSRF checks,
+and works with `bind`. An address never confers it, and it is **not expressible in the shared
+identity grammar** (`ROADSTEAD_API_KEYS` / `ROADSTEAD_ACL`) — declare it on a keys-file entry or
+with `POST /rs/v1/admin/keys {"agent_id": "…", "calls_push": true}`. `GET /rs/v1/admin/keys` reports
+it per key beside `admin`. It does not restrict the key's ordinary inference use as its `agent_id`;
+bind it to the pusher's address to narrow who can present it.
 
 🚨 **`admin_readonly` NARROWS `admin`, and can never widen anything.** A credential with
 `admin: true, admin_readonly: true` reaches every `GET` on the management plane and is refused, with
@@ -1926,6 +1939,13 @@ recomputed — not frozen — when a rate in `usage_rates.py` changes.
 | `total_tokens_out` | int | |
 | `today_start` | int | The boundary actually used — echo it rather than recomputing midnight client-side. |
 | `by_endpoint` | list | Descending by `total_usd`. |
+| `undeclared` | list | Endpoint names in `by_endpoint` that have **no pricing decision** in `usage_rates.py` — neither priced nor deliberately zeroed — descending by tokens. `[]` when every name is decided. Added 2026-09-28. |
+
+🚨 **`undeclared` exists because `$0` is ambiguous.** A lane that is genuinely free and a lane nobody
+ever priced both book `0.0` and read identically in `by_endpoint`; a rename or a host move silently
+zeroed real lanes this way. Pricing stays fail-open (an unknown name never raises), so the miss is
+reported here, and logged once per name at WARNING (`usage_rates: endpoint '…' has NO pricing
+decision`). A monitor should alert on a non-empty list.
 
 `by_endpoint[]`:
 
@@ -1936,6 +1956,15 @@ recomputed — not frozen — when a rate in `usage_rates.py` changes.
 | `total_usd` | float | 4dp. |
 | `tokens_in` | int | **Lifetime**, not today. |
 | `tokens_out` | int | **Lifetime**, not today. |
+
+`undeclared[]`:
+
+| field | type | meaning |
+|---|---|---|
+| `endpoint` | string | The name as persisted. |
+| `requests` | int | Requests still HELD in `proxy_completions` (the retention window). ⚠️ Not lifetime: the rollup keeps tokens only, so this can be `0` for a name whose rows have all aged out. |
+| `input_tokens` | int | **Lifetime**, like `by_endpoint[].tokens_in`. For a per-unit lane these are packed units (audio centiseconds, characters), not tokens. |
+| `output_tokens` | int | **Lifetime.** |
 
 #### `GET /v1/usage` → `usage_rollup(dimension, hours)`
 
@@ -1971,7 +2000,7 @@ With no DB connection each producer returns an early-out that is **not** the ful
 | producer | degraded shape |
 |---|---|
 | `fleet_activity` | `window_s`, `bin_s`, `calls`, `by_endpoint_1h` — **no `now`** |
-| `savings_summary` | `today_usd`, `total_usd`, `by_endpoint` — **no token totals, no `today_start`** |
+| `savings_summary` | `today_usd`, `total_usd`, `by_endpoint`, `undeclared` — **no token totals, no `today_start`** |
 | `usage_rollup` | `[]` |
 
 A consumer that assumes `now` or `today_start` is always present will `KeyError` rather than degrade.
@@ -2024,11 +2053,15 @@ of them.
 exists so one store answers "what did the fleet spend?", rather than the proxy's own traffic living
 here and everything else living somewhere a dashboard has to join against.
 
-🚨 **Admin-gated**, and one of the two admin-gated routes that are not an `admin/` path — the other
-is `GET /v1/stream` (§3.7), gated since 2026-09-01. The gate is `deny_non_admin`, so the network
-gate, the `admin` scope and — because this is a mutation — the three CSRF checks of §3 all apply. In
-practice a pusher must send `Content-Type: application/json` (else `415`) and, if it authenticates
-with HTTP Basic, `X-Roadstead-Request: 1`.
+🚨 **Admin-gated, or the ingest scope**, and one of the two gated routes that are not an `admin/`
+path — the other is `GET /v1/stream` (§3.7), gated since 2026-09-01. The gate is `deny_non_ingest`:
+the network gate, then either an `admin` credential or a key carrying `calls_push` (§3.3), and —
+because this is a mutation — the three CSRF checks of §3 all apply. In practice a pusher must send
+`Content-Type: application/json` (else `415`) and, if it authenticates with HTTP Basic,
+`X-Roadstead-Request: 1`. **A request with no credential is refused `403 {"error": "access denied
+for <ip>"}`** — an address alone has not granted admin since 2026-09-01, so a pusher that presents
+nothing is refused from anywhere, loopback included. A pusher relayed through another service needs
+that service to forward a `calls_push` key.
 
 Body — every field optional except the endpoint, which may arrive under any of three names:
 

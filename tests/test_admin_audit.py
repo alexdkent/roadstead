@@ -261,8 +261,8 @@ def test_only_identity_decides_what_a_scope_permits():
     to prevent, and the exact shape of the `_remote_ip` that had to be removed
     from `management.py`.
 
-    Reading `may_admin_write` (or `admin_readonly`) anywhere but `identity.py`
-    is that second place, whatever it then does with the answer.
+    Reading `may_admin_write`, `admin_readonly` or `calls_push` anywhere but
+    `identity.py` is that second place, whatever it then does with the answer.
     """
     offenders = []
     pkg = _ROOT / "roadstead"
@@ -272,7 +272,7 @@ def test_only_identity_decides_what_a_scope_permits():
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr in {
-                    "may_admin_write", "admin_readonly"}:
+                    "may_admin_write", "admin_readonly", "calls_push"}:
                 offenders.append(f"{path.relative_to(_ROOT)}:{node.lineno}")
     assert not offenders, (
         "what an admin scope permits is decided outside identity.py: "
