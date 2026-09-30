@@ -178,3 +178,25 @@ _PAYLOAD_KIND = {
 #: whole point of the re-ask is that it is BOUNDED in a way the call it replaces
 #: was not.
 _ANSWER_NOW_MAX_TOKENS = 8000
+
+#: The re-ask's REASONING bound on an endpoint with NO thinking switch
+#: (``lifecycle._answer_now_reasoning_budget``). Such an endpoint cannot be told not
+#: to reason, so without a bound the re-ask can spend its whole ``answer_max`` on a
+#: trace and return no content. vLLM's ``thinking_token_budget`` caps the trace, and
+#: the answer reserve (``answer_max``) is ADDED to ``max_tokens`` on top of it, so
+#: the total is ``budget + answer_max`` and the answer always keeps its full room.
+#: Half the reserve, clamped: the floor stops a tiny caller ``max_tokens`` starving
+#: the reasoning it needs to state an answer at all, the ceiling keeps the bound
+#: binding when the reserve is large — the whole re-ask can never exceed
+#: ``_ANSWER_NOW_MAX_TOKENS + _ANSWER_NOW_REASONING_MAX_TOKENS``. CHOSEN, NOT
+#: MEASURED: at the lowest effort a rescue that already has its notes should need a
+#: few hundred reasoning tokens; a probe at a BINDING shape is what would move these.
+_ANSWER_NOW_REASONING_FRACTION = 0.5
+_ANSWER_NOW_REASONING_MIN_TOKENS = 512
+_ANSWER_NOW_REASONING_MAX_TOKENS = 2000
+
+#: Reasoning-effort words in ascending order, the ONLY ordering the code knows.
+#: ``lifecycle._lowest_declared_effort`` picks the lowest of the words an endpoint
+#: DECLARES; a declared word that is not on this ladder has no known rank and is never
+#: picked, and ``"none"`` is not a rung (on a no-switch endpoint it cannot mean off).
+_EFFORT_LADDER = ("minimal", "low", "medium", "high", "xhigh", "max")

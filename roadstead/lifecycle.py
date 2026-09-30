@@ -47,7 +47,11 @@ from .config import (
 )
 from .constants import (
     _ANSWER_NOW_MAX_TOKENS,
+    _ANSWER_NOW_REASONING_FRACTION,
+    _ANSWER_NOW_REASONING_MAX_TOKENS,
+    _ANSWER_NOW_REASONING_MIN_TOKENS,
     _DEFAULT_TIMEOUT_S,
+    _EFFORT_LADDER,
     _MIN_RETRY_BUDGET_S,
     _PAYLOAD_KIND,
     _RETRY_BACKOFF_S,
@@ -91,6 +95,7 @@ from .legacy import (
 )
 from .observability import MetricsSample, RequestLogRecord
 from .on_demand import OnDemandUnavailable
+from .providers import provider_for
 from .providers.payload import _THINKING_KWARG_NAMES
 from .reasoning_replay import accumulate_tool_call_deltas
 from .scheduler import CompletionRecord, DispatchDecision, QueuedRequest
@@ -157,9 +162,10 @@ def _answer_now_switch_off(ep_cfg) -> dict:
 
     🚨 On a no-switch endpoint the re-ask therefore STILL REASONS: nothing can
     turn that off. It is asked for the answer and budgeted for the answer
-    (``_ANSWER_NOW_MAX_TOKENS``), but it can spend that budget on reasoning and
-    return no content — which ``_answer_now_stream`` treats as a failed rescue,
-    not a served one. ``backend`` removes any switch a later edit might add here
+    (``_ANSWER_NOW_MAX_TOKENS``), so it is BOUNDED instead —
+    :func:`_lowest_declared_effort` and :func:`_answer_now_reasoning_budget`. A
+    re-ask that still returns no content is a failed rescue, not a served one.
+    ``backend`` removes any switch a later edit might add here
     (``strip_thinking_switch``)."""
     if getattr(ep_cfg, "no_thinking_switch", False):
         return {}
@@ -167,6 +173,46 @@ def _answer_now_switch_off(ep_cfg) -> dict:
     if keys:
         return {k: False for k in keys}
     return {"thinking": False, "enable_thinking": False}
+
+
+def _lowest_declared_effort(ep_cfg) -> str:
+    """The lowest reasoning-effort word this endpoint DECLARES, or ``""``.
+
+    Declared = a value of ``policy.reasoning_effort_map`` (the words its template
+    actually understands), ``policy.thinking_effort`` or ``policy.reasoning_effort``.
+    Ranked by :data:`_EFFORT_LADDER`; a word the ladder does not know has no rank and
+    is skipped, so this never returns a word the operator did not write and never
+    guesses one for an endpoint that declared none. Returned verbatim (trimmed), as
+    ``apply_reasoning_effort_map`` sends a mapped word."""
+    words = [*(getattr(ep_cfg, "reasoning_effort_map", None) or {}).values(),
+             getattr(ep_cfg, "thinking_effort", ""),
+             getattr(ep_cfg, "reasoning_effort", "")]
+    ranked = [(_EFFORT_LADDER.index(w.strip().lower()), w.strip())
+              for w in words if isinstance(w, str) and w.strip().lower() in _EFFORT_LADDER]
+    return min(ranked)[1] if ranked else ""
+
+
+def _answer_now_reasoning_budget(ep_cfg, answer_max: int) -> int:
+    """Tokens of REASONING the answer-now re-ask may spend on an endpoint that has
+    no thinking switch, or 0 = no bound available.
+
+    Only where the mechanism exists and is safe to send: a declared no-switch
+    endpoint on a vLLM provider (llama.cpp names its cap differently and this is
+    not that mechanism), that DECLARES the launch flag which makes
+    ``thinking_token_budget`` legal (``thinking_budget_ratio`` or an absolute
+    ``reasoning_budget_tokens``) — vLLM 400s the whole request otherwise, which
+    would turn a rescue into a failure. A switch-bearing endpoint is not bounded
+    here; its switch turns thinking off."""
+    if not getattr(ep_cfg, "no_thinking_switch", False):
+        return 0
+    if provider_for(ep_cfg).name != "vllm":
+        return 0
+    if not (getattr(ep_cfg, "thinking_budget_ratio", 0) > 0
+            or getattr(ep_cfg, "reasoning_budget_tokens", 0) > 0):
+        return 0
+    return min(max(int(answer_max * _ANSWER_NOW_REASONING_FRACTION),
+                   _ANSWER_NOW_REASONING_MIN_TOKENS),
+               _ANSWER_NOW_REASONING_MAX_TOKENS)
 
 
 def _answer_now_template_kwargs(payload: dict, ep_cfg) -> dict:
@@ -1101,6 +1147,11 @@ class Lifecycle:
         # the one correction here that can add tokens to the PROMPT rather
         # than the completion, which is worth reading first.
         self.correction.apply_reasoning_replay_restore(req)
+
+        # The caller's OWN thinking switch, under whichever spelling, read BEFORE
+        # any correction below writes the endpoint's default (see
+        # `Correction.canonicalize_thinking_switch` for the defect this order fixes).
+        self.correction.canonicalize_thinking_switch(req)
 
         # Forced-reasoning endpoints (e.g. creative/Trinity-Mini, capabilities.reasoning
         # =true) ALWAYS spend max_tokens on an un-disable-able CoT before the answer, so
@@ -2988,12 +3039,17 @@ class Lifecycle:
         (see :func:`_answer_now_switch_off`). Leaving it on re-enters the regime
         that just looped, and there is nothing left to deliberate about — the
         deliberation is in the notes. On an endpoint that declares NO switch there
-        is nothing to turn off, so the re-ask may reason; if it spends its budget
-        doing so and returns no content, that is a FAILED rescue and is reported
-        as one (``(0, False)``, and ``reasoning_loops_answered`` is not counted).
+        is nothing to turn off, so the re-ask may reason and is BOUNDED instead:
+        the endpoint's lowest declared effort (:func:`_lowest_declared_effort`,
+        replacing whatever effort the caller sent — the caller's effort is what the
+        looping call ran at) and, on vLLM, a ``thinking_token_budget`` with the
+        answer reserve added on top of ``max_tokens``
+        (:func:`_answer_now_reasoning_budget`). If it still returns no content,
+        that is a FAILED rescue and is reported as one (``(0, False)``, and
+        ``reasoning_loops_answered`` is not counted).
 
-        The caller's own ``chat_template_kwargs`` other than the switch (an effort,
-        a template variable) ride along: they describe the prompt, not the mode."""
+        The caller's own ``chat_template_kwargs`` other than the switch (a
+        template variable) ride along: they describe the prompt, not the mode."""
         try:
             payload = req.payload
             if not isinstance(payload, dict):
@@ -3026,6 +3082,28 @@ class Lifecycle:
                 "stream": True,
             }
             kwargs = _answer_now_template_kwargs(payload, ep_cfg)
+            # A NO-SWITCH endpoint still reasons on this turn, so bound it: the
+            # lowest effort it declares, and a reasoning budget with the answer
+            # reserve added ON TOP (vLLM counts both against `max_tokens`, so the
+            # total is budget + answer_max and the answer keeps its full room).
+            # A switch-bearing endpoint is untouched — its switch is off.
+            effort = ""
+            if getattr(ep_cfg, "no_thinking_switch", False):
+                effort = _lowest_declared_effort(ep_cfg)
+                if effort:
+                    kwargs["reasoning_effort"] = effort
+                    # A second effort beside it is a 'conflicting reasoning_effort' 400.
+                    second.pop("reasoning_effort", None)
+                    obj = second.get("reasoning")
+                    if isinstance(obj, dict) and "effort" in obj:
+                        rest = {k: v for k, v in obj.items() if k != "effort"}
+                        second.pop("reasoning")
+                        if rest:
+                            second["reasoning"] = rest
+                reasoning_budget = _answer_now_reasoning_budget(ep_cfg, answer_max)
+                if reasoning_budget:
+                    second["thinking_token_budget"] = reasoning_budget
+                    second["max_tokens"] = answer_max + reasoning_budget
             if kwargs:
                 second["chat_template_kwargs"] = kwargs
             # `extra_body` is merged over the top level by the provider, so a
@@ -3034,6 +3112,8 @@ class Lifecycle:
             if isinstance(eb, dict) and isinstance(eb.get("chat_template_kwargs"), dict):
                 eb_ck = {k: v for k, v in eb["chat_template_kwargs"].items()
                          if k not in _THINKING_KWARG_NAMES}
+                if effort and "reasoning_effort" in eb_ck:
+                    eb_ck["reasoning_effort"] = effort
                 second["extra_body"] = {
                     **{k: v for k, v in eb.items() if k != "chat_template_kwargs"},
                     **({"chat_template_kwargs": eb_ck} if eb_ck else {})}

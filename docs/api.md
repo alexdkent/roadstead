@@ -2660,7 +2660,16 @@ what its `type` says). An endpoint that declares both spellings renames nothing,
 that declares nothing is left alone. It composes with the effort policy: `reasoning_effort:
 "none"` still becomes the declared keys `false` (§3.14d / `fold_caller_effort`) — that runs first
 and writes only declared keys, so there is nothing left to rename.
-`reliability.think_switch_renamed` / `think_switch_renamed_by_endpoint` and the log marker
+
+The caller's switch is read **before** any endpoint default is written: the rename runs at request
+intake, ahead of the corrections that inject the endpoint's own default (a forced reasoner's
+declared switch + `policy.reasoning_effort`), and again at the last hop as a backstop for a path
+that never passes intake. So "the declared key is present" always means *the caller sent it*, and
+an endpoint default never outranks a caller's explicit switch under any spelling. (On 139494c a
+forced reasoner declaring `[enable_thinking]` received `{thinking: false}` and answered WITH
+reasoning: the default had already been written, the rename took it for the caller's, and the real
+"off" was dropped — counted as `thinking->dropped`.) A caller that says nothing still gets the
+default. `reliability.think_switch_renamed` / `think_switch_renamed_by_endpoint` and the log marker
 `ROADSTEAD_THINK_SWITCH_RENAMED` say who is spelling it the other way.
 
 **2. A trace that carries a marker — repaired.** Some engines leave the tag in `content`: llama.cpp
@@ -2696,9 +2705,18 @@ uses — `reasoning` for vLLM, `reasoning_content` otherwise — never a third s
   not guess where reasoning ends. Streaming repair inspects `choices[0]` only: a stream with
   `n > 1` is passed through unrepaired.
 * The **answer-now re-ask** (§3.14) builds its thinking switch from the endpoint's declaration and
-  keeps the caller's other `chat_template_kwargs`. On a no-switch endpoint it therefore still
-  reasons; a re-ask that spends its budget on reasoning and returns no content is a *failed*
-  rescue (the loop-break error is returned, and `reasoning_loops_answered` is not counted).
+  keeps the caller's other `chat_template_kwargs`. On a no-switch endpoint it still reasons, so it
+  is **bounded** instead: it requests the endpoint's **lowest declared effort** (the lowest of the
+  values of `policy.reasoning_effort_map`, `policy.thinking_effort` and `policy.reasoning_effort`,
+  ranked `minimal < low < medium < high < xhigh < max`; a word off that ladder, and `none`, are
+  never picked; nothing declared ⇒ nothing injected) in place of whatever effort the caller sent,
+  and — on a **vLLM** endpoint that declares `policy.thinking_budget_ratio` or
+  `policy.reasoning_budget_tokens` (the launch flag that makes it legal) — a
+  `thinking_token_budget` of half the answer reserve clamped to 512..2,000 tokens, with the reserve
+  added **on top** of `max_tokens` (total = budget + reserve, so the answer keeps its full room).
+  llama.cpp and switch-bearing endpoints get no budget field. A re-ask that still returns no
+  content is a *failed* rescue (the loop-break error is returned, and `reasoning_loops_answered` is
+  not counted).
 
 `GET /v1/status` → `reliability.think_switch_stripped` and `think_switch_stripped_by_endpoint`
 (`{endpoint: {count, spellings{"chat_template_kwargs.enable_thinking=false": n}}}` — a boolean

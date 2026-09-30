@@ -414,6 +414,26 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Fixed
 
+- **A caller's explicit thinking switch now beats the endpoint default, under any spelling.** On a
+  forced reasoner that declares its switch and an effort default (tier2-flash: `thinking_kwargs:
+  [enable_thinking]`), a caller's `chat_template_kwargs: {thinking: false}` was DROPPED and the
+  reply carried reasoning (measured on 139494c: counter `thinking->dropped`, 84 chars of
+  reasoning; `{enable_thinking: false}` gave 0). Cause: `apply_forced_reasoning_budget` wrote the
+  declared key (the endpoint default, `true`) before the last-hop rename ran, and the rename's rule
+  "a declared key already present is the caller's" then read the proxy's own value as theirs. The
+  rename now also runs at request intake (`Correction.canonicalize_thinking_switch`), before any
+  default is injected; the last-hop rename stays as a backstop and the last-hop strip for no-switch
+  endpoints is unchanged. A caller that says nothing still gets the default.
+  `docs/api.md` §3.14e. Pinned by `tests/test_think_bleed.py`.
+
+- **The answer-now re-ask on a no-switch endpoint is bounded.** Such an endpoint (tier3, GLM) cannot
+  be told not to reason, so the re-ask could spend its whole `answer_max` on a trace and return
+  nothing. It now requests the endpoint's lowest declared effort (replacing the caller's) and, on
+  vLLM where the endpoint declares `thinking_budget_ratio`/`reasoning_budget_tokens`, a
+  `thinking_token_budget` (half the answer reserve, clamped to 512..2,000) with the reserve added on
+  top of `max_tokens`. Nothing declared ⇒ nothing injected; switch-bearing and llama.cpp endpoints
+  are unchanged. `docs/api.md` §3.14e.
+
 - **A chain of thought is no longer delivered as the answer.** Measured 2026-09-29 on a vLLM tier
   serving GLM-5.3-Flash with `--reasoning-parser glm45`: that template has no thinking switch (it
   always reasons; only `reasoning_effort` is a lever), but the PARSER stands down for a request

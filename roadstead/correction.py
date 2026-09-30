@@ -41,6 +41,7 @@ from .hooks import degradation
 from .observability import MetricsSample, record_structured_outcome
 from .providers import provider_for
 from .reasoning_replay import replay_key
+from .think_bleed import rename_thinking_switch
 
 # Phase 3 schema-repair backstop deps. json-repair recovers parseable-but-not-
 # valid JSON (fences / trailing prose / trailing commas / a missing brace) before
@@ -2021,6 +2022,44 @@ class Correction:
         except Exception:  # noqa: BLE001 — a correction must never break a response
             logger.debug("reasoning replay store failed (call_site=%s)",
                          req.call_site, exc_info=True)
+
+    def canonicalize_thinking_switch(self, req: QueuedRequest) -> None:
+        """Request-side, FIRST among the reasoning corrections: on an endpoint that
+        declares its switch key(s), carry a caller's other spelling
+        (``thinking`` <-> ``enable_thinking``) onto the declared key, value kept.
+
+        🚨 WHY HERE AND NOT ONLY AT THE LAST HOP. The rename's rule is "a declared
+        key already present is the caller's and wins". That is only true while
+        nothing has written the declared key yet, and
+        :meth:`apply_forced_reasoning_budget` does exactly that (the endpoint's
+        default, ``True``) for a caller that sent no declared key. Measured live
+        on tier2-flash (``[enable_thinking]``, a forced reasoner): a caller's
+        ``chat_template_kwargs: {thinking: false}`` was DROPPED — the last-hop
+        rename saw the proxy's own ``enable_thinking: true``, took it for the
+        caller's, and discarded the real "off"; the reply carried reasoning.
+        ``{enable_thinking: false}`` gave none. Reading the caller's switch under
+        every known spelling BEFORE any default is injected makes "the declared key
+        is present" mean "the caller sent it", so a default can never outrank one.
+
+        ``backend._canonical_switch`` still renames at the last hop, as the
+        backstop for a path that never passes here; on a payload this has already
+        canonicalised it finds nothing to do. Stripping for a NO-switch endpoint is
+        not done here: nothing before the last hop writes a switch there, so the
+        strip has no ordering problem and stays with the one place every path
+        (including the answer-now re-ask) converges."""
+        p = req.payload
+        if not isinstance(p, dict) or req.payload_type != "chat_completion":
+            return
+        ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
+        declared = tuple(getattr(ep, "thinking_kwargs", ()) or ()) if ep is not None else ()
+        if not declared:
+            return
+        out, found = rename_thinking_switch(p, declared)
+        if not found:
+            return
+        req.payload = out
+        self.state.backend.think_bleed.note_renamed(
+            ep.endpoint_class or ep.role, found, req.request_id)
 
     def apply_forced_reasoning_budget(self, req: QueuedRequest) -> None:
         """Request-side: an endpoint whose model ALWAYS emits a reasoning trace it

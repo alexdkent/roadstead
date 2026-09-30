@@ -90,6 +90,8 @@ repair_message = _maybe("roadstead.think_bleed", "repair_message")
 strip_thinking_switch = _maybe("roadstead.think_bleed", "strip_thinking_switch")
 _answer_now_switch_off = _maybe("roadstead.lifecycle", "_answer_now_switch_off")
 _answer_now_template_kwargs = _maybe("roadstead.lifecycle", "_answer_now_template_kwargs")
+_lowest_declared_effort = _maybe("roadstead.lifecycle", "_lowest_declared_effort")
+_answer_now_reasoning_budget = _maybe("roadstead.lifecycle", "_answer_now_reasoning_budget")
 
 
 def _need(obj, name: str):
@@ -125,6 +127,9 @@ SCHEMA_FORMAT = {"type": "json_schema", "json_schema": {
 #                        not declare `reasoning` at all, so repair must not act here
 #   tier1  llama.cpp   — reasoning-capable, says NOTHING about a switch (UNDECLARED),
 #                        which is the case that must never be stripped
+#   flash  llama.cpp   — a FORCED reasoner that declares its switch AND an effort
+#                        default, so `apply_forced_reasoning_budget` writes the declared
+#                        key for a caller that said nothing (tier2-flash's shape)
 _CATALOG = """
 providers:
   glm-box: {engine: vllm, host: 127.0.0.1, port: 1}
@@ -154,6 +159,15 @@ endpoints:
     slots: 4
     context_per_slot: 8192
     capabilities: {reasoning: true, streaming: true, tool_calling: true, structured_output: true}
+  flash:
+    provider: cpp-box
+    kind: chat
+    slots: 4
+    context_per_slot: 8192
+    capabilities: {reasoning: true, streaming: true, tool_calling: true, structured_output: true}
+    policy:
+      thinking_kwargs: [enable_thinking]
+      reasoning_effort: low
 """
 
 
@@ -615,6 +629,88 @@ def test_rename_is_a_no_op_when_nothing_is_foreign():
         assert out is p and found == []
 
 
+# --- the caller's own switch beats the endpoint DEFAULT ------------------------ #
+#
+# Measured live on 139494c: tier2-flash declares `[enable_thinking]` and forces
+# reasoning. A caller's `chat_template_kwargs.thinking: false` was DROPPED (counter
+# `thinking->dropped`) and the reply carried reasoning; `enable_thinking: false` gave
+# none. Cause: `apply_forced_reasoning_budget` wrote the declared key (the endpoint
+# default, True) BEFORE the last-hop rename ran, so the rename read a proxy-injected
+# value as the caller's own and let it win. The caller's spelling is now carried onto
+# the declared key at INTAKE, before any default is written.
+
+FORCED_OFF_SHAPES = {
+    "ck": {"chat_template_kwargs": {"thinking": False}},
+    "extra_body": {"extra_body": {"chat_template_kwargs": {"thinking": False}}},
+}
+
+
+def _forced_switchable(rig: Rig) -> None:
+    rig.fake.reject_chat_template_kwargs = ("thinking",)
+    rig.fake.think = ThinkScript(THINK_SWITCHABLE, REASONING, ANSWER)
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+@pytest.mark.parametrize("door", DOORS)
+@pytest.mark.parametrize("shape", FORCED_OFF_SHAPES)
+async def test_a_foreign_off_beats_the_endpoint_default_on_a_forced_reasoner(
+        rig, shape, door, stream):
+    _forced_switchable(rig)
+    reply = await DOORS[door](rig, "flash", _payload(**FORCED_OFF_SHAPES[shape]), stream)
+    assert reply.status == 200, reply.text[:300]
+    assert reply.content == ANSWER
+    assert reply.reasoning == "", (
+        "the caller said thinking OFF; the endpoint default must not turn it back on")
+    ck = _wire_ck(rig)
+    assert ck.get("enable_thinking") is False, ck
+    assert "thinking" not in ck, ck
+    prefix = "extra_body." if shape == "extra_body" else ""
+    rel = await rig.status()
+    assert rel["think_switch_renamed_by_endpoint"]["flash"]["renames"] == {
+        f"{prefix}chat_template_kwargs.thinking->enable_thinking=false": 1}, (
+        "counted once, and never as `dropped`")
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+async def test_a_foreign_on_is_carried_and_the_declared_effort_still_applies(rig, stream):
+    _forced_switchable(rig)
+    reply = await _openai(
+        rig, "flash", _payload(chat_template_kwargs={"thinking": True}), stream)
+    assert reply.status == 200 and reply.content == ANSWER
+    assert reply.reasoning.strip() == REASONING
+    assert _wire_ck(rig) == {"enable_thinking": True, "reasoning_effort": "low"}
+
+
+@pytest.mark.parametrize("sent,wire_switch", [
+    ({"thinking": False, "enable_thinking": True}, True),
+    ({"thinking": True, "enable_thinking": False}, False)],
+    ids=["declared_on_foreign_off", "declared_off_foreign_on"])
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+async def test_both_spellings_disagreeing_the_declared_key_wins(
+        rig, sent, wire_switch, stream):
+    """The documented rule: a caller who sent the DECLARED key meant it, and the
+    foreign spelling is dropped. Only a caller-sent key qualifies — the proxy's own
+    default never did (the test above)."""
+    _forced_switchable(rig)
+    reply = await _openai(rig, "flash", _payload(chat_template_kwargs=sent), stream)
+    assert reply.status == 200 and reply.content == ANSWER
+    ck = _wire_ck(rig)
+    assert ck.get("enable_thinking") is wire_switch and "thinking" not in ck, ck
+    assert (reply.reasoning.strip() == REASONING) is wire_switch
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+async def test_a_caller_that_says_nothing_gets_the_endpoint_default(rig, stream):
+    """CONTROL: the default must still apply, or the fix above is just "never
+    inject"."""
+    _forced_switchable(rig)
+    reply = await _openai(rig, "flash", _payload(), stream)
+    assert reply.status == 200 and reply.content == ANSWER
+    assert reply.reasoning.strip() == REASONING
+    assert _wire_ck(rig) == {"enable_thinking": True, "reasoning_effort": "low"}
+    assert await rig.counter("think_switch_renamed") == 0
+
+
 # --- composition with the effort policy -------------------------------------- #
 
 async def test_a_callers_real_effort_still_works_on_a_no_switch_endpoint(rig):
@@ -692,10 +788,10 @@ def _loop_text() -> str:
     return "Need to check the table again, same cell, same value. " * 80
 
 
-def _arm_answer_now(rig: Rig, monkeypatch) -> None:
+def _arm_answer_now(rig: Rig, monkeypatch, endpoint: str = "tier3") -> None:
     monkeypatch.setenv("ROADSTEAD_PROXY_REASONING_LOOP_SHADOW", "0")
     monkeypatch.setenv("ROADSTEAD_PROXY_REASONING_LOOP_ANSWER_NOW", "1")
-    ep = rig.svc._config.endpoints["tier3"]
+    ep = rig.svc._config.endpoints[endpoint]
     ep.reasoning_loop_window_chars = 800
     ep.reasoning_loop_min_chars = 800
     ep.reasoning_loop_max_distinct_ratio = 0.5
@@ -751,18 +847,18 @@ async def test_a_reask_that_spends_its_budget_on_reasoning_is_not_counted_as_ans
 
 
 async def test_the_reask_keeps_the_callers_other_template_kwargs(rig, monkeypatch):
-    """`reasoning_effort` and any template variable describe the PROMPT, not the
-    mode: dropping them changed what the re-ask rendered. Only switches go."""
+    """A template variable describes the PROMPT, not the mode: dropping it changed
+    what the re-ask rendered. Only the switch goes — and, on a no-switch endpoint
+    that declares effort rungs, the effort is the endpoint's LOWEST (below)."""
     _arm_answer_now(rig, monkeypatch)
     rig.fake.think = _looping_then(
         ThinkScript(THINK_GLM_VLLM, "notes", ANSWER, chunk_chars=40))
     reply = await _openai(rig, "tier3", _payload(
         max_tokens=256,
-        chat_template_kwargs={"reasoning_effort": "high", "enable_thinking": False,
-                              "my_var": 7}), True)
+        chat_template_kwargs={"enable_thinking": False, "my_var": 7}), True)
     assert reply.content == ANSWER
     assert rig.chat_bodies()[1]["chat_template_kwargs"] == {
-        "reasoning_effort": "high", "my_var": 7}
+        "reasoning_effort": "low", "my_var": 7}
 
 
 @pytest.mark.parametrize("declared,expected", [
@@ -779,6 +875,167 @@ def test_answer_now_template_kwargs_per_declaration(declared, expected):
     payload = {"chat_template_kwargs": {"reasoning_effort": "high", "thinking": True,
                                         "enable_thinking": True}}
     assert build(payload, eps[declared]) == expected
+
+
+# --- the re-ask on a no-switch endpoint is BOUNDED ---------------------------- #
+#
+# A no-switch endpoint cannot be told not to reason, so the re-ask reasons and could
+# spend its whole `answer_max` on it (a failed rescue). Two bounds, both built from
+# the endpoint's own declarations: its LOWEST declared effort rung, and (vLLM only, and
+# only where the endpoint declares the launch flag that makes it legal) a
+# `thinking_token_budget` with the answer reserve added on top of `max_tokens`.
+
+#: tier3-shaped rungs: `none`/`minimal`/`low` all land on `low`; `ultra` is off the
+#: ladder the code knows and must never be picked.
+_RUNGS = {"none": "low", "minimal": "low", "low": "low", "medium": "high",
+          "high": "high", "xhigh": "high", "max": "max", "ultra": "max"}
+
+
+def _declare_bound(ep, *, effort_map=None, thinking_effort="", ratio=0.6):
+    ep.reasoning_effort_map = dict(effort_map or {})
+    ep.thinking_effort = thinking_effort
+    ep.thinking_budget_ratio = ratio
+
+
+async def _reask_body(rig, monkeypatch, endpoint="tier3", **payload) -> dict:
+    _arm_answer_now(rig, monkeypatch, endpoint)
+    rig.fake.think = _looping_then(
+        ThinkScript(THINK_GLM_VLLM, "notes", ANSWER, chunk_chars=40))
+    await _openai(rig, endpoint, _payload(**payload), True)
+    assert len(rig.chat_bodies()) == 2, "the re-ask never happened — the test is blind"
+    return rig.chat_bodies()[1]
+
+
+async def test_the_reask_on_a_no_switch_vllm_endpoint_asks_for_the_lowest_effort_and_a_budget(
+        rig, monkeypatch):
+    _declare_bound(rig.svc._config.endpoints["tier3"], effort_map=_RUNGS,
+                   thinking_effort="high")
+    body = await _reask_body(
+        rig, monkeypatch, max_tokens=256, reasoning_effort="high",
+        chat_template_kwargs={"reasoning_effort": "max", "my_var": 7})
+    assert body["chat_template_kwargs"] == {"reasoning_effort": "low", "my_var": 7}
+    assert "reasoning_effort" not in body, (
+        "a top-level effort beside the injected one is a 'conflicting reasoning_effort' 400")
+    budget = body["thinking_token_budget"]
+    assert budget == _need(_answer_now_reasoning_budget, "lifecycle._answer_now_reasoning_budget")(
+        rig.svc._config.endpoints["tier3"], 256)
+    assert 0 < budget
+    assert body["max_tokens"] == 256 + budget, (
+        "the answer reserve must sit ON TOP of the reasoning budget, not inside it")
+    _assert_no_switch_on_the_wire(body)
+
+
+async def test_the_reask_effort_also_replaces_one_nested_in_extra_body(rig, monkeypatch):
+    """`extra_body` is merged over the top level by the provider, so an effort left in
+    there would win over the lowest one."""
+    _declare_bound(rig.svc._config.endpoints["tier3"], effort_map=_RUNGS)
+    body = await _reask_body(
+        rig, monkeypatch, max_tokens=256,
+        extra_body={"chat_template_kwargs": {"reasoning_effort": "max", "my_var": 7}})
+    assert body["chat_template_kwargs"] == {"reasoning_effort": "low", "my_var": 7}
+
+
+async def test_a_reask_bound_is_absent_where_the_endpoint_declares_no_budget_support(
+        rig, monkeypatch):
+    """vLLM 400s the WHOLE request when `thinking_token_budget` arrives at a server
+    launched without `--reasoning-config`; `thinking_budget_ratio` is the mirror of
+    that flag. No declaration, no field — the effort still applies."""
+    _declare_bound(rig.svc._config.endpoints["tier3"], effort_map=_RUNGS, ratio=0.0)
+    body = await _reask_body(rig, monkeypatch, max_tokens=256)
+    assert "thinking_token_budget" not in body
+    assert body["max_tokens"] == 256
+    assert body["chat_template_kwargs"] == {"reasoning_effort": "low"}
+
+
+async def test_a_reask_on_an_endpoint_with_no_declared_rungs_invents_no_effort(
+        rig, monkeypatch):
+    """No map, no `thinking_effort`, no `reasoning_effort`: nothing to pick from, so
+    nothing is injected and the caller's own effort is left as it was. The budget does
+    not depend on the rungs."""
+    _declare_bound(rig.svc._config.endpoints["tier3"])
+    body = await _reask_body(
+        rig, monkeypatch, max_tokens=256,
+        chat_template_kwargs={"reasoning_effort": "high"})
+    assert body["chat_template_kwargs"] == {"reasoning_effort": "high"}
+    assert body["thinking_token_budget"] > 0
+
+
+async def test_a_reask_on_a_no_switch_llamacpp_endpoint_gets_no_budget_field(
+        rig, monkeypatch):
+    """llama.cpp names its cap `reasoning_budget_tokens` and the bound here is vLLM's
+    mechanism only: no field of either name, `max_tokens` untouched."""
+    ep = rig.svc._config.endpoints["tier1"]
+    ep.no_thinking_switch = True
+    _declare_bound(ep, effort_map=_RUNGS)
+    body = await _reask_body(rig, monkeypatch, endpoint="tier1", max_tokens=256)
+    assert "thinking_token_budget" not in body
+    assert "reasoning_budget_tokens" not in body
+    # tier1 is a forced reasoner, so the first call's cap was padded; the re-ask
+    # inherits it and adds nothing of its own.
+    assert body["max_tokens"] == rig.chat_bodies()[0]["max_tokens"]
+
+
+async def test_a_reask_on_a_switch_endpoint_is_unchanged(rig, monkeypatch):
+    """The switch turns thinking off there; nothing about effort or a budget is
+    added, whatever rungs and ratio the endpoint declares."""
+    ep = rig.svc._config.endpoints["tier2"]
+    ep.engine = "vllm"
+    _declare_bound(ep, effort_map=_RUNGS, thinking_effort="low")
+    body = await _reask_body(
+        rig, monkeypatch, endpoint="tier2", max_tokens=256,
+        chat_template_kwargs={"reasoning_effort": "high", "enable_thinking": True})
+    assert body["chat_template_kwargs"] == {"reasoning_effort": "high",
+                                            "enable_thinking": False}
+    assert "thinking_token_budget" not in body
+    assert body["max_tokens"] == 256
+
+
+@pytest.mark.parametrize("answer_max,expected", [
+    (64, 512),          # the floor: a tiny answer must not starve its own reasoning
+    (256, 512),
+    (2048, 1024),       # half the answer reserve
+    (4000, 2000),
+    (8000, 2000),       # the ceiling: the bound must actually bind
+])
+def test_the_reask_reasoning_budget_is_a_bounded_fraction_of_the_answer_reserve(
+        tmp_path, answer_max, expected):
+    budget = _need(_answer_now_reasoning_budget, "lifecycle._answer_now_reasoning_budget")
+    ep = _endpoints(tmp_path, "127.0.0.1", 1)["tier3"]
+    ep.thinking_budget_ratio = 0.6
+    assert budget(ep, answer_max) == expected
+
+
+def test_the_reask_reasoning_budget_is_zero_off_its_mechanism(tmp_path):
+    budget = _need(_answer_now_reasoning_budget, "lifecycle._answer_now_reasoning_budget")
+    eps = _endpoints(tmp_path, "127.0.0.1", 1)
+    eps["tier3"].thinking_budget_ratio = 0.6
+    assert budget(eps["tier3"], 256) > 0
+    eps["tier3"].thinking_budget_ratio = 0.0
+    assert budget(eps["tier3"], 256) == 0                # no launch flag declared
+    eps["tier3"].reasoning_budget_tokens = 700
+    assert budget(eps["tier3"], 256) > 0                 # an absolute cap declares it too
+    for name in ("tier1", "tier2"):
+        eps[name].thinking_budget_ratio = 0.6
+    assert budget(eps["tier2"], 256) == 0                # has a switch
+    eps["tier1"].no_thinking_switch = True
+    assert budget(eps["tier1"], 256) == 0                # llama.cpp names it differently
+
+
+@pytest.mark.parametrize("declared,expected", [
+    ({"effort_map": _RUNGS}, "low"),
+    ({"effort_map": {"medium": "high", "max": "max"}}, "high"),
+    ({"effort_map": {"max": "max"}, "thinking_effort": "high"}, "high"),
+    ({"thinking_effort": "LOW "}, "LOW"),                # verbatim, trimmed
+    ({"effort_map": {"none": "none", "x": "ultra", "y": "bogus"}}, ""),
+    ({"effort_map": {"a": "xhigh", "b": "max"}}, "xhigh"),
+    ({}, "")])
+def test_the_lowest_declared_effort_is_picked_from_declared_words_only(
+        tmp_path, declared, expected):
+    lowest = _need(_lowest_declared_effort, "lifecycle._lowest_declared_effort")
+    ep = _endpoints(tmp_path, "127.0.0.1", 1)["tier3"]
+    ep.reasoning_effort_map = dict(declared.get("effort_map", {}))
+    ep.thinking_effort = declared.get("thinking_effort", "")
+    assert lowest(ep) == expected
 
 
 # --- unit level: the strip itself -------------------------------------------- #
