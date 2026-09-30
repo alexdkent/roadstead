@@ -179,18 +179,22 @@ _PAYLOAD_KIND = {
 #: was not.
 _ANSWER_NOW_MAX_TOKENS = 8000
 
-#: The re-ask's REASONING bound on an endpoint with NO thinking switch
-#: (``lifecycle._answer_now_reasoning_budget``). Such an endpoint cannot be told not
-#: to reason, so without a bound the re-ask can spend its whole ``answer_max`` on a
-#: trace and return no content. vLLM's ``thinking_token_budget`` caps the trace, and
-#: the answer reserve (``answer_max``) is ADDED to ``max_tokens`` on top of it, so
-#: the total is ``budget + answer_max`` and the answer always keeps its full room.
-#: Half the reserve, clamped: the floor stops a tiny caller ``max_tokens`` starving
-#: the reasoning it needs to state an answer at all, the ceiling keeps the bound
-#: binding when the reserve is large — the whole re-ask can never exceed
-#: ``_ANSWER_NOW_MAX_TOKENS + _ANSWER_NOW_REASONING_MAX_TOKENS``. CHOSEN, NOT
-#: MEASURED: at the lowest effort a rescue that already has its notes should need a
-#: few hundred reasoning tokens; a probe at a BINDING shape is what would move these.
+#: The re-ask's REASONING bound on a no-switch endpoint that has OPTED IN
+#: (``policy.answer_now_reasoning_budget``, absent => off; see
+#: ``lifecycle._answer_now_reasoning_budget``). Such an endpoint cannot be told not
+#: to reason, so the re-ask can spend its whole ``answer_max`` on a trace. vLLM's
+#: ``thinking_token_budget`` would cap the trace, with the answer reserve
+#: (``answer_max``) ADDED to ``max_tokens`` on top (total = budget + answer_max).
+#:
+#: 🚨 IT IS OFF BY DEFAULT BECAUSE A BINDING BUDGET REINTRODUCES THE BLEED.
+#: Measured live 2026-09-30 on tier3 (GLM-5.3-Flash, direct vLLM), budget 16 forced
+#: to bind (``reasoning_tokens`` exactly 16), effort low and high, N=6: on 4 of 6 runs
+#: the cut reasoning spilled into ``content`` and one hit ``finish=length`` (vLLM
+#: #39697 family). At budgets 64/512 it never bound (natural low-effort reasoning is
+#: ~30-150 tokens): 0 leaks and no evidence either way. What IS the default is the
+#: lowest declared effort, whose controls reasoned ~50 tokens and answered cleanly.
+#: These three numbers are CHOSEN, NOT MEASURED; declare the opt-in only for an
+#: endpoint probed clean at a BINDING shape. Half the reserve, clamped to 512..2000.
 _ANSWER_NOW_REASONING_FRACTION = 0.5
 _ANSWER_NOW_REASONING_MIN_TOKENS = 512
 _ANSWER_NOW_REASONING_MAX_TOKENS = 2000

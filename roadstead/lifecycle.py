@@ -162,8 +162,9 @@ def _answer_now_switch_off(ep_cfg) -> dict:
 
     🚨 On a no-switch endpoint the re-ask therefore STILL REASONS: nothing can
     turn that off. It is asked for the answer and budgeted for the answer
-    (``_ANSWER_NOW_MAX_TOKENS``), so it is BOUNDED instead —
-    :func:`_lowest_declared_effort` and :func:`_answer_now_reasoning_budget`. A
+    (``_ANSWER_NOW_MAX_TOKENS``), so it is LOWERED instead —
+    :func:`_lowest_declared_effort`, plus the opt-in
+    :func:`_answer_now_reasoning_budget`. A
     re-ask that still returns no content is a failed rescue, not a served one.
     ``backend`` removes any switch a later edit might add here
     (``strip_thinking_switch``)."""
@@ -194,15 +195,21 @@ def _lowest_declared_effort(ep_cfg) -> str:
 
 def _answer_now_reasoning_budget(ep_cfg, answer_max: int) -> int:
     """Tokens of REASONING the answer-now re-ask may spend on an endpoint that has
-    no thinking switch, or 0 = no bound available.
+    no thinking switch, or 0 = no bound (THE DEFAULT).
 
-    Only where the mechanism exists and is safe to send: a declared no-switch
-    endpoint on a vLLM provider (llama.cpp names its cap differently and this is
-    not that mechanism), that DECLARES the launch flag which makes
+    Opt-in only (``policy.answer_now_reasoning_budget``): measured 2026-09-30, a
+    BINDING ``thinking_token_budget`` on GLM-5.3-Flash spilled the cut reasoning into
+    ``content`` on 4 of 6 runs — the bleed ``think_bleed`` exists to remove — so
+    nothing is sent unless an operator has declared the endpoint measured clean.
+    Even then only where the mechanism exists and is safe to send: a declared
+    no-switch endpoint on a vLLM provider (llama.cpp names its cap differently and
+    this is not that mechanism), that DECLARES the launch flag which makes
     ``thinking_token_budget`` legal (``thinking_budget_ratio`` or an absolute
     ``reasoning_budget_tokens``) — vLLM 400s the whole request otherwise, which
     would turn a rescue into a failure. A switch-bearing endpoint is not bounded
     here; its switch turns thinking off."""
+    if not getattr(ep_cfg, "answer_now_reasoning_budget", False):
+        return 0
     if not getattr(ep_cfg, "no_thinking_switch", False):
         return 0
     if provider_for(ep_cfg).name != "vllm":
@@ -3039,12 +3046,12 @@ class Lifecycle:
         (see :func:`_answer_now_switch_off`). Leaving it on re-enters the regime
         that just looped, and there is nothing left to deliberate about — the
         deliberation is in the notes. On an endpoint that declares NO switch there
-        is nothing to turn off, so the re-ask may reason and is BOUNDED instead:
+        is nothing to turn off, so the re-ask may reason and is LOWERED instead:
         the endpoint's lowest declared effort (:func:`_lowest_declared_effort`,
         replacing whatever effort the caller sent — the caller's effort is what the
-        looping call ran at) and, on vLLM, a ``thinking_token_budget`` with the
-        answer reserve added on top of ``max_tokens``
-        (:func:`_answer_now_reasoning_budget`). If it still returns no content,
+        looping call ran at) and, ONLY on an endpoint that opted in, a vLLM
+        ``thinking_token_budget`` with the answer reserve added on top of
+        ``max_tokens`` (:func:`_answer_now_reasoning_budget`). If it still returns no content,
         that is a FAILED rescue and is reported as one (``(0, False)``, and
         ``reasoning_loops_answered`` is not counted).
 
@@ -3082,11 +3089,11 @@ class Lifecycle:
                 "stream": True,
             }
             kwargs = _answer_now_template_kwargs(payload, ep_cfg)
-            # A NO-SWITCH endpoint still reasons on this turn, so bound it: the
-            # lowest effort it declares, and a reasoning budget with the answer
-            # reserve added ON TOP (vLLM counts both against `max_tokens`, so the
-            # total is budget + answer_max and the answer keeps its full room).
-            # A switch-bearing endpoint is untouched — its switch is off.
+            # A NO-SWITCH endpoint still reasons on this turn, so lower it: the
+            # lowest effort it declares. A reasoning BUDGET (answer reserve added ON
+            # TOP of `max_tokens`) only where the endpoint opted in — a binding one
+            # leaked reasoning into `content` when measured. A switch-bearing
+            # endpoint is untouched — its switch is off.
             effort = ""
             if getattr(ep_cfg, "no_thinking_switch", False):
                 effort = _lowest_declared_effort(ep_cfg)

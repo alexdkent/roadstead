@@ -450,6 +450,23 @@ class EndpointConfig:
     #: open-tag shape (``<think>…``) needs no opt-in: its first characters decide it.
     #: Also widens the non-streaming repair to endpoints that do not force reasoning.
     repair_close_only_reasoning: bool = False
+    #: Opt in to a ``thinking_token_budget`` on the answer-now re-ask of a NO-switch
+    #: vLLM endpoint, from ``policy.answer_now_reasoning_budget``. False = undeclared:
+    #: no budget field is sent and ``max_tokens`` is not inflated (the re-ask is still
+    #: pinned to the endpoint's lowest declared effort). Also needs the launch flag
+    #: declared (``thinking_budget_ratio`` / ``reasoning_budget_tokens``).
+    #:
+    #: 🚨 OFF BECAUSE A BINDING BUDGET REINTRODUCES THE BLEED. Measured live
+    #: 2026-09-30 on tier3 (GLM-5.3-Flash, direct vLLM), ``thinking_token_budget`` 16
+    #: forced to bind (``reasoning_tokens`` exactly 16 every run), effort low and high,
+    #: N=6: on 4 of 6 runs the CUT reasoning spilled into ``content``
+    #: (``'3·35, 5·21, 7·15. Pairs: (53,52)…## Setting Up'``,
+    #: ``'We need x² - y² = (x-y)(x+y) =105…'``) and one hit ``finish=length`` — the
+    #: think-bleed this work removes, via the vLLM #39697 family. At budgets 64 and 512
+    #: the budget never bound (natural low-effort reasoning is ~30-150 tokens): 0 leaks,
+    #: and 0 evidence the bound is safe when it does. Declare it only for an endpoint
+    #: whose binding behaviour has been measured clean.
+    answer_now_reasoning_budget: bool = False
     #: Reasoning EFFORT to apply on the proxy's ``thinking:`` opt-in, for a
     #: model that has NO thinking switch at all — i.e. ``thinking_kwargs`` is
     #: empty because the chat template always reasons and the only lever is

@@ -426,13 +426,15 @@ summary. The bullets below link in there where the long version is worth reading
   endpoints is unchanged. A caller that says nothing still gets the default.
   `docs/api.md` §3.14e. Pinned by `tests/test_think_bleed.py`.
 
-- **The answer-now re-ask on a no-switch endpoint is bounded.** Such an endpoint (tier3, GLM) cannot
-  be told not to reason, so the re-ask could spend its whole `answer_max` on a trace and return
-  nothing. It now requests the endpoint's lowest declared effort (replacing the caller's) and, on
-  vLLM where the endpoint declares `thinking_budget_ratio`/`reasoning_budget_tokens`, a
-  `thinking_token_budget` (half the answer reserve, clamped to 512..2,000) with the reserve added on
-  top of `max_tokens`. Nothing declared ⇒ nothing injected; switch-bearing and llama.cpp endpoints
-  are unchanged. `docs/api.md` §3.14e.
+- **The answer-now re-ask on a no-switch endpoint requests the lowest declared effort.** Such an
+  endpoint (tier3, GLM) cannot be told not to reason, so the re-ask could spend its whole
+  `answer_max` on a trace and return nothing. It now requests the endpoint's lowest declared effort
+  (replacing the caller's; nothing declared ⇒ nothing injected). A vLLM `thinking_token_budget`
+  (half the answer reserve clamped to 512..2,000, reserve added on top of `max_tokens`) is available
+  as an opt-in, `policy.answer_now_reasoning_budget` (absent ⇒ off), and is **off by default**
+  because a binding budget reintroduced the bleed — measured 2026-09-30 on tier3, budget 16, N=6:
+  cut reasoning spilled into `content` on 4 of 6 runs. Switch-bearing and llama.cpp endpoints are
+  unchanged. `docs/api.md` §3.14e.
 
 - **A chain of thought is no longer delivered as the answer.** Measured 2026-09-29 on a vLLM tier
   serving GLM-5.3-Flash with `--reasoning-parser glm45`: that template has no thinking switch (it

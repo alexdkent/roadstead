@@ -2706,17 +2706,20 @@ uses — `reasoning` for vLLM, `reasoning_content` otherwise — never a third s
   `n > 1` is passed through unrepaired.
 * The **answer-now re-ask** (§3.14) builds its thinking switch from the endpoint's declaration and
   keeps the caller's other `chat_template_kwargs`. On a no-switch endpoint it still reasons, so it
-  is **bounded** instead: it requests the endpoint's **lowest declared effort** (the lowest of the
-  values of `policy.reasoning_effort_map`, `policy.thinking_effort` and `policy.reasoning_effort`,
-  ranked `minimal < low < medium < high < xhigh < max`; a word off that ladder, and `none`, are
-  never picked; nothing declared ⇒ nothing injected) in place of whatever effort the caller sent,
-  and — on a **vLLM** endpoint that declares `policy.thinking_budget_ratio` or
-  `policy.reasoning_budget_tokens` (the launch flag that makes it legal) — a
-  `thinking_token_budget` of half the answer reserve clamped to 512..2,000 tokens, with the reserve
-  added **on top** of `max_tokens` (total = budget + reserve, so the answer keeps its full room).
-  llama.cpp and switch-bearing endpoints get no budget field. A re-ask that still returns no
-  content is a *failed* rescue (the loop-break error is returned, and `reasoning_loops_answered` is
-  not counted).
+  is **lowered**: it requests the endpoint's **lowest declared effort** (the lowest of the values
+  of `policy.reasoning_effort_map`, `policy.thinking_effort` and `policy.reasoning_effort`, ranked
+  `minimal < low < medium < high < xhigh < max`; a word off that ladder, and `none`, are never
+  picked; nothing declared ⇒ nothing injected) in place of whatever effort the caller sent. A
+  **reasoning budget is an opt-in**: only with `policy.answer_now_reasoning_budget: true` (absent
+  ⇒ off), on a **vLLM** endpoint that also declares `policy.thinking_budget_ratio` or
+  `policy.reasoning_budget_tokens`, does the re-ask carry a `thinking_token_budget` (half the answer
+  reserve clamped to 512..2,000 tokens, the reserve added **on top** of `max_tokens`). It is off by
+  default because a BINDING budget reintroduced the bleed: measured 2026-09-30 on GLM-5.3-Flash
+  (budget 16, N=6), the cut reasoning spilled into `content` on 4 of 6 runs; at budgets 64/512 it
+  never bound, so there is no evidence it is safe. Declare it only for an endpoint probed clean at a
+  binding shape. llama.cpp and switch-bearing endpoints never get a budget field. A re-ask that
+  still returns no content is a *failed* rescue (the loop-break error is returned, and
+  `reasoning_loops_answered` is not counted).
 
 `GET /v1/status` → `reliability.think_switch_stripped` and `think_switch_stripped_by_endpoint`
 (`{endpoint: {count, spellings{"chat_template_kwargs.enable_thinking=false": n}}}` — a boolean

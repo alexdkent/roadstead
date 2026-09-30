@@ -877,13 +877,15 @@ def test_answer_now_template_kwargs_per_declaration(declared, expected):
     assert build(payload, eps[declared]) == expected
 
 
-# --- the re-ask on a no-switch endpoint is BOUNDED ---------------------------- #
+# --- the re-ask on a no-switch endpoint is LOWERED, and BOUNDED only on opt-in - #
 #
 # A no-switch endpoint cannot be told not to reason, so the re-ask reasons and could
-# spend its whole `answer_max` on it (a failed rescue). Two bounds, both built from
-# the endpoint's own declarations: its LOWEST declared effort rung, and (vLLM only, and
-# only where the endpoint declares the launch flag that makes it legal) a
-# `thinking_token_budget` with the answer reserve added on top of `max_tokens`.
+# spend its whole `answer_max` on it (a failed rescue). By default it is pinned to the
+# endpoint's LOWEST declared effort rung. A `thinking_token_budget` (with the answer
+# reserve added on top of `max_tokens`) is an OPT-IN, `policy.answer_now_reasoning_
+# budget`, because measured 2026-09-30 on tier3 a BINDING budget of 16 spilled the cut
+# reasoning into `content` on 4 of 6 runs — the bleed this file exists to prevent. The
+# fake cannot reproduce that; what these tests pin is that nothing is sent by default.
 
 #: tier3-shaped rungs: `none`/`minimal`/`low` all land on `low`; `ultra` is off the
 #: ladder the code knows and must never be picked.
@@ -891,10 +893,11 @@ _RUNGS = {"none": "low", "minimal": "low", "low": "low", "medium": "high",
           "high": "high", "xhigh": "high", "max": "max", "ultra": "max"}
 
 
-def _declare_bound(ep, *, effort_map=None, thinking_effort="", ratio=0.6):
+def _declare_bound(ep, *, effort_map=None, thinking_effort="", ratio=0.6, opt_in=False):
     ep.reasoning_effort_map = dict(effort_map or {})
     ep.thinking_effort = thinking_effort
     ep.thinking_budget_ratio = ratio
+    ep.answer_now_reasoning_budget = opt_in
 
 
 async def _reask_body(rig, monkeypatch, endpoint="tier3", **payload) -> dict:
@@ -906,8 +909,10 @@ async def _reask_body(rig, monkeypatch, endpoint="tier3", **payload) -> dict:
     return rig.chat_bodies()[1]
 
 
-async def test_the_reask_on_a_no_switch_vllm_endpoint_asks_for_the_lowest_effort_and_a_budget(
+async def test_the_reask_on_a_no_switch_vllm_endpoint_asks_for_the_lowest_effort_and_no_budget(
         rig, monkeypatch):
+    """The DEFAULT: the lowest declared effort, and NO budget field and no
+    `max_tokens` inflation, even though the endpoint declares the launch flag."""
     _declare_bound(rig.svc._config.endpoints["tier3"], effort_map=_RUNGS,
                    thinking_effort="high")
     body = await _reask_body(
@@ -916,10 +921,22 @@ async def test_the_reask_on_a_no_switch_vllm_endpoint_asks_for_the_lowest_effort
     assert body["chat_template_kwargs"] == {"reasoning_effort": "low", "my_var": 7}
     assert "reasoning_effort" not in body, (
         "a top-level effort beside the injected one is a 'conflicting reasoning_effort' 400")
+    assert "thinking_token_budget" not in body
+    assert body["max_tokens"] == 256
+    _assert_no_switch_on_the_wire(body)
+
+
+async def test_the_reask_budget_appears_only_when_the_endpoint_opted_in(rig, monkeypatch):
+    budget_for = _need(_answer_now_reasoning_budget,
+                       "lifecycle._answer_now_reasoning_budget")
+    ep = rig.svc._config.endpoints["tier3"]
+    _declare_bound(ep, effort_map=_RUNGS, thinking_effort="high", opt_in=True)
+    body = await _reask_body(
+        rig, monkeypatch, max_tokens=256,
+        chat_template_kwargs={"reasoning_effort": "max", "my_var": 7})
+    assert body["chat_template_kwargs"] == {"reasoning_effort": "low", "my_var": 7}
     budget = body["thinking_token_budget"]
-    assert budget == _need(_answer_now_reasoning_budget, "lifecycle._answer_now_reasoning_budget")(
-        rig.svc._config.endpoints["tier3"], 256)
-    assert 0 < budget
+    assert budget == budget_for(ep, 256) and 0 < budget
     assert body["max_tokens"] == 256 + budget, (
         "the answer reserve must sit ON TOP of the reasoning budget, not inside it")
     _assert_no_switch_on_the_wire(body)
@@ -937,10 +954,11 @@ async def test_the_reask_effort_also_replaces_one_nested_in_extra_body(rig, monk
 
 async def test_a_reask_bound_is_absent_where_the_endpoint_declares_no_budget_support(
         rig, monkeypatch):
-    """vLLM 400s the WHOLE request when `thinking_token_budget` arrives at a server
-    launched without `--reasoning-config`; `thinking_budget_ratio` is the mirror of
-    that flag. No declaration, no field — the effort still applies."""
-    _declare_bound(rig.svc._config.endpoints["tier3"], effort_map=_RUNGS, ratio=0.0)
+    """Even opted in: vLLM 400s the WHOLE request when `thinking_token_budget` arrives
+    at a server launched without `--reasoning-config`; `thinking_budget_ratio` is the
+    mirror of that flag. No declaration, no field — the effort still applies."""
+    _declare_bound(rig.svc._config.endpoints["tier3"], effort_map=_RUNGS, ratio=0.0,
+                   opt_in=True)
     body = await _reask_body(rig, monkeypatch, max_tokens=256)
     assert "thinking_token_budget" not in body
     assert body["max_tokens"] == 256
@@ -951,13 +969,13 @@ async def test_a_reask_on_an_endpoint_with_no_declared_rungs_invents_no_effort(
         rig, monkeypatch):
     """No map, no `thinking_effort`, no `reasoning_effort`: nothing to pick from, so
     nothing is injected and the caller's own effort is left as it was. The budget does
-    not depend on the rungs."""
-    _declare_bound(rig.svc._config.endpoints["tier3"])
+    not depend on the rungs, only on the opt-in."""
+    _declare_bound(rig.svc._config.endpoints["tier3"], opt_in=True)
     body = await _reask_body(
         rig, monkeypatch, max_tokens=256,
         chat_template_kwargs={"reasoning_effort": "high"})
     assert body["chat_template_kwargs"] == {"reasoning_effort": "high"}
-    assert body["thinking_token_budget"] > 0
+    assert body["thinking_token_budget"] > 0        # opted in; rungs are independent
 
 
 async def test_a_reask_on_a_no_switch_llamacpp_endpoint_gets_no_budget_field(
@@ -966,7 +984,7 @@ async def test_a_reask_on_a_no_switch_llamacpp_endpoint_gets_no_budget_field(
     mechanism only: no field of either name, `max_tokens` untouched."""
     ep = rig.svc._config.endpoints["tier1"]
     ep.no_thinking_switch = True
-    _declare_bound(ep, effort_map=_RUNGS)
+    _declare_bound(ep, effort_map=_RUNGS, opt_in=True)
     body = await _reask_body(rig, monkeypatch, endpoint="tier1", max_tokens=256)
     assert "thinking_token_budget" not in body
     assert "reasoning_budget_tokens" not in body
@@ -980,7 +998,7 @@ async def test_a_reask_on_a_switch_endpoint_is_unchanged(rig, monkeypatch):
     added, whatever rungs and ratio the endpoint declares."""
     ep = rig.svc._config.endpoints["tier2"]
     ep.engine = "vllm"
-    _declare_bound(ep, effort_map=_RUNGS, thinking_effort="low")
+    _declare_bound(ep, effort_map=_RUNGS, thinking_effort="low", opt_in=True)
     body = await _reask_body(
         rig, monkeypatch, endpoint="tier2", max_tokens=256,
         chat_template_kwargs={"reasoning_effort": "high", "enable_thinking": True})
@@ -1002,14 +1020,20 @@ def test_the_reask_reasoning_budget_is_a_bounded_fraction_of_the_answer_reserve(
     budget = _need(_answer_now_reasoning_budget, "lifecycle._answer_now_reasoning_budget")
     ep = _endpoints(tmp_path, "127.0.0.1", 1)["tier3"]
     ep.thinking_budget_ratio = 0.6
+    ep.answer_now_reasoning_budget = True
     assert budget(ep, answer_max) == expected
 
 
 def test_the_reask_reasoning_budget_is_zero_off_its_mechanism(tmp_path):
     budget = _need(_answer_now_reasoning_budget, "lifecycle._answer_now_reasoning_budget")
     eps = _endpoints(tmp_path, "127.0.0.1", 1)
+    for ep in eps.values():
+        ep.answer_now_reasoning_budget = True
     eps["tier3"].thinking_budget_ratio = 0.6
     assert budget(eps["tier3"], 256) > 0
+    eps["tier3"].answer_now_reasoning_budget = False
+    assert budget(eps["tier3"], 256) == 0                # the opt-in is the gate
+    eps["tier3"].answer_now_reasoning_budget = True
     eps["tier3"].thinking_budget_ratio = 0.0
     assert budget(eps["tier3"], 256) == 0                # no launch flag declared
     eps["tier3"].reasoning_budget_tokens = 700
@@ -1586,6 +1610,21 @@ def test_the_close_only_opt_in_reaches_endpoint_config(tmp_path):
         cat = model_catalog.load_catalog(path, force=True)
         kw = model_catalog.build_endpoint_kwargs(cat)["tier1"]
         assert EndpointConfig(**kw).repair_close_only_reasoning is expected
+
+
+def test_the_answer_now_budget_opt_in_reaches_endpoint_config(tmp_path):
+    """A `policy:` key missing from `_POLICY_PASSTHROUGH` is dropped in silence, and
+    absent must mean OFF."""
+    for policy, expected in (("answer_now_reasoning_budget: true", True), ("{}", False)):
+        text = _CATALOG.replace(
+            "  tier1:\n    provider: cpp-box\n    kind: chat\n",
+            "  tier1:\n    provider: cpp-box\n    kind: chat\n    policy: "
+            + ("{" + policy + "}" if policy != "{}" else "{}") + "\n")
+        path = tmp_path / f"models-budget-{expected}.yaml"
+        path.write_text(text)
+        cat = model_catalog.load_catalog(path, force=True)
+        kw = model_catalog.build_endpoint_kwargs(cat)["tier1"]
+        assert EndpointConfig(**kw).answer_now_reasoning_budget is expected
 
 
 # --- the stream repairer: prefix hold, errors --------------------------------- #

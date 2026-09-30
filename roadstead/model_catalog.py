@@ -631,6 +631,11 @@ _POLICY_PASSTHROUGH = (
     # latency cost on every no-reasoning stream, so absent = off. Guarded by
     # test_think_bleed.py::test_the_close_only_opt_in_reaches_endpoint_config.
     "repair_close_only_reasoning",
+    # Opt in to a `thinking_token_budget` on the answer-now re-ask of a no-switch
+    # vLLM endpoint. Absent = off: a BINDING budget on GLM-5.3-Flash spilled cut
+    # reasoning into `content` on 4 of 6 runs (2026-09-30). Guarded by
+    # test_think_bleed.py::test_the_answer_now_budget_opt_in_reaches_endpoint_config.
+    "answer_now_reasoning_budget",
     # Prefix keep-alive (roadstead/prefix_keepalive.py). Trigger/idle/cap are
     # plain scalars; `prefix_keepalive_call_sites` is handled OUTSIDE this
     # loop below, for the same reason `thinking_kwargs` is — YAML hands us a
