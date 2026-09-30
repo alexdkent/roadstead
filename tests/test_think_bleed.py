@@ -14,6 +14,9 @@ answer the fake backend intended, and the reasoning it intended must be somewher
 No tag check, no phrase check.
 
 WHAT IT COVERS
+  * CANONICAL FORM — on an endpoint that declares its switch key, a caller's other
+    spelling is carried onto the declared one (an engine that reads only
+    ``enable_thinking`` 400s a ``thinking`` it parses as a different type).
   * PREVENTION — on an endpoint that declares no thinking switch, no switch spelling
     reaches the backend. Every door (``/v1/chat/completions``, ``/v1/submit``,
     ``/rs/v1/chat``) x streaming on/off x every spelling, with tools and with a
@@ -29,7 +32,7 @@ WHAT IT COVERS
 RUNNING IT (the fleet's deploy gate runs this file by path, from a source tree):
 
     cd <tree> && PYTHONPATH=<tree> python -m pytest tests/test_think_bleed.py -q \\
-        -p no:cacheprovider --timeout=120 --rootdir=<tree> -c <tree>/pyproject.toml
+        -p no:cacheprovider --timeout=120
 
 ``PYTHONPATH=<tree>`` is what makes ``import roadstead`` resolve INSIDE the tree under
 test rather than an editable install pointing somewhere else;
@@ -70,10 +73,11 @@ from roadstead.testing import (
 # that need a helper call `_need()`, which FAILS — never skips — when it is missing.
 try:
     from roadstead.think_bleed import (
-        StreamRepair, repair_message, strip_thinking_switch,
+        StreamRepair, rename_thinking_switch, repair_message, strip_thinking_switch,
     )
 except ImportError:                                    # pragma: no cover
-    StreamRepair = repair_message = strip_thinking_switch = None
+    StreamRepair = rename_thinking_switch = repair_message = None
+    strip_thinking_switch = None
 try:
     from roadstead.lifecycle import _answer_now_switch_off
 except ImportError:                                    # pragma: no cover
@@ -449,6 +453,158 @@ async def test_a_structured_reply_is_only_the_json(rig, stream, spelling):
     _assert_the_answer_and_only_the_answer(reply, JSON_ANSWER)
     assert json.loads(reply.content) == {"total": 73915}
     _assert_no_switch_on_the_wire(rig.last_wire_body())
+
+
+# --- a declared switch, spelled differently by the caller ------------------- #
+#
+# The other half of "put the switch in the form the endpoint reads". `tier2` declares
+# `[enable_thinking]` and its fake engine 400s a `thinking` (measured on a
+# Qwen-family engine that parses it as an Anthropic-style object), which the proxy
+# surfaces as a 502. The caller's INTENT must arrive, under the key the template reads.
+
+FOREIGN = {
+    "thinking_false": ({"chat_template_kwargs": {"thinking": False}},
+                       {"enable_thinking": False}),
+    "thinking_true": ({"chat_template_kwargs": {"thinking": True}},
+                      {"enable_thinking": True}),
+    "extra_body_thinking_false":
+        ({"extra_body": {"chat_template_kwargs": {"thinking": False}}},
+         {"enable_thinking": False}),
+    # The caller sent BOTH: its own declared key is the one it meant.
+    "both_declared_wins": ({"chat_template_kwargs": {"thinking": True,
+                                                     "enable_thinking": False}},
+                           {"enable_thinking": False}),
+}
+
+
+def _wire_ck(rig: Rig) -> dict:
+    wire = rig.last_wire_body()
+    return wire.get("chat_template_kwargs") or {}
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+@pytest.mark.parametrize("door", DOORS)
+async def test_a_foreign_switch_spelling_is_carried_onto_the_declared_key(
+        rig, door, stream):
+    rig.fake.reject_chat_template_kwargs = ("thinking",)
+    rig.fake.think = ThinkScript(THINK_SWITCHABLE, REASONING, ANSWER)
+    reply = await DOORS[door](
+        rig, "tier2", _payload(**FOREIGN["thinking_false"][0]), stream)
+    assert reply.status == 200, reply.text[:300]
+    assert reply.content == ANSWER
+    assert reply.reasoning == "", "the caller said thinking OFF; the value must survive"
+    assert _wire_ck(rig) == {"enable_thinking": False}
+
+
+@pytest.mark.parametrize("case", FOREIGN)
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+async def test_every_foreign_spelling_keeps_the_callers_value(rig, case, stream):
+    sent, wire_ck = FOREIGN[case]
+    rig.fake.reject_chat_template_kwargs = ("thinking",)
+    rig.fake.think = ThinkScript(THINK_SWITCHABLE, REASONING, ANSWER)
+    reply = await _openai(rig, "tier2", _payload(**sent), stream)
+    assert reply.status == 200, reply.text[:300]
+    assert reply.content == ANSWER
+    assert _wire_ck(rig) == wire_ck
+    # The value did its job: ON -> the engine reasoned into the reasoning field,
+    # OFF -> it did not reason at all.
+    assert (reply.reasoning.strip() == REASONING) is wire_ck["enable_thinking"]
+
+
+async def test_a_rename_is_counted_and_logged(rig, caplog):
+    rig.fake.reject_chat_template_kwargs = ("thinking",)
+    rig.fake.think = ThinkScript(THINK_SWITCHABLE, REASONING, ANSWER)
+    with caplog.at_level(logging.WARNING, logger="roadstead.think_bleed"):
+        await _openai(rig, "tier2", _payload(**FOREIGN["thinking_false"][0]), False)
+    rel = await rig.status()
+    assert rel["think_switch_renamed"] == 1
+    assert rel["think_switch_renamed_by_endpoint"]["tier2"]["renames"] == {
+        "chat_template_kwargs.thinking->enable_thinking=false": 1}
+    assert "ROADSTEAD_THINK_SWITCH_RENAMED" in caplog.text
+    assert rel["think_switch_stripped"] == 0     # a rename is not a strip
+
+
+async def test_the_declared_spelling_is_forwarded_untouched(rig):
+    rig.fake.reject_chat_template_kwargs = ("thinking",)
+    rig.fake.think = ThinkScript(THINK_SWITCHABLE, REASONING, ANSWER)
+    reply = await _openai(
+        rig, "tier2", _payload(chat_template_kwargs={"enable_thinking": True}), False)
+    assert reply.status == 200 and reply.content == ANSWER
+    assert _wire_ck(rig) == {"enable_thinking": True}
+    assert await rig.counter("think_switch_renamed") == 0
+
+
+async def test_an_endpoint_declaring_both_spellings_renames_nothing(rig):
+    """A template that reads either name (DeepSeek-style) declares both, and then
+    NEITHER spelling is foreign."""
+    rig.svc._config.endpoints["tier1"].thinking_kwargs = ("thinking", "enable_thinking")
+    rig.fake.think = ThinkScript(THINK_CLEAN, REASONING, ANSWER,
+                                 reasoning_key="reasoning_content")
+    reply = await _openai(
+        rig, "tier1", _payload(chat_template_kwargs={"thinking": False}), False)
+    assert reply.status == 200 and reply.content == ANSWER
+    assert _wire_ck(rig) == {"thinking": False}
+    assert await rig.counter("think_switch_renamed") == 0
+
+
+async def test_an_undeclared_endpoint_is_never_renamed(rig):
+    """`tier1` declares nothing — we do not know which key its template reads, so
+    the caller's spelling goes through as sent."""
+    rig.fake.think = ThinkScript(THINK_CLEAN, REASONING, ANSWER,
+                                 reasoning_key="reasoning_content")
+    reply = await _openai(
+        rig, "tier1", _payload(chat_template_kwargs={"thinking": False}), False)
+    assert reply.status == 200
+    assert _wire_ck(rig) == {"thinking": False}
+    assert await rig.counter("think_switch_renamed") == 0
+
+
+def test_rename_carries_the_value_and_never_mutates():
+    rename = _need(rename_thinking_switch, "think_bleed.rename_thinking_switch")
+    declared = ("enable_thinking",)
+    original = {"messages": [], "chat_template_kwargs": {"thinking": False, "keep": 1},
+                "extra_body": {"chat_template_kwargs": {"thinking": True}}}
+    snapshot = json.loads(json.dumps(original))
+    out, found = rename(original, declared)
+    assert original == snapshot
+    assert out["chat_template_kwargs"] == {"keep": 1, "enable_thinking": False}
+    assert out["extra_body"]["chat_template_kwargs"] == {"enable_thinking": True}
+    assert len(found) == 2
+
+
+def test_rename_drops_a_disagreeing_pair_rather_than_pick_one():
+    rename = _need(rename_thinking_switch, "think_bleed.rename_thinking_switch")
+    out, found = rename(
+        {"chat_template_kwargs": {"thinking": True, "enable_thinking": False}},
+        ("some_other_key",))
+    assert out["chat_template_kwargs"] == {}
+    assert found and "dropped" in found[0]
+
+
+@pytest.mark.parametrize("value,carried", [
+    ({"type": "enabled", "budget_tokens": 1024}, True),
+    ({"type": "disabled"}, False),
+    ({"type": "adaptive"}, True),
+    ("yes", None), (1, None), ({"budget_tokens": 5}, None)])
+def test_an_anthropic_style_object_is_read_for_what_it_says_or_dropped(value, carried):
+    """The very reading that makes an engine 400 a bare `thinking` is also the one a
+    caller may have MEANT. Its `type` is carried; a value with no boolean meaning is
+    dropped, because renaming an object onto a boolean key only moves the 400."""
+    rename = _need(rename_thinking_switch, "think_bleed.rename_thinking_switch")
+    out, _ = rename({"chat_template_kwargs": {"thinking": value}}, ("enable_thinking",))
+    expected = {} if carried is None else {"enable_thinking": carried}
+    assert out["chat_template_kwargs"] == expected
+
+
+def test_rename_is_a_no_op_when_nothing_is_foreign():
+    rename = _need(rename_thinking_switch, "think_bleed.rename_thinking_switch")
+    for declared, ck in [(("enable_thinking",), {"enable_thinking": False}),
+                         (("thinking", "enable_thinking"), {"thinking": False}),
+                         (("enable_thinking",), {"reasoning_effort": "low"}),
+                         ((), {"thinking": False})]:
+        p = {"messages": [], "chat_template_kwargs": ck}
+        out, found = rename(p, declared)
+        assert out is p and found == []
 
 
 # --- composition with the effort policy -------------------------------------- #

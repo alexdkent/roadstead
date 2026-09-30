@@ -22,6 +22,12 @@ payload reaches the wire. It is keyed on ``EndpointConfig.no_thinking_switch``
 (a DECLARATION), never on ``thinking_kwargs == ()`` (which an unmeasured
 template also produces).
 
+**1b. The same control under the wrong name — RENAMED.** ``thinking`` and
+``enable_thinking`` are one control in two spellings and the template decides which it
+reads. On an endpoint that declares its key(s), :func:`rename_thinking_switch` carries a
+caller's other spelling onto the declared one, value kept: measured, an engine that reads
+only ``enable_thinking`` 400s a ``thinking`` it parses as an object.
+
 **2. A trace that carries a marker — REPAIRED.** Some engines leave the tag in
 ``content``: llama.cpp with its reasoning parser off returns
 ``<think>…</think>answer``, and its reasoning-budget cap binding returns
@@ -145,6 +151,82 @@ def strip_thinking_switch(payload: Any) -> tuple[Any, list[str]]:
     eb = out.get("extra_body")
     if isinstance(eb, dict):
         new_eb = _strip_container(eb, "extra_body.", found)
+        if new_eb is not eb:
+            out = dict(out)
+            out["extra_body"] = new_eb
+    return out, found
+
+
+def _as_switch_value(value: Any) -> bool | None:
+    """The boolean a caller's switch value means, or None when it means nothing
+    a boolean switch can carry. A bool is itself; an Anthropic-style object
+    (``{"type": "enabled" | "disabled" | "adaptive"}`` — the reading that makes some
+    engines 400 a bare ``thinking``) is what its ``type`` says. Anything else is
+    not carried: renaming an object onto a boolean key would just move the 400."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, dict):
+        kind = str(value.get("type") or "").strip().lower()
+        if kind in ("enabled", "adaptive"):
+            return True
+        if kind == "disabled":
+            return False
+    return None
+
+
+def _rename_container(container: dict, prefix: str, declared: tuple[str, ...],
+                      found: list[str]) -> dict:
+    ck = container.get("chat_template_kwargs")
+    if not isinstance(ck, dict):
+        return container
+    foreign = [k for k in ("thinking", "enable_thinking")
+               if k in ck and k not in declared]
+    if not foreign:
+        return container
+    values = [_as_switch_value(ck[k]) for k in foreign]
+    agreed = values[0] is not None and all(v == values[0] for v in values)
+    new_ck = {k: v for k, v in ck.items() if k not in foreign}
+    landed = []
+    if agreed:
+        for key in declared:
+            if key not in new_ck:            # the caller's own declared key wins
+                new_ck[key] = values[0]
+                landed.append(key)
+    label = "->".join(("+".join(foreign), "+".join(landed) or "dropped"))
+    found.append(f"{prefix}chat_template_kwargs.{label}"
+                 + (f"={json.dumps(values[0])}" if landed else ""))
+    out = dict(container)
+    out["chat_template_kwargs"] = new_ck
+    return out
+
+
+def rename_thinking_switch(payload: Any, declared: tuple[str, ...]) -> tuple[Any, list[str]]:
+    """On an endpoint that DECLARES its switch key(s), put a caller's switch under
+    the declared spelling — value kept — instead of forwarding the wrong one.
+
+    ``thinking`` and ``enable_thinking`` are two spellings of one control and which
+    one a template reads is per-model. An engine that reads only ``enable_thinking``
+    may not merely ignore ``thinking``: measured, one 400s it (it parses ``thinking``
+    as an Anthropic-style object), which reaches the caller as a 502. So the caller's
+    intent is carried, not echoed.
+
+    Per container (payload and ``extra_body``): a known spelling that is not
+    declared moves onto every declared key not already present. If the caller ALSO
+    sent a declared key, theirs wins and the foreign one is dropped; if the foreign
+    spellings disagree with each other there is no single value to carry, so they
+    are dropped and the endpoint's default applies. An endpoint that declares both
+    spellings never has anything renamed. Same copy-on-write contract as
+    :func:`strip_thinking_switch`. This does not touch efforts:
+    ``correction.fold_caller_effort`` already turns ``"none"`` into the declared
+    keys, and composes with this (it runs first, and writes only declared keys).
+    """
+    if not isinstance(payload, dict) or not declared:
+        return payload, []
+    found: list[str] = []
+    out = _rename_container(payload, "", declared, found)
+    eb = out.get("extra_body")
+    if isinstance(eb, dict):
+        new_eb = _rename_container(eb, "extra_body.", declared, found)
         if new_eb is not eb:
             out = dict(out)
             out["extra_body"] = new_eb
@@ -447,6 +529,8 @@ class ThinkBleedStats:
     def __init__(self) -> None:
         self.switch_stripped = 0
         self.switch_stripped_by_endpoint: dict[str, dict] = {}
+        self.switch_renamed = 0
+        self.switch_renamed_by_endpoint: dict[str, dict] = {}
         self.bleed_repaired = 0
         self.bleed_repaired_by_endpoint: dict[str, dict] = {}
         self._logged: dict[tuple[str, str], tuple[float, int]] = {}
@@ -479,6 +563,23 @@ class ThinkBleedStats:
                 "backend's reasoning parser stand down and the whole trace land "
                 "in content with no tag to find",
                 endpoint, request_id, ",".join(spellings), n)
+
+    def note_renamed(self, endpoint: str, renames: list[str],
+                     request_id: str) -> None:
+        self.switch_renamed += 1
+        row = self.switch_renamed_by_endpoint.setdefault(
+            endpoint, {"count": 0, "renames": {}})
+        row["count"] += 1
+        for r in renames:
+            row["renames"][r] = row["renames"].get(r, 0) + 1
+        n = self._should_log("renamed", endpoint)
+        if n:
+            logger.warning(
+                "ROADSTEAD_THINK_SWITCH_RENAMED endpoint=%s request_id=%s "
+                "renames=%s events=%d — the caller spelled the thinking switch "
+                "differently from the key this endpoint's template reads "
+                "(policy.thinking_kwargs); carried its value onto the declared key",
+                endpoint, request_id, ",".join(renames), n)
 
     def note_repaired(self, endpoint: str, request_id: str, *, shape: str,
                       stream: bool, reasoning_chars: int,

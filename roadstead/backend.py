@@ -29,8 +29,8 @@ from .cost_model import estimate_tokens_from_chars
 from .providers import DEFAULT_PROVIDER, ProviderError, provider_for
 from .providers.payload import _thinking_is_on
 from .think_bleed import (
-    StreamRepair, ThinkBleedStats, default_reasoning_key, repair_body,
-    strip_thinking_switch,
+    StreamRepair, ThinkBleedStats, default_reasoning_key, rename_thinking_switch,
+    repair_body, strip_thinking_switch,
 )
 
 logger = logging.getLogger(__name__)
@@ -258,28 +258,40 @@ class BackendClientPool:
         # the answer-now re-ask, the keep-alive touch — has converged.
         self.think_bleed = ThinkBleedStats()
 
-    def _strip_undeclared_switch(
+    def _canonical_switch(
         self, ep_cfg: EndpointConfig, payload: dict, request_id: str,
     ) -> dict:
-        """PREVENTION. On an endpoint that DECLARES it has no thinking switch,
-        remove every switch spelling from what is about to be sent — see
-        ``think_bleed`` for why forwarding one turns a clean reasoning split into
-        a trace in ``content`` with no tag to find.
+        """Put the thinking switch on the wire in the form THIS endpoint reads.
+
+        * ``policy.thinking_kwargs: []`` (``no_thinking_switch``) — the model has NO
+          switch, so REMOVE every spelling: forwarding one makes the backend's
+          reasoning parser stand down and the trace land in ``content`` with no tag
+          to find (``think_bleed`` explains). PREVENTION, never repaired.
+        * a declared key — rename a caller's other known spelling onto it, value
+          kept: an engine that reads only ``enable_thinking`` can 400 a
+          ``thinking`` it parses as something else.
+        * nothing declared — leave the payload alone; we do not know this template.
 
         Here rather than in one correction step because this is the only place
         every path passes through: ``handle_submit``'s corrections do not run for
-        the answer-now re-ask or a keep-alive touch, and a strip that covered
-        four doors of five would leak from the fifth. Runs AFTER every
-        correction, so it is also the last word on what ``apply_thinking`` /
-        ``fold_caller_effort`` wrote. A declaration only: an endpoint that merely
-        names no switch (``no_thinking_switch`` False) is never touched."""
-        if not getattr(ep_cfg, "no_thinking_switch", False):
-            return payload
-        out, found = strip_thinking_switch(payload)
-        if found:
-            self.think_bleed.note_stripped(
-                ep_cfg.endpoint_class or ep_cfg.role, found, request_id)
-        return out
+        the answer-now re-ask or a keep-alive touch, and a fix that covered four
+        doors of five would leak from the fifth. Runs AFTER every correction, so
+        it is also the last word on what ``apply_thinking`` / ``fold_caller_effort``
+        wrote.
+        """
+        name = ep_cfg.endpoint_class or ep_cfg.role
+        if getattr(ep_cfg, "no_thinking_switch", False):
+            out, found = strip_thinking_switch(payload)
+            if found:
+                self.think_bleed.note_stripped(name, found, request_id)
+            return out
+        declared = tuple(getattr(ep_cfg, "thinking_kwargs", ()) or ())
+        if declared:
+            out, found = rename_thinking_switch(payload, declared)
+            if found:
+                self.think_bleed.note_renamed(name, found, request_id)
+            return out
+        return payload
 
     @staticmethod
     def _expects_reasoning(ep_cfg: EndpointConfig, payload: dict) -> bool:
@@ -377,7 +389,7 @@ class BackendClientPool:
             path = provider.path_for(payload_type)
             headers = provider.request_headers(ep_cfg, request_id)
             if payload_type == "chat_completion":
-                payload = self._strip_undeclared_switch(ep_cfg, payload, request_id)
+                payload = self._canonical_switch(ep_cfg, payload, request_id)
                 payload = provider.prepare_chat_payload(
                     payload,
                     model_id=ep_cfg.effective_model_id,
@@ -498,7 +510,7 @@ class BackendClientPool:
             path = provider.path_for(payload_type)
             headers = provider.request_headers(ep_cfg, request_id)
             if payload_type == "chat_completion":
-                payload = self._strip_undeclared_switch(ep_cfg, payload, request_id)
+                payload = self._canonical_switch(ep_cfg, payload, request_id)
                 payload = provider.prepare_chat_payload(
                     payload,
                     model_id=ep_cfg.effective_model_id,
@@ -1059,7 +1071,7 @@ class BackendClientPool:
         try:
             path = provider.path_for("chat_completion")
             headers = provider.request_headers(ep_cfg, request_id)
-            payload = self._strip_undeclared_switch(ep_cfg, payload, request_id)
+            payload = self._canonical_switch(ep_cfg, payload, request_id)
             prepared = provider.prepare_chat_payload(
                 payload,
                 model_id=ep_cfg.effective_model_id,

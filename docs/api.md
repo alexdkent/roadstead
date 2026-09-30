@@ -2613,7 +2613,7 @@ stale or wrong word.
 an operator can see who is being remapped and to what. Grep marker in the log:
 `ROADSTEAD_REASONING_EFFORT_REMAP` (logged once per distinct caller+value, not once per request).
 
-### 3.14e Reasoning that leaks into `content` — `policy.thinking_kwargs: []`, prevention and repair
+### 3.14e The thinking switch on the wire, and reasoning that leaks into `content`
 
 **A chain of thought must never be read as an answer.** Two different defects produce that
 symptom and get two different tools.
@@ -2646,6 +2646,22 @@ Any other effort word is left for `policy.reasoning_effort_map` (§3.14d) to jud
 `policy.thinking_effort` (§3.14c), and outranks an effort of `"none"` exactly as it does on a
 switch-bearing endpoint. The removal is applied to what goes on the wire; the caller's own stored
 request is not rewritten.
+
+**1b. A declared switch, spelled differently by the caller — carried onto the declared key.**
+`thinking` and `enable_thinking` are two spellings of one control, and which one a template reads
+is per model. On an endpoint that declares `policy.thinking_kwargs: [enable_thinking]` a caller's
+`chat_template_kwargs.thinking` (top level or in `extra_body`) is **renamed onto the declared
+key with its value kept**, not forwarded: measured on a Qwen-family engine that parses a bare
+`thinking` as an Anthropic-style object, the raw spelling draws a `400` that reaches the caller as a
+`502`. If the caller also sent the declared key, theirs wins and the other is dropped; spellings
+that disagree with each other, or a value with no boolean meaning, are dropped and the endpoint's
+default applies (an Anthropic-style `{"type": "enabled" | "disabled" | "adaptive"}` is read for
+what its `type` says). An endpoint that declares both spellings renames nothing, and an endpoint
+that declares nothing is left alone. It composes with the effort policy: `reasoning_effort:
+"none"` still becomes the declared keys `false` (§3.14d / `fold_caller_effort`) — that runs first
+and writes only declared keys, so there is nothing left to rename.
+`reliability.think_switch_renamed` / `think_switch_renamed_by_endpoint` and the log marker
+`ROADSTEAD_THINK_SWITCH_RENAMED` say who is spelling it the other way.
 
 **2. A trace that carries a marker — repaired.** Some engines leave the tag in `content`: llama.cpp
 with its reasoning parser off returns `<think>…</think>answer`, and a binding reasoning-budget cap

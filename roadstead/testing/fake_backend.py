@@ -413,6 +413,11 @@ class FakeBackend:
     #: path (no fault) answers with it instead of ``echo: …`` — sync and streaming,
     #: with the trace landing on the wire the way the scripted engine ``mode``
     #: really lands it. Faults still win, so an ``http_500`` stays a 500.
+    #: ``chat_template_kwargs`` keys this engine REFUSES with a 400 — a template
+    #: that reads ``enable_thinking`` and parses a caller's ``thinking`` as a
+    #: different type does exactly that (measured on a Qwen-family engine). Checked
+    #: at the top level and under ``extra_body``, on the wire body as received.
+    reject_chat_template_kwargs: Tuple[str, ...] = ()
     #: May instead be a callable ``(request_body) -> ThinkScript`` for a test that
     #: needs a DIFFERENT reply per call (a looping first call, then a re-ask).
     think: Any = None
@@ -469,6 +474,7 @@ class FakeBackend:
         self.structured_content = None
         self.structured_tool_args = None
         self.think = None
+        self.reject_chat_template_kwargs = ()
         self.requests.clear()
         self.requests_seen = 0
         with self._lock:
@@ -631,6 +637,19 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
             await _sleep_or_disconnect(request, arg if arg > 0 else 2.0)
             # If the caller hasn't already abandoned us, still answer.
             return JSONResponse(_completion_body("late: " + _last_user_text(body)))
+
+        if controller.reject_chat_template_kwargs and body:
+            for container in (body, body.get("extra_body")):
+                ck = container.get("chat_template_kwargs") if isinstance(
+                    container, dict) else None
+                bad = [k for k in controller.reject_chat_template_kwargs
+                       if isinstance(ck, dict) and k in ck]
+                if bad:
+                    return JSONResponse(
+                        {"error": {"message": f"chat_template_kwargs.{bad[0]}: "
+                                              "Input should be a valid dictionary "
+                                              "(injected)", "code": 400}},
+                        status_code=400)
 
         if controller.think is not None and fault == FAULT_NONE:
             script = (controller.think if isinstance(controller.think, ThinkScript)

@@ -940,6 +940,11 @@ class ProxyHttpHandlers:
                 "think_switch_stripped": self.state.backend.think_bleed.switch_stripped,
                 "think_switch_stripped_by_endpoint":
                     self.state.backend.think_bleed.switch_stripped_by_endpoint,
+                # A caller's other spelling of the switch, carried onto the key
+                # this endpoint's template reads (`thinking->enable_thinking=false`).
+                "think_switch_renamed": self.state.backend.think_bleed.switch_renamed,
+                "think_switch_renamed_by_endpoint":
+                    self.state.backend.think_bleed.switch_renamed_by_endpoint,
                 "think_bleed_repaired": self.state.backend.think_bleed.bleed_repaired,
                 "think_bleed_repaired_by_endpoint":
                     self.state.backend.think_bleed.bleed_repaired_by_endpoint,
