@@ -780,6 +780,13 @@ def build_endpoint_kwargs(cat: Catalog | None = None,
         if isinstance(raw_tk, (list, tuple)):
             kw["thinking_kwargs"] = tuple(
                 str(k) for k in raw_tk if isinstance(k, str) and k.strip())
+            # A PRESENT, EMPTY list is a declaration ("no switch"); an absent
+            # key is not. `thinking_kwargs == ()` is the same tuple either way,
+            # which is why this needs its own flag — see
+            # EndpointConfig.no_thinking_switch. A list whose entries were all
+            # junk is a typo, not a declaration, and stays undeclared.
+            if not raw_tk:
+                kw["no_thinking_switch"] = True
         elif isinstance(raw_tk, str) and raw_tk.strip():
             kw["thinking_kwargs"] = (raw_tk.strip(),)
         # Same reason as `thinking_kwargs` just above: YAML hands us a list of

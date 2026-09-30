@@ -411,6 +411,29 @@ class EndpointConfig:
     #: a caller's own pin is deliberately NOT gated on this: see
     #: ``backend._THINKING_KWARG_NAMES``.
     thinking_kwargs: tuple[str, ...] = ()
+    #: The stanza DECLARED ``policy.thinking_kwargs: []`` — an explicit "this
+    #: model's chat template has NO thinking switch". False = the key is absent
+    #: (unknown template) or names a switch.
+    #:
+    #: 🚨 ``thinking_kwargs == ()`` CANNOT TELL THESE TWO APART, and the
+    #: difference is a leak. Absent means "we have not measured this template,
+    #: leave the caller's payload alone"; ``[]`` means "measured: it always
+    #: reasons and no request field changes that". Only the second licenses
+    #: :func:`think_bleed.strip_thinking_switch` to remove a caller's switch, and
+    #: it must be a declaration rather than an inference: stripping on
+    #: ``thinking_kwargs == ()`` would delete a working switch from every
+    #: endpoint whose template nobody had written down yet.
+    #:
+    #: THE DEFECT (measured 2026-09-29, GLM-5.3-Flash on vLLM ``--reasoning-
+    #: parser glm45``): the template ALWAYS ends the prompt ``<think>``, whatever
+    #: ``enable_thinking``/``thinking`` says — but the PARSER reads that kwarg
+    #: and switches itself OFF for the request. The model still reasons, the
+    #: ``</think>`` special token is stripped from the output, and the whole
+    #: trace lands in ``content`` with no tag left to find (``content='7391573915'``
+    #: for an answer of ``73915``). ~1,560 sampled calls in four days sent the
+    #: kwarg. Sending a switch to a model that has none is not harmless — it is
+    #: the one request field that breaks the reasoning split.
+    no_thinking_switch: bool = False
     #: Reasoning EFFORT to apply on the proxy's ``thinking:`` opt-in, for a
     #: model that has NO thinking switch at all — i.e. ``thinking_kwargs`` is
     #: empty because the chat template always reasons and the only lever is

@@ -2613,6 +2613,72 @@ stale or wrong word.
 an operator can see who is being remapped and to what. Grep marker in the log:
 `ROADSTEAD_REASONING_EFFORT_REMAP` (logged once per distinct caller+value, not once per request).
 
+### 3.14e Reasoning that leaks into `content` — `policy.thinking_kwargs: []`, prevention and repair
+
+**A chain of thought must never be read as an answer.** Two different defects produce that
+symptom and get two different tools.
+
+**1. A thinking switch sent to a model that has none — prevented, never repaired.** Measured
+2026-09-29 on GLM-5.3-Flash under vLLM `--reasoning-parser glm45`: the chat template ALWAYS ends
+the prompt `<think>` whatever `enable_thinking`/`thinking` says (its only lever is
+`reasoning_effort`), but the parser reads that kwarg and stands down for the request when it is
+false. The model still reasons, the `</think>` special token is removed from the output, and the
+whole trace lands in `content` **with no tag left to find** — `content: "7391573915"` for an answer
+of `73915`. Nothing downstream can split that, so the only fix is to never send the kwarg.
+
+`policy.thinking_kwargs: []` is the endpoint's statement that its template has **no** switch. It
+is a *declaration*, and it is not the same as leaving the key out: an absent key means "not
+measured — leave the caller's payload alone", `[]` means "measured: no request field changes
+this". Only the second licenses stripping, so `GET /v1/status` → `endpoints[].thinking` reads
+`{"kwargs": [], "no_switch": true}` for a declared-empty endpoint (nothing for an undeclared one).
+
+On such an endpoint Roadstead removes, from the payload and from `extra_body`, **on every door and
+every dispatch path** (`/v1/chat/completions`, `/v1/submit`, `/rs/v1/chat`, streaming or not, the
+retries, the answer-now re-ask, the prefix keep-alive touch):
+
+| removed | why |
+|---|---|
+| `chat_template_kwargs.thinking`, `chat_template_kwargs.enable_thinking` — at any value | `false` is the one that breaks the split; `true` is harmless but is still a switch sent to a model with none |
+| `reasoning_effort: "none"` (top level or in `chat_template_kwargs`), `reasoning.effort: "none"` | on a model with a switch, `"none"` is the OpenAI spelling of *off*. Here there is no switch for it to become, so it **cannot mean off**: it is removed and the endpoint's own effort default applies. That is the lowest honest mapping — the model reasons either way |
+
+Any other effort word is left for `policy.reasoning_effort_map` (§3.14d) to judge, and a caller's
+`reasoning_effort: "high"` still works. `thinking: true` still applies the endpoint's declared
+`policy.thinking_effort` (§3.14c), and outranks an effort of `"none"` exactly as it does on a
+switch-bearing endpoint. The removal is applied to what goes on the wire; the caller's own stored
+request is not rewritten.
+
+**2. A trace that carries a marker — repaired.** Some engines leave the tag in `content`: llama.cpp
+with its reasoning parser off returns `<think>…</think>answer`, and a binding reasoning-budget cap
+returns `…</think>answer` with the OPENING tag missing (llama.cpp #28182). On an endpoint that
+declares `capabilities.reasoning` (absent ⇒ off) Roadstead moves the trace into the reasoning field
+and returns only the answer as `content`, sync and streaming (including a tag split across delta
+chunks), on tool turns and structured replies alike. The field name is the one the engine already
+uses — `reasoning` for vLLM, `reasoning_content` otherwise — never a third spelling.
+
+* The closing-tag-only shape is believed only where the call is expected to reason (the endpoint
+  forces reasoning, declares no switch, or the request has thinking on): elsewhere a stray
+  `</think>` is far more likely to be an answer *about* the tag. A response that already carries a
+  reasoning field is never touched, and content with no marker is byte-identical.
+* **A truncation inside the trace is never delivered as content.** `<think>…` with no close and
+  `finish_reason: "length"` becomes reasoning with EMPTY content and the finish stays `length`.
+  Non-streaming, that is exactly the shape the empty-completion gate already answers with
+  `502 … spent its ENTIRE budget on REASONING`, and the repair runs before that gate so both
+  parser-split and tag-split truncations get the same error.
+* Streaming, an endpoint expected to reason holds content back only until it can tell whether it is
+  a trace (bounded at 65,536 characters, then released as content). A held chunk still counts as
+  progress for the stall watchdogs.
+* Not repairable, by construction: a leak with **no marker at all** (case 1 above). Roadstead does
+  not guess where reasoning ends.
+
+`GET /v1/status` → `reliability.think_switch_stripped` and `think_switch_stripped_by_endpoint`
+(`{endpoint: {count, spellings{"chat_template_kwargs.enable_thinking=false": n}}}` — the value is
+part of the key, so the spelling that would actually have leaked is distinguishable from a benign
+`true`), and `reliability.think_bleed_repaired` and `think_bleed_repaired_by_endpoint`
+(`{endpoint: {count, sync, stream, shapes{open_tag|close_only|unclosed: n}}}`). A non-zero
+`think_bleed_repaired` means an engine is mis-splitting. Grep markers, at most one line per
+endpoint per minute carrying its count: `ROADSTEAD_THINK_SWITCH_STRIPPED`,
+`ROADSTEAD_THINK_BLEED_REPAIRED`. The battery that pins all of this is `tests/test_think_bleed.py`.
+
 ### 3.15 Structured content blank-run abort — `policy.structured_blank_run_abort_chars`
 
 **A sibling of §3.14 in a different channel.** The reasoning loop-break guard watches the

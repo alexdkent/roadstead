@@ -690,7 +690,12 @@ class ProxyHttpHandlers:
                     "declared": ep_cfg.model_fingerprint or None,
                     "serving": ep_cfg.discovered_model_fingerprint or None,
                 }
-            if ep_cfg.thinking_kwargs:
+            if ep_cfg.no_thinking_switch:
+                # Declared "no switch" (`thinking_kwargs: []`), which is not the
+                # same as declaring nothing — and is what licenses the proxy to
+                # strip a caller's switch.
+                snap["thinking"] = {"kwargs": [], "no_switch": True}
+            elif ep_cfg.thinking_kwargs:
                 snap["thinking"] = {
                     "kwargs": list(ep_cfg.thinking_kwargs),
                     # "" = not probed yet (the first poll only arms the clock);
@@ -922,6 +927,22 @@ class ProxyHttpHandlers:
                 "reasoning_loops_detected": self.state.reasoning_loops_detected,
                 "reasoning_loops_broken": self.state.reasoning_loops_broken,
                 "reasoning_loops_answered": self.state.reasoning_loops_answered,
+                # Reasoning leaking into `content` (roadstead/think_bleed.py).
+                # `think_switch_stripped` is PREVENTION: a caller sent a thinking
+                # switch to an endpoint that declares it has none, and it was
+                # removed before the wire (the by-endpoint rows name each
+                # spelling AND its value — `…thinking=false` is the one that
+                # would have leaked). `think_bleed_repaired` is REPAIR: the
+                # backend left a tagged trace in content and it was moved to the
+                # reasoning field. Non-zero `think_bleed_repaired` on an endpoint
+                # means an engine is mis-splitting; the untaggable case (no
+                # marker at all) is not counted anywhere because nothing can see it.
+                "think_switch_stripped": self.state.backend.think_bleed.switch_stripped,
+                "think_switch_stripped_by_endpoint":
+                    self.state.backend.think_bleed.switch_stripped_by_endpoint,
+                "think_bleed_repaired": self.state.backend.think_bleed.bleed_repaired,
+                "think_bleed_repaired_by_endpoint":
+                    self.state.backend.think_bleed.bleed_repaired_by_endpoint,
                 # Structured CONTENT blank-run abort
                 # (correction.StructuredBlankRunDetector). Five counters for
                 # the same reason the reasoning-loop three are: `detected -

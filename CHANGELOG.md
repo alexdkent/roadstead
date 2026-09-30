@@ -414,6 +414,32 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Fixed
 
+- **A chain of thought is no longer delivered as the answer.** Measured 2026-09-29 on a vLLM tier
+  serving GLM-5.3-Flash with `--reasoning-parser glm45`: that template has no thinking switch (it
+  always reasons; only `reasoning_effort` is a lever), but the PARSER stands down for a request
+  carrying `enable_thinking: false` / `thinking: false`. The model reasons anyway, `</think>` is a
+  removed special token, and the whole trace lands in `content` with no tag left — `content:
+  "7391573915"` for an answer of `73915`. ~1,560 sampled calls in four days sent one; the
+  answer-now re-ask in `lifecycle.py` hardcoded both spellings and leaked on its own account.
+  **Prevention:** `policy.thinking_kwargs: []` — now distinguishable from an absent key
+  (`EndpointConfig.no_thinking_switch`) — means "this template has no switch", and on such an
+  endpoint no thinking switch (`thinking`/`enable_thinking` in `chat_template_kwargs`, top level or
+  `extra_body`) and no `"none"` effort (`reasoning_effort`, `reasoning.effort`) reaches the backend,
+  on every door and dispatch path. `"none"` cannot mean *off* where there is no switch, so it is
+  removed and the endpoint's effort default applies; a real effort word and `thinking: true` still
+  work. An endpoint that merely declares nothing is left alone. The answer-now re-ask now builds its
+  switch from the endpoint's declaration. **Repair:** on an endpoint that declares
+  `capabilities.reasoning`, a trace the engine left in `content` WITH a marker (`<think>…</think>
+  answer`, `…</think>answer` with no opening tag, a tag split across stream chunks, a tool turn, a
+  structured reply) is moved to the reasoning field; a truncation inside the trace stays reasoning
+  with empty content and `finish_reason: length`. A leak with no marker cannot be repaired and is
+  not guessed at. New `/v1/status` counters `reliability.think_switch_stripped[_by_endpoint]` and
+  `think_bleed_repaired[_by_endpoint]`; log markers `ROADSTEAD_THINK_SWITCH_STRIPPED` /
+  `ROADSTEAD_THINK_BLEED_REPAIRED`. `docs/api.md` §3.14e. Pinned by `tests/test_think_bleed.py`,
+  whose assertions are semantic (caller-visible `content` equals the intended answer) rather than
+  lexical — a "starts with Okay" check is what let this through. `roadstead.testing.FakeBackend`
+  gained `think=ThinkScript(...)`, which emulates each engine's landing of the trace.
+
 - **A non-int `priority` body field on `POST /v1/chat/completions` reached vLLM's own int-typed
   `priority` field, drawing a 400 (surfaced to the caller as a 502).** Reproduced live 2026-09-26:
   `{"model": "tier3", "priority": "P2_POST_TURN", ...}`. `/v1/chat/completions` forwards everything

@@ -32,6 +32,11 @@ an in-process ``MockTransport`` for the mid-stream/reset/interleaved-frame fault
 A ``MockTransport`` handler (:func:`mock_transport_handler`) is also exported for
 pure-unit cases that don't need a socket.
 
+Separately from the fault library, :class:`ThinkScript` scripts a REASONING
+model's reply and emulates how a real engine lands the trace on the wire — the
+vLLM ``glm45`` shape that leaks it into ``content`` with no tag, llama.cpp's tagged
+leaks, a switchable Qwen-style template, and a clean engine. See ``FakeBackend.think``.
+
 Kept dependency-free beyond Starlette/uvicorn/httpx — all already declared
 package dependencies, so importing this adds nothing to the dependency set.
 🚨 Keep it that way: this module is now public surface, and a new import here is
@@ -116,6 +121,133 @@ STREAM_ONLY_FAULTS: Tuple[str, ...] = (
     FAULT_PARTIAL_SSE, FAULT_INTERLEAVED_SSE, FAULT_NO_DONE, FAULT_SLOW_DRAIN,
     FAULT_TRUNCATED_TOOL_CALLS,
 )
+
+
+# --- reasoning-bleed emulation ----------------------------------------------- #
+# How a reasoning engine lands its trace on the wire. Selected by
+# ``ThinkScript.mode``; each is a measured engine behaviour, not an invention.
+
+#: GLM-5.3-Flash under vLLM ``--reasoning-parser glm45`` (measured 2026-09-29).
+#: The model ALWAYS reasons — its chat template prefills ``<think>`` whatever the
+#: request says. The parser is on by default and splits the trace into the
+#: reasoning field. It reads ``chat_template_kwargs.enable_thinking`` /
+#: ``.thinking`` and STANDS DOWN for the request when either is false; the model
+#: still reasons, the ``</think>`` special token is removed from the output, and
+#: reasoning + answer come back concatenated in ``content`` with NO TAG (streaming
+#: too). ``reasoning_effort: "none"`` is treated the same way — vLLM's handling of
+#: that word differs by version, so the fake assumes the worst.
+THINK_GLM_VLLM = "glm_vllm"
+#: llama.cpp with its reasoning parser off: ``<think>…</think>answer`` in content.
+THINK_TAG_OPEN = "tag_open"
+#: llama.cpp with the reasoning-budget cap binding (#28182): the template prefilled
+#: ``<think>``, so the content is ``…</think>answer`` with NO opening tag.
+THINK_TAG_CLOSE_ONLY = "tag_close_only"
+#: A template with a working switch (Qwen-style): ``enable_thinking: false``
+#: really turns reasoning off, so the reply is the answer and nothing else;
+#: otherwise the parser splits the trace cleanly.
+THINK_SWITCHABLE = "switchable"
+#: A well-behaved engine: the parser splits the trace whatever the request says.
+THINK_CLEAN = "clean"
+
+ALL_THINK_MODES: Tuple[str, ...] = (
+    THINK_GLM_VLLM, THINK_TAG_OPEN, THINK_TAG_CLOSE_ONLY, THINK_SWITCHABLE,
+    THINK_CLEAN,
+)
+
+
+@dataclass
+class ThinkScript:
+    """One scripted reasoning reply. ``reasoning`` and ``answer`` are the two
+    things the model INTENDED; ``mode`` decides how they reach the wire, so a
+    test asserts against the answer it scripted rather than against a shape.
+
+    ``truncate_in_reasoning`` — the token budget ran out before ``</think>``:
+    ``finish_reason=length`` and no answer exists. ``tool_calls`` — a tool turn
+    (OpenAI shape, no ``index``); the answer is then usually ``""``.
+    ``reasoning_key`` is the wire name of the split channel (``reasoning`` on
+    current vLLM, ``reasoning_content`` on llama.cpp). ``chunk_chars`` is the
+    width of each streamed delta; a small odd number is what makes a tag straddle
+    two chunks."""
+    mode: str
+    reasoning: str = ""
+    answer: str = ""
+    truncate_in_reasoning: bool = False
+    tool_calls: Optional[list] = None
+    reasoning_key: str = "reasoning"
+    chunk_chars: int = 3
+
+
+@dataclass
+class _Rendered:
+    content: str
+    reasoning: str          # the reasoning FIELD ("" = the field is absent)
+    finish: str
+
+
+def _kwarg_false(body: Optional[dict], *names: str) -> bool:
+    """True when any of ``names`` is ``false`` in the request's
+    ``chat_template_kwargs`` — top level, or nested under ``extra_body`` (a
+    payload that reached the wire with ``extra_body`` intact was NOT normalized,
+    and the fake should not be more forgiving than the engine)."""
+    for container in (body or {}, (body or {}).get("extra_body")):
+        ck = container.get("chat_template_kwargs") if isinstance(container, dict) else None
+        if isinstance(ck, dict) and any(ck.get(n) is False for n in names):
+            return True
+    return False
+
+
+def _effort_none(body: Optional[dict]) -> bool:
+    for container in (body or {}, (body or {}).get("extra_body")):
+        if not isinstance(container, dict):
+            continue
+        ck = container.get("chat_template_kwargs")
+        vals = [container.get("reasoning_effort")]
+        if isinstance(ck, dict):
+            vals.append(ck.get("reasoning_effort"))
+        obj = container.get("reasoning")
+        if isinstance(obj, dict):
+            vals.append(obj.get("effort"))
+        if any(isinstance(v, str) and v.strip().lower() == "none" for v in vals):
+            return True
+    return False
+
+
+def _parser_stood_down(body: Optional[dict]) -> bool:
+    """The vLLM ``glm45`` parser is disabled for a request that carries a false
+    thinking switch (or, worst case, an effort of ``none``)."""
+    return _kwarg_false(body, "enable_thinking", "thinking") or _effort_none(body)
+
+
+def _render_think(s: ThinkScript, body: Optional[dict]) -> _Rendered:
+    r, a = s.reasoning, s.answer
+    finish = "length" if s.truncate_in_reasoning else (
+        "tool_calls" if s.tool_calls else "stop")
+    if s.mode == THINK_GLM_VLLM:
+        text_r, text_a = r, ("" if s.truncate_in_reasoning else a)
+        if _parser_stood_down(body):
+            # No tag survives: `</think>` is a special token and is stripped.
+            return _Rendered(text_r + text_a, "", finish)
+        return _Rendered(text_a, text_r, finish)
+    if s.mode == THINK_TAG_OPEN:
+        if s.truncate_in_reasoning:
+            return _Rendered("<think>\n" + r, "", finish)
+        return _Rendered("<think>\n" + r + "\n</think>\n\n" + a, "", finish)
+    if s.mode == THINK_TAG_CLOSE_ONLY:
+        if s.truncate_in_reasoning:
+            return _Rendered(r, "", finish)   # no tag at all: nothing to find
+        return _Rendered(r + "\n</think>\n\n" + a, "", finish)
+    if s.mode == THINK_SWITCHABLE:
+        if _kwarg_false(body, "enable_thinking", "thinking"):
+            return _Rendered(a, "", finish)
+        return _Rendered("" if s.truncate_in_reasoning else a, r, finish)
+    if s.mode == THINK_CLEAN:
+        return _Rendered("" if s.truncate_in_reasoning else a, r, finish)
+    raise ValueError(f"unknown think mode {s.mode!r}")
+
+
+def _slices(text: str, n: int) -> List[str]:
+    n = max(1, n)
+    return [text[i:i + n] for i in range(0, len(text), n)]
 
 
 # Sentinels for the adversarial usage-shape knobs (below). ``USAGE_DEFAULT``
@@ -277,6 +409,13 @@ class FakeBackend:
     # tool_call whose ``function.arguments`` is this EXACT string (empty content),
     # so a test can emit tool-call args that are repairable or hopeless.
     structured_tool_args: Optional[str] = None
+    #: A scripted REASONING reply (see :class:`ThinkScript`). When set, the happy
+    #: path (no fault) answers with it instead of ``echo: …`` — sync and streaming,
+    #: with the trace landing on the wire the way the scripted engine ``mode``
+    #: really lands it. Faults still win, so an ``http_500`` stays a 500.
+    #: May instead be a callable ``(request_body) -> ThinkScript`` for a test that
+    #: needs a DIFFERENT reply per call (a looping first call, then a re-ask).
+    think: Any = None
 
     #: The last :data:`REQUEST_LOG_CAPACITY` requests this backend received,
     #: oldest first. Indexing, ``len`` and iteration all work as they did.
@@ -329,6 +468,7 @@ class FakeBackend:
         self.raw_completion_text = None
         self.structured_content = None
         self.structured_tool_args = None
+        self.think = None
         self.requests.clear()
         self.requests_seen = 0
         with self._lock:
@@ -492,6 +632,11 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
             # If the caller hasn't already abandoned us, still answer.
             return JSONResponse(_completion_body("late: " + _last_user_text(body)))
 
+        if controller.think is not None and fault == FAULT_NONE:
+            script = (controller.think if isinstance(controller.think, ThinkScript)
+                      else controller.think(body or {}))
+            return _think_reply(script, body, streaming)
+
         if streaming:
             return _stream_response(body, fault, arg)
 
@@ -553,6 +698,39 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
             cached_tokens=controller.cached_tokens,
             usage_override=controller.usage_override,
             model=controller.served_model_id))
+
+    def _think_reply(script: ThinkScript, body: Optional[dict],
+                     streaming: bool) -> Response:
+        out = _render_think(script, body)
+        tokens = max(1, (len(script.reasoning) + len(script.answer)) // 4)
+        usage = {"prompt_tokens": 12, "completion_tokens": tokens,
+                 "total_tokens": 12 + tokens}
+        if not streaming:
+            resp = _completion_body(out.content, finish=out.finish,
+                                    tool_calls=script.tool_calls,
+                                    model=controller.served_model_id)
+            msg = resp["choices"][0]["message"]
+            if out.reasoning:
+                msg[script.reasoning_key] = out.reasoning
+            resp["usage"] = usage
+            return JSONResponse(resp)
+
+        async def gen() -> AsyncIterator[bytes]:
+            yield _sse(_chunk({"role": "assistant"}))
+            # The engine emits the reasoning channel first, then content.
+            for piece in _slices(out.reasoning, script.chunk_chars):
+                yield _sse(_chunk({script.reasoning_key: piece}))
+            for piece in _slices(out.content, script.chunk_chars):
+                yield _sse(_chunk({"content": piece}))
+            if script.tool_calls:
+                yield _sse(_chunk({"tool_calls": [
+                    {"index": i, **tc} for i, tc in enumerate(script.tool_calls)]}))
+            yield _sse(_chunk({}, finish=out.finish))
+            yield _sse({"id": "chatcmpl-fake", "object": "chat.completion.chunk",
+                        "choices": [], "usage": usage})
+            yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
 
     def _stream_response(body: Optional[dict], fault: str, arg: float) -> StreamingResponse:
         text = "echo: " + _last_user_text(body)

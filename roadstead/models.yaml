@@ -320,6 +320,13 @@ endpoints:
       # chat-template variable. Declaring both names is right for a family whose
       # template reads either; declaring the wrong one makes thinking a silent
       # no-op. Never hardcode it.
+      # 🚨 An EMPTY list is a different statement from an absent key. Absent =
+      # "not measured, leave callers' payloads alone". `thinking_kwargs: []` =
+      # "measured: this template ALWAYS reasons and no request field changes
+      # that" — and it makes the proxy strip any thinking switch a caller sends,
+      # because on such a model the switch does not turn reasoning off, it turns
+      # the reasoning PARSER off and the trace lands in `content` (docs/api.md
+      # §3.14e). Declare it only for a model you have measured that way.
       thinking_kwargs: [thinking, enable_thinking]
       # Fraction of max_tokens reasoning may consume. 🚨 This is a DECLARATION
       # OF A LAUNCH FLAG, not a tuning knob: vLLM 400s the entire request if

@@ -139,6 +139,32 @@ _COOLDOWN_BEST_EFFORT_RATIO = 0.1
 _BLANK_RUN_RETRY_EXTRAS: dict = {}
 
 
+def _answer_now_switch_off(ep_cfg) -> dict:
+    """The ``chat_template_kwargs`` that turn reasoning OFF for the answer-now
+    re-ask, built from what THIS endpoint declares rather than a fixed pair.
+
+    * declared switch keys → each one ``False``;
+    * ``policy.thinking_kwargs: []`` (``no_thinking_switch``) → ``{}``. There is
+      no switch to turn off, and sending one is the leak this module exists to
+      prevent: the backend's parser stands down, the model reasons anyway, and
+      the re-ask's whole answer arrives as ``7391573915``-style trace+answer with
+      no tag. (This call site hardcoded both spellings until 2026-09-29, so the
+      rescue itself produced the defect on a no-switch endpoint.);
+    * nothing declared (an unmeasured template) → both known spellings, as
+      before: which key a template reads is per-model, and sending only one
+      leaves reasoning on wherever the other is the live switch.
+
+    An empty result means "send no ``chat_template_kwargs`` at all". On a
+    no-switch endpoint the re-ask therefore still reasons; ``backend`` removes
+    any switch a later edit might add here (``strip_thinking_switch``)."""
+    if getattr(ep_cfg, "no_thinking_switch", False):
+        return {}
+    keys = tuple(getattr(ep_cfg, "thinking_kwargs", ()) or ())
+    if keys:
+        return {k: False for k in keys}
+    return {"thinking": False, "enable_thinking": False}
+
+
 def _blank_run_eligible(correction: "Correction", req: QueuedRequest) -> bool:
     """Eligibility for the structured CONTENT blank-run guard, on EITHER
     dispatch path — one gate so sync and streaming can never disagree about
@@ -2600,6 +2626,20 @@ class Lifecycle:
                                         "type": "chunk",
                                         "data": json.dumps(part),
                                     })
+                    elif event.event_type == "hold":
+                        # `think_bleed.StreamRepair` swallowed a backend chunk
+                        # while it works out whether the text is a reasoning
+                        # trace. Nothing is relayed, but the backend IS still
+                        # producing tokens, so this is progress for every
+                        # watchdog exactly as a relayed chunk would be — else
+                        # a held stream is killed as a "stall" it is not in.
+                        now_m = time.monotonic()
+                        last_chunk_at = now_m
+                        remaining = hard_limit_s - (now_m - t0)
+                        if remaining <= 0:
+                            hit_hard_cap = True
+                            raise asyncio.TimeoutError
+                        _cm.reschedule(loop.time() + min(gap_deadline_s, remaining))
                     elif event.event_type == "done":
                         saw_backend_done = True
                         break
@@ -2957,11 +2997,10 @@ class Lifecycle:
                 }],
                 "max_tokens": answer_max,
                 "stream": True,
-                # Off on BOTH spellings: which key a template reads is per-model,
-                # and sending only one leaves reasoning on wherever the other is
-                # the live switch.
-                "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
             }
+            switch_off = _answer_now_switch_off(ep_cfg)
+            if switch_off:
+                second["chat_template_kwargs"] = switch_off
             out_tokens = 0
             saw_done = False
             relayed = 0

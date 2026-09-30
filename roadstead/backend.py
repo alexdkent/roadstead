@@ -27,6 +27,11 @@ import httpx
 from .config import EndpointConfig, max_response_bytes_from_env
 from .cost_model import estimate_tokens_from_chars
 from .providers import DEFAULT_PROVIDER, ProviderError, provider_for
+from .providers.payload import _thinking_is_on
+from .think_bleed import (
+    StreamRepair, ThinkBleedStats, default_reasoning_key, repair_body,
+    strip_thinking_switch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +252,51 @@ class BackendClientPool:
         # endpoint's concurrency after first use). They stay open so their
         # in-flight requests finish unharmed; closed at shutdown.
         self._retired: list[httpx.AsyncClient] = []
+        # Reasoning-leak prevention and repair tallies (think_bleed.py), read by
+        # /v1/status. Owned here because both act at the last hop, in `call()`
+        # and `stream()`, where every dispatch path — the two doors, the retries,
+        # the answer-now re-ask, the keep-alive touch — has converged.
+        self.think_bleed = ThinkBleedStats()
+
+    def _strip_undeclared_switch(
+        self, ep_cfg: EndpointConfig, payload: dict, request_id: str,
+    ) -> dict:
+        """PREVENTION. On an endpoint that DECLARES it has no thinking switch,
+        remove every switch spelling from what is about to be sent — see
+        ``think_bleed`` for why forwarding one turns a clean reasoning split into
+        a trace in ``content`` with no tag to find.
+
+        Here rather than in one correction step because this is the only place
+        every path passes through: ``handle_submit``'s corrections do not run for
+        the answer-now re-ask or a keep-alive touch, and a strip that covered
+        four doors of five would leak from the fifth. Runs AFTER every
+        correction, so it is also the last word on what ``apply_thinking`` /
+        ``fold_caller_effort`` wrote. A declaration only: an endpoint that merely
+        names no switch (``no_thinking_switch`` False) is never touched."""
+        if not getattr(ep_cfg, "no_thinking_switch", False):
+            return payload
+        out, found = strip_thinking_switch(payload)
+        if found:
+            self.think_bleed.note_stripped(
+                ep_cfg.endpoint_class or ep_cfg.role, found, request_id)
+        return out
+
+    @staticmethod
+    def _expects_reasoning(ep_cfg: EndpointConfig, payload: dict) -> bool:
+        """Whether this call is expected to REASON, judged from the payload as it
+        goes on the wire. Gates the one repair that could misread an answer (a
+        close-tag with no opening tag) and the streaming hold that goes with it."""
+        return bool(
+            getattr(ep_cfg, "forces_reasoning", False)
+            or getattr(ep_cfg, "no_thinking_switch", False)
+            or _thinking_is_on(payload))
+
+    @staticmethod
+    def _repairs_bleed(ep_cfg: EndpointConfig, payload_type: str) -> bool:
+        """Repair acts only where the endpoint DECLARES ``capabilities.reasoning``
+        — absent means off, like every other opt-in here."""
+        return (payload_type == "chat_completion"
+                and "reasoning" in (getattr(ep_cfg, "capabilities", None) or ()))
 
     def _client_for(
         self, base_url: str, min_pool: int = 0,
@@ -327,6 +377,7 @@ class BackendClientPool:
             path = provider.path_for(payload_type)
             headers = provider.request_headers(ep_cfg, request_id)
             if payload_type == "chat_completion":
+                payload = self._strip_undeclared_switch(ep_cfg, payload, request_id)
                 payload = provider.prepare_chat_payload(
                     payload,
                     model_id=ep_cfg.effective_model_id,
@@ -395,6 +446,19 @@ class BackendClientPool:
         # legitimately have empty content, so they're exempt.
         finish_reason: str | None = None
         if payload_type == "chat_completion":
+            # BEFORE the gate below, so a trace left in `content` is judged as
+            # what it is: a truncation inside the reasoning is then the same
+            # "spent its entire budget on REASONING" error a parser-split one
+            # is, instead of passing as a 200 whose content is a chain of thought.
+            if self._repairs_bleed(ep_cfg, payload_type):
+                fixed = repair_body(
+                    body, expects_reasoning=self._expects_reasoning(ep_cfg, payload),
+                    default_key=default_reasoning_key(provider.name))
+                if fixed is not None:
+                    self.think_bleed.note_repaired(
+                        ep_cfg.endpoint_class or ep_cfg.role, request_id,
+                        shape=fixed[0], stream=False,
+                        reasoning_chars=fixed[1], answer_chars=fixed[2])
             choice0 = (body.get("choices") or [{}])[0] or {}
             finish_reason = choice0.get("finish_reason")
             msg = choice0.get("message") or {}
@@ -434,6 +498,7 @@ class BackendClientPool:
             path = provider.path_for(payload_type)
             headers = provider.request_headers(ep_cfg, request_id)
             if payload_type == "chat_completion":
+                payload = self._strip_undeclared_switch(ep_cfg, payload, request_id)
                 payload = provider.prepare_chat_payload(
                     payload,
                     model_id=ep_cfg.effective_model_id,
@@ -445,6 +510,29 @@ class BackendClientPool:
         except ProviderError as exc:
             raise BackendError(
                 400, f"backend {ep_cfg.role} ({provider.name}): {exc}")
+
+        # A trace the engine left in `content` is moved to the reasoning field
+        # in-stream (think_bleed.StreamRepair). None = this endpoint does not
+        # declare reasoning, so not one chunk is inspected.
+        repair = (
+            StreamRepair(
+                expects_reasoning=self._expects_reasoning(ep_cfg, payload),
+                default_key=default_reasoning_key(provider.name))
+            if self._repairs_bleed(ep_cfg, payload_type) else None)
+
+        def _relay(parsed: dict | None, data: str) -> list["BackendStreamEvent"]:
+            """The event(s) to yield for one backend chunk. An EMPTY chunk with
+            no output is reported as a ``hold`` event, never dropped silently:
+            the consumer's stall watchdog counts chunks, and a stream whose
+            content is being held back is still demonstrably making progress."""
+            if repair is None or not isinstance(parsed, dict):
+                return [BackendStreamEvent(
+                    event_type="chunk", data=data, parsed=parsed)]
+            frames = repair.feed(parsed, data)
+            if not frames:
+                return [BackendStreamEvent(event_type="hold", data="")]
+            return [BackendStreamEvent(event_type="chunk", data=d, parsed=p)
+                    for p, d in frames]
 
         try:
             async with client.stream(
@@ -484,15 +572,26 @@ class BackendClientPool:
                     if line.startswith("data: "):
                         data = line[6:]
                         if data == "[DONE]":
+                            # Anything still held goes out BEFORE the terminator.
+                            if repair is not None:
+                                for p, d in repair.finish():
+                                    yield BackendStreamEvent(
+                                        event_type="chunk", data=d, parsed=p)
                             yield BackendStreamEvent(event_type="done", data=data)
                             break
                         try:
                             parsed = json.loads(data)
                         except json.JSONDecodeError:
                             parsed = None
+                        for ev in _relay(parsed, data):
+                            yield ev
+                if repair is not None:
+                    # The stream ended with no `[DONE]` (a real truncation the
+                    # caller must still see as one): release what is held. A
+                    # no-op after the branch above, which already did.
+                    for p, d in repair.finish():
                         yield BackendStreamEvent(
-                            event_type="chunk", data=data, parsed=parsed,
-                        )
+                            event_type="chunk", data=d, parsed=p)
         except httpx.ConnectError as exc:
             raise BackendUnavailable(f"backend {ep_cfg.role} unreachable: {exc}")
         except httpx.RemoteProtocolError as exc:
@@ -513,6 +612,15 @@ class BackendClientPool:
             raise BackendTimeout(f"backend {ep_cfg.role} stream timeout after {timeout_s}s")
         except httpx.HTTPError as exc:
             raise BackendError(502, f"backend {ep_cfg.role} stream http error: {exc}")
+        finally:
+            # In a `finally` so a stream cut short after the trace was already
+            # being moved still counts: the caller was served a repaired prefix.
+            if repair is not None and repair.repaired:
+                self.think_bleed.note_repaired(
+                    ep_cfg.endpoint_class or ep_cfg.role, request_id,
+                    shape=repair.shape or "?", stream=True,
+                    reasoning_chars=repair.reasoning_chars,
+                    answer_chars=repair.answer_chars)
 
     async def call_watched(
         self,
@@ -951,6 +1059,7 @@ class BackendClientPool:
         try:
             path = provider.path_for("chat_completion")
             headers = provider.request_headers(ep_cfg, request_id)
+            payload = self._strip_undeclared_switch(ep_cfg, payload, request_id)
             prepared = provider.prepare_chat_payload(
                 payload,
                 model_id=ep_cfg.effective_model_id,

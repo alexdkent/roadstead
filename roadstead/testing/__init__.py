@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from .fake_backend import (
     ALL_FAULTS,
+    ALL_THINK_MODES,
     FAULT_CAPACITY_DESYNC,
     FAULT_DEGENERATE_LOOP,
     FAULT_EMPTY_COMPLETION,
@@ -58,12 +59,18 @@ from .fake_backend import (
     FAULT_TTFT_STALL,
     OMIT_USAGE,
     STREAM_ONLY_FAULTS,
+    THINK_CLEAN,
+    THINK_GLM_VLLM,
+    THINK_SWITCHABLE,
+    THINK_TAG_CLOSE_ONLY,
+    THINK_TAG_OPEN,
     USAGE_DEFAULT,
     FakeBackend,
     FakeBackendServer,
     MidStreamReset,
     RecordedRequest,
     REQUEST_LOG_CAPACITY,
+    ThinkScript,
     make_fake_app,
     mock_transport_handler,
 )
@@ -79,6 +86,14 @@ __all__ = [
     "RecordedRequest",
     "REQUEST_LOG_CAPACITY",
     "MidStreamReset",
+    # scripted reasoning replies (see FakeBackend.think)
+    "ThinkScript",
+    "ALL_THINK_MODES",
+    "THINK_GLM_VLLM",
+    "THINK_TAG_OPEN",
+    "THINK_TAG_CLOSE_ONLY",
+    "THINK_SWITCHABLE",
+    "THINK_CLEAN",
     # usage-shape knobs (see FakeBackend.usage_override)
     "USAGE_DEFAULT",
     "OMIT_USAGE",
