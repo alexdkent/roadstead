@@ -46,8 +46,10 @@ catalog, and needs no other file under ``tests/``.
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -71,17 +73,23 @@ from roadstead.testing import (
 # drive nothing but HTTP and must fail there for the RIGHT reason (a leaked trace),
 # so an ImportError here must not take the whole file down with it. The unit tests
 # that need a helper call `_need()`, which FAILS — never skips — when it is missing.
-try:
-    from roadstead.think_bleed import (
-        StreamRepair, rename_thinking_switch, repair_message, strip_thinking_switch,
-    )
-except ImportError:                                    # pragma: no cover
-    StreamRepair = rename_thinking_switch = repair_message = None
-    strip_thinking_switch = None
-try:
-    from roadstead.lifecycle import _answer_now_switch_off
-except ImportError:                                    # pragma: no cover
-    _answer_now_switch_off = None
+def _maybe(module: str, name: str):
+    """One name at a time: a tree that has some of the helpers must not lose the rest
+    to a single missing one."""
+    try:
+        return getattr(importlib.import_module(module), name)
+    except (ImportError, AttributeError):              # pragma: no cover
+        return None
+
+
+StreamRepair = _maybe("roadstead.think_bleed", "StreamRepair")
+ThinkBleedStats = _maybe("roadstead.think_bleed", "ThinkBleedStats")
+PREFIX_HOLD_CHARS = _maybe("roadstead.think_bleed", "PREFIX_HOLD_CHARS")
+rename_thinking_switch = _maybe("roadstead.think_bleed", "rename_thinking_switch")
+repair_message = _maybe("roadstead.think_bleed", "repair_message")
+strip_thinking_switch = _maybe("roadstead.think_bleed", "strip_thinking_switch")
+_answer_now_switch_off = _maybe("roadstead.lifecycle", "_answer_now_switch_off")
+_answer_now_template_kwargs = _maybe("roadstead.lifecycle", "_answer_now_template_kwargs")
 
 
 def _need(obj, name: str):
@@ -684,13 +692,7 @@ def _loop_text() -> str:
     return "Need to check the table again, same cell, same value. " * 80
 
 
-async def test_the_answer_now_reask_on_a_no_switch_endpoint_returns_only_the_answer(
-        rig, monkeypatch):
-    """The rescue call was itself a leak site: it hardcoded both switch spellings,
-    so on a no-switch endpoint the re-ask's answer came back with the trace glued in
-    front of it. Driven through the real stream: the first call loops in its
-    REASONING channel, the detector breaks it, and the re-ask must deliver the answer
-    alone."""
+def _arm_answer_now(rig: Rig, monkeypatch) -> None:
     monkeypatch.setenv("ROADSTEAD_PROXY_REASONING_LOOP_SHADOW", "0")
     monkeypatch.setenv("ROADSTEAD_PROXY_REASONING_LOOP_ANSWER_NOW", "1")
     ep = rig.svc._config.endpoints["tier3"]
@@ -699,21 +701,84 @@ async def test_the_answer_now_reask_on_a_no_switch_endpoint_returns_only_the_ans
     ep.reasoning_loop_max_distinct_ratio = 0.5
     ep.reasoning_loop_check_every_chars = 200
 
-    reask_reasoning = "Notes say the total is what was asked."
 
+def _looping_then(reask: ThinkScript):
+    """First call loops in its REASONING channel; the re-ask (recognisable by the
+    `<notes>` block the proxy adds) gets `reask`."""
     def script(body: dict) -> ThinkScript:
         if any("<notes>" in str(m.get("content")) for m in body.get("messages", [])):
-            return ThinkScript(THINK_GLM_VLLM, reask_reasoning, ANSWER, chunk_chars=40)
+            return reask
         return ThinkScript(THINK_GLM_VLLM, _loop_text(), "never reached",
                            chunk_chars=40)
+    return script
 
-    rig.fake.think = script
+
+async def test_the_answer_now_reask_on_a_no_switch_endpoint_returns_only_the_answer(
+        rig, monkeypatch):
+    """The rescue call was itself a leak site: it hardcoded both switch spellings,
+    so on a no-switch endpoint the re-ask's answer came back with the trace glued in
+    front of it. Driven through the real stream: the first call loops in its
+    REASONING channel, the detector breaks it, and the re-ask must deliver the answer
+    alone."""
+    _arm_answer_now(rig, monkeypatch)
+    reask_reasoning = "Notes say the total is what was asked."
+    rig.fake.think = _looping_then(
+        ThinkScript(THINK_GLM_VLLM, reask_reasoning, ANSWER, chunk_chars=40))
     reply = await _openai(rig, "tier3", _payload(max_tokens=256), True)
     assert reply.status == 200, reply.text[-400:]
     assert len(rig.chat_bodies()) == 2, "the re-ask never happened — the test is blind"
     assert reply.content == ANSWER, f"caller-visible content is {reply.content!r}"
     assert reask_reasoning not in reply.content
     _assert_no_switch_on_the_wire(rig.chat_bodies()[1])
+    assert (await rig.status())["reasoning_loops_answered"] == 1
+
+
+async def test_a_reask_that_spends_its_budget_on_reasoning_is_not_counted_as_answered(
+        rig, monkeypatch):
+    """A no-switch endpoint cannot be told not to reason, so the re-ask can run out
+    of budget inside its own trace: reasoning chunks, no content, `length`. That is a
+    FAILED rescue. It must fall back to the loop-break error, and
+    `reasoning_loops_answered` must not claim an answer nobody received."""
+    _arm_answer_now(rig, monkeypatch)
+    rig.fake.think = _looping_then(ThinkScript(
+        THINK_GLM_VLLM, "still working it out " * 20, "", chunk_chars=40,
+        truncate_in_reasoning=True))
+    reply = await _openai(rig, "tier3", _payload(max_tokens=256), True)
+    assert len(rig.chat_bodies()) == 2, "the re-ask never happened — the test is blind"
+    assert reply.content == ""
+    assert "the answer-now re-ask returned nothing" in reply.text
+    assert (await rig.status())["reasoning_loops_answered"] == 0
+
+
+async def test_the_reask_keeps_the_callers_other_template_kwargs(rig, monkeypatch):
+    """`reasoning_effort` and any template variable describe the PROMPT, not the
+    mode: dropping them changed what the re-ask rendered. Only switches go."""
+    _arm_answer_now(rig, monkeypatch)
+    rig.fake.think = _looping_then(
+        ThinkScript(THINK_GLM_VLLM, "notes", ANSWER, chunk_chars=40))
+    reply = await _openai(rig, "tier3", _payload(
+        max_tokens=256,
+        chat_template_kwargs={"reasoning_effort": "high", "enable_thinking": False,
+                              "my_var": 7}), True)
+    assert reply.content == ANSWER
+    assert rig.chat_bodies()[1]["chat_template_kwargs"] == {
+        "reasoning_effort": "high", "my_var": 7}
+
+
+@pytest.mark.parametrize("declared,expected", [
+    ("no_switch", {"reasoning_effort": "high"}),
+    ("switch", {"reasoning_effort": "high", "enable_thinking": False}),
+    ("undeclared", {"reasoning_effort": "high", "thinking": False,
+                    "enable_thinking": False}),
+])
+def test_answer_now_template_kwargs_per_declaration(declared, expected):
+    build = _need(_answer_now_template_kwargs, "lifecycle._answer_now_template_kwargs")
+    ep = dataclasses.make_dataclass("Ep", ["thinking_kwargs", "no_thinking_switch"])
+    eps = {"no_switch": ep((), True), "switch": ep(("enable_thinking",), False),
+           "undeclared": ep((), False)}
+    payload = {"chat_template_kwargs": {"reasoning_effort": "high", "thinking": True,
+                                        "enable_thinking": True}}
+    assert build(payload, eps[declared]) == expected
 
 
 # --- unit level: the strip itself -------------------------------------------- #
@@ -777,10 +842,20 @@ def _tagged(mode, *, answer=ANSWER, **kw) -> ThinkScript:
 REPAIR_MODES = {"open_tag": THINK_TAG_OPEN, "close_only": THINK_TAG_CLOSE_ONLY}
 
 
+def _arm(rig: Rig, shape: str, stream: bool, endpoint: str = "tier1") -> None:
+    """Streaming close-only repair holds content until the tag shows up, so it is an
+    operator opt-in (`policy.repair_close_only_reasoning`). Everything else — the
+    open-tag shape, and close-only when not streaming on a forced reasoner — needs
+    no declaration, and is exercised WITHOUT one."""
+    if shape == "close_only" and stream:
+        rig.svc._config.endpoints[endpoint].repair_close_only_reasoning = True
+
+
 @pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
 @pytest.mark.parametrize("door", DOORS)
 @pytest.mark.parametrize("shape", REPAIR_MODES)
 async def test_a_tagged_trace_is_moved_to_the_reasoning_field(rig, shape, door, stream):
+    _arm(rig, shape, stream)
     rig.fake.think = _tagged(REPAIR_MODES[shape])
     reply = await DOORS[door](rig, "tier1", _payload(), stream)
     _assert_the_answer_and_only_the_answer(reply, ANSWER)
@@ -789,6 +864,7 @@ async def test_a_tagged_trace_is_moved_to_the_reasoning_field(rig, shape, door, 
 @pytest.mark.parametrize("width", [1, 2, 3, 5, 7])
 @pytest.mark.parametrize("shape", REPAIR_MODES)
 async def test_a_tag_split_across_stream_chunks_is_still_found(rig, shape, width):
+    _arm(rig, shape, True)
     rig.fake.think = _tagged(REPAIR_MODES[shape], chunk_chars=width)
     reply = await _openai(rig, "tier1", _payload(), True)
     _assert_the_answer_and_only_the_answer(reply, ANSWER)
@@ -798,6 +874,7 @@ async def test_a_tag_split_across_stream_chunks_is_still_found(rig, shape, width
 @pytest.mark.parametrize("shape", REPAIR_MODES)
 async def test_a_tool_turn_with_a_tagged_trace_keeps_call_and_drops_trace(
         rig, shape, stream):
+    _arm(rig, shape, stream)
     rig.fake.think = _tagged(REPAIR_MODES[shape], answer="", tool_calls=[TOOL_CALL])
     reply = await _openai(rig, "tier1", _payload(tools=TOOLS), stream)
     assert reply.status == 200, reply.text[:300]
@@ -810,6 +887,7 @@ async def test_a_tool_turn_with_a_tagged_trace_keeps_call_and_drops_trace(
 @pytest.mark.parametrize("shape", REPAIR_MODES)
 async def test_a_structured_reply_behind_a_tagged_trace_is_only_the_json(
         rig, shape, stream):
+    _arm(rig, shape, stream)
     rig.fake.think = _tagged(REPAIR_MODES[shape], answer=JSON_ANSWER)
     reply = await _openai(
         rig, "tier1", _payload(response_format=SCHEMA_FORMAT), stream)
@@ -844,7 +922,7 @@ def test_repair_message_keeps_length_and_puts_the_trace_in_the_reasoning_field()
     """The message-level truth behind the two tests above, without the gate."""
     msg = {"role": "assistant", "content": "<think>\n" + REASONING}
     out = _need(repair_message, "think_bleed.repair_message")(
-        msg, expects_reasoning=False, default_key="reasoning_content")
+        msg, close_only=False, default_key="reasoning_content")
     assert out == ("unclosed", len(REASONING), 0)
     assert msg["content"] == "" and msg["reasoning_content"] == REASONING
 
@@ -947,7 +1025,7 @@ async def test_repair_does_not_act_on_an_endpoint_that_declares_no_reasoning(
     delivered as the backend sent it, tag and all."""
     rig.fake.think = _tagged(THINK_TAG_OPEN)
     reply = await _openai(rig, "tier2", _payload(), stream)
-    assert reply.content == "<think>\n" + REASONING + "\n</think>\n\n" + ANSWER
+    assert reply.content == "<think>\n" + REASONING + "\n</think>\n" + ANSWER
     assert await rig.counter("think_bleed_repaired") == 0
 
 
@@ -994,17 +1072,21 @@ def _slice(text: str, n: int) -> list[dict]:
 
 @pytest.mark.parametrize("width", range(1, 14))
 @pytest.mark.parametrize("raw,reasoning,answer", [
-    ("<think>\nR R R\n</think>\n\nthe answer", "R R R", "the answer"),
+    ("<think>\nR R R\n</think>\nthe answer", "R R R", "the answer"),
     ("  <think>R</think>A", "R", "A"),
-    ("R R R\n</think>\n\nthe answer", "R R R", "the answer"),
+    ("R R R\n</think>\nthe answer", "R R R", "the answer"),
     ("R</think>A", "R", "A"),
     ("<think>R</think>", "R", ""),
-    ("<think>R</think>\n\n\n   A  B", "R", "A  B"),
+    # ONE newline is the template's, and only that is removed: everything the
+    # ANSWER starts with (a blank line, indentation) is the answer's own.
+    ("<think>R</think>\n\n\n   A  B", "R", "\n\n   A  B"),
+    ("<think>R</think>\r\n    code()", "R", "    code()"),
+    ("R</think>\n    indented", "R", "    indented"),
 ], ids=["open", "open_lead_ws", "close_only", "close_only_tiny", "no_answer",
-        "ws_after_tag"])
+        "only_one_newline", "crlf", "indentation_survives"])
 def test_every_chunking_of_every_marked_shape_splits_the_same(
         width, raw, reasoning, answer):
-    r = _repairer(expects_reasoning=True, default_key="reasoning")
+    r = _repairer(hold_for_close_tag=True, default_key="reasoning")
     content, got_reasoning, finish = _run(r, _frames(*_slice(raw, width)))
     assert content == answer
     assert got_reasoning.strip() == reasoning
@@ -1013,7 +1095,7 @@ def test_every_chunking_of_every_marked_shape_splits_the_same(
 
 @pytest.mark.parametrize("width", range(1, 10))
 def test_an_unclosed_trace_is_reasoning_and_the_finish_survives(width):
-    r = _repairer(expects_reasoning=False, default_key="reasoning")
+    r = _repairer(hold_for_close_tag=False, default_key="reasoning")
     raw = "<think>\nstill thinking when the budget ran out"
     content, reasoning, finish = _run(r, _frames(*_slice(raw, width), finish="length"))
     assert content == ""
@@ -1027,35 +1109,35 @@ def test_an_unclosed_trace_is_reasoning_and_the_finish_survives(width):
 def test_unmarked_content_is_released_byte_identical(width, raw):
     """Without an opening tag and NOT expected to reason, nothing is ever held past
     the first chunk that rules out `<think>` — and what comes out is what went in."""
-    r = _repairer(expects_reasoning=False, default_key="reasoning")
+    r = _repairer(hold_for_close_tag=False, default_key="reasoning")
     content, reasoning, _ = _run(r, _frames(*_slice(raw, width)))
     assert content == raw and reasoning == "" and not r.repaired
 
 
 @pytest.mark.parametrize("width", range(1, 10))
 def test_an_expected_reasoner_holds_unmarked_content_then_releases_it_whole(width):
-    r = _repairer(expects_reasoning=True, default_key="reasoning")
+    r = _repairer(hold_for_close_tag=True, default_key="reasoning")
     raw = "just an answer with no marker anywhere"
     content, reasoning, _ = _run(r, _frames(*_slice(raw, width)))
     assert content == raw and reasoning == "" and not r.repaired
 
 
 def test_a_reasoning_field_on_the_wire_means_the_engine_split_it():
-    r = _repairer(expects_reasoning=True, default_key="reasoning")
+    r = _repairer(hold_for_close_tag=True, default_key="reasoning")
     frames = _frames({"reasoning": "thinking"}, {"content": "a </think> b"})
     content, reasoning, _ = _run(r, frames)
     assert content == "a </think> b" and reasoning == "thinking" and not r.repaired
 
 
 def test_the_hold_is_bounded():
-    r = _repairer(expects_reasoning=True, default_key="reasoning", hold_limit=20)
+    r = _repairer(hold_for_close_tag=True, default_key="reasoning", hold_limit=20)
     raw = "x" * 50 + "</think>after"
     content, reasoning, _ = _run(r, _frames(*_slice(raw, 5)))
     assert content == raw and reasoning == ""
 
 
 def test_untouched_frames_keep_their_original_bytes():
-    r = _repairer(expects_reasoning=False, default_key="reasoning")
+    r = _repairer(hold_for_close_tag=False, default_key="reasoning")
     frames = _frames({"role": "assistant"}, {"content": "hello"}, {"content": " there"})
     out = []
     for parsed, data in frames:
@@ -1064,7 +1146,7 @@ def test_untouched_frames_keep_their_original_bytes():
 
 
 def test_a_usage_only_frame_and_a_second_choice_pass_through():
-    r = _repairer(expects_reasoning=True, default_key="reasoning")
+    r = _repairer(hold_for_close_tag=True, default_key="reasoning")
     usage = {"id": "c", "choices": [], "usage": {"completion_tokens": 3}}
     other = {"id": "c", "choices": [{"index": 1, "delta": {"content": "</think>x"}}]}
     assert r.feed(usage, json.dumps(usage)) == [(usage, json.dumps(usage))]
@@ -1072,7 +1154,7 @@ def test_a_usage_only_frame_and_a_second_choice_pass_through():
 
 
 def test_tool_calls_arriving_while_holding_release_the_held_text_first():
-    r = _repairer(expects_reasoning=True, default_key="reasoning")
+    r = _repairer(hold_for_close_tag=True, default_key="reasoning")
     tool = {"tool_calls": [{"index": 0, "id": "c0", "type": "function",
                             "function": {"name": "f", "arguments": "{}"}}]}
     frames = _frames({"content": "some prose"}, tool, finish="tool_calls")
@@ -1083,3 +1165,236 @@ def test_tool_calls_arriving_while_holding_release_the_held_text_first():
               "tool" if p["choices"][0]["delta"].get("tool_calls") else "finish")
              for p, _ in out]
     assert kinds == ["content", "tool", "finish"]
+
+
+# --------------------------------------------------------------------------- #
+# 5. What a healthy stream must NOT pay, and what an answer must NOT lose
+# --------------------------------------------------------------------------- #
+#
+# The first cut of the repair held content back on any endpoint "expected to reason":
+# every no-reasoning stream on tier3 (~30% of short calls, measured) and every
+# switched-off stream on a forced reasoner. Time-to-first-token became total
+# generation time. These pin that a healthy stream flows, and that a `</think>` in an
+# answer is the answer's own text.
+
+SLOW_S = 0.2
+SENTENCE = "one sentence about the sea"
+
+
+def _flash_shaped(rig: Rig) -> None:
+    """A forced reasoner (llama.cpp + a reasoning model) with a declared switch."""
+    ep = rig.svc._config.endpoints["tier1"]
+    ep.thinking_kwargs = ("enable_thinking",)
+    assert ep.forces_reasoning
+
+
+async def _first_content_and_total(rig: Rig, endpoint: str, payload: dict):
+    """Seconds to the first CONTENT event out of the backend pool, and to the end.
+    Measured at `BackendClientPool.stream` because httpx's ASGI transport buffers a
+    whole response body and would hide exactly the delay under test."""
+    pool: BackendClientPool = rig.svc._backend
+    ep = rig.svc._config.endpoints[endpoint]
+    t0 = time.monotonic()
+    first = None
+    async for ev in pool.stream(ep, {**payload, "stream": True},
+                                "chat_completion", "latency"):
+        for ch in (ev.parsed or {}).get("choices") or []:
+            if (ch.get("delta") or {}).get("content") and first is None:
+                first = time.monotonic() - t0
+    return first, time.monotonic() - t0
+
+
+def _assert_flowing(first, total):
+    assert first is not None
+    assert total > SLOW_S * 4, "the fake was not slow — the test measures nothing"
+    assert first < SLOW_S * 3 and first < total / 2, (
+        f"first content chunk after {first:.2f}s of a {total:.2f}s stream — the "
+        f"stream was held back")
+
+
+async def test_a_no_reasoning_stream_on_a_no_switch_endpoint_is_not_held(rig):
+    """tier3-shaped: parser on, the model answered without reasoning."""
+    rig.fake.think = ThinkScript(THINK_CLEAN, "", SENTENCE, chunk_chars=5,
+                                 token_delay_s=SLOW_S)
+    _assert_flowing(*await _first_content_and_total(rig, "tier3", _payload()))
+
+
+async def test_a_switched_off_stream_on_a_forced_reasoner_is_not_held(rig):
+    """tier2-flash-shaped: forces_reasoning, `enable_thinking: false` streams
+    content only. An explicit off means "not expected to reason"."""
+    _flash_shaped(rig)
+    rig.fake.think = ThinkScript(THINK_SWITCHABLE, REASONING, SENTENCE,
+                                 chunk_chars=5, token_delay_s=SLOW_S)
+    _assert_flowing(*await _first_content_and_total(
+        rig, "tier1", _payload(chat_template_kwargs={"enable_thinking": False})))
+
+
+async def test_a_forced_reasoner_with_no_reasoning_field_is_not_held_either(rig):
+    """No kwargs at all, content only. Without an opt-in there is no reason to wait
+    for a tag that has given no sign of coming."""
+    rig.fake.think = ThinkScript(THINK_CLEAN, "", SENTENCE, chunk_chars=5,
+                                 token_delay_s=SLOW_S)
+    _assert_flowing(*await _first_content_and_total(rig, "tier1", _payload()))
+
+
+FALSE_POSITIVE = "Close the block with </think> and then answer."
+INDENTED = "    def f():\n        return 1"
+
+
+@pytest.mark.parametrize("thinking", [False, True], ids=["plain", "thinking_on"])
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+async def test_a_tag_in_the_answer_survives_on_a_tier3_shaped_endpoint(
+        rig, stream, thinking):
+    rig.fake.think = ThinkScript(THINK_CLEAN, "", FALSE_POSITIVE, chunk_chars=3)
+    extra = {"thinking": True} if thinking else {}
+    reply = await _openai(rig, "tier3", _payload(**extra), stream)
+    assert reply.status == 200, reply.text[:300]
+    assert reply.content == FALSE_POSITIVE
+    assert await rig.counter("think_bleed_repaired") == 0
+
+
+@pytest.mark.parametrize("opted_in", [False, True], ids=["default", "opted_in"])
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+async def test_a_tag_in_the_answer_survives_on_a_switched_off_forced_reasoner(
+        rig, stream, opted_in):
+    """Even an endpoint that opted in to the close-only repair does not apply it to
+    a call whose switch is explicitly off: that call is not reasoning."""
+    _flash_shaped(rig)
+    rig.svc._config.endpoints["tier1"].repair_close_only_reasoning = opted_in
+    rig.fake.think = ThinkScript(THINK_SWITCHABLE, REASONING, FALSE_POSITIVE,
+                                 chunk_chars=3)
+    reply = await _openai(
+        rig, "tier1", _payload(chat_template_kwargs={"enable_thinking": False}), stream)
+    assert reply.status == 200, reply.text[:300]
+    assert reply.content == FALSE_POSITIVE
+    assert await rig.counter("think_bleed_repaired") == 0
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+@pytest.mark.parametrize("shape", REPAIR_MODES)
+async def test_an_answer_that_starts_with_indentation_keeps_it(rig, shape, stream):
+    """Only the template's ONE newline after the tag is removed."""
+    _arm(rig, shape, stream)
+    rig.fake.think = _tagged(REPAIR_MODES[shape], answer=INDENTED)
+    reply = await _openai(rig, "tier1", _payload(), stream)
+    assert reply.content == INDENTED
+
+
+def test_reasoning_under_any_key_means_the_engine_split_it():
+    repair = _need(repair_message, "think_bleed.repair_message")
+    for msg in ({"content": "a</think>b", "reasoning": None, "reasoning_content": "x"},
+                {"content": "a</think>b", "reasoning": "x", "reasoning_content": None},
+                {"content": "<think>t</think>b", "reasoning_content": "x"}):
+        before = dict(msg)
+        assert repair(msg, close_only=True, default_key="reasoning") is None
+        assert msg == before
+
+
+# --- the close-only repair is narrow ------------------------------------------ #
+
+async def test_close_only_is_not_repaired_on_an_endpoint_that_neither_opted_in_nor_forces(
+        rig):
+    """tier3 is not a forced reasoner and has not opted in: `R</think>A` is passed
+    through as sent, because it cannot be told from an answer that mentions the tag."""
+    rig.fake.think = _tagged(THINK_TAG_CLOSE_ONLY)
+    reply = await _openai(rig, "tier3", _payload(), False)
+    assert reply.content == REASONING + "\n</think>\n" + ANSWER
+
+
+async def test_close_only_is_repaired_on_an_opted_in_endpoint_that_does_not_force(rig):
+    rig.svc._config.endpoints["tier3"].repair_close_only_reasoning = True
+    rig.fake.think = _tagged(THINK_TAG_CLOSE_ONLY)
+    for stream in (False, True):
+        reply = await _openai(rig, "tier3", _payload(), stream)
+        _assert_the_answer_and_only_the_answer(reply, ANSWER)
+
+
+async def test_streaming_close_only_without_the_opt_in_is_passed_through_unheld(rig):
+    """The documented trade: a forced reasoner that has NOT opted in streams the
+    close-only shape as it came (and, per the latency tests, promptly)."""
+    rig.fake.think = _tagged(THINK_TAG_CLOSE_ONLY)
+    reply = await _openai(rig, "tier1", _payload(), True)
+    assert reply.content == REASONING + "\n</think>\n" + ANSWER
+
+
+def test_the_close_only_opt_in_reaches_endpoint_config(tmp_path):
+    """A `policy:` key missing from `_POLICY_PASSTHROUGH` is dropped in silence."""
+    for policy, expected in (("repair_close_only_reasoning: true", True), ("{}", False)):
+        text = _CATALOG.replace(
+            "  tier1:\n    provider: cpp-box\n    kind: chat\n",
+            "  tier1:\n    provider: cpp-box\n    kind: chat\n    policy: "
+            + ("{" + policy + "}" if policy != "{}" else "{}") + "\n")
+        path = tmp_path / f"models-{expected}.yaml"
+        path.write_text(text)
+        cat = model_catalog.load_catalog(path, force=True)
+        kw = model_catalog.build_endpoint_kwargs(cat)["tier1"]
+        assert EndpointConfig(**kw).repair_close_only_reasoning is expected
+
+
+# --- the stream repairer: prefix hold, errors --------------------------------- #
+
+def test_without_the_opt_in_the_prefix_hold_is_a_handful_of_characters():
+    keep = _need(PREFIX_HOLD_CHARS, "think_bleed.PREFIX_HOLD_CHARS")
+    # Text that is plainly not a tag is released by the very first chunk.
+    r = _repairer(hold_for_close_tag=False, default_key="reasoning")
+    frames = _frames(*_slice("hello there", 1), finish="")
+    assert r.feed(*frames[0]) == [frames[0]]
+    # A `<` could still become the tag, so it is held; `<b` proves it is not.
+    r = _repairer(hold_for_close_tag=False, default_key="reasoning")
+    frames = _frames(*_slice("<b>x", 1), finish="")
+    assert r.feed(*frames[0]) == []
+    released = r.feed(*frames[1])
+    assert [f["choices"][0]["delta"]["content"] for f, _ in released] == ["<b"]
+    # Whitespace cannot be held forever waiting for a tag.
+    r = _repairer(hold_for_close_tag=False, default_key="reasoning")
+    got = ""
+    for parsed, data in _frames(*_slice(" " * (keep + 4), 1), finish=""):
+        for f, _ in r.feed(parsed, data):
+            got += f["choices"][0]["delta"].get("content") or ""
+    assert got and len(got) <= keep + 4
+
+
+def test_held_text_is_released_before_an_error_frame():
+    r = _repairer(hold_for_close_tag=True, default_key="reasoning")
+    held = _frames({"content": "the partial answer"}, finish="")
+    assert r.feed(*held[0]) == []
+    err = {"error": {"message": "boom", "type": "proxy_error"}}
+    out = r.feed(err, json.dumps(err))
+    assert out[0][0]["choices"][0]["delta"]["content"] == "the partial answer"
+    assert out[-1] == (err, json.dumps(err))
+
+
+# --- counter cardinality ------------------------------------------------------- #
+
+def test_counter_keys_do_not_grow_with_caller_supplied_values():
+    """A counter keyed on raw caller input is a caller-controlled allocation."""
+    strip = _need(strip_thinking_switch, "think_bleed.strip_thinking_switch")
+    rename = _need(rename_thinking_switch, "think_bleed.rename_thinking_switch")
+    stats = _need(ThinkBleedStats, "think_bleed.ThinkBleedStats")()
+    for i in range(1000):
+        _, found = strip({"chat_template_kwargs": {"enable_thinking": f"value-{i}"}})
+        stats.note_stripped("tier3", found, f"r{i}")
+        _, found = rename(
+            {"chat_template_kwargs": {"thinking": {"type": f"kind-{i}"}}},
+            ("enable_thinking",))
+        stats.note_renamed("tier2", found, f"r{i}")
+        _, found = rename(
+            {"chat_template_kwargs": {"thinking": f"value-{i}"}}, ("enable_thinking",))
+        stats.note_renamed("tier2", found, f"r{i}")
+    stripped = stats.switch_stripped_by_endpoint["tier3"]
+    assert stripped["count"] == 1000
+    assert set(stripped["spellings"]) == {"chat_template_kwargs.enable_thinking=str"}
+    assert len(stats.switch_renamed_by_endpoint["tier2"]["renames"]) <= 3
+    assert "value-" not in json.dumps(stats.switch_renamed_by_endpoint)
+
+
+def test_a_bool_switch_keeps_its_value_in_the_label_because_false_is_the_leak():
+    strip = _need(strip_thinking_switch, "think_bleed.strip_thinking_switch")
+    labels = {}
+    for v in (False, True, None, 3, "x", [1]):
+        _, found = strip({"chat_template_kwargs": {"thinking": v}})
+        labels[repr(v)] = found[0]
+    assert labels["False"].endswith("=false") and labels["True"].endswith("=true")
+    assert labels["None"].endswith("=null")
+    assert labels["3"].endswith("=int") and labels["'x'"].endswith("=str")
+    assert labels["[1]"].endswith("=list")

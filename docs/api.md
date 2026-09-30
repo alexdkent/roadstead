@@ -2671,25 +2671,39 @@ and returns only the answer as `content`, sync and streaming (including a tag sp
 chunks), on tool turns and structured replies alike. The field name is the one the engine already
 uses — `reasoning` for vLLM, `reasoning_content` otherwise — never a third spelling.
 
-* The closing-tag-only shape is believed only where the call is expected to reason (the endpoint
-  forces reasoning, declares no switch, or the request has thinking on): elsewhere a stray
-  `</think>` is far more likely to be an answer *about* the tag. A response that already carries a
-  reasoning field is never touched, and content with no marker is byte-identical.
+* The **open-tag** shape (`<think>…`) needs no declaration beyond `capabilities.reasoning`: the
+  first few characters decide it, so a stream holds content for at most 16 characters (and only
+  when it starts with `<`).
+* The **close-tag-only** shape is the one that can misread an answer, so it is narrow. Never on a
+  call whose switch is explicitly off (a `false` thinking key on the wire). **Non-streaming**, on a
+  forced reasoner (llama.cpp with a reasoning model) or an endpoint that opted in. **Streaming**,
+  only on an endpoint that opted in with `policy.repair_close_only_reasoning: true` (absent ⇒ off):
+  with no opening tag there is nothing to tell a trace from an answer until `</think>` arrives, so
+  the stream has to be *held* until then (bounded at 65,536 characters, then released as content) —
+  which delays the first token of every healthy no-reasoning stream on that endpoint (measured on
+  a live tier: ~30% of short calls stream no reasoning at all). Declare it only for an endpoint
+  seen to leak this shape. A response that already carries reasoning under **any** key
+  (`reasoning` or `reasoning_content`) is never touched, content with no marker is byte-identical,
+  and only the template's one newline after the tag is removed (indentation in the answer survives).
 * **A truncation inside the trace is never delivered as content.** `<think>…` with no close and
   `finish_reason: "length"` becomes reasoning with EMPTY content and the finish stays `length`.
   Non-streaming, that is exactly the shape the empty-completion gate already answers with
   `502 … spent its ENTIRE budget on REASONING`, and the repair runs before that gate so both
   parser-split and tag-split truncations get the same error.
-* Streaming, an endpoint expected to reason holds content back only until it can tell whether it is
-  a trace (bounded at 65,536 characters, then released as content). A held chunk still counts as
-  progress for the stall watchdogs.
+* A held stream chunk still counts as progress for the stall watchdogs, and held text is released
+  before an error frame is passed through.
 * Not repairable, by construction: a leak with **no marker at all** (case 1 above). Roadstead does
-  not guess where reasoning ends.
+  not guess where reasoning ends. Streaming repair inspects `choices[0]` only: a stream with
+  `n > 1` is passed through unrepaired.
+* The **answer-now re-ask** (§3.14) builds its thinking switch from the endpoint's declaration and
+  keeps the caller's other `chat_template_kwargs`. On a no-switch endpoint it therefore still
+  reasons; a re-ask that spends its budget on reasoning and returns no content is a *failed*
+  rescue (the loop-break error is returned, and `reasoning_loops_answered` is not counted).
 
 `GET /v1/status` → `reliability.think_switch_stripped` and `think_switch_stripped_by_endpoint`
-(`{endpoint: {count, spellings{"chat_template_kwargs.enable_thinking=false": n}}}` — the value is
-part of the key, so the spelling that would actually have leaked is distinguishable from a benign
-`true`), and `reliability.think_bleed_repaired` and `think_bleed_repaired_by_endpoint`
+(`{endpoint: {count, spellings{"chat_template_kwargs.enable_thinking=false": n}}}` — a boolean
+value is part of the key, so the spelling that would actually have leaked is distinguishable from a
+benign `true`; any other value is recorded as its TYPE (`=str`, `=null`), never as caller input), and `reliability.think_bleed_repaired` and `think_bleed_repaired_by_endpoint`
 (`{endpoint: {count, sync, stream, shapes{open_tag|close_only|unclosed: n}}}`). A non-zero
 `think_bleed_repaired` means an engine is mis-splitting. Grep markers, at most one line per
 endpoint per minute carrying its count: `ROADSTEAD_THINK_SWITCH_STRIPPED`,

@@ -626,6 +626,11 @@ _POLICY_PASSTHROUGH = (
     # Guarded by
     # test_reasoning_replay.py::test_declared_flag_reaches_endpoint_config.
     "replay_reasoning_history",
+    # Opt in to repairing the close-only reasoning leak (`…</think>answer`, no
+    # opening tag) in a STREAM, which holds content until the tag shows up — a
+    # latency cost on every no-reasoning stream, so absent = off. Guarded by
+    # test_think_bleed.py::test_the_close_only_opt_in_reaches_endpoint_config.
+    "repair_close_only_reasoning",
     # Prefix keep-alive (roadstead/prefix_keepalive.py). Trigger/idle/cap are
     # plain scalars; `prefix_keepalive_call_sites` is handled OUTSIDE this
     # loop below, for the same reason `thinking_kwargs` is — YAML hands us a

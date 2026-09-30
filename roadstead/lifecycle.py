@@ -91,6 +91,7 @@ from .legacy import (
 )
 from .observability import MetricsSample, RequestLogRecord
 from .on_demand import OnDemandUnavailable
+from .providers.payload import _THINKING_KWARG_NAMES
 from .reasoning_replay import accumulate_tool_call_deltas
 from .scheduler import CompletionRecord, DispatchDecision, QueuedRequest
 from .sse_hub import DROP_SENTINEL
@@ -140,12 +141,12 @@ _BLANK_RUN_RETRY_EXTRAS: dict = {}
 
 
 def _answer_now_switch_off(ep_cfg) -> dict:
-    """The ``chat_template_kwargs`` that turn reasoning OFF for the answer-now
+    """The thinking-switch entries of ``chat_template_kwargs`` for the answer-now
     re-ask, built from what THIS endpoint declares rather than a fixed pair.
 
     * declared switch keys → each one ``False``;
     * ``policy.thinking_kwargs: []`` (``no_thinking_switch``) → ``{}``. There is
-      no switch to turn off, and sending one is the leak this module exists to
+      no switch to turn off, and sending one is the leak ``think_bleed`` exists to
       prevent: the backend's parser stands down, the model reasons anyway, and
       the re-ask's whole answer arrives as ``7391573915``-style trace+answer with
       no tag. (This call site hardcoded both spellings until 2026-09-29, so the
@@ -154,15 +155,29 @@ def _answer_now_switch_off(ep_cfg) -> dict:
       before: which key a template reads is per-model, and sending only one
       leaves reasoning on wherever the other is the live switch.
 
-    An empty result means "send no ``chat_template_kwargs`` at all". On a
-    no-switch endpoint the re-ask therefore still reasons; ``backend`` removes
-    any switch a later edit might add here (``strip_thinking_switch``)."""
+    🚨 On a no-switch endpoint the re-ask therefore STILL REASONS: nothing can
+    turn that off. It is asked for the answer and budgeted for the answer
+    (``_ANSWER_NOW_MAX_TOKENS``), but it can spend that budget on reasoning and
+    return no content — which ``_answer_now_stream`` treats as a failed rescue,
+    not a served one. ``backend`` removes any switch a later edit might add here
+    (``strip_thinking_switch``)."""
     if getattr(ep_cfg, "no_thinking_switch", False):
         return {}
     keys = tuple(getattr(ep_cfg, "thinking_kwargs", ()) or ())
     if keys:
         return {k: False for k in keys}
     return {"thinking": False, "enable_thinking": False}
+
+
+def _answer_now_template_kwargs(payload: dict, ep_cfg) -> dict:
+    """``chat_template_kwargs`` for the re-ask: the caller's OWN entries (a
+    ``reasoning_effort``, a template variable this proxy knows nothing about) kept,
+    with every thinking switch removed — the re-ask sets its own, per
+    :func:`_answer_now_switch_off`, and on a no-switch endpoint sets none."""
+    ck = payload.get("chat_template_kwargs")
+    kept = ({k: v for k, v in ck.items() if k not in _THINKING_KWARG_NAMES}
+            if isinstance(ck, dict) else {})
+    return {**kept, **_answer_now_switch_off(ep_cfg)}
 
 
 def _blank_run_eligible(correction: "Correction", req: QueuedRequest) -> bool:
@@ -2634,6 +2649,11 @@ class Lifecycle:
                         # watchdog exactly as a relayed chunk would be — else
                         # a held stream is killed as a "stall" it is not in.
                         now_m = time.monotonic()
+                        if ttft_ms is None:
+                            # The backend's first token, which is what this
+                            # measures; without it a first-event hold would
+                            # leave the stall label reading "ttft".
+                            ttft_ms = (now_m - t0) * 1000.0
                         last_chunk_at = now_m
                         remaining = hard_limit_s - (now_m - t0)
                         if remaining <= 0:
@@ -2964,9 +2984,16 @@ class Lifecycle:
         the loop; handing it back and asking for a conclusion seeds the failure
         we just interrupted. See ``ReasoningLoopDetector.head``.
 
-        THINKING IS EXPLICITLY OFF on this turn. Leaving it on re-enters the
-        regime that just looped, and there is nothing left to deliberate about —
-        the deliberation is in the notes."""
+        THINKING IS SWITCHED OFF on this turn wherever the endpoint has a switch
+        (see :func:`_answer_now_switch_off`). Leaving it on re-enters the regime
+        that just looped, and there is nothing left to deliberate about — the
+        deliberation is in the notes. On an endpoint that declares NO switch there
+        is nothing to turn off, so the re-ask may reason; if it spends its budget
+        doing so and returns no content, that is a FAILED rescue and is reported
+        as one (``(0, False)``, and ``reasoning_loops_answered`` is not counted).
+
+        The caller's own ``chat_template_kwargs`` other than the switch (an effort,
+        a template variable) ride along: they describe the prompt, not the mode."""
         try:
             payload = req.payload
             if not isinstance(payload, dict):
@@ -2998,12 +3025,22 @@ class Lifecycle:
                 "max_tokens": answer_max,
                 "stream": True,
             }
-            switch_off = _answer_now_switch_off(ep_cfg)
-            if switch_off:
-                second["chat_template_kwargs"] = switch_off
+            kwargs = _answer_now_template_kwargs(payload, ep_cfg)
+            if kwargs:
+                second["chat_template_kwargs"] = kwargs
+            # `extra_body` is merged over the top level by the provider, so a
+            # switch nested in it would win over the one built above.
+            eb = second.get("extra_body")
+            if isinstance(eb, dict) and isinstance(eb.get("chat_template_kwargs"), dict):
+                eb_ck = {k: v for k, v in eb["chat_template_kwargs"].items()
+                         if k not in _THINKING_KWARG_NAMES}
+                second["extra_body"] = {
+                    **{k: v for k, v in eb.items() if k != "chat_template_kwargs"},
+                    **({"chat_template_kwargs": eb_ck} if eb_ck else {})}
             out_tokens = 0
             saw_done = False
             relayed = 0
+            content_chars = 0
             async for event in self.state.backend.stream(
                 ep_cfg, second, req.payload_type,
                 f"{req.request_id}-answernow", timeout_s=max(5.0, timeout_s),
@@ -3014,6 +3051,11 @@ class Lifecycle:
                         if usage:
                             out_tokens = coerce_token_count(
                                 usage.get("completion_tokens"), out_tokens)
+                        for ch in event.parsed.get("choices") or []:
+                            d = ch.get("delta") if isinstance(ch, dict) else None
+                            piece = d.get("content") if isinstance(d, dict) else None
+                            if isinstance(piece, str):
+                                content_chars += len(piece.strip())
                     relayed += 1
                     await stream_q.put({"type": "chunk", "data": event.data})
                 elif event.event_type == "done":
@@ -3028,6 +3070,17 @@ class Lifecycle:
                 len(notes), answer_max, relayed, out_tokens, saw_done,
             )
             if relayed == 0:
+                return 0, False
+            if content_chars == 0:
+                # Chunks arrived but none was ANSWER text: the re-ask spent its
+                # budget on reasoning (a no-switch endpoint cannot be told not
+                # to). Not a rescue — the caller falls back to the loop-break
+                # error, and `answered` must not claim a served answer.
+                logger.warning(
+                    "ROADSTEAD_ANSWER_NOW_NO_CONTENT endpoint=%s request_id=%s "
+                    "chunks=%d output_tokens=%d — the re-ask produced no "
+                    "content; treating the rescue as failed",
+                    req.endpoint, req.request_id, relayed, out_tokens)
                 return 0, False
             self.state.reasoning_loops_answered += 1
             return out_tokens, saw_done

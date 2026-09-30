@@ -38,6 +38,11 @@ to the reasoning field and leave only the answer in ``content``. Acts only on an
 endpoint that DECLARES ``capabilities.reasoning``; never touches content without
 a marker.
 
+The close-only shape is the expensive one: in a STREAM it means holding content until a
+``</think>`` shows up, which delays every healthy no-reasoning stream on the endpoint, so
+streaming close-only repair is an operator opt-in (``policy.repair_close_only_reasoning``,
+absent ⇒ off). The open-tag shape needs no hold beyond the first few characters.
+
 WHAT THIS DELIBERATELY DOES NOT DO. It does not guess where reasoning ends when no
 tag exists (the GLM shape above), and it does not move a truncated trace back into
 ``content``: an unclosed ``<think>…`` with ``finish_reason=length`` becomes
@@ -62,13 +67,18 @@ THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
 
 #: How much content a stream will HOLD back while it waits to learn whether the
-#: text so far is a reasoning trace (the close-only shape has no opening tag to
-#: announce itself). Only ever reached on an endpoint that is expected to reason
-#: on this call and has emitted no reasoning field — i.e. exactly when the
-#: engine is not splitting. Past it the text is released as content: 64k chars is
-#: ~16k tokens, above the 8k-token reasoning headroom the proxy grants, and
-#: holding longer only trades a leak for a silent stream.
+#: text so far is a reasoning trace with no opening tag (the close-only shape).
+#: Reached ONLY on an endpoint that opted in with
+#: ``policy.repair_close_only_reasoning`` — holding is a latency cost paid by every
+#: healthy no-reasoning stream on such an endpoint, so it is never a default. Past
+#: the bound the text is released as content: 64k chars is ~16k tokens, above the
+#: 8k-token reasoning headroom the proxy grants.
 HOLD_LIMIT_CHARS = 65536
+
+#: How much leading content ANY stream will hold while it works out whether the
+#: text opens with ``<think>``. The tag is 7 characters; the rest is leading
+#: whitespace, and past this many characters the text is plainly not a trace.
+PREFIX_HOLD_CHARS = 16
 
 #: A rate limit on the log line, not on the counter. One line per (kind,
 #: endpoint) per interval, carrying how many it stands for.
@@ -80,6 +90,22 @@ _REASONING_KEYS = ("reasoning", "reasoning_content")
 # --------------------------------------------------------------------------- #
 # 1. Prevention
 # --------------------------------------------------------------------------- #
+
+def _value_label(value: Any) -> str:
+    """A BOUNDED description of a caller-supplied value, for a counter key.
+
+    The value is caller input, and a counter keyed on it is a caller-controlled
+    allocation: 1,000 distinct strings would be 1,000 keys. So a bool reads
+    ``true``/``false`` (the distinction that matters — ``false`` is the one that
+    leaks), ``None`` reads ``null``, and anything else reads as its TYPE."""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    return type(value).__name__
+
 
 def _is_none_effort(value: Any) -> bool:
     return isinstance(value, str) and value.strip().lower() == "none"
@@ -93,7 +119,8 @@ def _strip_container(container: dict, prefix: str, found: list[str]) -> dict:
     if isinstance(ck, dict):
         new_ck = dict(ck)
         for key in [k for k in ck if k in _THINKING_KWARG_NAMES]:
-            found.append(f"{prefix}chat_template_kwargs.{key}={json.dumps(ck[key])}")
+            found.append(
+                f"{prefix}chat_template_kwargs.{key}={_value_label(ck[key])}")
             del new_ck[key]
         if _is_none_effort(new_ck.get("reasoning_effort")):
             found.append(f"{prefix}chat_template_kwargs.reasoning_effort=none")
@@ -194,7 +221,7 @@ def _rename_container(container: dict, prefix: str, declared: tuple[str, ...],
                 landed.append(key)
     label = "->".join(("+".join(foreign), "+".join(landed) or "dropped"))
     found.append(f"{prefix}chat_template_kwargs.{label}"
-                 + (f"={json.dumps(values[0])}" if landed else ""))
+                 + (f"={_value_label(values[0])}" if landed else ""))
     out = dict(container)
     out["chat_template_kwargs"] = new_ck
     return out
@@ -244,7 +271,16 @@ def default_reasoning_key(engine: str) -> str:
     return "reasoning" if engine == "vllm" else "reasoning_content"
 
 
-def _split(content: str, *, expects_reasoning: bool) -> tuple[str, str, str] | None:
+def _after_tag(text: str) -> str:
+    """What follows a ``</think>``: the template puts ONE newline between the tag and
+    the answer, and that is all that is removed — an answer that begins with
+    indentation (code) keeps it."""
+    if text.startswith("\r\n"):
+        return text[2:]
+    return text[1:] if text.startswith("\n") else text
+
+
+def _split(content: str, *, close_only: bool) -> tuple[str, str, str] | None:
     """``(reasoning, answer, shape)`` or None when ``content`` carries no marker
     this endpoint may act on.
 
@@ -252,9 +288,11 @@ def _split(content: str, *, expects_reasoning: bool) -> tuple[str, str, str] | N
     ``unclosed``   ``<think>R``                    — truncated inside the trace
     ``close_only`` ``R</think>A``                  — template prefilled ``<think>``
 
-    ``close_only`` is only believed where the endpoint is expected to be
-    reasoning on this call: elsewhere a stray ``</think>`` is far more likely to
-    be an answer ABOUT the tag than a leak, and rewriting it would corrupt it.
+    ``close_only`` is only believed where the caller has decided the endpoint
+    reasons on this call (``backend._close_only_expected``: an operator opt-in, or
+    a forced reasoner not switched off). Elsewhere a stray ``</think>`` is far
+    more likely to be an answer ABOUT the tag than a leak, and rewriting it would
+    lose the answer's own text.
     """
     lead = content.lstrip()
     if lead.startswith(THINK_OPEN):
@@ -262,22 +300,23 @@ def _split(content: str, *, expects_reasoning: bool) -> tuple[str, str, str] | N
         i = body.find(THINK_CLOSE)
         if i < 0:
             return body.strip(), "", "unclosed"
-        return body[:i].strip(), body[i + len(THINK_CLOSE):].lstrip(), "open_tag"
-    if expects_reasoning:
+        return (body[:i].strip(), _after_tag(body[i + len(THINK_CLOSE):]),
+                "open_tag")
+    if close_only:
         i = content.find(THINK_CLOSE)
         if i >= 0:
             return (content[:i].strip(),
-                    content[i + len(THINK_CLOSE):].lstrip(), "close_only")
+                    _after_tag(content[i + len(THINK_CLOSE):]), "close_only")
     return None
 
 
-def repair_message(msg: Any, *, expects_reasoning: bool,
+def repair_message(msg: Any, *, close_only: bool,
                    default_key: str) -> tuple[str, int, int] | None:
     """Move a tagged trace out of ``msg["content"]`` (in place). Returns
     ``(shape, reasoning_chars, answer_chars)`` when it changed anything.
 
-    Skipped when the response ALREADY carries reasoning: the engine split it, so
-    a tag left in ``content`` is the answer's own text. Tool calls are untouched
+    Skipped when the response ALREADY carries reasoning under ANY key: the engine
+    split it, so a tag left in ``content`` is the answer's own text. Tool calls are untouched
     and, for a turn whose whole content was trace, ``content`` becomes ``""``.
     """
     if not isinstance(msg, dict):
@@ -285,10 +324,12 @@ def repair_message(msg: Any, *, expects_reasoning: bool,
     content = msg.get("content")
     if not isinstance(content, str) or not content:
         return None
-    key = next((k for k in _REASONING_KEYS if k in msg), None)
-    if key is not None and str(msg.get(key) or "").strip():
+    # EVERY key, not the first present: `{"reasoning": null, "reasoning_content":
+    # "x"}` HAS reasoning, and a null in one spelling says nothing about the other.
+    if any(str(msg.get(k) or "").strip() for k in _REASONING_KEYS):
         return None
-    hit = _split(content, expects_reasoning=expects_reasoning)
+    key = next((k for k in _REASONING_KEYS if k in msg), None)
+    hit = _split(content, close_only=close_only)
     if hit is None:
         return None
     reasoning, answer, shape = hit
@@ -297,14 +338,14 @@ def repair_message(msg: Any, *, expects_reasoning: bool,
     return shape, len(reasoning), len(answer)
 
 
-def repair_body(body: Any, *, expects_reasoning: bool,
+def repair_body(body: Any, *, close_only: bool,
                 default_key: str) -> tuple[str, int, int] | None:
     """:func:`repair_message` on ``choices[0].message`` of a chat.completion."""
     try:
         msg = body["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
         return None
-    return repair_message(msg, expects_reasoning=expects_reasoning,
+    return repair_message(msg, close_only=close_only,
                           default_key=default_key)
 
 
@@ -335,23 +376,33 @@ class StreamRepair:
     several synthesized frames, or ``[]`` when it is holding content back.
     Call :meth:`finish` once at the end of the stream.
 
-    STATES.  ``UNDECIDED`` (start): content is held only as long as it could
-    still turn out to be a trace. A leading ``<think>`` commits to ``IN_THINK``
+    STATES.  ``UNDECIDED`` (start): a leading ``<think>`` commits to ``IN_THINK``
     at once — trace text streams out as reasoning deltas as it arrives, with only
-    the last few bytes retained in case they are half a ``</think>``. Anything
-    else that does not look like the start of that tag is released untouched
-    (``PASS``) UNLESS the endpoint is ``expects_reasoning``, in which case it is
-    held until a ``</think>`` appears (the close-only shape) or the bound in
-    :data:`HOLD_LIMIT_CHARS` is reached. A chunk that carries a reasoning field
-    proves the engine is splitting: everything after it passes through.
+    the last few bytes retained in case they are half a ``</think>``. Content is
+    held only until its first non-whitespace characters prove or disprove that
+    tag (at most :data:`PREFIX_HOLD_CHARS`), then released untouched (``PASS``),
+    so a healthy stream's first token is not delayed by more than that.
 
-    Only ``choices[0]`` is inspected; a frame with no choices (the usage-only
-    frame) or another choice index passes through untouched.
+    ``hold_for_close_tag`` is the ONE case that holds longer, and it is an
+    operator opt-in (``policy.repair_close_only_reasoning``): the close-only shape
+    (``…</think>answer``, no opening tag) is indistinguishable from an answer until
+    the tag arrives, so an opted-in endpoint holds content until a ``</think>``
+    appears or the bound in :data:`HOLD_LIMIT_CHARS` is reached. That trades the
+    time-to-first-token of every no-reasoning stream on the endpoint for the
+    repair, which is why it is off unless declared.
+
+    A chunk that carries a reasoning field proves the engine is splitting:
+    everything after it passes through. A frame carrying an ``error`` releases
+    whatever is held BEFORE it, so the caller sees the text and then the failure.
+
+    Only ``choices[0]`` is inspected (``n > 1`` streams are not repaired); a frame
+    with no choices (the usage-only frame) or another choice index passes through
+    untouched.
     """
 
-    def __init__(self, *, expects_reasoning: bool, default_key: str,
+    def __init__(self, *, hold_for_close_tag: bool, default_key: str,
                  hold_limit: int = HOLD_LIMIT_CHARS) -> None:
-        self._expects = expects_reasoning
+        self._hold_close = hold_for_close_tag
         self._key = default_key
         self._limit = hold_limit
         self._state = _UNDECIDED
@@ -392,13 +443,16 @@ class StreamRepair:
         return [self._frame({"content": text})]
 
     def _answer(self, rest: str) -> list[Frame]:
-        """Text that follows a ``</think>``: the answer begins here, minus the
-        whitespace the template puts between the tag and it."""
-        self._state = _ANSWER_LEAD
-        rest = rest.lstrip()
-        if not rest:
+        """Text that follows a ``</think>``. The template puts one newline between
+        the tag and the answer and only that is removed. If the tag ended the chunk
+        the newline may still be coming, so the next content chunk gets the same
+        treatment (``_ANSWER_LEAD``)."""
+        if rest in ("", "\r"):
+            self._state = _ANSWER_LEAD
+            self._buf = rest                      # a lone CR may be half a CRLF
             return []
         self._state = _PASS
+        rest = _after_tag(rest)
         self.answer_chars += len(rest)
         return self._content(rest)
 
@@ -419,10 +473,12 @@ class StreamRepair:
         if self._state == _IN_THINK:
             return self._think(piece)
         if self._state == _ANSWER_LEAD:
-            out = piece.lstrip()
-            if not out:
+            piece, self._buf = self._buf + piece, ""
+            if piece == "\r":
+                self._buf = piece                 # wait for the "\n" of a CRLF
                 return []
             self._state = _PASS
+            out = _after_tag(piece)
             self.answer_chars += len(out)
             return self._content(out)
         # UNDECIDED
@@ -434,10 +490,7 @@ class StreamRepair:
             self._strip_reasoning_lead = True
             self._buf = ""
             return self._think(lead[len(THINK_OPEN):])
-        if not lead or THINK_OPEN.startswith(lead):
-            self._buf = buf                       # could still become the tag
-            return []
-        if self._expects:
+        if self._hold_close:
             i = buf.find(THINK_CLOSE)
             if i >= 0:
                 self.shape = "close_only"
@@ -447,6 +500,10 @@ class StreamRepair:
             if len(buf) <= self._limit:
                 self._buf = buf                   # the tag may still be coming
                 return []
+        elif ((not lead or THINK_OPEN.startswith(lead))
+              and len(buf) <= PREFIX_HOLD_CHARS):
+            self._buf = buf                       # could still become `<think>`
+            return []
         # Decided: content. Untouched when nothing was held, so the common case
         # relays the backend's own bytes.
         self._buf = ""
@@ -462,6 +519,8 @@ class StreamRepair:
         out: list[Frame] = []
         if self._state == _UNDECIDED and self._buf:
             out = self._content(self._buf)
+        elif self._state == _ANSWER_LEAD:
+            out = self._content(self._buf)
         elif self._state == _IN_THINK:
             if self.shape == "open_tag":
                 self.shape = "unclosed"
@@ -474,6 +533,8 @@ class StreamRepair:
     def feed(self, parsed: dict, data: str) -> list[Frame]:
         if self._state == _PASS:
             return [(parsed, data)]
+        if isinstance(parsed, dict) and "error" in parsed:
+            return self._settle() + [(parsed, data)]
         choices = parsed.get("choices") if isinstance(parsed, dict) else None
         if not choices or not isinstance(choices[0], dict):
             return [(parsed, data)]

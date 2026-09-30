@@ -434,6 +434,22 @@ class EndpointConfig:
     #: kwarg. Sending a switch to a model that has none is not harmless — it is
     #: the one request field that breaks the reasoning split.
     no_thinking_switch: bool = False
+    #: Opt in to repairing the CLOSE-ONLY reasoning leak (``…</think>answer`` with
+    #: no opening tag — the llama.cpp #28182 cap-binding shape) in a STREAM, from
+    #: ``policy.repair_close_only_reasoning``. False = undeclared, and no stream is
+    #: ever held for it.
+    #:
+    #: 🚨 OFF BECAUSE IT COSTS EVERY HEALTHY STREAM. Without an opening tag there
+    #: is nothing to tell a trace from an answer until ``</think>`` arrives, so the
+    #: repair has to hold content back until then. Measured live 2026-09-29: ~30%
+    #: of short tier3 calls stream no reasoning field at all, and a forced reasoner
+    #: with its switch off streams content only — every one of those would have its
+    #: first token delayed to the end of generation, blinding the degeneration and
+    #: blank-run detectors and losing the partial text to a mid-hold deadline.
+    #: Declare it only for an endpoint that has been SEEN to leak this shape. The
+    #: open-tag shape (``<think>…``) needs no opt-in: its first characters decide it.
+    #: Also widens the non-streaming repair to endpoints that do not force reasoning.
+    repair_close_only_reasoning: bool = False
     #: Reasoning EFFORT to apply on the proxy's ``thinking:`` opt-in, for a
     #: model that has NO thinking switch at all — i.e. ``thinking_kwargs`` is
     #: empty because the chat template always reasons and the only lever is

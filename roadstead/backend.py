@@ -27,7 +27,7 @@ import httpx
 from .config import EndpointConfig, max_response_bytes_from_env
 from .cost_model import estimate_tokens_from_chars
 from .providers import DEFAULT_PROVIDER, ProviderError, provider_for
-from .providers.payload import _thinking_is_on
+from .providers.payload import _THINKING_KWARG_NAMES
 from .think_bleed import (
     StreamRepair, ThinkBleedStats, default_reasoning_key, rename_thinking_switch,
     repair_body, strip_thinking_switch,
@@ -150,7 +150,10 @@ class BackendResponse:
 @dataclass
 class BackendStreamEvent:
     """One SSE event from a streaming backend call."""
-    event_type: str   # "chunk" | "done" | "error"
+    event_type: str   # "chunk" | "done" | "error" | "hold"
+    # "hold": a backend chunk was consumed but nothing is relayed for it yet (the
+    # reasoning-leak repair is working out what the text is). It carries no data;
+    # a consumer treats it as progress for its watchdogs and otherwise ignores it.
     data: str         # raw SSE data line
     parsed: dict | None = None  # parsed JSON if applicable
 
@@ -294,14 +297,32 @@ class BackendClientPool:
         return payload
 
     @staticmethod
-    def _expects_reasoning(ep_cfg: EndpointConfig, payload: dict) -> bool:
-        """Whether this call is expected to REASON, judged from the payload as it
-        goes on the wire. Gates the one repair that could misread an answer (a
-        close-tag with no opening tag) and the streaming hold that goes with it."""
-        return bool(
-            getattr(ep_cfg, "forces_reasoning", False)
-            or getattr(ep_cfg, "no_thinking_switch", False)
-            or _thinking_is_on(payload))
+    def _thinking_switched_off(payload: dict) -> bool:
+        """The payload, as it goes on the wire, carries a thinking switch set
+        false. For a forced reasoner that is the caller saying "do not reason" —
+        the engine then streams content only, and a ``</think>`` in it is the
+        answer's own text."""
+        ck = payload.get("chat_template_kwargs") if isinstance(payload, dict) else None
+        return isinstance(ck, dict) and any(ck.get(n) is False for n in _THINKING_KWARG_NAMES)
+
+    @classmethod
+    def _close_only_expected(
+        cls, ep_cfg: EndpointConfig, payload: dict, *, stream: bool,
+    ) -> bool:
+        """May the close-only shape (``…</think>answer``, no opening tag) be
+        believed on this call? It is the one repair that can misread an answer,
+        so it is narrow: never when the switch is explicitly off; in a STREAM only
+        on an endpoint that opted in (it costs a hold on every healthy stream, see
+        ``EndpointConfig.repair_close_only_reasoning``); non-streaming, on an
+        opted-in endpoint or a FORCED reasoner (llama.cpp with a reasoning model).
+        ``think_bleed.repair_message`` additionally refuses when the response
+        already carries reasoning under any key."""
+        if cls._thinking_switched_off(payload):
+            return False
+        opted_in = bool(getattr(ep_cfg, "repair_close_only_reasoning", False))
+        if stream:
+            return opted_in
+        return opted_in or bool(getattr(ep_cfg, "forces_reasoning", False))
 
     @staticmethod
     def _repairs_bleed(ep_cfg: EndpointConfig, payload_type: str) -> bool:
@@ -464,7 +485,8 @@ class BackendClientPool:
             # is, instead of passing as a 200 whose content is a chain of thought.
             if self._repairs_bleed(ep_cfg, payload_type):
                 fixed = repair_body(
-                    body, expects_reasoning=self._expects_reasoning(ep_cfg, payload),
+                    body, close_only=self._close_only_expected(
+                        ep_cfg, payload, stream=False),
                     default_key=default_reasoning_key(provider.name))
                 if fixed is not None:
                     self.think_bleed.note_repaired(
@@ -528,7 +550,8 @@ class BackendClientPool:
         # declare reasoning, so not one chunk is inspected.
         repair = (
             StreamRepair(
-                expects_reasoning=self._expects_reasoning(ep_cfg, payload),
+                hold_for_close_tag=self._close_only_expected(
+                    ep_cfg, payload, stream=True),
                 default_key=default_reasoning_key(provider.name))
             if self._repairs_bleed(ep_cfg, payload_type) else None)
 

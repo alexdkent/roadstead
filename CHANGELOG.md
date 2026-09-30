@@ -439,7 +439,15 @@ summary. The bullets below link in there where the long version is worth reading
   502). New `/v1/status` counters `reliability.think_switch_stripped[_by_endpoint]`,
   `think_switch_renamed[_by_endpoint]` and `think_bleed_repaired[_by_endpoint]`; log markers
   `ROADSTEAD_THINK_SWITCH_STRIPPED` / `ROADSTEAD_THINK_SWITCH_RENAMED` /
-  `ROADSTEAD_THINK_BLEED_REPAIRED`. `docs/api.md` §3.14e. Pinned by `tests/test_think_bleed.py`,
+  `ROADSTEAD_THINK_BLEED_REPAIRED`. **Streaming close-tag-only repair is an opt-in**
+  (`policy.repair_close_only_reasoning`, absent ⇒ off): it must hold content until `</think>`
+  arrives, which delayed the first token of every no-reasoning stream (~30% of short tier3 calls,
+  and every switched-off stream on a forced reasoner); the open-tag repair holds at most 16
+  characters. Non-streaming close-only is limited to opted-in endpoints and forced reasoners with the
+  switch not off, never when the response has reasoning under any key, and only the template's one
+  newline after the tag is removed. The answer-now re-ask keeps the caller's other
+  `chat_template_kwargs`, and no longer counts as `reasoning_loops_answered` a re-ask that produced
+  no content. Counter keys record a caller's non-boolean value as its type, not its text. `docs/api.md` §3.14e. Pinned by `tests/test_think_bleed.py`,
   whose assertions are semantic (caller-visible `content` equals the intended answer) rather than
   lexical — a "starts with Okay" check is what let this through. `roadstead.testing.FakeBackend`
   gained `think=ThinkScript(...)`, which emulates each engine's landing of the trace.

@@ -175,6 +175,10 @@ class ThinkScript:
     tool_calls: Optional[list] = None
     reasoning_key: str = "reasoning"
     chunk_chars: int = 3
+    #: Seconds slept before EACH streamed delta (a slow decode). What makes
+    #: time-to-first-content measurable: a proxy that holds a stream back shows up
+    #: as a first token arriving at the end instead of one interval in.
+    token_delay_s: float = 0.0
 
 
 @dataclass
@@ -231,11 +235,11 @@ def _render_think(s: ThinkScript, body: Optional[dict]) -> _Rendered:
     if s.mode == THINK_TAG_OPEN:
         if s.truncate_in_reasoning:
             return _Rendered("<think>\n" + r, "", finish)
-        return _Rendered("<think>\n" + r + "\n</think>\n\n" + a, "", finish)
+        return _Rendered("<think>\n" + r + "\n</think>\n" + a, "", finish)
     if s.mode == THINK_TAG_CLOSE_ONLY:
         if s.truncate_in_reasoning:
             return _Rendered(r, "", finish)   # no tag at all: nothing to find
-        return _Rendered(r + "\n</think>\n\n" + a, "", finish)
+        return _Rendered(r + "\n</think>\n" + a, "", finish)
     if s.mode == THINK_SWITCHABLE:
         if _kwarg_false(body, "enable_thinking", "thinking"):
             return _Rendered(a, "", finish)
@@ -738,8 +742,12 @@ def make_fake_app(controller: FakeBackend) -> Starlette:
             yield _sse(_chunk({"role": "assistant"}))
             # The engine emits the reasoning channel first, then content.
             for piece in _slices(out.reasoning, script.chunk_chars):
+                if script.token_delay_s:
+                    await asyncio.sleep(script.token_delay_s)
                 yield _sse(_chunk({script.reasoning_key: piece}))
             for piece in _slices(out.content, script.chunk_chars):
+                if script.token_delay_s:
+                    await asyncio.sleep(script.token_delay_s)
                 yield _sse(_chunk({"content": piece}))
             if script.tool_calls:
                 yield _sse(_chunk({"tool_calls": [
