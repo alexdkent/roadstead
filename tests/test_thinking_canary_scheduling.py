@@ -26,9 +26,10 @@ import types
 
 import pytest
 
-from roadstead.config import EndpointConfig
+from roadstead.config import EndpointConfig, thinking_canary_interval_s
 from roadstead.flags import RuntimeFlags
 from roadstead.goodput import GoodputMonitor
+from roadstead import health as health_module
 from roadstead.health import Health
 
 
@@ -58,12 +59,27 @@ def _state(**over):
     return state
 
 
+def _due_checked_at() -> float:
+    """A `thinking_canary_checked_at` that is DUE, whatever the clock reads.
+
+    🚨 The canary compares `time.monotonic() - checked_at` with an hour-long
+    interval, and `time.monotonic()` is the HOST's uptime. A literal `1.0` means
+    "last probed one second after boot", which is only an hour stale once the
+    host has been up an hour: it held on every dev machine and failed on every
+    fresh CI runner (~5 min of uptime), where the probe never fired and five of
+    these tests read "0 calls" (red from 2026-09-26). Anchor to NOW instead, read
+    off the very clock `Health` reads (`health.time`) so a shim of it moves both —
+    negative on a young host, which is fine: only `0.0` means "never checked".
+    """
+    return health_module.time.monotonic() - thinking_canary_interval_s() - 1.0
+
+
 def _ep(**over) -> EndpointConfig:
     kw = dict(endpoint_class="tier3", role="reasoner",
               thinking_kwargs=("thinking",),
-              # Non-zero: skips the "never probe on the first poll after
+              # Truthy: skips the "never probe on the first poll after
               # startup" arm-the-clock branch, so a due call actually fires.
-              thinking_canary_checked_at=1.0)
+              thinking_canary_checked_at=_due_checked_at())
     kw.update(over)
     return EndpointConfig(**kw)
 
@@ -179,7 +195,7 @@ async def test_a_second_schedule_call_does_not_start_a_second_task_in_flight():
     # The interval hasn't elapsed again (checked_at was just stamped), but even
     # if it had, a scheduling call while one is in flight must be a no-op —
     # simulate that directly by resetting the interval gate and re-scheduling.
-    ep.thinking_canary_checked_at = 1.0
+    ep.thinking_canary_checked_at = _due_checked_at()
     health._schedule_thinking_canary("tier3", ep)
 
     assert state.thinking_canary_tasks["tier3"] is first_task, (
@@ -202,7 +218,7 @@ async def test_a_new_canary_can_be_scheduled_once_the_previous_one_finished():
     health._schedule_thinking_canary("tier3", ep)
     await asyncio.wait_for(state.thinking_canary_tasks["tier3"], timeout=1.0)
 
-    ep.thinking_canary_checked_at = 1.0  # due again
+    ep.thinking_canary_checked_at = _due_checked_at()  # due again
     health._schedule_thinking_canary("tier3", ep)
     await asyncio.wait_for(state.thinking_canary_tasks["tier3"], timeout=1.0)
 
