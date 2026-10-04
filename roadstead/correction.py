@@ -767,6 +767,28 @@ def _arg_str_valid(tc: dict) -> bool:
 TRUNCATED_TOOL_TURN_CODE = "truncated_tool_turn"
 
 
+def has_cut_tool_call(tool_calls: list) -> bool:
+    """True iff a NAMED tool call carries arguments that never formed one
+    complete JSON value — exactly what ``_ToolCallStreamSanitizer`` drops (and
+    relabels ``length``) at the finish chunk. Same decoder, so a trailing-junk
+    call the sanitizer would trim is NOT cut here; empty arguments are a legal
+    no-arg call, as there."""
+    for tc in tool_calls or []:
+        try:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if not isinstance(fn, dict):
+                continue
+            name, args = fn.get("name"), fn.get("arguments")
+            if not (isinstance(name, str) and name.strip()):
+                continue  # the phantom opener: dropped silently, not "cut"
+            if isinstance(args, str) and args.strip() and not (
+                    _ToolCallStreamSanitizer._complete_value(args)[1]):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
 def request_declares_tools(payload: Any) -> bool:
     """True when the request offers the model at least one tool. An empty
     ``tools`` array declares nothing — a harness that always sends the key
@@ -3009,33 +3031,58 @@ class Correction:
 
     def is_truncated_tool_turn(
         self, req: "QueuedRequest", finish_reason: str | None, tool_calls: list,
+        output_tokens: int = 0,
     ) -> bool:
-        """The turn declared tools, ran into ``max_tokens`` and produced no tool
-        call a caller can execute.
+        """The turn declared tools and ran into ``max_tokens`` before finishing
+        an action a caller can trust. Two spellings of one fault:
+
+        * ``finish_reason=length`` and no tool call a caller can execute. A
+          partial call (arguments cut mid-JSON) counts as none.
+        * 🚨 **the CAP was reached but the finish says ``tool_calls``** — the
+          backend's own ``completion_tokens`` is at or past the ``max_tokens`` it
+          was given, and a tool call is present. Measured live 2026-10-04 on
+          tier3 (vLLM, GLM tool parser), stream AND sync, ``max_tokens=400`` and
+          a ``write_file`` whose ``content`` is far longer than that:
+          ``finish_reason: "tool_calls"``, ``completion_tokens: 400``, and
+          ``arguments`` that PARSE — the parser builds the arguments object from
+          what it saw and closes the cut string itself (``..., which guarded the"}``).
+          So neither the ``length`` label nor "does it parse" can see this, and a
+          harness would run ``write_file`` and leave a file cut mid-sentence. The
+          backend's token count against the cap is the one signal it cannot
+          paper over. A call that completes on exactly the last token is the
+          false positive; its remedy (a larger ``max_tokens``) is harmless.
+          Needs a measured ``output_tokens`` and a numeric ``max_tokens``; with
+          either absent this arm cannot fire (a stream whose usage frame never
+          arrived reads 0).
 
         🚨 WHY THIS IS AN ERROR AND NOT A 200. An agent harness reads a
         ``finish_reason=length`` completion with no tool call as "the model
         finished" and exits 0 having done nothing — measured with the ``pi``
         coding agent, a silent no-op. The proxy already logged
-        ``ROADSTEAD_TRUNCATION`` for it; the caller never heard. A partial tool
-        call (arguments cut mid-JSON) is no better than none, so it counts as
-        none. Only a request that declares ``tools`` qualifies: a plain
-        free-text ``length`` is a short answer, not a missing action, and stays
-        a 200 (the dj agent produces ~943 of those per 14 days on purpose).
+        ``ROADSTEAD_TRUNCATION`` for it; the caller never heard. Only a request
+        that declares ``tools`` qualifies: a plain free-text ``length`` is a
+        short answer, not a missing action, and stays a 200 (the dj agent
+        produces ~943 of those per 14 days on purpose).
         Total: never raises."""
         try:
-            if finish_reason != "length":
-                return False
             if req.payload_type != "chat_completion":
                 return False
             if not request_declares_tools(req.payload):
                 return False
-            return not any(tool_call_is_complete(tc) for tc in (tool_calls or []))
+            calls = tool_calls or []
+            if finish_reason == "length":
+                return not any(tool_call_is_complete(tc) for tc in calls)
+            if finish_reason in ("tool_calls", "stop") and calls:
+                cap = req.payload.get("max_tokens")
+                return (isinstance(cap, int) and not isinstance(cap, bool)
+                        and cap > 0 and int(output_tokens or 0) >= cap)
+            return False
         except Exception:  # noqa: BLE001 — a guard must never break a response
             return False
 
     def truncated_tool_turn_message(
         self, req: "QueuedRequest", role: str, output_tokens: int,
+        finish_reason: str | None = "length",
     ) -> str:
         """The caller-facing error text — states the remedy and both numbers.
 
@@ -3050,39 +3097,54 @@ class Correction:
         precedent as ``toolcall_truncated``."""
         p = req.payload if isinstance(req.payload, dict) else {}
         max_tokens = p.get("max_tokens")
+        nums = (f"max_tokens={max_tokens if max_tokens else 'unset'}, "
+                f"output_tokens={output_tokens}")
+        if finish_reason == "length":
+            what = (f"tool turn ran out of max_tokens: finish_reason=length with "
+                    f"no complete tool call, {nums}). Nothing was executable")
+        else:
+            what = (f"tool turn ran out of max_tokens: finish_reason="
+                    f"{finish_reason} but output_tokens reached max_tokens, {nums}). "
+                    f"The tool call was CUT OFF — its arguments may still parse, "
+                    f"but its content is incomplete and must not be executed")
         return (
-            f"backend {role} truncated structured output (tool turn ran out of "
-            f"max_tokens: finish_reason=length with no complete tool call, "
-            f"max_tokens={max_tokens if max_tokens else 'unset'}, "
-            f"output_tokens={output_tokens}). Nothing was executable — the "
-            f"model spent its whole output budget before finishing a tool call "
+            f"backend {role} truncated structured output ({what} — the model "
+            f"spent its whole output budget before finishing a tool call "
             f"(reasoning counts against it). Raise max_tokens or reduce "
             f"reasoning, then retry; retrying unchanged truncates the same way.")
 
     def record_truncated_tool_turn(
         self, req: "QueuedRequest", *, stream: bool, output_tokens: int,
+        finish_reason: str | None = "length",
     ) -> None:
         """Tally + marker for a tool turn failed as :data:`TRUNCATED_TOOL_TURN_CODE`.
 
-        Deliberately NOT a second :meth:`record_truncation_event`: every
-        ``finish_reason=length`` completion already reaches that through
-        ``Lifecycle.record_completion`` (the single choke point), so calling it
-        here would double ``truncation_total``. This counter is the subset of
-        those truncations that were turned into a caller-visible error, which is
-        the number that says how often a harness was told rather than left
-        guessing. ``ROADSTEAD_TRUNCATED_TOOL_TURN`` is the stable grep marker."""
+        A ``finish_reason=length`` completion already reaches
+        :meth:`record_truncation_event` through ``Lifecycle.record_completion``
+        (the single choke point), so calling it here for that finish would double
+        ``truncation_total``. A cap-reached turn whose finish says ``tool_calls``
+        never reaches it from there (the choke point keys on ``length``), so this
+        records it — otherwise the one truncation that looked like success would
+        be the one nothing counted. ``truncated_tool_turns_*`` is the subset of
+        truncations turned into a caller-visible error: how often a harness was
+        told rather than left guessing. ``ROADSTEAD_TRUNCATED_TOOL_TURN`` is the
+        stable grep marker."""
         key = normalize_endpoint(req.endpoint)
         self.state.truncated_tool_turns_total += 1
         self.state.truncated_tool_turns_by_endpoint[key] = (
             self.state.truncated_tool_turns_by_endpoint.get(key, 0) + 1)
+        if finish_reason != "length":
+            self.record_truncation_event(
+                req, structured=False, stream=stream,
+                output_tokens=output_tokens, status="truncated")
         p = req.payload if isinstance(req.payload, dict) else {}
         logger.warning(
             "ROADSTEAD_TRUNCATED_TOOL_TURN model=%s agent=%s call_site=%s "
-            "max_tokens=%s output_tokens=%d stream=%s — tools declared, "
-            "finish_reason=length, no complete tool call: failed as %s "
-            "instead of a silent 200",
+            "max_tokens=%s output_tokens=%d finish_reason=%s stream=%s — tools "
+            "declared and the turn ran out of max_tokens without a trustworthy "
+            "tool call: failed as %s instead of a silent 200",
             req.endpoint, req.agent_id, req.call_site, p.get("max_tokens"),
-            output_tokens, stream, TRUNCATED_TOOL_TURN_CODE)
+            output_tokens, finish_reason, stream, TRUNCATED_TOOL_TURN_CODE)
 
     def enforce_toolcall_truncation(self, req: "QueuedRequest", result: dict) -> None:
         """SYNC mirror of the stream sanitizer's finalize rule (operator mandate

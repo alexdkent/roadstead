@@ -399,6 +399,15 @@ summary. The bullets below link in there where the long version is worth reading
   double the cost. **Streaming**: the chunks and the `length` finish are already sent, so the error is
   the stream's error frame in place of `[DONE]` (OpenAI door: `data: {"error": {…, "code":
   "truncated_tool_turn"}}`; enriched/legacy doors: their `error` frame, now carrying `code`).
+  **The common vLLM spelling is covered too:** measured live on tier3 (streaming and not,
+  `max_tokens=400`, a `write_file` far longer than that), the backend answers `finish_reason:
+  "tool_calls"` with `completion_tokens == max_tokens` and `arguments` that PARSE — its tool parser
+  closes the cut string — so the `length` label and the JSON check both see a clean call. A tool call
+  present with the backend's `completion_tokens` at or past the request's `max_tokens` therefore fails
+  the same way, and this is counted in `truncation_total` explicitly (the `length` choke point cannot).
+  A stream whose tool call never forms a JSON value at a non-`length` finish (which the stream
+  sanitizer would drop and relabel `length`) ends in an error frame with the existing
+  `toolcall_truncated` code.
   **Requests with no `tools` — and an empty `tools` array — are unchanged** (still `200`). Counted as
   `reliability.truncated_tool_turns_total` / `truncated_tool_turns_by_endpoint` on `/v1/status`,
   `roadstead_truncated_tool_turns_total{endpoint}` on `/metrics`, and the `ROADSTEAD_TRUNCATED_TOOL_TURN`

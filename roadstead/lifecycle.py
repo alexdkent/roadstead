@@ -76,6 +76,7 @@ from .correction import (
     _degenerate_text_arm,
     _fmt_evidence,
     _response_tool_calls,
+    has_cut_tool_call,
     request_declares_tools,
     strip_trailing_blank_chars,
 )
@@ -2174,13 +2175,16 @@ class Lifecycle:
             # the caller gets one error that says what to change. Free-text
             # `length` WITHOUT tools is untouched (still a 200).
             if self.correction.is_truncated_tool_turn(
-                    req, resp.finish_reason, _response_tool_calls(resp.body)):
+                    req, resp.finish_reason, _response_tool_calls(resp.body),
+                    resp.output_tokens):
                 self.correction.record_truncated_tool_turn(
-                    req, stream=False, output_tokens=resp.output_tokens)
+                    req, stream=False, output_tokens=resp.output_tokens,
+                    finish_reason=resp.finish_reason)
                 self.state.resolve_error(
                     req,
                     self.correction.truncated_tool_turn_message(
-                        req, ep_cfg.role, resp.output_tokens),
+                        req, ep_cfg.role, resp.output_tokens,
+                        resp.finish_reason),
                     code=TRUNCATED_TOOL_TURN_CODE)
                 self.record_completion(
                     req, decision, duration,
@@ -2944,16 +2948,41 @@ class Lifecycle:
         # turns "the model finished" into "the turn failed". Only looks at a
         # stream nothing above has already failed, so a structured turn keeps
         # its own `truncated structured output` frame.
-        if (stream_guard_err is None and tools_declared
-                and self.correction.is_truncated_tool_turn(
-                    req, last_finish_reason,
-                    [stream_tool_calls[i] for i in sorted(stream_tool_calls)])):
-            self.correction.record_truncated_tool_turn(
-                req, stream=True, output_tokens=output_tokens)
-            stream_guard_err = self.correction.truncated_tool_turn_message(
-                req, ep_cfg.role, output_tokens)
-            stream_guard_code = TRUNCATED_TOOL_TURN_CODE
-            stream_guard_status = "truncated"
+        #
+        # Two ways a tool stream is cut, and the second is the common one on
+        # vLLM: (1) `finish_reason=length` with no complete call; (2) the cap was
+        # REACHED (usage `completion_tokens` >= `max_tokens`) but the finish says
+        # `tool_calls` — measured live on tier3 2026-10-04, where the backend's
+        # tool parser closes the cut string itself, so the call PARSES and the
+        # sanitizer below relays it as complete. Only the token count sees it.
+        if stream_guard_err is None and tools_declared:
+            calls = [stream_tool_calls[i] for i in sorted(stream_tool_calls)]
+            if self.correction.is_truncated_tool_turn(
+                    req, last_finish_reason, calls, output_tokens):
+                self.correction.record_truncated_tool_turn(
+                    req, stream=True, output_tokens=output_tokens,
+                    finish_reason=last_finish_reason)
+                stream_guard_err = self.correction.truncated_tool_turn_message(
+                    req, ep_cfg.role, output_tokens, last_finish_reason)
+                stream_guard_code = TRUNCATED_TOOL_TURN_CODE
+                stream_guard_status = "truncated"
+            elif last_finish_reason != "length" and has_cut_tool_call(calls):
+                # (3) Arguments that never formed a JSON value at a non-length
+                # finish: `_ToolCallStreamSanitizer` DROPS the call and relabels
+                # the finish `length`, so the client would see a `length` finish
+                # with no call and `[DONE]` — the silent no-op again. Well under
+                # the cap this is the model's own malformed JSON, not a budget
+                # problem, so it keeps the SYNC mirror's code and message
+                # (`enforce_toolcall_truncation`), not the raise-max_tokens one.
+                self.correction.record_truncation_event(
+                    req, structured=True, stream=True,
+                    output_tokens=output_tokens, status="truncated")
+                stream_guard_err = (
+                    f"backend {ep_cfg.role} truncated structured output "
+                    f"(finish_reason={last_finish_reason} mislabel — tool_call "
+                    f"arguments cut mid-JSON, output_tokens={output_tokens})")
+                stream_guard_code = "toolcall_truncated"
+                stream_guard_status = "truncated"
 
         # --- terminal-chunk repair + per-stream observability (2026-08-24) ---
         #

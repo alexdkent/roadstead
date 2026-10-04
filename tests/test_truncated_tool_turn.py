@@ -19,6 +19,16 @@ What is pinned, per the operator's decision:
   * STREAMING: the chunks are already on the wire, so the error is the stream's
     error frame (OpenAI door: `data: {"error": {...}}`, no `[DONE]`) — never a
     clean finish.
+  * THE CAP-REACHED CASE, measured live on tier3 (vLLM + GLM tool parser) 2026-10-04,
+    stream AND sync, max_tokens=400, a write_file whose content is far longer:
+    finish_reason "tool_calls", completion_tokens == 400, and `arguments` that
+    PARSE (the backend closes the cut string itself: `…which guarded the"}`).
+    Neither the `length` label nor "does it parse" can see it; the backend's own
+    token count against the cap can. Fails as `truncated_tool_turn`.
+  * a STREAM whose call arguments never form a JSON value at a non-length finish
+    (the sanitizer would drop the call and relabel `length`) ends in an error
+    frame too — `toolcall_truncated`, the sync mirror's code, because under the
+    cap it is the model's malformed JSON, not a budget problem.
   * no proxy-side retry: exactly ONE backend dispatch.
   * counted: `truncation_total` ONCE (the existing choke point — not doubled)
     and the new `truncated_tool_turns_*` tally, on /metrics and /v1/status.
@@ -504,5 +514,183 @@ async def test_the_tally_is_visible_on_status_and_metrics():
 
         text = (await svc.handle_prometheus_metrics(_AdminReq())).body.decode()
         assert 'roadstead_truncated_tool_turns_total{endpoint="tier3"} 2' in text
+    finally:
+        await svc.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# THE CAP-REACHED CASE — finish says `tool_calls`, arguments PARSE, tokens == cap
+# (the shape captured live from tier3 on 2026-10-04; see the module docstring)
+# --------------------------------------------------------------------------- #
+
+_CUT_BUT_CLOSED_ARGS = (
+    '{"path": "/tmp/essay.txt", "content": "The Pharos was built in three '
+    'tiers: a square base, an octagonal middle section, and a cylindrical top '
+    'crowned with a statue, which guarded the"}')
+_CUT_BUT_CLOSED_CALL = {"id": "c1", "type": "function", "function": {
+    "name": "write_file", "arguments": _CUT_BUT_CLOSED_ARGS}}
+
+
+def test_the_live_capture_really_parses():
+    """The premise of this whole section: what tier3 returned PARSES, so
+    nothing that inspects the arguments can tell it was cut."""
+    assert tool_call_is_complete(_CUT_BUT_CLOSED_CALL)
+
+
+@pytest.mark.asyncio
+async def test_sync_cap_reached_with_a_tool_calls_finish_is_an_error():
+    svc, dispatches = await _svc(call=_sync_backend(_completion(
+        "tool_calls", tool_calls=[_CUT_BUT_CLOSED_CALL], out=400)))
+    try:
+        resp, body = await _openai_sync(svc, _payload(max_tokens=400))
+        assert resp.status_code == 502
+        err = body["error"]
+        assert err["code"] == "truncated_tool_turn"
+        assert "finish_reason=tool_calls" in err["message"]
+        assert "max_tokens=400" in err["message"] and "output_tokens=400" in err["message"]
+        assert "truncated structured output" in err["message"]
+        assert "CUT OFF" in err["message"]
+        # the finish says tool_calls, so record_completion's `length` choke point
+        # never counted it — the gate must, exactly once
+        assert _st(svc).truncation_total == 1
+        assert _st(svc).truncated_tool_turns_total == 1
+        assert len(dispatches) == 1
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_sync_a_short_call_well_under_the_cap_is_unchanged():
+    """The live control: `hello world` write_file, 22 tokens against a cap of 400."""
+    svc, _ = await _svc(call=_sync_backend(_completion(
+        "tool_calls", tool_calls=[_COMPLETE_CALL], out=22)))
+    try:
+        resp, _body = await _openai_sync(svc, _payload(max_tokens=400))
+        assert resp.status_code == 200
+        assert _st(svc).truncated_tool_turns_total == 0
+        assert _st(svc).truncation_total == 0
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_sync_the_cap_arm_needs_a_tool_call_and_a_known_cap():
+    # tokens at the cap but NO tool call and a `stop` finish: an answer that
+    # happened to fill the budget, not a cut action
+    svc, _ = await _svc(call=_sync_backend(_completion("stop", content="done", out=400)))
+    try:
+        resp, _ = await _openai_sync(svc, _payload(max_tokens=400))
+        assert resp.status_code == 200
+    finally:
+        await svc.shutdown()
+    # a cut-looking call but the caller set no max_tokens: nothing to compare to
+    svc, _ = await _svc(call=_sync_backend(_completion(
+        "tool_calls", tool_calls=[_CUT_BUT_CLOSED_CALL], out=400)))
+    try:
+        p = _payload()
+        del p["max_tokens"]
+        resp, _ = await _openai_sync(svc, p)
+        assert resp.status_code == 200
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stream_cap_reached_with_a_tool_calls_finish_is_an_error_frame():
+    """The captured stream: one parseable tool call, finish `tool_calls`, usage
+    `completion_tokens` == max_tokens. Without the cap arm this relays as a
+    complete write_file followed by `[DONE]`."""
+    svc, dispatches = await _svc(stream=_stream_backend(_tool_frames(
+        finish="tool_calls", out=400,
+        fragments=[_opener(args=_CUT_BUT_CLOSED_ARGS)])))
+    try:
+        frames = await _openai_stream(svc, _payload(max_tokens=400))
+        err = _error_frame(frames)
+        assert err["code"] == "truncated_tool_turn"
+        assert "CUT OFF" in err["message"] and "output_tokens=400" in err["message"]
+        assert "[DONE]" not in frames and '"error"' in frames[-1]
+        assert _st(svc).truncation_total == 1
+        assert _st(svc).truncated_tool_turns_by_endpoint == {"tier3": 1}
+        assert len(dispatches) == 1
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stream_a_short_call_well_under_the_cap_is_a_normal_finish():
+    svc, _ = await _svc(stream=_stream_backend(_tool_frames(
+        finish="tool_calls", out=22,
+        fragments=[_opener(args='{"content": "hello world", "path": "/tmp/hello.txt"}')])))
+    try:
+        frames = await _openai_stream(svc, _payload(max_tokens=400))
+        assert frames[-1] == "[DONE]" and not any('"error"' in f for f in frames)
+        assert _st(svc).truncated_tool_turns_total == 0
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stream_trailing_brace_repair_must_not_launder_a_cut_call():
+    """The sanitizer trims a trailing `}` (vLLM #39584) and emits the call as
+    complete. That is right for a call that really finished — and wrong for one
+    that was cut, whose repaired arguments still PARSE. Same arguments, same
+    stray brace: under the cap it is the normal finish, at the cap it is an
+    error. The token count, not the JSON, decides."""
+    junk_args = '{"path": "/tmp/a", "content": "cut off here"}}'
+    svc, _ = await _svc(stream=_stream_backend(_tool_frames(
+        finish="tool_calls", out=90, fragments=[_opener(args=junk_args)])))
+    try:
+        frames = await _openai_stream(svc, _payload(max_tokens=400))
+        assert frames[-1] == "[DONE]" and not any('"error"' in f for f in frames)
+    finally:
+        await svc.shutdown()
+    svc, _ = await _svc(stream=_stream_backend(_tool_frames(
+        finish="tool_calls", out=400, fragments=[_opener(args=junk_args)])))
+    try:
+        frames = await _openai_stream(svc, _payload(max_tokens=400))
+        assert _error_frame(frames)["code"] == "truncated_tool_turn"
+    finally:
+        await svc.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# the stream a sanitizer would drop-and-relabel `length`
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_stream_a_call_with_unfinished_arguments_at_a_tool_calls_finish_is_an_error():
+    """Under the cap, so not a budget problem: the model's own malformed JSON.
+    The sanitizer would drop the call and relabel `length`, leaving the client a
+    `length` finish with no call and `[DONE]`. Must end in an error frame, with
+    the sync mirror's code."""
+    svc, _ = await _svc(stream=_stream_backend(_tool_frames(
+        finish="tool_calls", out=120,
+        fragments=[_opener(args='{"path": "/tmp/a", "content": "oops'),])))
+    try:
+        frames = await _openai_stream(svc, _payload(max_tokens=400))
+        err = _error_frame(frames)
+        assert err["code"] == "toolcall_truncated"
+        assert "truncated structured output" in err["message"]
+        assert "output_tokens=120" in err["message"]
+        assert "[DONE]" not in frames
+        assert _st(svc).truncation_total == 1
+        # the sync mirror's code, not this module's: that counter is not touched
+        assert _st(svc).truncated_tool_turns_total == 0
+    finally:
+        await svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stream_a_phantom_opener_and_trailing_junk_are_not_cut_calls():
+    """What the sanitizer repairs/drops silently must not become an error: a
+    name-less phantom delta (vLLM #39584) beside a real, complete call."""
+    phantom = {"index": 1, "id": "ph", "type": "function",
+               "function": {"name": None, "arguments": ""}}
+    real = _opener(args='{"path": "/tmp/a"}')
+    svc, _ = await _svc(stream=_stream_backend(_tool_frames(
+        finish="tool_calls", out=40, fragments=[real, phantom])))
+    try:
+        frames = await _openai_stream(svc, _payload(max_tokens=400))
+        assert frames[-1] == "[DONE]" and not any('"error"' in f for f in frames)
     finally:
         await svc.shutdown()
