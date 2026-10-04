@@ -445,6 +445,16 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Fixed
 
+- **A stream the proxy stops reading at `[DONE]` is now closed, not left to the garbage collector.**
+  Both streaming consumers in `lifecycle.py` (the main stream and the answer-now re-ask) `break` on
+  the backend's `done` frame, which left the backend generator suspended; its `finally` (the
+  think-bleed repair tally and `ROADSTEAD_THINK_BLEED_REPAIRED` log, and the release of the HTTP
+  response) ran only when the interpreter finalised it, on a task the loop schedules later. A
+  `/v1/status` read straight after a stream ended could therefore miss that stream's repair (seen on
+  Python 3.12+; 3.11 got the same ordering by scheduling luck). Both now use `contextlib.aclosing`,
+  as `call_watched` already did. Observable effect: counters and the log line land with the stream,
+  not a few loop turns after it. No wire change.
+
 - **A caller's explicit thinking switch now beats the endpoint default, under any spelling.** On a
   forced reasoner that declares its switch and an effort default (tier2-flash: `thinking_kwargs:
   [enable_thinking]`), a caller's `chat_template_kwargs: {thinking: false}` was DROPPED and the

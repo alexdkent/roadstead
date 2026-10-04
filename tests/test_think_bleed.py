@@ -1235,6 +1235,40 @@ async def test_a_repair_is_counted_and_logged(rig, caplog):
     assert "ROADSTEAD_THINK_BLEED_REPAIRED" in caplog.text
 
 
+async def test_the_stream_is_closed_when_the_proxy_stops_reading_it(rig, monkeypatch):
+    """The proxy `break`s on the backend's `done` frame. An async generator left
+    suspended there is finalised by the garbage collector, via a task the loop
+    schedules LATER — and the repair tally + log live in that generator's
+    `finally`. `test_a_repair_is_counted_and_logged` read the tally straight after
+    the stream and saw one repair fewer on Python 3.12+ (CI red from 2026-09-26),
+    while passing on 3.11 by scheduling luck. Pin the cause, not the timing:
+    the consumer must CLOSE the stream itself, which holds on every Python."""
+    backend = rig.svc._backend
+    real_stream = backend.stream
+    closed: list[bool] = []
+
+    class _Tracked:
+        def __init__(self, gen):
+            self._gen = gen
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await self._gen.__anext__()
+
+        async def aclose(self):
+            closed.append(True)
+            await self._gen.aclose()
+
+    monkeypatch.setattr(
+        backend, "stream", lambda *a, **kw: _Tracked(real_stream(*a, **kw)))
+    rig.fake.think = _tagged(THINK_TAG_OPEN)
+    await _openai(rig, "tier1", _payload(), True)
+    assert closed == [True], "the streaming consumer abandoned the backend stream"
+    assert (await rig.status())["think_bleed_repaired"] == 1
+
+
 # --------------------------------------------------------------------------- #
 # 3. CONTROLS — the harness can see the things that must NOT change
 # --------------------------------------------------------------------------- #

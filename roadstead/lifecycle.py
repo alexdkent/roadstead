@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import time
+from contextlib import aclosing
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -2586,16 +2587,27 @@ class Lifecycle:
         # path, because `asyncio.timeout` firing cancels the `async for` — once
         # we are in the except block the stream is already gone.
         progress_probe: asyncio.Task | None = None
+        # 🚨 Closed by `aclosing` below, never left to the garbage collector. The
+        # loop `break`s on the backend's `done` frame, which leaves the generator
+        # suspended at its last `yield`; its `finally` (the think-bleed repair
+        # tally + log, and the HTTP response's release) then runs only when the
+        # interpreter finalises the abandoned generator — a task scheduled by the
+        # loop's asyncgen hook, some turns later and at a point that differs by
+        # Python version. `/v1/status` read straight after the stream ended
+        # showed one repair fewer than had happened (3.12+). `call_watched` has
+        # always closed its generator explicitly, for the same reason.
+        backend_stream = self.state.backend.stream(
+            ep_cfg, payload, req.payload_type,
+            req.request_id, timeout_s=hard_limit_s,
+        )
         try:
-            async with asyncio.timeout(ttft_deadline_s) as _cm:
+            async with asyncio.timeout(ttft_deadline_s) as _cm, \
+                    aclosing(backend_stream):
                 progress_probe = asyncio.create_task(self._stream_progress_probe(
                     ep_cfg, _cm, lambda: last_chunk_at, lambda: ttft_ms,
                     gap_deadline_s, hard_limit_s, t0, req,
                 ))
-                async for event in self.state.backend.stream(
-                    ep_cfg, payload, req.payload_type,
-                    req.request_id, timeout_s=hard_limit_s,
-                ):
+                async for event in backend_stream:
                     if event.event_type == "chunk":
                         now_m = time.monotonic()
                         if ttft_ms is None:
@@ -3223,26 +3235,29 @@ class Lifecycle:
             saw_done = False
             relayed = 0
             content_chars = 0
-            async for event in self.state.backend.stream(
+            # `aclosing`: the loop breaks on `done`, and an abandoned generator's
+            # `finally` (repair tally, response release) must not wait for the GC.
+            async with aclosing(self.state.backend.stream(
                 ep_cfg, second, req.payload_type,
                 f"{req.request_id}-answernow", timeout_s=max(5.0, timeout_s),
-            ):
-                if event.event_type == "chunk":
-                    if event.parsed:
-                        usage = event.parsed.get("usage")
-                        if usage:
-                            out_tokens = coerce_token_count(
-                                usage.get("completion_tokens"), out_tokens)
-                        for ch in event.parsed.get("choices") or []:
-                            d = ch.get("delta") if isinstance(ch, dict) else None
-                            piece = d.get("content") if isinstance(d, dict) else None
-                            if isinstance(piece, str):
-                                content_chars += len(piece.strip())
-                    relayed += 1
-                    await stream_q.put({"type": "chunk", "data": event.data})
-                elif event.event_type == "done":
-                    saw_done = True
-                    break
+            )) as answer_stream:
+                async for event in answer_stream:
+                    if event.event_type == "chunk":
+                        if event.parsed:
+                            usage = event.parsed.get("usage")
+                            if usage:
+                                out_tokens = coerce_token_count(
+                                    usage.get("completion_tokens"), out_tokens)
+                            for ch in event.parsed.get("choices") or []:
+                                d = ch.get("delta") if isinstance(ch, dict) else None
+                                piece = d.get("content") if isinstance(d, dict) else None
+                                if isinstance(piece, str):
+                                    content_chars += len(piece.strip())
+                        relayed += 1
+                        await stream_q.put({"type": "chunk", "data": event.data})
+                    elif event.event_type == "done":
+                        saw_done = True
+                        break
             logger.info(
                 "ROADSTEAD_ANSWER_NOW endpoint=%s call_site=%s request_id=%s "
                 "notes_chars=%d answer_max_tokens=%d chunks=%d output_tokens=%d "
