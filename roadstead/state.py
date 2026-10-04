@@ -327,6 +327,14 @@ class ProxyState:
         # json.loads after every repair layer ran (sync 502 / stream error frame).
         self.truncation_total = 0
         self.truncation_by_model_caller: dict[str, dict] = {}
+        # The subset of those truncations that were turned into a caller-visible
+        # error (`truncated_tool_turn`, docs/api.md §2.1): a request that
+        # declared tools, ended finish_reason=length, and carried no complete
+        # tool call. Counted in addition to `truncation_total`, never instead of
+        # it. Loop-thread-only writes; per-endpoint on /metrics as
+        # ``roadstead_truncated_tool_turns_total{endpoint}``.
+        self.truncated_tool_turns_total = 0
+        self.truncated_tool_turns_by_endpoint: dict[str, int] = {}
         self.structured_parse_failure_total = 0
         self.structured_parse_failures_by_model_caller: dict[str, int] = {}
         # Empty-structured-response detection (2026-08-01, ledger
@@ -803,7 +811,8 @@ class ProxyState:
 
     def resolve_error(self, req: "QueuedRequest", error: str, *,
                       backend_status: int | None = None,
-                      partial_content: str | None = None) -> None:
+                      partial_content: str | None = None,
+                      code: str | None = None) -> None:
         """Release a queued/pending request with an error, resolving whichever
         wait primitive the caller is blocked on (sync future or streaming queue).
 
@@ -825,6 +834,13 @@ class ProxyState:
         array) needs to work from. Omitted (never an empty string) when there
         is nothing to carry, so its presence alone tells a caller whether a
         salvage attempt is possible.
+
+        🚨 ``code`` is the machine-readable ``docs/api.md`` §2.1 code, for a
+        failure raised HERE rather than by a correction rule (which attaches its
+        own to ``result["code"]``). Omitted when None, so every existing caller's
+        payload — and the legacy ``backend_error`` fallback every door applies —
+        is unchanged. It rides the stream error frame too: a streaming caller
+        learns the same code a sync caller does.
         """
         payload = {
             "request_id": req.request_id,
@@ -835,6 +851,8 @@ class ProxyState:
             payload["backend_status"] = int(backend_status)
         if partial_content:
             payload["partial_content"] = partial_content
+        if code:
+            payload["code"] = code
         future = self.pending_futures.get(req.request_id)
         if future and not future.done():
             future.set_result(dict(payload))
@@ -845,6 +863,8 @@ class ProxyState:
                 frame["backend_status"] = int(backend_status)
             if partial_content:
                 frame["partial_content"] = partial_content
+            if code:
+                frame["code"] = code
             try:
                 stream_q.put_nowait(frame)
             except asyncio.QueueFull:

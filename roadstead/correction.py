@@ -761,6 +761,48 @@ def _arg_str_valid(tc: dict) -> bool:
         return False
 
 
+#: The `code` a truncated TOOL turn carries on every door and in the stream
+#: error frame (docs/api.md §2.1). One constant so the sync gate, the
+#: end-of-stream gate and the tests cannot drift apart on the spelling.
+TRUNCATED_TOOL_TURN_CODE = "truncated_tool_turn"
+
+
+def request_declares_tools(payload: Any) -> bool:
+    """True when the request offers the model at least one tool. An empty
+    ``tools`` array declares nothing — a harness that always sends the key
+    must not have its plain turns reclassified."""
+    tools = payload.get("tools") if isinstance(payload, dict) else None
+    return isinstance(tools, list) and len(tools) > 0
+
+
+def tool_call_is_complete(tc: Any) -> bool:
+    """True iff a tool call is one a caller can DISPATCH: a function name and an
+    arguments string that parses to a JSON object.
+
+    Stricter than :func:`_arg_str_valid` on purpose. That one answers "is this
+    argument string corrupt" and so lets absent/empty arguments through as a
+    legal no-arg call; this one is asked about a turn the backend CUT OFF
+    (``finish_reason=length``), where an empty arguments string is the shape of
+    a call that was started and never filled in. A finished no-arg call renders
+    ``{}``, so ``{}`` is complete and ``""`` is not.
+    """
+    try:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if not isinstance(fn, dict):
+            return False
+        name = fn.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return False
+        args = fn.get("arguments")
+        if isinstance(args, dict):  # a shim that already parsed it
+            return True
+        if not isinstance(args, str) or not args.strip():
+            return False
+        return isinstance(json.loads(args), dict)
+    except Exception:  # noqa: BLE001 — a shape we cannot read is not dispatchable
+        return False
+
+
 def _clone_with_content(body: dict, new_content: str) -> dict:
     """A deep copy of body with choices[0].message.content replaced."""
     import copy
@@ -2964,6 +3006,83 @@ class Correction:
             "max_tokens=%s output_tokens=%d structured=%s stream=%s status=%s",
             req.endpoint, req.agent_id, req.call_site, req.priority.name,
             max_tokens, output_tokens, structured, stream, status)
+
+    def is_truncated_tool_turn(
+        self, req: "QueuedRequest", finish_reason: str | None, tool_calls: list,
+    ) -> bool:
+        """The turn declared tools, ran into ``max_tokens`` and produced no tool
+        call a caller can execute.
+
+        🚨 WHY THIS IS AN ERROR AND NOT A 200. An agent harness reads a
+        ``finish_reason=length`` completion with no tool call as "the model
+        finished" and exits 0 having done nothing — measured with the ``pi``
+        coding agent, a silent no-op. The proxy already logged
+        ``ROADSTEAD_TRUNCATION`` for it; the caller never heard. A partial tool
+        call (arguments cut mid-JSON) is no better than none, so it counts as
+        none. Only a request that declares ``tools`` qualifies: a plain
+        free-text ``length`` is a short answer, not a missing action, and stays
+        a 200 (the dj agent produces ~943 of those per 14 days on purpose).
+        Total: never raises."""
+        try:
+            if finish_reason != "length":
+                return False
+            if req.payload_type != "chat_completion":
+                return False
+            if not request_declares_tools(req.payload):
+                return False
+            return not any(tool_call_is_complete(tc) for tc in (tool_calls or []))
+        except Exception:  # noqa: BLE001 — a guard must never break a response
+            return False
+
+    def truncated_tool_turn_message(
+        self, req: "QueuedRequest", role: str, output_tokens: int,
+    ) -> str:
+        """The caller-facing error text — states the remedy and both numbers.
+
+        🚨 Carries the ``truncated structured output`` marker and an
+        ``output_tokens=N`` fragment on purpose, although a tool turn is not
+        structured output. Callers classify on those SUBSTRINGS (docs/api.md
+        §2.2: rewording is a breaking change), and the fleet's classifier sends
+        that marker to "raise the budget" recovery. Without it this error would
+        read as a generic proxy 502 — transient, retry unchanged — and a retry
+        at the same ``max_tokens`` truncates identically, which is a silent
+        doubling of cost, exactly what this error exists to prevent. Same
+        precedent as ``toolcall_truncated``."""
+        p = req.payload if isinstance(req.payload, dict) else {}
+        max_tokens = p.get("max_tokens")
+        return (
+            f"backend {role} truncated structured output (tool turn ran out of "
+            f"max_tokens: finish_reason=length with no complete tool call, "
+            f"max_tokens={max_tokens if max_tokens else 'unset'}, "
+            f"output_tokens={output_tokens}). Nothing was executable — the "
+            f"model spent its whole output budget before finishing a tool call "
+            f"(reasoning counts against it). Raise max_tokens or reduce "
+            f"reasoning, then retry; retrying unchanged truncates the same way.")
+
+    def record_truncated_tool_turn(
+        self, req: "QueuedRequest", *, stream: bool, output_tokens: int,
+    ) -> None:
+        """Tally + marker for a tool turn failed as :data:`TRUNCATED_TOOL_TURN_CODE`.
+
+        Deliberately NOT a second :meth:`record_truncation_event`: every
+        ``finish_reason=length`` completion already reaches that through
+        ``Lifecycle.record_completion`` (the single choke point), so calling it
+        here would double ``truncation_total``. This counter is the subset of
+        those truncations that were turned into a caller-visible error, which is
+        the number that says how often a harness was told rather than left
+        guessing. ``ROADSTEAD_TRUNCATED_TOOL_TURN`` is the stable grep marker."""
+        key = normalize_endpoint(req.endpoint)
+        self.state.truncated_tool_turns_total += 1
+        self.state.truncated_tool_turns_by_endpoint[key] = (
+            self.state.truncated_tool_turns_by_endpoint.get(key, 0) + 1)
+        p = req.payload if isinstance(req.payload, dict) else {}
+        logger.warning(
+            "ROADSTEAD_TRUNCATED_TOOL_TURN model=%s agent=%s call_site=%s "
+            "max_tokens=%s output_tokens=%d stream=%s — tools declared, "
+            "finish_reason=length, no complete tool call: failed as %s "
+            "instead of a silent 200",
+            req.endpoint, req.agent_id, req.call_site, p.get("max_tokens"),
+            output_tokens, stream, TRUNCATED_TOOL_TURN_CODE)
 
     def enforce_toolcall_truncation(self, req: "QueuedRequest", result: dict) -> None:
         """SYNC mirror of the stream sanitizer's finalize rule (operator mandate

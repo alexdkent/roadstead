@@ -103,6 +103,9 @@ ERROR_CODES: frozenset[str] = frozenset({
     "structured_invalid_json",
     "schema_invalid",
     "toolcall_truncated",
+    # A tool turn that ran into max_tokens with no complete tool call
+    # (docs/api.md §2.1).
+    "truncated_tool_turn",
 })
 
 #: Codes a caller should DEFER on: retry later, or hand the work to a queue.
@@ -134,6 +137,13 @@ DEFERRABLE_CODES: frozenset[str] = frozenset({
     # without consulting the prose, so this SDK threw away a tool call the next
     # attempt would have completed.
     "toolcall_truncated",
+    # The same fault from the other end: a tool turn that hit max_tokens before
+    # finishing a tool call. §2.1's row says raise the budget (or reduce
+    # reasoning) and retry; `deferrable` reads an unknown code as non-deferrable,
+    # so leaving it out would have this SDK discard a call a larger budget
+    # completes. NOT a retry-unchanged code — the proxy declines to retry it for
+    # exactly that reason.
+    "truncated_tool_turn",
     # `schema_invalid` is deliberately NOT here: the proxy repaired, then
     # retried once with the validation error fed back, and the model failed the
     # schema anyway. §2.1 — the caller must change the schema, not the clock.

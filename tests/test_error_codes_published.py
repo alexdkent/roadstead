@@ -89,7 +89,8 @@ def emitted_codes() -> dict[str, list[str]]:
 
 
 #: The count §2.1 states in prose, which must match the list it then gives.
-_COUNT_WORDS = {"fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18}
+_COUNT_WORDS = {"fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+                "nineteen": 19}
 
 
 def _section_2_1() -> str:

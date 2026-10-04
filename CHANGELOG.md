@@ -387,6 +387,28 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Breaking
 
+- **A chat request that declares `tools` and ends `finish_reason: "length"` with no complete tool call
+  is now a `502` with the new error code `truncated_tool_turn`, not a `200`.** An agent harness read
+  the `200` as "the model finished" and exited 0 having done nothing (measured with the `pi` coding
+  agent); `ROADSTEAD_TRUNCATION` logged the condition and the caller never heard. A partial tool call
+  (arguments cut mid-JSON) counts as none; one complete call keeps the `200`. The message states the
+  remedy (raise `max_tokens` or reduce reasoning) and carries `max_tokens=` and `output_tokens=`, plus
+  the existing `truncated structured output` marker so a prose-matching caller routes it to budget
+  recovery instead of "retry unchanged". Deferrable in `roadstead.client`, like `toolcall_truncated`.
+  **No proxy-side retry**: the same request at the same `max_tokens` truncates again and would silently
+  double the cost. **Streaming**: the chunks and the `length` finish are already sent, so the error is
+  the stream's error frame in place of `[DONE]` (OpenAI door: `data: {"error": {…, "code":
+  "truncated_tool_turn"}}`; enriched/legacy doors: their `error` frame, now carrying `code`).
+  **Requests with no `tools` — and an empty `tools` array — are unchanged** (still `200`). Counted as
+  `reliability.truncated_tool_turns_total` / `truncated_tool_turns_by_endpoint` on `/v1/status`,
+  `roadstead_truncated_tool_turns_total{endpoint}` on `/metrics`, and the `ROADSTEAD_TRUNCATED_TOOL_TURN`
+  log marker; `truncation_total` still counts it once, as before (this is a subset, not a second tally).
+  `docs/api.md` §2.1 (nineteen codes now), §2.2 and §3 metrics updated in the same commit.
+  Also: the **non-streaming OpenAI door now reports the `code` a failure actually carries** instead of
+  always `backend_error` — `toolcall_truncated`, `schema_invalid` and `structured_invalid_json` were
+  being minted and reaching OpenAI-door callers as `backend_error`. The enriched and legacy doors
+  already did this.
+
 - **`models.yaml` endpoint field `token_speed` renamed to `decode_tok_s`.** Nothing outside this
   repo has populated the field yet, so the blast radius is zero today. Two collisions forced the
   rename: (1) the fleet catalog this repo mirrors already uses `token_speed` for an unrelated

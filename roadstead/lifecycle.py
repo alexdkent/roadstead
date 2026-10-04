@@ -67,6 +67,7 @@ from .constants import (
 )
 from .correction import (
     _EMPTY_RESCUE_MIN_TOKENS,
+    TRUNCATED_TOOL_TURN_CODE,
     ReasoningLoopDetector,
     StructuredBlankRunDetector,
     _ToolCallStreamSanitizer,
@@ -74,6 +75,8 @@ from .correction import (
     _degeneracy_evidence,
     _degenerate_text_arm,
     _fmt_evidence,
+    _response_tool_calls,
+    request_declares_tools,
     strip_trailing_blank_chars,
 )
 from .cost_model import context_fit, estimate_input_tokens
@@ -1367,7 +1370,10 @@ class Lifecycle:
                                     headers=enrichment_headers(req, corrections))
             return _openai_error(
                 result.get("error", "backend error"), "backend_error", 502,
-                code="backend_error",
+                # The code the failure carries (§2.1), `backend_error` only when
+                # nothing more specific was attached — the same fallback the
+                # enriched and legacy doors already apply.
+                code=result.get("code") or "backend_error",
                 partial_content=result.get("partial_content"),
             )
         if wire == WIRE_LEGACY:
@@ -1534,14 +1540,15 @@ class Lifecycle:
                             yield "data: [DONE]\n\n"
                             break
                         if etype == "error":
-                            yield (
-                                "data: "
-                                + json.dumps({"error": {
-                                    "message": event.get("error", "stream error"),
-                                    "type": "proxy_error",
-                                }})
-                                + "\n\n"
-                            )
+                            err_obj = {
+                                "message": event.get("error", "stream error"),
+                                "type": "proxy_error",
+                            }
+                            # Additive, and only when the producer attached one
+                            # (§2.1): every other error frame stays byte-identical.
+                            if event.get("code"):
+                                err_obj["code"] = event["code"]
+                            yield "data: " + json.dumps({"error": err_obj}) + "\n\n"
                             break
                         # queued / admitted / anything else → not an OpenAI frame.
                         continue
@@ -2158,6 +2165,32 @@ class Lifecycle:
                 )
                 return
 
+            # A TOOL turn that ran into max_tokens without finishing a tool call
+            # is not a short answer — it is a missing action, and a harness
+            # reading a 200 `finish_reason=length` takes it for "done" and exits
+            # having done nothing. Fail it loud under its own code, never cached
+            # (status != ok). No proxy-side retry: the same request at the same
+            # max_tokens truncates again and would silently double the cost, so
+            # the caller gets one error that says what to change. Free-text
+            # `length` WITHOUT tools is untouched (still a 200).
+            if self.correction.is_truncated_tool_turn(
+                    req, resp.finish_reason, _response_tool_calls(resp.body)):
+                self.correction.record_truncated_tool_turn(
+                    req, stream=False, output_tokens=resp.output_tokens)
+                self.state.resolve_error(
+                    req,
+                    self.correction.truncated_tool_turn_message(
+                        req, ep_cfg.role, resp.output_tokens),
+                    code=TRUNCATED_TOOL_TURN_CODE)
+                self.record_completion(
+                    req, decision, duration,
+                    resp.input_tokens, resp.output_tokens, "truncated",
+                    response_body=resp.body,
+                    finish_reason=resp.finish_reason,
+                    cached_tokens=resp.cached_tokens,
+                )
+                return
+
             result = {
                 "request_id": req.request_id,
                 "queue_wait_ms": round(decision.queue_wait_ms, 1),
@@ -2439,6 +2472,14 @@ class Lifecycle:
         replay_on = bool(getattr(ep_cfg, "replay_reasoning_history", False))
         accumulated_reasoning = ""
         stream_tool_calls: dict[int, dict] = {}
+        # A stream that declared tools has its tool-call deltas reassembled too,
+        # so the end-of-stream gate below can tell "ran out of tokens with no
+        # complete call" from a normal finish. One accumulator for both this and
+        # the replay store: a second pass over the same deltas would concatenate
+        # every fragment twice.
+        tools_declared = (
+            req.payload_type == "chat_completion"
+            and request_declares_tools(req.payload))
         accumulate = uniform_on or stream_expects_json or replay_on
         accumulated_content = ""
         # Reasoning LOOP-BREAK (2026-09-15). Built from the ENDPOINT's declared
@@ -2632,6 +2673,7 @@ class Lifecycle:
                                         rrc = delta.get("reasoning_content")
                                     if isinstance(rrc, str):
                                         accumulated_reasoning += rrc
+                                if (replay_on or tools_declared) and isinstance(delta, dict):
                                     accumulate_tool_call_deltas(
                                         stream_tool_calls, delta.get("tool_calls"))
                                 if loop_detector.armed and isinstance(delta, dict):
@@ -2872,6 +2914,7 @@ class Lifecycle:
         # request's max_tokens. Kill-switch ROADSTEAD_PROXY_STRUCTURED_VALIDITY
         # (guard_on) restores the legacy clean-'done' behavior.
         stream_guard_err: str | None = None
+        stream_guard_code: str | None = None
         stream_guard_status = "ok"
         if stream_structured and last_finish_reason == "length":
             # Same message shape as the sync truncation error so existing client
@@ -2891,6 +2934,26 @@ class Lifecycle:
                     f"structured request (stream reassembly does not parse; "
                     f"output_tokens={output_tokens})")
                 stream_guard_status = "error"
+
+        # A TOOL turn that ran into max_tokens without a complete tool call —
+        # the streaming half of the sync gate in `execute_sync`. The chunks are
+        # already on the wire (including the `finish_reason=length` one) and
+        # cannot be recalled, so the error rides the established end-of-stream
+        # error frame in place of the `[DONE]`/`done` a clean finish would get:
+        # an OpenAI SDK raises on a `data: {"error": …}` frame, which is what
+        # turns "the model finished" into "the turn failed". Only looks at a
+        # stream nothing above has already failed, so a structured turn keeps
+        # its own `truncated structured output` frame.
+        if (stream_guard_err is None and tools_declared
+                and self.correction.is_truncated_tool_turn(
+                    req, last_finish_reason,
+                    [stream_tool_calls[i] for i in sorted(stream_tool_calls)])):
+            self.correction.record_truncated_tool_turn(
+                req, stream=True, output_tokens=output_tokens)
+            stream_guard_err = self.correction.truncated_tool_turn_message(
+                req, ep_cfg.role, output_tokens)
+            stream_guard_code = TRUNCATED_TOOL_TURN_CODE
+            stream_guard_status = "truncated"
 
         # --- terminal-chunk repair + per-stream observability (2026-08-24) ---
         #
@@ -2973,7 +3036,10 @@ class Lifecycle:
         )
 
         if stream_guard_err is not None:
-            await stream_q.put({"type": "error", "error": stream_guard_err})
+            err_frame = {"type": "error", "error": stream_guard_err}
+            if stream_guard_code:
+                err_frame["code"] = stream_guard_code
+            await stream_q.put(err_frame)
         else:
             done_frame = {
                 "type": "done",

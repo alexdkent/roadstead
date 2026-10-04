@@ -298,6 +298,10 @@ answer is not a fix, it is a silencer.
 - **An output-cap hit never passes silently to any caller.** Every completion that ends
   `finish_reason=length` logs a stable `ROADSTEAD_TRUNCATION` marker and a per-(model, caller)
   tally, from the single completion choke point, for both streaming and non-streaming.
+- **…and a tool turn that ran out of tokens is an error, not a 200.** A request that declares `tools`,
+  ends `finish_reason=length` and carries no complete tool call returns `502 truncated_tool_turn`
+  (streaming: the error frame in place of `[DONE]`), because an agent harness reads a `length` 200 as
+  "finished" and exits having done nothing. Free-text `length` without `tools` is unchanged.
 - **vLLM mislabels a `max_tokens` truncation mid-tool-call as `finish_reason="tool_calls"`.**
   llama.cpp gets this right. So on a vLLM non-streaming 200, a tool call whose `function.arguments`
   does not parse is treated as truncation and never as a repair target. This ordering is

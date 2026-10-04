@@ -637,6 +637,17 @@ class ProxyHttpHandlers:
                 out.append(Metric("roadstead_empty_completion_total", int(n or 0),
                                   {"endpoint": str(endpoint)}, "gauge",
                                   help="empty (position-0-EOS) completions by endpoint"))
+
+            # Tool turns failed as `truncated_tool_turn` (docs/api.md §2.1): a
+            # request that declared tools ran into max_tokens with no complete
+            # tool call, and the caller was told instead of handed a silent 200.
+            # A SUBSET of the `length` hits in roadstead_truncations_total, so
+            # the two are never summed. Climbing on one endpoint means a caller's
+            # max_tokens (or reasoning) is too large a share of its own turn.
+            for endpoint, n in (self.state.truncated_tool_turns_by_endpoint or {}).items():
+                out.append(Metric("roadstead_truncated_tool_turns_total", int(n or 0),
+                                  {"endpoint": str(endpoint)}, "gauge",
+                                  help="tool turns failed as truncated_tool_turn by endpoint"))
         except Exception:
             logger.exception("roadstead /metrics render failed")
             out = []
@@ -982,6 +993,11 @@ class ProxyHttpHandlers:
                 # Grep markers: ROADSTEAD_TRUNCATION / ROADSTEAD_STRUCTURED_INVALID.
                 "truncation_total": self.state.truncation_total,
                 "truncation_by_model_caller": self.state.truncation_by_model_caller,
+                # Tool turns failed as `truncated_tool_turn` — the subset of the
+                # `length` truncations above that a caller was TOLD about.
+                "truncated_tool_turns_total": self.state.truncated_tool_turns_total,
+                "truncated_tool_turns_by_endpoint":
+                    self.state.truncated_tool_turns_by_endpoint,
                 # The "no accidental MAX" reasoning-effort guard (§policy
                 # `reasoning_effort_map`) — every remap/removal since boot,
                 # keyed "endpoint|from->to" ("to": null = the value was

@@ -89,6 +89,8 @@ def test_the_deferrable_set_is_a_real_subset(doc):
     # state is a one-line edit no other assertion would notice.
     assert "toolcall_truncated" in W.DEFERRABLE_CODES
     assert "schema_invalid" not in W.DEFERRABLE_CODES
+    # Same fault, found in a tool turn that hit max_tokens (docs/api.md §2.1).
+    assert "truncated_tool_turn" in W.DEFERRABLE_CODES
 
 
 def test_the_context_overflow_marker_is_verbatim(doc):
