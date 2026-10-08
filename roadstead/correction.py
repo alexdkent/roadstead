@@ -38,6 +38,7 @@ from .grammar import (
     verify_conformance,
 )
 from .hooks import degradation
+from .no_store import engaged, outcome_of, redact
 from .observability import MetricsSample, record_structured_outcome
 from .providers import provider_for
 from .reasoning_replay import replay_key
@@ -1530,18 +1531,29 @@ class Correction:
         if grammar is None:
             return None
 
-        h = grammar_hash(grammar)
-        result = self.state.grammar_cache.get(h)
+        # 🚨 A no-store request bypasses BOTH memos below. `grammar_cache` holds
+        # the grammar's text (normalized) for the life of the process, keyed by
+        # its hash, and `grammar_alerted` holds the hash of every invalid one —
+        # a grammar can encode a schema's enum values, so it is request content
+        # that would outlive the call. Validation is cheap; the cost is a loud
+        # log line per invalid request instead of one per distinct grammar.
+        no_store = engaged(req)
+        h = None if no_store else grammar_hash(grammar)
+        result = None if no_store else self.state.grammar_cache.get(h)
         if result is None:
             result = normalize_and_validate(grammar)
-            self.state.grammar_cache[h] = result
+            if not no_store:
+                self.state.grammar_cache[h] = result
 
         if not result.ok:
-            if h not in self.state.grammar_alerted:
-                self.state.grammar_alerted.add(h)
+            if no_store or h not in self.state.grammar_alerted:
+                if not no_store:
+                    self.state.grammar_alerted.add(h)
                 logger.error(
                     "GRAMMAR INVALID — failing loud (call_site=%s endpoint=%s): %s",
-                    req.call_site, req.endpoint, result.error_payload()["detail"],
+                    req.call_site, req.endpoint,
+                    # The detail can quote the caller's own grammar text.
+                    redact(no_store, result.error_payload()["detail"]),
                 )
             return result.error_payload()
 
@@ -1692,9 +1704,11 @@ class Correction:
                             f"{req.request_id}-degen{i}", timeout_s=max(2.0, remaining),
                         )
                     except Exception as exc:  # noqa: BLE001
+                        # `exc` is a backend error whose body can quote the
+                        # prompt it rejected; withheld for a no-store request.
                         logger.warning(
                             "degeneration re-dispatch %d failed (call_site=%s): %s",
-                            i, cs, exc)
+                            i, cs, redact(engaged(req), exc))
                         self.state.metrics.record(MetricsSample(
                             timestamp=time.monotonic(), endpoint=req.endpoint,
                             agent_id=req.agent_id, priority=req.priority.name,
@@ -1730,6 +1744,7 @@ class Correction:
                                 session_id=req.session_id, turn_id=req.turn_id,
                                 caller_id=req.caller_id,
                                 finish_reason=resp.finish_reason,
+                                no_store=outcome_of(req),
                             )
                         except Exception:  # noqa: BLE001 — accounting must not break the response
                             logger.debug("degen corrected-row persist failed",
@@ -1828,9 +1843,12 @@ class Correction:
             # status == "failed": in-memory repair insufficient.
             error_msg = _validation_error(response, schema)
             if shadow:
+                # `error_msg` quotes the offending VALUE from the response
+                # (a jsonschema message); withheld for a no-store request.
                 logger.info(
                     "schema-backstop WOULD retry+fail (shadow) call_site=%s "
-                    "endpoint=%s: %s", cs, req.endpoint, error_msg)
+                    "endpoint=%s: %s", cs, req.endpoint,
+                    redact(engaged(req), error_msg))
                 return
 
             # (2) One bounded retry with the error fed back.
@@ -1864,7 +1882,7 @@ class Correction:
             result.pop("response", None)
             logger.warning(
                 "schema-backstop UNRECOVERABLE call_site=%s endpoint=%s: %s",
-                cs, req.endpoint, error_msg)
+                cs, req.endpoint, redact(engaged(req), error_msg))
         except Exception:  # noqa: BLE001 — backstop must never break a response
             logger.debug("schema backstop failed", exc_info=True)
     async def _schema_retry(
@@ -1918,7 +1936,7 @@ class Correction:
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "schema-backstop retry dispatch failed (call_site=%s): %s",
-                req.call_site or "?", exc)
+                req.call_site or "?", redact(engaged(req), exc))
             self.state.metrics.record(MetricsSample(
                 timestamp=time.monotonic(), endpoint=req.endpoint,
                 agent_id=req.agent_id, priority=req.priority.name,
@@ -1949,6 +1967,7 @@ class Correction:
                 payload=req.payload, response=body,
                 session_id=req.session_id, turn_id=req.turn_id,
                 caller_id=req.caller_id,
+                no_store=outcome_of(req),
             )
         except Exception:  # noqa: BLE001 — accounting must not break the response
             logger.debug("schema corrected-row persist failed", exc_info=True)
@@ -2003,6 +2022,13 @@ class Correction:
         Never raises into the request path: a failure here costs a
         prefix-cache hit on the backend, never a served response."""
         if req.payload_type != "chat_completion":
+            return
+        if engaged(req):
+            # No-store neither feeds nor reads the replay cache: STORING keeps a
+            # turn's reasoning (derived from its content) for minutes in memory,
+            # and a restore with nothing stored could only count a miss. The
+            # price is the prefix-cache break replay exists to prevent, for
+            # this caller only.
             return
         p = req.payload
         if not isinstance(p, dict):
@@ -2061,7 +2087,7 @@ class Correction:
         built identically either way. Never raises into the request/response
         path: a failure here costs a future prefix-cache hit, never this
         response."""
-        if req.payload_type != "chat_completion":
+        if req.payload_type != "chat_completion" or engaged(req):
             return
         ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
         if ep is None or not getattr(ep, "replay_reasoning_history", False):
@@ -3366,7 +3392,7 @@ class Correction:
                 req.endpoint, getattr(req, "agent_id", "?"), cs,
                 getattr(req, "request_id", "?"), stream,
                 schema is not None, _schema_required_keys(schema),
-                n_keys, content[:120],
+                n_keys, redact(engaged(req), content[:120]),
             )
             try:
                 degradation(

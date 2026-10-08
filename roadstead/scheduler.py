@@ -177,6 +177,18 @@ class QueuedRequest:
     #: on an otherwise spill-happy identity needs.
     allow_degrade: bool | None = None
     allow_spill: bool | None = None
+    #: What became of an `X-Roadstead-No-Store` request (``no_store.py``): ``""``
+    #: = never asked (every request that does not send the header), ``"honoured"``
+    #: = the operator granted this caller and its content is withheld from every
+    #: store, ``"refused:<reason>"`` = it asked, was not granted, and is stored in
+    #: full. Decided ONCE in ``Lifecycle.handle_submit`` and read everywhere a
+    #: store or a log line could hold content — never recomputed downstream.
+    no_store_outcome: str = ""
+
+    @property
+    def no_store(self) -> bool:
+        """True when this request's content must reach no store and no log."""
+        return self.no_store_outcome == "honoured"
 
     @classmethod
     def create(
@@ -200,6 +212,7 @@ class QueuedRequest:
         requested: str = "",
         allow_degrade: bool | None = None,
         allow_spill: bool | None = None,
+        no_store_outcome: str = "",
     ) -> QueuedRequest:
         # Soft-default a malformed priority to P1 (never raise on the request
         # path — a bad label must not 500 the caller's LLM call).
@@ -235,6 +248,7 @@ class QueuedRequest:
             routed_to=ep,
             allow_degrade=allow_degrade,
             allow_spill=allow_spill,
+            no_store_outcome=no_store_outcome,
         )
 
 

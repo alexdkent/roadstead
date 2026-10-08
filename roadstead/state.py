@@ -310,6 +310,13 @@ class ProxyState:
         # min_tokens; recovered = those that produced a real response.
         self.empty_rescue_attempts = 0
         self.structured_fault_retries = 0
+        # No-store (roadstead/no_store.py): `X-Roadstead-No-Store` requests by
+        # outcome, and per caller. A REFUSED ask is never silent — it is counted
+        # here, logged with the caller's name, and written to the completion row.
+        # {agent_id: {"honoured": n, "refused": n, "<refusal reason>": n}}.
+        self.no_store_honoured = 0
+        self.no_store_refused = 0
+        self.no_store_by_agent: dict[str, dict[str, int]] = {}
         self.empty_rescue_recovered = 0
         # Per-endpoint empty-completion events (audit 2026-07-12, C-3): a 2xx
         # backend response with no content/tool_calls (position-0-EOS), counted

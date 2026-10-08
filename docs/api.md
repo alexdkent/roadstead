@@ -898,6 +898,7 @@ The OpenAI body stays byte-identical (§1.7). What can be said in headers is:
 | `X-Roadstead-Endpoint` | The endpoint admission chose. |
 | `X-Roadstead-Deadline-S` | The deadline actually applied. |
 | `X-Roadstead-Deadline-Source` | `caller` \| `computed` — see §1.7.3. |
+| `X-Roadstead-No-Store` | Present only when the request sent the header of the same name (§1.11): `honoured` or `refused:<reason>`. A caller that asked to leave no trace and was not granted it must be able to see that, not just the operator. |
 | `X-Roadstead-Corrected` | Comma-separated tokens naming what the correction layer rewrote (or silently could not fix) before this response was served — `json_object_stripped`, `forced_tool_schema`, `schema_repaired`, `schema_retried`, `schema_unrecoverable`, `degenerate_unrecovered`, `toolcall_truncated`. Absent when nothing fired. On a STREAMING response this can only ever carry `json_object_stripped` — the rest are decided after the backend has answered, past the point headers go on the wire (see the note below). |
 
 🚨 **`toolcall_truncated` is also an envelope `code` (§2.1).** It is the one token
@@ -1124,6 +1125,108 @@ response and the proxy's own defer/retry loop must not spend a slot retrying it.
 
 Neither cap touches the inference doors' Bearer-keyed admission logic, and neither is configurable
 per caller — both are fleet-wide, ASGI/transport-level bounds.
+
+### 1.11 No-store — withholding a request's content from every store 🚨
+
+By default Roadstead keeps what it serves: the request and response bodies on the completion row
+(the payload retention window, 48 h by default), the restart WAL, and the log lines that quote them when
+something goes wrong. A caller whose content must not sit in a database can **ask** for that, and the
+**operator** decides whether the ask is honoured. The default for everyone, and for any caller who asks
+without being granted, is full logging.
+
+**The request** — one header, on every door (`/v1/chat/completions`, `/v1/embeddings`, `/rs/v1/chat`,
+and the legacy `/v1/submit`; an OpenAI body has no room for a Roadstead field, so a header is the one
+signal that works everywhere):
+
+```
+X-Roadstead-No-Store: content
+```
+
+Any other non-empty value is a `400 invalid_request_error`, not a shrug: a caller who wrote `true`, was
+ignored and believes it opted out is the outcome this feature exists to rule out.
+
+**The grant** — a caller is honoured only when **all three** hold, and the header is otherwise
+decoration:
+
+1. **Authenticated.** The caller's identity was established by an **API key** (§1.5). An address
+   registration identifies a host, not a caller, so no address-derived identity — and no body- or
+   header-declared `agent_id` — can be granted. Refusal reason `not_authenticated`.
+2. **Not a shared identity.** The resolved `agent_id` is not one an address registration
+   (`ROADSTEAD_ACL`, or the built-in `internal`) also maps to — a key minted for a shared label would
+   let every holder of that label opt out. Refusal reason `shared_identity`.
+3. **Granted in the operator's agents config file**, by a stanza carrying all three keys:
+
+   ```yaml
+   some-caller:
+     content_no_store: allowed     # the string "allowed" — YAML true/yes/on do not count
+     approved_by: operator         # exactly this
+     approved_on: 2026-01-31       # an ISO date, not in the future
+   ```
+
+   A stanza missing either approval key, or with any value other than the above, is **not a grant**:
+   the caller is stored in full and a `CONFIG NOTICE` (`problem=invalid_grant`) is emitted and retained
+   on `GET /rs/v1/admin/config` (§3.5). Absent ⇒ off. The shipped example grants nothing. Refusal
+   reason `not_granted`.
+
+   🚨 **The grant is file-only.** `PATCH /rs/v1/admin/callers/{agent_id}` refuses `content_no_store`,
+   `approved_by` and `approved_on` with a `400` that says so, and the runtime overlay cannot carry
+   them: a credential that can edit quotas must not be able to grant itself a content privilege. A
+   grant is therefore always a reviewable edit to the operator's own file, and Roadstead logs
+   `NO-STORE GRANT agent=… approved_by=… approved_on=…` at WARNING when it loads one.
+
+**A refused ask is never silent.** The request is stored in full, exactly as if it had not asked, and
+in addition: `reliability.no_store_refused` and `no_store_by_agent` on `GET /v1/status` count it
+(with the reason as a key), `roadstead_no_store_requests_total{agent,outcome}` is emitted on
+`/metrics`, a WARNING `ROADSTEAD_NO_STORE_REFUSED agent=… key_id=… source=… reason=…` names the
+caller, the completion row carries `no_store = 'refused:<reason>'` (the counters reset at a restart
+and `docker logs` does not survive a redeploy; the row does), and the response carries
+`X-Roadstead-No-Store: refused:<reason>` (and `identity.no_store` on the enriched envelope).
+
+**What an honoured request does NOT store** — content, from every place Roadstead would have kept it:
+
+| surface | no-store behaviour |
+|---|---|
+| `proxy_completions.payload_json` / `response_json` | `NULL`. The replay corpus (`export_corpus`) and the cache-ability screen read only non-NULL rows, so the request is invisible to them. |
+| `proxy_queue.payload_json` (the restart WAL) | **No row is written.** The cost: a restart while the request is queued abandons it — its caller's connection died with the process, so recovery would only have run it for nobody. |
+| Corrected-row rewrites (degeneration re-dispatch, schema repair) | Same drop, same flag — they `INSERT OR REPLACE` the completion row and would otherwise restore the content. |
+| Shadow backend comparison | Not dispatched, so no second backend sees the content and no `shadow-` row is written. |
+| Deterministic response cache (`temperature: 0`) | Neither read nor written. |
+| Reasoning-replay cache (`policy.replay_reasoning_history`) | Neither stored nor restored. Cost: the prefix-cache break replay exists to prevent, for this caller only. |
+| Grammar memos (the validated-grammar cache and the invalid-grammar alert set) | Bypassed: the grammar is validated afresh and an invalid one logs (detail redacted) on every request instead of once per distinct grammar. The memos hold the grammar's text / its hash for the life of the process, and a grammar can encode a schema's enum values. |
+| Prefix keep-alive capture (`policy.prefix_keepalive_*`) | Not captured, so the prefix is never held or re-sent on a timer. |
+| Remote spill | **Never spilled** (`allow_spill` is forced false): spill sends the content to a third party's servers, where Roadstead cannot honour the withholding. Failover to another local endpoint is unaffected. |
+| Log lines that would quote content | Backend error bodies, jsonschema messages about the offending value, grammar-error detail and the structured-empty `content=` excerpt are replaced by `<withheld: no-store>` (`ROADSTEAD_STRUCTURED_EMPTY`, `GRAMMAR INVALID`, `schema-backstop …`, `degeneration re-dispatch … failed`, `transient backend error …`, `dispatch … failed`). An unhandled-exception backstop logs the exception **type** only when the request carried the header. |
+
+**What it still records** (the point of withholding content only):
+
+| where | what |
+|---|---|
+| `proxy_completions` columns | identity (`agent_id`, `caller_id`, `key_id`), endpoint, `call_site`, session/turn ids, timings, `queue_wait_ms`, `input_tokens`, `output_tokens`, `cached_tokens`, `status`, `finish_reason`, `kind`, and `no_store = 'honoured'` |
+| `proxy_completions.content_meta` | JSON: `payload_bytes` and `response_bytes` (the size of what was dropped), `message_count`, `roles` (counts, protocol roles only), `tools_declared` and `tool_calls` (function NAMES), `choice_count`, `input_count` (embeddings), and the served `model` / `model_source` |
+| errors, retries, truncation | status, `finish_reason`, error codes, and the existing counters and `ROADSTEAD_*` markers (identity, endpoint, token counts — no excerpt) |
+| the request log, `/v1/recent`, SSE frames | unchanged — they never carried content |
+| `/v1/status`, `/metrics` | `no_store_honoured` / `no_store_refused` / `no_store_by_agent`, `roadstead_no_store_requests_total` |
+
+🚨 **There is deliberately no content hash.** A plain digest of a short prompt is reversible by a
+dictionary over the caller's vocabulary, and a keyed one needs a key that either lives beside the
+database it protects or dies at every restart. `request_id`, `session_id`, `turn_id`, `call_site` and
+the recorded sizes already correlate every row a caller can usefully correlate.
+
+🚨 **The grant is read on the `agent_id` the request is billed as** — the same name its quota and its DRR
+share attach to. A key whose operator gave it `may_assert` (§1.5) therefore wears the asserted name's
+grant exactly as it wears that name's quota; the allowlist is the operator's, so this is the operator
+widening a credential, never a caller doing it. A body- or header-declared `agent_id` that the
+credential may not assert changes nothing.
+
+⚠️ **Known limits, stated rather than hidden.** (0) Labels the caller chooses — `call_site`,
+`caller_id`, `session_id`, `turn_id` — are metadata and are recorded verbatim; function names are
+recorded after a character-class check. Do not put content in them. (1) While a request is in flight its content is in
+process memory — it has to be. (2) The prompt and the answer necessarily reach the **backend**, and
+the backend's own logging is outside Roadstead's reach. (3) An unhandled Python exception in a code
+path nobody anticipated is logged by the ASGI server with its message, which could quote a value;
+the backstop above removes Roadstead's own copy only. (4) Process memory is not zeroed. (5) The
+legacy `/v1/submit` envelope carries no disclosure of the outcome (the shape is frozen); the header,
+counters, row and log line still apply.
 
 
 ## 2. Error contract 🚨
@@ -1447,6 +1550,7 @@ restart; it is kept rather than corrected because the name is the contract.
 | `roadstead_endpoint_goodput_generation_tps_per_request` | gauge | `endpoint` | Generation tokens per second per busy slot. ⚠️ **A low value alone is not a fault** — a prefill-heavy caller reads 0.42 here while perfectly healthy; the prefill series is what separates them. |
 | `roadstead_endpoint_goodput_prefill_tps` | gauge | `endpoint` | Prompt tokens per second. The clause that keeps huge-prompt/tiny-output callers out of the wedge band. |
 | `roadstead_endpoint_goodput_busy_max` | gauge | `endpoint` | Maximum reading of the declared external busy gauge (e.g. GPU watts) across the window — the chunked-prefill discriminator (§3.13). Emitted only when `policy.goodput_busy_min` is declared; absent, never zero, on every other endpoint or on any scrape failure. |
+| `roadstead_no_store_requests_total` | gauge | `agent`, `outcome` | `X-Roadstead-No-Store` requests (§1.11) by caller and outcome (`honoured` \| `refused`). A climbing `refused` series is a caller that believes its content is not being kept and is wrong; the reason is on `GET /v1/status` → `reliability.no_store_by_agent` and on the completion row. Series appear on first use. |
 | `roadstead_empty_completion_total` | gauge | `endpoint` | Empty (position-0-EOS) completions, counted each time the fail-loud gate trips. |
 | `roadstead_truncations_total` | gauge | `endpoint`, `caller`, `structured` | Output-cap (`finish_reason=length`) hits, split `structured="true"`/`"false"` so a rule can alert on structured truncations alone — a climbing structured series is a caller's `max_tokens` set too low. |
 | `roadstead_truncated_tool_turns_total` | gauge | `endpoint` | Tool turns failed as `truncated_tool_turn` (§2.1), both arms: the request declared `tools` and either ended `finish_reason=length` with no complete tool call, or a tool call is present but the backend's `completion_tokens` reached the request's `max_tokens` (the cut call can parse, and the backend may label it `tool_calls`). A SUBSET of the hits counted in `roadstead_truncations_total` (the second arm is added to that tally explicitly, since its finish is not `length`); never sum the two; also `GET /v1/status` → `reliability.truncated_tool_turns_total` / `truncated_tool_turns_by_endpoint`, and the `ROADSTEAD_TRUNCATED_TOOL_TURN` log marker. |
@@ -1626,7 +1730,8 @@ inferable.
 
 `PATCH /rs/v1/admin/callers/{agent_id}` accepts exactly the fields an `agents.yaml` stanza accepts:
 `weight`, `max_balance_ss`, `default_priority`, `degrade_ok`, `spill_ok`, `daily_spend_usd`,
-`requests_per_minute`. An unknown field is a **400 that names the known set** — never a silent drop,
+`requests_per_minute`. `content_no_store` / `approved_by` / `approved_on` (§1.11) are accepted in the
+file and **refused here** with a `400` that says so. An unknown field is a **400 that names the known set** — never a silent drop,
 on the surface whose purpose is to expose silent drops. For both thresholds `null` is *no threshold*
 and `0` is a real one (*no paid spend at all*; *this caller should not be sending*), and they are one
 keystroke apart.

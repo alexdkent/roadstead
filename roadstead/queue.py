@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import no_store as no_store_mod
 from .config import LLMPriority, normalize_endpoint, priority_to_band
 from .scheduler import QueuedRequest
 
@@ -331,6 +332,14 @@ class PersistentQueue:
             "kind": "TEXT",
             "cached_tokens": "INTEGER",  # Phase 2a prefix-cache attribution
             "key_id": "TEXT",            # delegation: who asserted the agent_id
+            # No-store (no_store.py). `no_store` is NULL for every request that
+            # never sent the header, 'honoured' when the operator's grant held
+            # (payload_json/response_json are then NULL by construction and
+            # `content_meta` carries the shape), and 'refused:<reason>' when it
+            # asked and was not granted — durable, because the in-memory counter
+            # resets at a restart and `docker logs` does not survive a redeploy.
+            "no_store": "TEXT",
+            "content_meta": "TEXT",
         })
         # Index supporting the fleet-usage rollups (group by endpoint over a
         # recent window) now that the table holds whole-fleet call metrics.
@@ -660,6 +669,13 @@ class PersistentQueue:
     # ----- write operations -----
 
     def persist_enqueue(self, req: QueuedRequest) -> None:
+        if no_store_mod.engaged(req):
+            # 🚨 The restart WAL holds the whole payload (it is how a queued
+            # request is re-dispatched after a crash), so a no-store request
+            # gets NO row. The cost is stated in docs/api.md: a restart while
+            # one is queued abandons it — and its caller's connection died with
+            # the process anyway, so recovery would only have run it for nobody.
+            return
         self._w(
             "INSERT OR REPLACE INTO proxy_queue "
             "(request_id, agent_id, endpoint, priority, call_site, "
@@ -705,10 +721,27 @@ class PersistentQueue:
         kind: str | None = "llm",
         cached_tokens: int | None = None,
         key_id: str | None = None,
+        no_store: str | None = None,
     ) -> None:
+        """Record a finished request.
+
+        ``no_store`` is the request's no-store outcome (``QueuedRequest.
+        no_store_outcome``; ``None``/``""`` when it never asked). When it is
+        ``honoured`` the ``payload`` and ``response`` are NOT written — only
+        :func:`no_store.content_summary` of them is — which makes this the one
+        place the completion-row half of the guarantee lives. Every caller of
+        this method passes it; ``tests/test_no_store.py`` fails by AST if one
+        does not.
+        """
         if not self._conn:
             return
         now = time.time()
+        content_meta = None
+        if no_store == no_store_mod.OUTCOME_HONOURED:
+            content_meta = json.dumps(
+                no_store_mod.content_summary(payload, response),
+                separators=(",", ":"))
+            payload = response = None
         self._w(
             "DELETE FROM proxy_queue WHERE request_id=?",
             (request_id,),
@@ -720,13 +753,15 @@ class PersistentQueue:
             "(request_id, agent_id, endpoint, call_site, priority, "
             " input_tokens, output_tokens, cached_tokens, duration_s, queue_wait_ms, "
             " status, completed_at, payload_json, response_json, "
-            " session_id, turn_id, caller_id, finish_reason, kind, key_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " session_id, turn_id, caller_id, finish_reason, kind, key_id, "
+            " no_store, content_meta) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 request_id, agent_id, endpoint, call_site, priority,
                 input_tokens, output_tokens, cached_tokens, duration_s, queue_wait_ms,
                 status, now, payload_s, response_s,
                 session_id, turn_id, caller_id, finish_reason, kind, key_id,
+                no_store or None, content_meta,
             ),
         )
 

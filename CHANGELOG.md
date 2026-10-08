@@ -14,6 +14,21 @@ summary. The bullets below link in there where the long version is worth reading
 
 ### Added
 
+- **Operator-granted no-store: `X-Roadstead-No-Store: content`** (`docs/api.md` §1.11,
+  `roadstead/no_store.py`). A caller whose content must not sit in a database can ask for it to be
+  withheld from the completion row, the restart WAL, the response and reasoning-replay caches, the
+  prefix keep-alive capture, the shadow comparison and the log lines that quote it — keeping identity,
+  endpoint, timings, token counts, status, `finish_reason`, sizes, message count and roles, and tool
+  names. **Default is full logging, and so is the outcome for a caller who asks without a grant.** A
+  grant needs an API-key identity that no address registration shares AND a stanza in the operator's
+  agents config carrying `content_no_store: allowed`, `approved_by: operator` and an ISO
+  `approved_on` (file-only: the admin PATCH refuses it). A refused ask is counted
+  (`reliability.no_store_refused`, `roadstead_no_store_requests_total`), logged with the caller's name,
+  written to the completion row (`no_store = 'refused:<reason>'`) and echoed in the response header.
+  A no-store request also bypasses the grammar memos and is never eligible for remote spill.
+  The shipped example grants nothing. New `proxy_completions` columns `no_store` and `content_meta`
+  (added by the existing idempotent `ALTER`).
+
 - **Honest availability on `/v1/status`: `state`, `reachable`, and a read-only `residency`.** An
   `on_demand` endpoint that is not loaded was skipped by the capacity poller, so an endpoint nothing
   manages (no lease is ever held) was never probed again, its circuit breaker sat at its initial

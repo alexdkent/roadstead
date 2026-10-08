@@ -213,6 +213,17 @@ class IPIdentityMap:
                              "min_timeout_s": reg.min_timeout_s}
         return out
 
+    def address_identities(self) -> frozenset[str]:
+        """Every ``agent_id`` an ADDRESS can resolve to, the built-in ``internal``
+        included. These name hosts, not callers — whatever answers at the address
+        wears the label — so no per-caller privilege may attach to one
+        (``no_store.decide``: ``shared_identity``).
+        """
+        return frozenset(
+            {"internal"}
+            | {reg.agent_id for reg in self._exact.values()}
+            | {reg.agent_id for _net, reg in self._subnets})
+
     def identify(self, remote_ip: str) -> tuple[str, LLMPriority] | None:
         """Returns (agent_id, default_priority) for the given IP, or None
         if the IP is not registered."""

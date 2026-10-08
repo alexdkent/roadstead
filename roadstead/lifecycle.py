@@ -98,6 +98,8 @@ from .legacy import (
     sync_response as legacy_sync_response,
     timeout_response as legacy_timeout_response,
 )
+from . import no_store as no_store_mod
+from .no_store import engaged, outcome_of, redact
 from .observability import MetricsSample, RequestLogRecord
 from .on_demand import OnDemandUnavailable
 from .providers import provider_for
@@ -699,6 +701,32 @@ class Lifecycle:
         # caller into an error.
         declared_priority = self.state.spend_demote(agent_id, declared_priority)
 
+        # No-store (roadstead/no_store.py): the request ASKS, the operator's
+        # grant decides, and the answer is fixed here, once, for every store and
+        # log line downstream. Decided from the RESOLVED principal and the final
+        # `agent_id` — never from anything the body or a header says about who
+        # the caller is.
+        try:
+            no_store_asked = no_store_mod.parse_header(
+                no_store_mod.read_header(request))
+        except no_store_mod.InvalidNoStoreHeader as exc:
+            if wire == WIRE_OPENAI:
+                return _openai_error(str(exc), "invalid_request_error", 400,
+                                     code="invalid_request_error")
+            return JSONResponse(
+                {"status": "error", "error": str(exc),
+                 "code": "invalid_request_error"}, status_code=400)
+        agent_cfg = self.state.config.agents.get(agent_id)
+        no_store = no_store_mod.decide(
+            no_store_asked,
+            authenticated=principal.authenticated,
+            agent_id=agent_id,
+            granted=bool(agent_cfg and agent_cfg.content_no_store),
+            shared_identities=self.state.acl.address_identities(),
+        )
+        if no_store.requested:
+            self.note_no_store(no_store, agent_id, principal)
+
         now = time.monotonic()
 
         # Unknown-endpoint gate. Without it a typo'd role enqueues into a
@@ -875,7 +903,13 @@ class Lifecycle:
             # sets either True grants nothing on its own; both gates take the
             # AND with the operator's opt-in.
             allow_degrade=body.get("allow_degrade"),
-            allow_spill=body.get("allow_spill"),
+            # 🚨 A no-store request is never SPILLED. Spill sends the content to
+            # a third party's servers, where Roadstead cannot honour the
+            # withholding; a caller that asked to leave no trace here has not
+            # asked to leave one there. (Failover to another LOCAL endpoint is
+            # unaffected — that content stays inside the operator's own fleet.)
+            allow_spill=False if no_store.honoured else body.get("allow_spill"),
+            no_store_outcome=no_store.outcome,
         )
 
         # Payload-shape gate (north-face hardening). A chat payload whose
@@ -977,7 +1011,10 @@ class Lifecycle:
                     "fast 422", err, caller, req.call_site)
 
         # Check deterministic cache
-        cache_key = self.state.cache.cache_key(req.endpoint, req.payload)
+        # A no-store request neither reads nor writes the response cache: a
+        # cached entry is the response text, held in memory for the TTL.
+        cache_key = (None if engaged(req)
+                     else self.state.cache.cache_key(req.endpoint, req.payload))
         if cache_key:
             cached = self.state.cache.get(cache_key)
             if cached:
@@ -1385,6 +1422,35 @@ class Lifecycle:
             # a contract somebody else is validating against.
             return legacy_sync_response(req, result)
         return self._enriched_response(req, result, corrections)
+    def note_no_store(self, decision, agent_id: str, principal) -> None:
+        """Count and name a no-store request — honoured or refused.
+
+        🚨 A REFUSED ask is the loud half of the feature: the request is about
+        to be stored in full, and the caller believes otherwise, so the counter
+        moves, the WARNING names the caller and the reason, and the completion
+        row records it (``proxy_completions.no_store``). The log line carries no
+        content — only the identity, the credential's public ``key_id`` and why.
+        """
+        st = self.state
+        tally = st.no_store_by_agent.setdefault(agent_id, {})
+        if decision.honoured:
+            st.no_store_honoured += 1
+            tally["honoured"] = tally.get("honoured", 0) + 1
+            logger.info(
+                "ROADSTEAD_NO_STORE_HONOURED agent=%s key_id=%s — content "
+                "withheld from every store and log line for this request",
+                agent_id, principal.key_id or "-")
+            return
+        st.no_store_refused += 1
+        tally["refused"] = tally.get("refused", 0) + 1
+        tally[decision.reason] = tally.get(decision.reason, 0) + 1
+        logger.warning(
+            "ROADSTEAD_NO_STORE_REFUSED agent=%s key_id=%s source=%s reason=%s "
+            "— %s asked for no-store and was NOT granted it; the request is "
+            "stored in full as usual",
+            agent_id, principal.key_id or "-", principal.source, decision.reason,
+            agent_id)
+
     def _predicted_ms(self, req: QueuedRequest) -> float | None:
         """What the timeout model would recommend for this call, in ms.
 
@@ -1745,8 +1811,10 @@ class Lifecycle:
             raise
         except Exception as exc:
             duration = time.monotonic() - t0
+            # A backend error body can quote the prompt it rejected.
             logger.error(
-                "dispatch %s failed: %s", req.request_id, exc,
+                "dispatch %s failed: %s", req.request_id,
+                redact(engaged(req), exc),
             )
             self.state.resolve_error(req, str(exc))
             self.record_completion(req, decision, duration, 0, 0, "error")
@@ -2021,12 +2089,12 @@ class Lifecycle:
                             "ROADSTEAD_STRUCTURED_FAULT_RETRY %s (attempt %d): "
                             "structured request died mid-generation with an "
                             "engine 500 — retrying once: %s",
-                            ep_cfg.role, attempts, exc,
+                            ep_cfg.role, attempts, redact(engaged(req), exc),
                         )
                     else:
                         logger.warning(
                             "transient backend error on %s (attempt %d) — retrying: %s",
-                            ep_cfg.role, attempts, exc,
+                            ep_cfg.role, attempts, redact(engaged(req), exc),
                         )
                     await asyncio.sleep(_RETRY_BACKOFF_S)
                     continue
@@ -2240,7 +2308,9 @@ class Lifecycle:
             )
 
             # Shadow backend A/B: fire-and-forget to the shadow if configured
-            if ep_cfg.shadow_host and ep_cfg.shadow_port:
+            # No shadow comparison for a no-store request: it would send the
+            # content to a second backend and record the pair.
+            if ep_cfg.shadow_host and ep_cfg.shadow_port and not engaged(req):
                 asyncio.create_task(self.execute_shadow(
                     req, ep_cfg, decision, resp,
                 ))
@@ -2270,6 +2340,7 @@ class Lifecycle:
             shadow_resp.duration_s, decision.queue_wait_ms, "ok",
             payload=req.payload, response=shadow_resp.body,
             cached_tokens=shadow_resp.cached_tokens,
+            no_store=outcome_of(req),
         )
 
     async def _stream_progress_probe(
@@ -3410,7 +3481,12 @@ class Lifecycle:
         # tracked prefix's countdown. Absent `policy.prefix_keepalive_call_sites`
         # -> `enabled()` is False and this is a single attribute read. Fail-open
         # like the truncation tally above: this must never break accounting.
-        if req.payload_type == "chat_completion":
+        #
+        # 🚨 Never for a no-store request: the tracker CAPTURES the prefix (tools
+        # + system + render skeleton, raw) and later re-sends it to the backend
+        # on a timer, which is content retained and replayed on the caller's
+        # behalf after the call is over.
+        if req.payload_type == "chat_completion" and not engaged(req):
             _pk_ep = self.state.config.endpoints.get(normalize_endpoint(req.endpoint))
             if _pk_ep is not None:
                 try:
@@ -3472,7 +3548,10 @@ class Lifecycle:
             req.call_site, int(req.priority),
             input_tokens, output_tokens, duration_s,
             decision.queue_wait_ms, status,
-            payload=req.payload if capture else None,
+            # A no-store row is handed its payload even for a non-chat type so
+            # `persist_complete` can record the SHAPE (sizes, counts) of what it
+            # then drops; for every other row the capture rule is unchanged.
+            payload=req.payload if (capture or engaged(req)) else None,
             response=response_body,
             session_id=req.session_id,
             turn_id=req.turn_id,
@@ -3483,6 +3562,7 @@ class Lifecycle:
             # Empty -> NULL, which is the meaningful default: the credential IS
             # the agent_id. Only a delegated call carries a value.
             key_id=req.asserted_by_key_id or None,
+            no_store=outcome_of(req),
         )
 
         # Log

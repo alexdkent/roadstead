@@ -126,8 +126,13 @@ def test_the_quota_allowlists_agree_with_each_other_and_with_the_dataclass():
     dataclass_fields = {
         f.name for f in dataclasses.fields(AgentQuotaConfig)
     } - {"agent_id"}
-    assert set(EDITABLE_QUOTA_FIELDS) == config_mod._AGENT_CONFIG_FIELDS
-    assert set(EDITABLE_QUOTA_FIELDS) == dataclass_fields
+    # The no-store grant is the one deliberate asymmetry: the FILE accepts it
+    # (three keys, `approved_by`/`approved_on` consumed by the loader) and the
+    # PATCH does not (`tests/test_no_store.py` pins the refusal).
+    file_only = config_mod._AGENT_FILE_ONLY_FIELDS
+    assert set(EDITABLE_QUOTA_FIELDS) | file_only == config_mod._AGENT_CONFIG_FIELDS
+    assert set(EDITABLE_QUOTA_FIELDS) | {"content_no_store"} == dataclass_fields
+    assert not set(EDITABLE_QUOTA_FIELDS) & file_only
 
 
 def test_the_file_parser_actually_reads_every_field_it_allows():

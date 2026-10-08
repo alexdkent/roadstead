@@ -648,6 +648,17 @@ class ProxyHttpHandlers:
                 out.append(Metric("roadstead_truncated_tool_turns_total", int(n or 0),
                                   {"endpoint": str(endpoint)}, "gauge",
                                   help="tool turns failed as truncated_tool_turn by endpoint"))
+            # `X-Roadstead-No-Store` requests (roadstead/no_store.py) by caller and
+            # outcome. `refused` climbing for any caller means somebody believes
+            # its content is not being kept and is wrong — alert on it.
+            for agent, tally in (self.state.no_store_by_agent or {}).items():
+                for outcome in ("honoured", "refused"):
+                    if tally.get(outcome):
+                        out.append(Metric(
+                            "roadstead_no_store_requests_total",
+                            int(tally[outcome]),
+                            {"agent": str(agent), "outcome": outcome}, "gauge",
+                            help="X-Roadstead-No-Store requests by caller and outcome"))
         except Exception:
             logger.exception("roadstead /metrics render failed")
             out = []
@@ -986,6 +997,15 @@ class ProxyHttpHandlers:
                 # with min_tokens, and how many produced a real response.
                 "empty_rescue_attempts": self.state.empty_rescue_attempts,
                 "structured_fault_retries": self.state.structured_fault_retries,
+                # No-store (roadstead/no_store.py). `refused` is the number an
+                # operator watches: every one is a caller who believes its
+                # content is not being kept and is wrong. `by_agent` names them
+                # (reason keys: not_authenticated / shared_identity /
+                # not_granted). Resets at a restart — the durable record is
+                # `proxy_completions.no_store`.
+                "no_store_honoured": self.state.no_store_honoured,
+                "no_store_refused": self.state.no_store_refused,
+                "no_store_by_agent": self.state.no_store_by_agent,
                 "empty_rescue_recovered": self.state.empty_rescue_recovered,
                 # Truncation / structured-validity guard (operator mandate
                 # 2026-07-11): per-(model, caller) finish_reason=length tallies

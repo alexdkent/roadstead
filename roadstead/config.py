@@ -13,6 +13,7 @@ proxy never read, and the two disagreed for as long as both existed.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import re
@@ -1008,6 +1009,19 @@ class AgentQuotaConfig:
     # meaning "this caller should not be sending at all", distinct from None —
     # which is why this is Optional rather than a float with a zero default.
     requests_per_minute: float | None = None
+    # Operator GRANT of the `X-Roadstead-No-Store: content` request header (see
+    # `no_store.py`). False — the default — means every request this caller
+    # sends is stored in full whatever it asks for, and an ask is counted and
+    # logged as refused.
+    #
+    # 🚨 Set ONLY by `load_agent_configs`, and only from a stanza that carries
+    # `content_no_store: allowed` AND `approved_by: operator` AND an ISO
+    # `approved_on`. It is deliberately NOT in `management.EDITABLE_QUOTA_FIELDS`:
+    # the admin plane edits quotas, and a credential that can edit a quota must
+    # not thereby be able to grant a content privilege. The file is the only
+    # door, so a grant is always a reviewable edit to the operator's private
+    # config rather than a runtime side effect.
+    content_no_store: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1554,7 +1568,81 @@ _DEFAULT_AGENTS_CONFIG_PATH = Path(__file__).resolve().parent / "agents.yaml"
 _AGENT_CONFIG_FIELDS = frozenset({
     "weight", "max_balance_ss", "default_priority",
     "degrade_ok", "spill_ok", "daily_spend_usd", "requests_per_minute",
+    # The no-store grant is three keys read TOGETHER (see `_content_no_store_grant`):
+    # file-only, so they are in this allowlist and not in the admin plane's.
+    "content_no_store", "approved_by", "approved_on",
 })
+
+#: The subset of ``_AGENT_CONFIG_FIELDS`` only the FILE can set. Pinned against
+#: ``management.EDITABLE_QUOTA_FIELDS`` by
+#: ``tests/test_management_plane.py::test_the_quota_allowlists_agree_...``.
+_AGENT_FILE_ONLY_FIELDS = frozenset({
+    "content_no_store", "approved_by", "approved_on",
+})
+
+#: Identities that name no one caller. A grant stanza for one is refused at
+#: load. The address-registered identities (``ROADSTEAD_ACL``) are the other
+#: half of "shared", and only known at request time — see ``no_store.decide``.
+_NEVER_GRANTED = frozenset({"internal"})
+
+
+def _content_no_store_grant(agent_id: str, cfg: dict, source: str) -> bool:
+    """Whether this stanza is a VALID no-store grant. Reports why not.
+
+    🚨 Three keys or nothing: ``content_no_store: allowed``, ``approved_by:
+    operator`` and ``approved_on: <ISO date>``. The approval pair exists because
+    code cannot prove who edited a YAML file; what it can do is refuse a grant
+    that was not written as one, so a stanza copied from another or added by a
+    tool that did not know the rule carries no privilege, and the failure is a
+    loud notice rather than a quiet grant. The fleet side pairs this with a
+    test that enumerates the granted identities, so adding one is a reviewable
+    change to a literal list.
+
+    ``content_no_store`` must be the STRING ``allowed``: YAML's ``true`` /
+    ``yes`` / ``on`` are too easy to type by accident for a privilege.
+    """
+    if cfg.get("content_no_store") in (None, False):
+        # Absent, or written down as off: nothing was asked, nothing to report.
+        # The approval keys alone are inert.
+        return False
+    problems: list[str] = []
+    if cfg["content_no_store"] != "allowed":
+        problems.append(
+            f"content_no_store must be the string 'allowed' (got "
+            f"{cfg['content_no_store']!r})")
+    if cfg.get("approved_by") != "operator":
+        problems.append("approved_by must be 'operator'")
+    approved_on = cfg.get("approved_on")
+    if isinstance(approved_on, datetime.datetime):
+        approved_on = approved_on.date()
+    if isinstance(approved_on, str):
+        try:
+            approved_on = datetime.date.fromisoformat(approved_on.strip())
+        except ValueError:
+            approved_on = None
+    if not isinstance(approved_on, datetime.date):
+        problems.append("approved_on must be an ISO date (YYYY-MM-DD)")
+    elif approved_on > datetime.date.today() + datetime.timedelta(days=1):
+        problems.append(f"approved_on {approved_on.isoformat()} is in the future")
+    if agent_id in _NEVER_GRANTED:
+        problems.append(
+            f"{agent_id!r} is a built-in shared identity, never a grantee")
+    if problems:
+        hooks.config_notice(
+            source=source,
+            subject=agent_id,
+            problem="invalid_grant",
+            detail=("content_no_store is NOT granted to this caller and its "
+                    "requests are stored in full: " + "; ".join(problems)),
+            keys=["content_no_store", "approved_by", "approved_on"],
+        )
+        return False
+    logger.warning(
+        "NO-STORE GRANT agent=%s approved_by=%s approved_on=%s source=%s — "
+        "requests from this caller may withhold their content from storage "
+        "when they present an API key and ask for it",
+        agent_id, cfg["approved_by"], approved_on.isoformat(), source)
+    return True
 
 
 
@@ -1612,7 +1700,11 @@ def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaCo
         degrade_ok (bool — failover opt-in, § 9.5),
         spill_ok (bool — paid remote-spill opt-in, Workstream D),
         daily_spend_usd (float or null — per-day REAL-money cap; crossing it
-            degrades the caller, never rejects it).
+            degrades the caller, never rejects it),
+        content_no_store + approved_by + approved_on (the operator's grant of
+            the ``X-Roadstead-No-Store`` request header — all three or none;
+            FILE-ONLY, never settable through the admin plane. See
+            ``no_store.py`` and ``_content_no_store_grant``).
     Missing keys fall back to the AgentQuotaConfig dataclass defaults.
     ⚠️ A key not parsed below is IGNORED — adding a knob to AgentQuotaConfig is
     not enough to make it operator-reachable. Guarded by
@@ -1672,6 +1764,11 @@ def load_agent_configs(path: str | Path | None = None) -> dict[str, AgentQuotaCo
             kwargs["degrade_ok"] = bool(cfg["degrade_ok"])
         if "spill_ok" in cfg:
             kwargs["spill_ok"] = bool(cfg["spill_ok"])
+        # Read as a group; `approved_by`/`approved_on` are consumed here and
+        # held nowhere else.
+        if "approved_by" in cfg or "approved_on" in cfg or "content_no_store" in cfg:
+            if _content_no_store_grant(str(agent_id), cfg, str(p)):
+                kwargs["content_no_store"] = True
         if "requests_per_minute" in cfg:
             raw_rate = cfg["requests_per_minute"]
             # Same shape as daily_spend_usd below, and the same reason: null is

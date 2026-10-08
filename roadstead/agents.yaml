@@ -196,3 +196,22 @@ hygiene:
 # bankrupt fastest, and its work is the least urgent.
 #
 # (Any caller not listed here uses the AgentQuotaConfig defaults.)
+
+
+# --- content_no_store: the operator's grant, and this file grants nothing ------
+# A caller may send `X-Roadstead-No-Store: content` to ask that its prompt and
+# response not be stored (docs/api.md §1.11). The header grants nothing; THIS
+# file does, and only for a caller that authenticates with an API key, in a
+# stanza carrying ALL THREE of these lines:
+#
+#   some-caller:
+#     content_no_store: allowed
+#     approved_by: operator
+#     approved_on: 2026-01-31
+#
+# Absent = off, which is the default and what every caller is today: asking
+# without a grant is counted, logged by name, and stored in full anyway. A
+# stanza missing an approval line is NOT a grant (a CONFIG NOTICE says why).
+# It is file-only — `PATCH /rs/v1/admin/callers/{id}` refuses it — so a grant
+# is always a reviewable edit to your own copy of this file. Keep real grants in
+# your private config, never in the shipped example.

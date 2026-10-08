@@ -83,6 +83,7 @@ from starlette.responses import JSONResponse, Response
 
 from .config import LLMPriority, ROLE_TO_CLASS, normalize_endpoint
 from .cost_model import estimate_input_tokens
+from .no_store import outcome_of
 from .intent import (
     IntentError,
     ModelFacts,
@@ -129,6 +130,10 @@ ENRICHMENT_HEADERS = {
     # a sync response may add whatever `corrections_applied` found once the
     # backend has actually answered.
     "corrected": "X-Roadstead-Corrected",
+    # `honoured` / `refused:<reason>` — present ONLY when the request sent
+    # `X-Roadstead-No-Store` (`no_store.py`). A refusal must be visible to the
+    # caller that believes it opted out, not just to the operator's log.
+    "no_store": "X-Roadstead-No-Store",
 }
 
 
@@ -675,6 +680,11 @@ def identity_block(req) -> dict:
     if declared:
         block["declared"] = declared
         block["honoured"] = declared == req.agent_id
+    # Only when the caller sent `X-Roadstead-No-Store`: `honoured` or
+    # `refused:<reason>` (`no_store.py`).
+    no_store = outcome_of(req)
+    if no_store:
+        block["no_store"] = no_store
     return block
 
 
@@ -740,4 +750,7 @@ def enrichment_headers(req, corrections: list[str] | None = None) -> dict[str, s
     }
     if corrections:
         headers[ENRICHMENT_HEADERS["corrected"]] = ",".join(corrections)
+    no_store = outcome_of(req)
+    if no_store:
+        headers[ENRICHMENT_HEADERS["no_store"]] = no_store
     return headers

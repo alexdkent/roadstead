@@ -174,4 +174,5 @@ def test_every_documented_metric_is_emitted():
 def test_the_documented_set_is_the_whole_set():
     """Pin the count, so a bulk edit that drops half the table is not silently
     consistent with a builder edit that drops the same half."""
-    assert len(_documented_metric_names()) == 33
+    # 34: +`roadstead_no_store_requests_total` (docs/api.md §1.11).
+    assert len(_documented_metric_names()) == 34

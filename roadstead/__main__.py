@@ -24,6 +24,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from . import __version__
+from . import no_store as no_store_mod
 from .config import (
     ProxyConfig,
     env_with_legacy_prefix as _env,
@@ -66,8 +67,17 @@ async def _on_unhandled(request: Request, exc: Exception) -> JSONResponse:
     JSON 500 instead of a raw ASGI 500. This is the front door for all fleet
     LLM traffic — a malformed field from any caller must never surface as an
     unhandled `Exception in ASGI application`."""
-    logger.exception("unhandled proxy error in %s %s",
-                     request.method, request.url.path)
+    if no_store_mod.read_header(request) is not None:
+        # The caller asked for no-store; whether it was granted is decided deep
+        # in the handler that just failed, so assume it was. An exception's
+        # message can quote the value that broke it, so log the TYPE only.
+        logger.error("unhandled proxy error in %s %s (%s) — traceback withheld "
+                     "because the request carried %s; repeat without it to "
+                     "diagnose", request.method, request.url.path,
+                     type(exc).__name__, no_store_mod.HEADER)
+    else:
+        logger.exception("unhandled proxy error in %s %s",
+                         request.method, request.url.path)
     return JSONResponse({"status": "error", "error": "internal proxy error"},
                         status_code=500)
 

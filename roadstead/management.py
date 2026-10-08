@@ -131,6 +131,7 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from . import hooks, model_catalog
 from .config import (AgentQuotaConfig, CANONICAL_ENV_PREFIX, EndpointConfig,
                      LEGACY_ENV_PREFIX, LLMPriority, env_with_legacy_prefix)
+from .config import _AGENT_FILE_ONLY_FIELDS
 from .enriched import _error
 from .identity import iso_time
 from .providers import known_engines, provider_for_engine
@@ -219,6 +220,11 @@ EDITABLE_QUOTA_FIELDS = (
     "weight", "max_balance_ss", "default_priority",
     "degrade_ok", "spill_ok", "daily_spend_usd", "requests_per_minute",
 )
+
+#: Agent-config keys the FILE accepts and this API deliberately does not: the
+#: no-store grant (``config.AgentQuotaConfig.content_no_store``). Named here so
+#: the refusal in :func:`validate_quota_patch` can say why.
+_FILE_ONLY_QUOTA_FIELDS = _AGENT_FILE_ONLY_FIELDS
 
 #: Fields a ``POST /rs/v1/admin/keys`` accepts.
 _KEY_CREATE_FIELDS = frozenset({
@@ -677,6 +683,14 @@ def validate_quota_patch(body: Any) -> dict:
     """
     if not isinstance(body, dict) or not body:
         raise Invalid("expected a non-empty JSON object of quota fields")
+    file_only = sorted(set(body) & _FILE_ONLY_QUOTA_FIELDS)
+    if file_only:
+        # 🚨 Named, rather than falling through to "unknown field": an operator
+        # (or a caller holding an admin key) reaching for the no-store grant
+        # here should learn that the refusal is the design, and where the grant
+        # lives. A credential that edits quotas must not be able to grant this.
+        raise Invalid(f"{file_only} can only be set in the agents config file "
+                      f"by the operator, never through this API")
     unknown = sorted(set(body) - set(EDITABLE_QUOTA_FIELDS))
     if unknown:
         raise Invalid(f"unknown quota field(s) {unknown}; editable fields are "
@@ -1640,6 +1654,11 @@ class ManagementApi:
                     "addresses": addresses.get(agent_id, []),
                 },
                 "quota": self._quota_view(agent_id),
+                # Read-only: the operator's file-only grant of the
+                # `X-Roadstead-No-Store` header (`no_store.py`). Beside the
+                # quota, not in it, because the quota block is what a PATCH can
+                # change and this is not.
+                "content_no_store": bool(cfg.content_no_store),
                 "drr": budgets.get(agent_id),
                 # 🚨 Two kinds of money, never summed (spend.py, §1.6): the first
                 # is an invoice and the second is a saving. They are reported as
