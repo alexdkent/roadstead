@@ -165,6 +165,12 @@ _ENDPOINT_CLASS: dict[str, str | None] = {
     # the low end of the mid-market 8B rentals, so it can only under-claim.
     "usersim": "tier1",
     "embed": "embed", "embeddings": "embed",
+    # 🚨 The multimodal embedding endpoints, by the names a deployment gives
+    # them. Same failure as the split tier-2 names above: the bare `embed` key
+    # never matches a new endpoint name, so its traffic booked $0 while reading
+    # as a priced lane and surfaced only under `undeclared` in the savings
+    # payload. Embedding input is tokens, so it prices exactly like `embed`.
+    "embed-mm": "embed", "eg2-embed": "embed",
     "rerank": "rerank",
     # --- remote spill: real money, and not this table's business. Explicitly
     # None so a stray lookup reads as unpriced rather than free — `spend.py`

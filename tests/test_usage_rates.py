@@ -59,6 +59,9 @@ class TestEveryLiveEndpointIsPriced:
             ("diarize-gpu", "diarize"),
             # a synthetic-traffic LLM lane is still priced (see the table note)
             ("usersim", "tier1"),
+            # the multimodal embedding endpoints: an embedding, not an unknown name
+            ("embed-mm", "embed"),
+            ("eg2-embed", "embed"),
         ],
     )
     def test_endpoint_resolves_to_its_rate_class(self, endpoint, expected_class):
@@ -72,6 +75,7 @@ class TestEveryLiveEndpointIsPriced:
             "unraid-htdemucs", "orpheus-tts", "chatterbox-tts",
             "cortex-orpheus-tts", "cortex-chatterbox-tts", "cortex-diarize",
             "cortex-diarize-offline", "diarize-gpu", "usersim",
+            "embed-mm", "eg2-embed",
         ],
     )
     def test_endpoint_bills_something_for_real_volume(self, endpoint):
@@ -83,6 +87,18 @@ class TestEveryLiveEndpointIsPriced:
         """
         cost = cloud_cost_usd(endpoint, 10_000 * SEC, 50_000)
         assert cost > 0.0, f"{endpoint} bills $0 on 10k units — priced in name only"
+
+
+class TestMultimodalEmbedEndpointsPriceAsEmbed:
+    """`embed-mm` / `eg2-embed` were unknown names: $0, listed under `undeclared`."""
+
+    @pytest.mark.parametrize("endpoint", ["embed-mm", "eg2-embed"])
+    def test_prices_exactly_like_embed_and_is_declared(self, endpoint):
+        assert is_declared_endpoint(endpoint)
+        assert cloud_cost_usd(endpoint, 2_000_000, 0) == pytest.approx(
+            cloud_cost_usd("embed", 2_000_000, 0)
+        )
+        assert cloud_cost_usd(endpoint, 2_000_000, 0) > 0.0
 
 
 class TestDeliberateZeroesStayZero:
